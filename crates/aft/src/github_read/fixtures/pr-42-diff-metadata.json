@@ -1,0 +1,10 @@
+{
+  "headRefOid": "0123456789abcdef0123456789abcdef01234567",
+  "url": "https://github.com/owner/repo/pull/42",
+  "changedFiles": 3,
+  "files": [
+    { "path": "src/main.rs", "additions": 1, "deletions": 1 },
+    { "path": "src/new.rs", "previousPath": "src/old.rs", "additions": 1, "deletions": 1 },
+    { "path": "assets/logo.png", "additions": 0, "deletions": 0 }
+  ]
+}

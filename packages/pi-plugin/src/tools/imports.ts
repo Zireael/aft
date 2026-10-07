@@ -19,6 +19,7 @@ import {
   accentPath,
   asNumber,
   asRecord,
+  asRecordOrEmpty,
   asRecords,
   asString,
   collapsibleResult,
@@ -80,15 +81,15 @@ const ImportParams = Type.Object({
 });
 
 /** Exported for renderer unit tests. */
-export function buildImportSections(
-  args: Static<typeof ImportParams>,
-  payload: unknown,
-  theme: Theme,
-): string[] {
+export function buildImportSections(args: unknown, payload: unknown, theme: Theme): string[] {
+  const safeArgs = asRecordOrEmpty(args);
+  const op = asString(safeArgs.op);
+  const path = asString(safeArgs.path);
+  const moduleNameArg = asString(safeArgs.module);
   const response = asRecord(payload);
   if (!response) return [theme.fg("muted", "No import result.")];
 
-  if (args.op === "organize") {
+  if (op === "organize") {
     const groups = asRecords(response.groups);
     const groupText =
       groups.length > 0
@@ -97,49 +98,60 @@ export function buildImportSections(
             .join(" · ")
         : "No imports found";
     return [
-      `${theme.fg("success", "organized")} ${theme.fg("accent", asString(response.file) ?? args.path ?? "")}`,
+      `${theme.fg("success", "organized")} ${theme.fg("accent", asString(response.file) ?? path ?? "")}`,
       `${theme.fg("muted", "groups")} ${groupText}`,
       `${theme.fg("muted", "duplicates removed")} ${asNumber(response.removed_duplicates) ?? 0}`,
     ];
   }
 
-  if (args.op === "add") {
-    const moduleName = asString(response.module) ?? args.module ?? "(module)";
+  if (op === "add") {
+    const moduleName = asString(response.module) ?? moduleNameArg ?? "(module)";
     const status =
       response.already_present === true
         ? theme.fg("warning", "already present")
         : theme.fg("success", "added");
     return [
       `${status} ${theme.fg("accent", moduleName)}`,
-      `${theme.fg("muted", "file")} ${theme.fg("accent", asString(response.file) ?? args.path ?? "")}`,
+      `${theme.fg("muted", "file")} ${theme.fg("accent", asString(response.file) ?? path ?? "")}`,
       `${theme.fg("muted", "group")} ${asString(response.group) ?? "—"}`,
     ];
   }
 
-  const moduleName = asString(response.module) ?? args.module ?? "(module)";
+  if (op !== "remove") {
+    const partial = [
+      asString(response.file) ?? path,
+      asString(response.module) ?? moduleNameArg,
+    ].filter((value): value is string => Boolean(value));
+    return [
+      theme.fg("muted", "Import result available."),
+      ...partial.map((value) => theme.fg("accent", value)),
+    ];
+  }
+
+  const moduleName = asString(response.module) ?? moduleNameArg ?? "(module)";
   const didRemove = response.removed !== false;
   const removeStatus = didRemove
     ? `${theme.fg("success", "removed")} ${theme.fg("accent", moduleName)}`
     : `${theme.fg("warning", "not present")} ${theme.fg("accent", moduleName)}`;
   return [
     removeStatus,
-    `${theme.fg("muted", "file")} ${theme.fg("accent", asString(response.file) ?? args.path ?? "")}`,
-    args.removeName
-      ? `${theme.fg("muted", "name")} ${args.removeName}`
+    `${theme.fg("muted", "file")} ${theme.fg("accent", asString(response.file) ?? path ?? "")}`,
+    asString(safeArgs.removeName)
+      ? `${theme.fg("muted", "name")} ${asString(safeArgs.removeName)}`
       : `${theme.fg("muted", "scope")} entire import`,
   ];
 }
 
 /** Exported for renderer unit tests. */
-export function renderImportCall(
-  args: Static<typeof ImportParams>,
-  theme: Theme,
-  context: RenderContextLike,
-) {
+export function renderImportCall(args: unknown, theme: Theme, context: RenderContextLike) {
+  const safeArgs = asRecordOrEmpty(args);
+  const op = asString(safeArgs.op);
+  const path = asString(safeArgs.path);
+  const moduleName = asString(safeArgs.module);
   const summary = [
-    theme.fg("accent", args.op),
-    accentPath(theme, args.path ?? ""),
-    args.module ? theme.fg("toolOutput", args.module) : undefined,
+    op ? theme.fg("accent", op) : undefined,
+    path ? accentPath(theme, path) : undefined,
+    moduleName ? theme.fg("toolOutput", moduleName) : undefined,
   ]
     .filter(Boolean)
     .join(" ");
@@ -149,7 +161,7 @@ export function renderImportCall(
 /** Exported for renderer unit tests. */
 export function renderImportResult(
   result: AgentToolResult<unknown>,
-  args: Static<typeof ImportParams>,
+  args: unknown,
   theme: Theme,
   context: RenderContextLike,
   options: RenderResultOptionsLike = { expanded: true },
@@ -157,8 +169,9 @@ export function renderImportResult(
   if (context.isError) return renderErrorResult(result, "import failed", theme, context);
   const payload = extractStructuredPayload(result);
   const sections = buildImportSections(args, payload, theme);
+  const op = asString(asRecordOrEmpty(args).op) ?? "import";
   return collapsibleResult({
-    summary: sections[0] ?? `${args.op} import completed`,
+    summary: sections[0] ?? `${op} import completed`,
     full: renderSections(sections, context),
     expanded: options.expanded,
     context,

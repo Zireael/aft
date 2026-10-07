@@ -1,0 +1,13 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "ts-perf-audit-2",
+    "views-callgraph-precutover-gaps"
+  ],
+  "note": "TypeScript bridge/plugin perf slice (stamped digests, async migration, Pi stream tail, idle-session retention) and the views call-graph pre-cutover gaps (keyless generation refusal, zoom view status); no ranking-fence file."
+}

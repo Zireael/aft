@@ -91,7 +91,7 @@ impl From<serde_json::Error> for PinError {
     }
 }
 
-/// A durable pin around an in-progress assembly.
+/// An on-disk pin around an in-progress assembly, meaningful while its owner lives.
 #[derive(Debug)]
 pub struct AssemblyPin {
     keys_path: PathBuf,
@@ -101,7 +101,7 @@ pub struct AssemblyPin {
 }
 
 impl AssemblyPin {
-    /// Creates and syncs `pins/<generation>.keys` before making the pin visible.
+    /// Writes `pins/<generation>.keys` before making the pin visible.
     /// The caller must create this guard before its first blob put.
     pub fn create(
         view_dir: &Path,
@@ -226,7 +226,6 @@ impl AssemblyPin {
         }
         let _ = fs::remove_file(&self.metadata_path);
         let _ = fs::remove_file(&self.keys_path);
-        fs_lock::sync_parent(&self.metadata_path);
         self.released = true;
     }
 }
@@ -269,7 +268,7 @@ pub(crate) fn pin_paths(view_dir: &Path, generation: &str) -> (PathBuf, PathBuf)
     )
 }
 
-/// Something whose key list is durable on disk, where a family sweep reads it.
+/// Something whose key list is visible on disk, where a family sweep reads it.
 pub trait Protection {
     fn durable_keys_path(&self) -> &Path;
 }
@@ -281,7 +280,7 @@ impl Protection for AssemblyPin {
 }
 
 /// Touches `keys` in `store`, but only after checking that every one of them
-/// is already listed in `protection`'s durable key file. This is the
+/// is already listed in `protection`'s on-disk key file. This is the
 /// "protect, then touch" order the family GC relies on: a sweep either saw
 /// the protection while marking, or the touch landed at its new epoch.
 /// Keys reported missing must be put again from the caller's bytes.
@@ -344,11 +343,12 @@ fn write_keys(path: &Path, mut encoded: Vec<String>) -> Result<(), PinError> {
     encoded.dedup();
     let file = create_private(path)?;
     write_key_lines(file, encoded.iter().map(String::as_str))?;
-    fs_lock::sync_parent(path);
     Ok(())
 }
 
-/// Writes one key per line and syncs the file. The lines are assembled in
+/// Writes one key per line. Sweeps consult keys only while their owner lives,
+/// so page-cache visibility is enough; dead owners' keys are never consumed.
+/// The lines are assembled in
 /// memory and handed to the kernel in one `write_all`: writing line by line
 /// on an unbuffered `File` costs a system call (or two) per key, which adds
 /// up when a pin lists thousands of blobs.
@@ -362,8 +362,7 @@ pub(crate) fn write_key_lines<'a>(
         contents.push(b'\n');
     }
     let mut file = work_counters::CountingFile(file);
-    file.write_all(&contents)?;
-    file.sync_all()
+    file.write_all(&contents)
 }
 
 /// Counts the system-call work spent writing pin key files, so tests can pin
@@ -379,6 +378,8 @@ pub mod work_counters {
     thread_local! {
         static WRITES: Cell<u64> = const { Cell::new(0) };
         static SYNCS: Cell<u64> = const { Cell::new(0) };
+        #[cfg(test)]
+        static BYTES: Cell<u64> = const { Cell::new(0) };
     }
 
     /// Pin key-file `(write calls, fsyncs)` made on this thread so far.
@@ -386,19 +387,21 @@ pub mod work_counters {
         (WRITES.with(Cell::get), SYNCS.with(Cell::get))
     }
 
-    pub(crate) struct CountingFile(pub(crate) File);
-
-    impl CountingFile {
-        pub(crate) fn sync_all(&self) -> io::Result<()> {
-            SYNCS.with(|c| c.set(c.get() + 1));
-            self.0.sync_all()
-        }
+    /// Bytes actually written to pin key files on this thread.
+    #[cfg(test)]
+    pub(crate) fn key_file_bytes() -> u64 {
+        BYTES.with(Cell::get)
     }
+
+    pub(crate) struct CountingFile(pub(crate) File);
 
     impl Write for CountingFile {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             WRITES.with(|c| c.set(c.get() + 1));
-            self.0.write(buf)
+            let written = self.0.write(buf)?;
+            #[cfg(test)]
+            BYTES.with(|c| c.set(c.get() + written as u64));
+            Ok(written)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -413,10 +416,11 @@ fn write_metadata(path: &Path, metadata: &PinMetadata) -> Result<(), PinError> {
         let mut file = create_private(&temporary)?;
         serde_json::to_writer(&mut file, metadata)?;
         file.write_all(b"\n")?;
-        file.sync_all()?;
+        crate::durability::sync_file(&file, path)?;
         drop(file);
         fs_lock::rename_over(&temporary, path)?;
-        fs_lock::sync_parent(path);
+        // Strict family sweeps abort on malformed metadata. Keep its data
+        // flush even though keys and directory entries are process-lifetime.
         Ok(())
     })();
     if result.is_err() {
@@ -454,6 +458,20 @@ fn parse_hex_key(value: &str) -> Result<[u8; 32], PinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durability_assembly_pin_counts() {
+        let view = tempfile::tempdir().unwrap();
+        crate::durability::take();
+        let mut pin =
+            AssemblyPin::create(view.path(), "family", "view", "generation", &[]).unwrap();
+        assert_eq!(crate::durability::sync_count(&crate::durability::take()), 1);
+        pin.metadata.renewed_at = now_ms().saturating_sub(PIN_RENEW_INTERVAL_MS);
+        pin.renew_if_due().unwrap();
+        assert_eq!(crate::durability::sync_count(&crate::durability::take()), 1);
+        pin.release();
+        assert_eq!(crate::durability::sync_count(&crate::durability::take()), 0);
+    }
 
     #[test]
     fn failed_renewal_stops_the_next_put() {

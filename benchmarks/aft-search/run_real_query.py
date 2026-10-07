@@ -268,11 +268,14 @@ def _schema_block(text: str) -> str:
 
 def load_capability(path: Path) -> JsonObject:
     raw = path.read_bytes()
-    digest = hashlib.sha256(raw).hexdigest()
     try:
         value = json.loads(raw)
     except json.JSONDecodeError:
-        block = _schema_block(raw.decode("utf-8"))
+        # Renderer and implementation edits do not change the tool's parameters.
+        # Preserve schema text exactly apart from platform-specific line endings.
+        text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        block = _schema_block(text)
+        digest = hashlib.sha256(block.encode("utf-8")).hexdigest()
         offset_match = re.search(r"(?m)^\s*offset\s*:", block)
         declared = offset_match is not None
         capability: JsonObject = {
@@ -290,6 +293,7 @@ def load_capability(path: Path) -> JsonObject:
         return capability
     if not isinstance(value, Mapping) or not isinstance(value.get("properties"), Mapping):
         raise InputFault("capability_schema_invalid")
+    digest = hashlib.sha256(canonical_json(value)).hexdigest()
     offset = value["properties"].get("offset")
     declared = isinstance(offset, Mapping)
     capability = {"schema_path": _display_path(path), "schema_sha256": digest, "offset_declared": declared}

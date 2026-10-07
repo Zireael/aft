@@ -233,7 +233,7 @@ const MODEL: &str = "views-semantic-mock";
 fn configure(root: &Path, storage: &Path, server: &MockEmbedder, views: bool) -> Arc<AppContext> {
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config::default(),
+        crate::context_storage::isolate(Config::default()),
     ));
     send_configure(&ctx, root, storage, server, views, MODEL);
     aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
@@ -343,6 +343,72 @@ fn search(ctx: &AppContext, query: &str) -> Value {
         ctx,
     ))
     .unwrap()
+}
+
+#[test]
+fn prose_watchdog_query_reports_views_coverage_and_keeps_symbol_previews() {
+    let _serial = crate::helpers::watcher_serial_lock();
+    let _audit = EnvGuard(
+        "AFT_SEARCH_RECALL_AUDIT",
+        std::env::var_os("AFT_SEARCH_RECALL_AUDIT"),
+    );
+    // SAFETY: environment changes in this module hold watcher_serial_lock.
+    unsafe { std::env::set_var("AFT_SEARCH_RECALL_AUDIT", "1") };
+    let server = MockEmbedder::start();
+    let repo = repository();
+    write(&repo.main, "src/watchdog.rs",
+        "// The bash watchdog stops background tasks when their time budget expires.\n\npub fn kill_expired_task() {\n    terminate_child();\n}\n");
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = configure(&repo.main, storage.path(), &server, true);
+    wait_views_filled(&ctx);
+    let runtime = ctx.checkout_semantic_runtime().unwrap();
+    let query = "how does the bash watchdog kill a background task that exceeded its timeout";
+    let query_vector = vector(&format!("views-semantic-mock\u{0}{query}"));
+    let vectors = runtime.index().unwrap().len();
+    let raw = runtime.search(&query_vector, 100, &|_| true).unwrap();
+    let answer = search(&ctx, query);
+    let audit = &answer["recall_audit"]["semantic_preview"];
+    let mut diagnostics = format!(
+        "repository root={:?}, configured root={:?}, cache root={:?}\n",
+        repo.main,
+        ctx.config().project_root,
+        ctx.canonical_cache_root_opt()
+    );
+    for section in ["metadata", "symbol_metadata", "ranked_page"] {
+        diagnostics.push_str(&format!("semantic preview {section}:\n"));
+        if let Some(rows) = audit[section].as_array() {
+            for row in rows {
+                diagnostics.push_str(&format!(
+                    "  path={} details={}\n",
+                    row["path_debug"].as_str().unwrap_or("<missing Debug path>"),
+                    row
+                ));
+            }
+        } else {
+            diagnostics.push_str("  <missing audit section>\n");
+        }
+    }
+    diagnostics.push_str(&format!("raw semantic hits: {:#?}\n", raw.results));
+    eprintln!("watchdog reproduction: vectors={vectors}, raw_semantic_hits={}, pending={}, failed={}, complete={}\n{}", raw.results.len(), raw.pending.len(), raw.failed.len(), raw.complete(), answer["text"]);
+    assert!(
+        audit["metadata"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "missing semantic metadata diagnostics\n{diagnostics}\n{answer:#}"
+    );
+    assert_eq!(
+        audit["ranked_page"].as_array().map(Vec::len),
+        answer["results"].as_array().map(Vec::len),
+        "missing ranked-path diagnostics\n{diagnostics}\n{answer:#}"
+    );
+    assert!(vectors > 0 && !raw.results.is_empty(), "{diagnostics}");
+    assert_eq!(answer["complete"], true, "{answer:#}");
+    let text = answer["text"].as_str().unwrap();
+    assert!(
+        text.contains("kill_expired_task [function] lines 3-5"),
+        "{text}\n{diagnostics}"
+    );
+    assert!(text.contains("terminate_child();"), "{text}\n{diagnostics}");
 }
 
 /// The ranked rows of a search answer, relative to `root`.
@@ -499,7 +565,7 @@ fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
     let legacy_storage = tempfile::tempdir().unwrap();
     let legacy = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config::default(),
+        crate::context_storage::isolate(Config::default()),
     ));
     send_configure(
         &legacy,
@@ -536,7 +602,7 @@ fn views_on_back_to_back_configures_leave_one_worker() {
     let chunks = unique_chunks(&repo.main);
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config::default(),
+        crate::context_storage::isolate(Config::default()),
     ));
     send_configure(
         &ctx,

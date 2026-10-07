@@ -1,0 +1,10 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": ["perf-bash-sandbox-compression", "pi-renderers-untrusted-args", "bash-cargo-test-verdicts"],
+  "note": "packages/pi-plugin/src/tools/semantic.ts only adds guards so the Pi renderer for aft_search tolerates missing or wrong-typed arguments while a call streams; the engine, its inputs and its rendered text are untouched, so no benchmark row may move. The rest of the train is bash artifact and sandbox work counts and cargo/nextest verdict lines kept under the bash reply caps."
+}

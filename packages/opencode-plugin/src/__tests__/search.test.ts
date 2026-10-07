@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { Effect } from "effect";
+import { projectV2Tool } from "../tools/definitions/v2.js";
 import { searchTools, splitIncludeArg } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
@@ -33,6 +35,10 @@ type AskCall = {
   patterns?: string[];
   metadata?: Record<string, unknown>;
 };
+
+function resultText(result: unknown): string {
+  return typeof result === "string" ? result : ((result as { output?: string })?.output ?? "");
+}
 
 function makeSearchRoot(): string {
   return fs.realpathSync(fs.mkdtempSync(path.join(process.cwd(), ".aft-search-plugin-")));
@@ -149,10 +155,14 @@ describe("searchTools", () => {
           "",
           "Found 2 match across 1 file",
         ].join("\n"),
+        matches: [{}, {}],
       }),
     );
 
-    const output = await tools.grep.execute({ pattern: "dispatch" }, sdkCtx);
+    const result = (await tools.grep.execute({ pattern: "dispatch" }, sdkCtx)) as {
+      output?: string;
+      metadata?: Record<string, unknown>;
+    };
 
     // The mock records server-side tool calls separately from direct bridge sends.
     expect(bridgeCalls.length).toBe(1);
@@ -165,7 +175,7 @@ describe("searchTools", () => {
         options: expect.objectContaining({ timeoutMs: 60_000 }),
       },
     ]);
-    expect(output).toBe(
+    expect(result.output).toBe(
       [
         "── src/main.rs (2 matches) ──",
         "  42: fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {",
@@ -174,6 +184,7 @@ describe("searchTools", () => {
         "Found 2 match across 1 file",
       ].join("\n"),
     );
+    expect(result.metadata?.matches).toBe(2);
   });
 
   test("returns glob response.text when provided", async () => {
@@ -191,7 +202,10 @@ describe("searchTools", () => {
       }),
     );
 
-    const output = await tools.glob.execute({ pattern: "src/**/*.ts" }, createMockSdkContext());
+    const result = (await tools.glob.execute(
+      { pattern: "src/**/*.ts" },
+      createMockSdkContext(),
+    )) as { output?: string; metadata?: Record<string, unknown> };
 
     expect(sendCalls).toEqual([]);
     expect(toolCallCalls).toEqual([
@@ -202,7 +216,7 @@ describe("searchTools", () => {
         options: expect.objectContaining({ timeoutMs: 60_000 }),
       },
     ]);
-    expect(output).toBe(
+    expect(result.output).toBe(
       [
         "21 files matching src/**/*.ts",
         "",
@@ -210,6 +224,31 @@ describe("searchTools", () => {
         "  one.ts, two.ts, three.ts, four.ts, five.ts, ...",
       ].join("\n"),
     );
+    expect(result.metadata).toMatchObject({ count: 2 });
+    // The path list is already in the output; repeating it in metadata would
+    // store it twice in the host session.
+    expect(result.metadata).not.toHaveProperty("files");
+  });
+
+  test("V2 projection preserves the host glob count and grep line count", async () => {
+    const { tools } = createMockSearchHarness({ disabled_tools: [] }, (command) =>
+      command === "grep"
+        ? { success: true, text: "Found 2 matches", matches: [{}, {}] }
+        : { success: true, text: "two paths", files: ["a.ts", "b.ts"] },
+    );
+    const consumers = { requestPermission: async () => {} };
+    const context = {
+      sessionID: "search-session",
+      progress: () => Effect.void,
+    };
+    const grep = projectV2Tool("grep", tools.grep, { directory: projectRoot }, consumers);
+    const glob = projectV2Tool("glob", tools.glob, { directory: projectRoot }, consumers);
+
+    const grepResult = await Effect.runPromise(grep.execute({ pattern: "needle" }, context));
+    const globResult = await Effect.runPromise(glob.execute({ pattern: "**/*.ts" }, context));
+
+    expect(grepResult.metadata).toMatchObject({ matches: 2 });
+    expect(globResult.metadata).toMatchObject({ count: 2 });
   });
 
   test("grep forwards include strings for server-side brace-aware translation", async () => {
@@ -335,8 +374,8 @@ describe("searchTools", () => {
       );
 
       expect(toolCallCalls[0]?.rawArgs.path).toBe(src);
-      expect(output).toContain("src/hit.ts:1");
-      expect(output).toContain(`Skipped 1 path not found: ${missing}`);
+      expect(resultText(output)).toContain("src/hit.ts:1");
+      expect(resultText(output)).toContain(`Skipped 1 path not found: ${missing}`);
       expect(bridgeResponse.complete).toBe(false);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -363,8 +402,8 @@ describe("searchTools", () => {
       );
 
       expect(toolCallCalls[0]?.rawArgs.path).toBe(`${src} ${e2e}`);
-      expect(output).toBe("ok");
-      expect(output).not.toContain("Skipped");
+      expect(resultText(output)).toBe("ok");
+      expect(resultText(output)).not.toContain("Skipped");
       expect(bridgeResponse.complete).toBe(true);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -420,8 +459,8 @@ describe("searchTools", () => {
       );
 
       expect(toolCallCalls[0]?.rawArgs.path).toBe(fs.realpathSync(spaced));
-      expect(output).toBe("ok");
-      expect(output).not.toContain("Skipped");
+      expect(resultText(output)).toBe("ok");
+      expect(resultText(output)).not.toContain("Skipped");
       expect(bridgeResponse.complete).toBe(true);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -447,8 +486,8 @@ describe("searchTools", () => {
       );
 
       expect(toolCallCalls[0]?.rawArgs.path).toBe(src);
-      expect(output).toContain("src/hit.ts");
-      expect(output).toContain(`Skipped 1 path not found: ${missing}`);
+      expect(resultText(output)).toContain("src/hit.ts");
+      expect(resultText(output)).toContain(`Skipped 1 path not found: ${missing}`);
       expect(bridgeResponse.complete).toBe(false);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -475,8 +514,8 @@ describe("searchTools", () => {
       );
 
       expect(toolCallCalls[0]?.rawArgs.path).toBe(`${src} ${e2e}`);
-      expect(output).toBe("src/a.ts\ne2e/b.ts");
-      expect(output).not.toContain("Skipped");
+      expect(resultText(output)).toBe("src/a.ts\ne2e/b.ts");
+      expect(resultText(output)).not.toContain("Skipped");
       expect(bridgeResponse.complete).toBe(true);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -532,8 +571,8 @@ describe("searchTools", () => {
       );
 
       expect(toolCallCalls[0]?.rawArgs.path).toBe(fs.realpathSync(spaced));
-      expect(output).toBe("with space/a.ts");
-      expect(output).not.toContain("Skipped");
+      expect(resultText(output)).toBe("with space/a.ts");
+      expect(resultText(output)).not.toContain("Skipped");
       expect(bridgeResponse.complete).toBe(true);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });

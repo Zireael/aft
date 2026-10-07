@@ -17,6 +17,7 @@ import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js"
 import {
   asNumber,
   asRecord,
+  asRecordOrEmpty,
   asRecords,
   asString,
   collapsibleResult,
@@ -278,21 +279,16 @@ export function collapseInspectPhases(phases: InspectPhaseEntry[]): string[] {
 
 /** Render every terminal honestly without reducing failures to a generic error. */
 export function renderInspectTerminal(terminal: InspectTerminal, serverText?: string): string {
+  // The server owns the status and findings; do not prepend a second status.
+  if (serverText?.match(/^(FRESH\n|PARTIAL — |INTERRUPTED — |PHASE-FAILED — )/)) return serverText;
   if (terminal.kind === "FRESH" || terminal.kind === "PARTIAL") {
     // FRESH never heads a result whose diagnostics are unknown: that result
     // is PARTIAL, and the header names the producers.
     const header =
       terminal.kind === "PARTIAL"
-        ? `PARTIAL: ${terminal.partialReason ?? "diagnostics unknown"} (see below)`
+        ? `PARTIAL — ${terminal.partialReason ?? "diagnostics unknown; retry aft_inspect."}`
         : terminal.kind;
-    const lines: string[] = [header, `wait-stamp: ${terminal.waitStampText ?? "not supplied"}`];
-    lines.push(
-      terminal.phases.length > 0
-        ? `completed phases:\n${collapseInspectPhases(terminal.phases)
-            .map((phase) => `- ${phase}`)
-            .join("\n")}`
-        : "completed phases: none",
-    );
+    const lines: string[] = [header];
     if (serverText?.trim()) lines.push(serverText);
     return lines.join("\n");
   }
@@ -301,20 +297,25 @@ export function renderInspectTerminal(terminal: InspectTerminal, serverText?: st
     const detail = compactTerminalField(terminal.failureDetail, "not supplied");
     const reason = compactTerminalField(terminal.failureReason, "not supplied");
     return [
-      `inspect could not complete: ${detail} (${reason}).`,
-      `Completed phases: ${terminal.phases.length}. Retry, or narrow with sections=...`,
+      `PHASE-FAILED — inspect could not complete: ${detail} (${reason}). Retry aft_inspect, or narrow the scope.`,
     ].join("\n");
   }
 
-  const phaseLabel = terminal.phases.length === 1 ? "phase" : "phases";
   return [
-    `inspect was interrupted before it could complete (after ${terminal.phases.length} completed ${phaseLabel}); no fresh snapshot was produced.`,
-    "Retry is safe; retry inspect, or narrow with sections=...",
+    "INTERRUPTED — inspect stopped before it could complete; no fresh snapshot was produced. Retry aft_inspect, or narrow the scope.",
   ].join("\n");
 }
 
 function compactTerminalField(value: string | undefined, fallback: string): string {
-  const compact = value?.trim().replace(/\s+/g, " ");
+  let compact = value?.trim().replace(/\s+/g, " ");
+  for (const [internal, plain] of [
+    ["lsp_start", "starting language servers"],
+    ["lsp_quiescence", "waiting for language servers"],
+    ["stat_verification", "verifying files are unchanged"],
+    ["callgraph_ready", "preparing call analysis"],
+    ["tier2_rescan", "running code analysis"],
+  ])
+    compact = compact?.replaceAll(internal, plain);
   return compact || fallback;
 }
 
@@ -448,18 +449,18 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
 }
 
 /** Exported for renderer unit tests. */
-export function renderInspectCall(
-  args: Static<typeof InspectParams>,
-  theme: Theme,
-  context: RenderContextLike,
-) {
-  const sections = Array.isArray(args.sections)
-    ? `${args.sections.length} sections`
-    : args.sections;
-  const scope = Array.isArray(args.scope) ? `${args.scope.length} scopes` : args.scope;
-  const summary = [sections, scope, args.topK ? `topK=${args.topK}` : undefined]
-    .filter(Boolean)
-    .join(" ");
+export function renderInspectCall(args: unknown, theme: Theme, context: RenderContextLike) {
+  const safeArgs = asRecordOrEmpty(args);
+  const sectionsValue = safeArgs.sections;
+  const scopeValue = safeArgs.scope;
+  const sections = Array.isArray(sectionsValue)
+    ? `${sectionsValue.filter((section) => typeof section === "string").length} sections`
+    : asString(sectionsValue);
+  const scope = Array.isArray(scopeValue)
+    ? `${scopeValue.filter((entry) => typeof entry === "string").length} scopes`
+    : asString(scopeValue);
+  const topK = asNumber(safeArgs.topK);
+  const summary = [sections, scope, topK ? `topK=${topK}` : undefined].filter(Boolean).join(" ");
   return renderToolCall(
     "inspect",
     summary ? theme.fg("toolOutput", summary) : undefined,
@@ -501,8 +502,8 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
     name: "aft_inspect",
     label: "inspect",
     description:
-      "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; PARTIAL is a completed result whose diagnostics are unknown for the producers its header names; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\n" +
-      "Use `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\n" +
+      "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\n" +
+      "Use `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\n" +
       "When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",

@@ -4218,6 +4218,23 @@ fn schedule_missing_artifact_loads(
     request_search: bool,
     request_semantic: bool,
 ) -> ArtifactLoadStarts {
+    let semantic_view_work_allowed =
+        request_semantic && ctx.config().views.enabled && ctx.heavy_root_work_allowed();
+    schedule_missing_artifact_loads_admitted(
+        ctx,
+        request_search,
+        request_semantic,
+        semantic_view_work_allowed,
+    )
+}
+
+/// The caller has already read lifecycle state, before entering admission.
+fn schedule_missing_artifact_loads_admitted(
+    ctx: &AppContext,
+    request_search: bool,
+    request_semantic: bool,
+    semantic_view_work_allowed: bool,
+) -> ArtifactLoadStarts {
     let _reload_guard = ctx.artifact_reload_guard();
     let missing = missing_artifact_loads(ctx);
     let load_search = request_search && missing.search;
@@ -4225,7 +4242,7 @@ fn schedule_missing_artifact_loads(
     if !load_search && !load_semantic {
         return (None, None);
     }
-    schedule_artifact_loads(ctx, load_search, load_semantic)
+    schedule_artifact_loads_admitted(ctx, load_search, load_semantic, semantic_view_work_allowed)
 }
 
 fn start_artifact_loads(starts: ArtifactLoadStarts) -> bool {
@@ -4254,7 +4271,9 @@ pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
     }
     let generation = ctx.configure_generation();
     ctx.run_if_subc_bound_generation(generation, || {
-        start_artifact_loads(schedule_missing_artifact_loads(ctx, true, false))
+        start_artifact_loads(schedule_missing_artifact_loads_admitted(
+            ctx, true, false, false,
+        ))
     })
     .unwrap_or(false)
 }
@@ -4288,7 +4307,7 @@ pub(crate) fn restart_search_index_after_load_disconnect(ctx: &AppContext) -> bo
             );
             return false;
         }
-        let started = start_artifact_loads(schedule_artifact_loads(ctx, true, false));
+        let started = start_artifact_loads(schedule_artifact_loads_admitted(ctx, true, false, false));
         if started {
             crate::slog_info!(
                 "search index load disconnected without an index; scheduled one automatic replacement load"
@@ -4389,7 +4408,12 @@ pub(crate) fn restart_semantic_artifacts_after_refresh_disconnect(
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
-        let started = start_artifact_loads(schedule_artifact_loads(ctx, false, true));
+        let started = start_artifact_loads(schedule_artifact_loads_admitted(
+            ctx,
+            false,
+            true,
+            heavy_root_work_allowed,
+        ));
         if !started {
             *ctx.semantic_index_status()
                 .write()
@@ -4422,8 +4446,16 @@ pub(crate) fn trigger_semantic_index_reload_if_evicted(ctx: &AppContext) -> bool
         return false;
     }
     let generation = ctx.configure_generation();
+    // Admission holds the root lifecycle mutex through worker-start commit.
+    // Its nested scheduler must consume this snapshot, not lock it recursively.
+    let semantic_view_work_allowed = ctx.config().views.enabled && ctx.heavy_root_work_allowed();
     ctx.run_if_subc_bound_generation(generation, || {
-        start_artifact_loads(schedule_missing_artifact_loads(ctx, false, true))
+        start_artifact_loads(schedule_missing_artifact_loads_admitted(
+            ctx,
+            false,
+            true,
+            semantic_view_work_allowed,
+        ))
     })
     .unwrap_or(false)
 }
@@ -4466,14 +4498,26 @@ fn warm_search_reload_limiter() -> Arc<crate::cold_build_limiter::ColdBuildLimit
     Arc::clone(&WARM_SEARCH_RELOAD_LIMITER)
 }
 
+#[cfg(test)]
 fn schedule_artifact_loads(
     ctx: &AppContext,
     load_search: bool,
     load_semantic: bool,
-) -> (
-    Option<crossbeam_channel::Sender<()>>,
-    Option<crossbeam_channel::Sender<()>>,
-) {
+) -> ArtifactLoadStarts {
+    let semantic_view_work_allowed =
+        load_semantic && ctx.config().views.enabled && ctx.heavy_root_work_allowed();
+    schedule_artifact_loads_admitted(ctx, load_search, load_semantic, semantic_view_work_allowed)
+}
+
+/// Schedule using the pre-admission lifecycle decision. Generation admission
+/// still serializes worker installation with unbind; no nested lifecycle read
+/// is needed to choose the semantic view lane.
+fn schedule_artifact_loads_admitted(
+    ctx: &AppContext,
+    load_search: bool,
+    load_semantic: bool,
+    semantic_view_work_allowed: bool,
+) -> ArtifactLoadStarts {
     let canonical_cache_root = ctx.canonical_cache_root();
     let project_key = ctx.memoized_artifact_cache_key(&canonical_cache_root);
     let config = ctx.config();
@@ -4841,7 +4885,7 @@ fn schedule_artifact_loads(
     // With views enabled, this checkout's own view serves semantic search
     // (see `views::semantic_runtime`); the legacy index is not built, so
     // identical content in sibling worktrees is embedded once per family.
-    let load_semantic = if load_semantic && views_enabled && ctx.heavy_root_work_allowed() {
+    let load_semantic = if load_semantic && views_enabled && semantic_view_work_allowed {
         semantic_artifact_load_start = Some(start_checkout_semantic_lane(
             ctx,
             &canonical_cache_root,
@@ -5991,6 +6035,9 @@ pub(crate) fn open_database_runtime(
 ) -> crate::database_open::DatabaseOpenReport {
     use crate::database_open::{DatabaseOpenOutcome, DatabaseOpenReport};
 
+    #[cfg(test)]
+    ctx.note_database_open_attempt_for_test();
+
     wait_on_configure_tail_stage_gate_for_test(
         canonical_cache_root,
         ConfigureMaintenanceStage::DatabaseRuntime,
@@ -6020,17 +6067,23 @@ pub(crate) fn open_database_runtime(
     // storage root's reader floor is above this build) is refused by name
     // before a read-write connection, PRAGMA or migration touches it.
     let floor_started = Instant::now();
+    let schema = ctx.app().database_schema_version(&db_path, mode);
     let gate = crate::persisted_format::gate(
         crate::persisted_format::PersistedStore::AftDb,
         &db_path,
         &db_path,
-        crate::db::peek_schema_version(&db_path).map(u64::from),
+        schema
+            .as_ref()
+            .ok()
+            .and_then(|(version, _)| *version)
+            .map(u64::from),
     );
     let floor_check = floor_started.elapsed();
     if let Err(refusal) = gate {
         let published = ctx.publish_database_open(epoch, |slot| {
             slot.ready_for = None;
-            ctx.app().clear_db_for_path(&db_path);
+            // Keep any process-shared handle: other roots may still own its
+            // pools, and evicting it would let a retry open a second descriptor.
             ctx.backup().lock().clear_db_pool();
             ctx.bash_background().clear_db_pool();
             ctx.finish_database_runtime_error(refusal.to_string(), false);
@@ -6049,9 +6102,9 @@ pub(crate) fn open_database_runtime(
             },
         };
     }
-    let reused_handle = ctx.app().db_for_path(&db_path).is_some();
+    let reused_handle = schema.as_ref().is_ok_and(|(_, reused)| *reused);
     let open_started = Instant::now();
-    let opened = ctx.app().open_db_with_mode(&db_path, mode);
+    let opened = schema.and_then(|_| ctx.app().open_db_with_mode(&db_path, mode));
     let open = open_started.elapsed();
     let (published, outcome) = match opened {
         Ok(shared) => (
@@ -6073,7 +6126,6 @@ pub(crate) fn open_database_runtime(
             // connection and WAL descriptors.
             let published = ctx.publish_database_open(epoch, |slot| {
                 slot.ready_for = None;
-                ctx.app().clear_db_for_path(&db_path);
                 ctx.backup().lock().clear_db_pool();
                 ctx.bash_background().clear_db_pool();
                 ctx.finish_database_runtime_error(message.clone(), err.is_busy());
@@ -6120,6 +6172,12 @@ fn replay_configure_session_parts(
     root_path: &Path,
 ) {
     crate::bash_background::repair_legacy_root_tasks(storage_root, harness);
+    // A replayed task a worker was waiting on is granted one worker wait
+    // window from now, so the registry needs the configured window first.
+    ctx.bash_background()
+        .set_worker_wait_window(std::time::Duration::from_millis(
+            crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
+        ));
     #[cfg(test)]
     CONFIGURE_REPLAY_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
     if let Err(error) =
@@ -6241,6 +6299,7 @@ struct ConfigureMaintenanceContinuation {
     stage: ConfigureMaintenanceStage,
     callgraph_start_baseline: u64,
     semantic_waits_for_callgraph_start: bool,
+    view_load: Option<crossbeam_channel::Receiver<Result<PreparedConfigureView, String>>>,
 }
 
 impl ConfigureMaintenanceContinuation {
@@ -6250,6 +6309,7 @@ impl ConfigureMaintenanceContinuation {
             stage: ConfigureMaintenanceStage::Admission,
             callgraph_start_baseline: 0,
             semantic_waits_for_callgraph_start: false,
+            view_load: None,
         }
     }
 }
@@ -6413,6 +6473,58 @@ pub(crate) fn drain_deferred_configure_maintenance_unit(
     !state.jobs.is_empty()
 }
 
+/// View store opens, manifest scans and legacy migration can take minutes on
+/// slow storage. Only install their completed snapshot on the request thread;
+/// an obsolete configure's worker never gets to replace the active snapshot.
+pub(crate) fn drain_standalone_configure_unit(
+    ctx: &Arc<AppContext>,
+    state: &mut ConfigureMaintenanceState,
+) -> bool {
+    state.absorb_enqueued(ctx);
+    drop_superseded_parked_continuations(ctx, state);
+    let Some(continuation) = state.jobs.front_mut() else {
+        return false;
+    };
+    if continuation.stage == ConfigureMaintenanceStage::ViewLoad
+        && ctx.config().views.enabled
+        && !continuation.job.home_match
+        && !crate::views::parent::held_by(ctx, &continuation.job.canonical_cache_root)
+    {
+        if continuation.view_load.is_none() {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let job = continuation.job.clone();
+            let input = ConfigureViewInput::capture(ctx, &job);
+            continuation.view_load = Some(rx);
+            let spawn = thread::Builder::new()
+                .name("aft-view-open".to_owned())
+                .spawn(move || {
+                    log_ctx::with_session(Some(job.session_id.clone()), || {
+                        let _ = tx.send(prepare_configure_view(&input, &job));
+                    });
+                });
+            if let Err(error) = spawn {
+                slog_warn!("content-addressed view worker failed: {}", error);
+            }
+        }
+        match continuation
+            .view_load
+            .as_ref()
+            .expect("view load receiver")
+            .try_recv()
+        {
+            Ok(result) => finish_configure_view_load(ctx, result),
+            Err(crossbeam_channel::TryRecvError::Empty) => return true,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                finish_configure_view_load(ctx, Err("view load worker disconnected".to_owned()));
+            }
+        }
+        continuation.view_load = None;
+        continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
+        return true;
+    }
+    drain_deferred_configure_maintenance_unit(ctx, state)
+}
+
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     drain_configure_tail(ctx, false);
 }
@@ -6465,15 +6577,13 @@ fn drop_superseded_parked_continuations(ctx: &AppContext, state: &mut ConfigureM
 }
 
 fn import_legacy_view_once(
-    ctx: &AppContext,
+    input: &ConfigureViewInput,
     job: &ConfigureMaintenanceJob,
+    view: &ViewRuntimeSnapshot,
 ) -> Result<bool, String> {
-    if ctx.shared_artifacts_read_only() {
+    if input.read_only {
         return Ok(true);
     }
-    let Some(view) = ctx.view_runtime_snapshot() else {
-        return Ok(true);
-    };
     if view.generation.is_some() {
         return Ok(true);
     }
@@ -6486,10 +6596,10 @@ fn import_legacy_view_once(
     {
         return Ok(true);
     }
-    let Some(_permit) = ctx.cold_build_limiter().try_acquire() else {
+    let Some(_permit) = input.limiter.try_acquire() else {
         return Ok(false);
     };
-    let semantic_config = ctx.config().semantic.clone();
+    let semantic_config = &input.semantic;
     let mut request = crate::migration::SemanticMigrationRequest::for_root(
         view.storage.clone(),
         job.canonical_cache_root.clone(),
@@ -6514,21 +6624,12 @@ fn import_legacy_view_once(
             0,
         )
         .map_err(|error| error.to_string())?;
-    if matches!(
-        report.outcome,
-        crate::migration::SemanticMigrationOutcome::Imported
-            | crate::migration::SemanticMigrationOutcome::PublishConflict { .. }
-            | crate::migration::SemanticMigrationOutcome::AlreadyPublished { .. }
-    ) {
-        open_view_runtime_for_configure(ctx, job)?;
-    }
     Ok(true)
 }
 
-fn run_configure_view_sweep(ctx: &AppContext) {
-    let Some(view) = ctx.view_runtime_snapshot() else {
-        return;
-    };
+fn run_configure_view_sweep(view: &ViewRuntimeSnapshot) {
+    #[cfg(any(test, feature = "test-timing-hooks"))]
+    crate::views::semantic_runtime::delay_startup_io_for_test("VIEW_SWEEP");
     if let Ok(store) = crate::views::ViewStore::open(&view.storage, &view.scope) {
         if let Err(error) = store.sweep_generations() {
             slog_warn!("content-addressed generation sweep failed: {}", error);
@@ -6935,31 +7036,10 @@ fn run_configure_maintenance_unit_inner(
                 // A parent folder owns no view; its session reads the children's.
                 ctx.clear_view_runtime();
             } else if ctx.config().views.enabled && !job.home_match {
-                if let Err(error) = open_view_runtime_for_configure(ctx, job) {
-                    ctx.clear_view_runtime();
-                    slog_warn!("content-addressed view load failed: {}", error);
-                } else {
-                    let import_ready = match import_legacy_view_once(ctx, job) {
-                        Ok(ready) => ready,
-                        Err(error) => {
-                            slog_warn!("legacy semantic view import failed: {}", error);
-                            false
-                        }
-                    };
-                    if import_ready
-                        && ctx
-                            .view_runtime_snapshot()
-                            .is_some_and(|view| !view.pending_paths.is_empty())
-                    {
-                        if let Err(error) = crate::executor::view_publication::schedule(
-                            ctx,
-                            BTreeSet::new(),
-                            !ctx.shared_artifacts_read_only(),
-                        ) {
-                            slog_warn!("content-addressed initial publication failed: {}", error);
-                        }
-                    }
-                }
+                finish_configure_view_load(
+                    ctx,
+                    prepare_configure_view(&ConfigureViewInput::capture(ctx, job), job),
+                );
             } else {
                 ctx.clear_view_runtime();
             }
@@ -6971,7 +7051,13 @@ fn run_configure_maintenance_unit_inner(
             } else {
                 run_configure_storage_sweeps(&job.storage_root, job.harness.clone());
             }
-            run_configure_view_sweep(ctx);
+            if let Some(view) = ctx.view_runtime_snapshot() {
+                if detach_storage_sweeps {
+                    thread::spawn(move || run_configure_view_sweep(&view));
+                } else {
+                    run_configure_view_sweep(&view);
+                }
+            }
             continuation.stage = ConfigureMaintenanceStage::ProcessFlags;
         }
         ConfigureMaintenanceStage::ProcessFlags => {
@@ -7080,7 +7166,7 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::Status;
         }
         ConfigureMaintenanceStage::Status => {
-            ctx.status_emitter().signal(ctx.build_status_snapshot());
+            ctx.signal_status_changed();
             return ConfigureMaintenanceUnitResult::Complete;
         }
     }
@@ -7099,10 +7185,12 @@ fn manifest_checkout_paths(manifest: &crate::views::Manifest) -> BTreeSet<Vec<u8
 }
 
 fn open_view_runtime_for_configure(
-    ctx: &AppContext,
+    input: &ConfigureViewInput,
     job: &ConfigureMaintenanceJob,
-) -> Result<(), String> {
-    let family = ctx.memoized_artifact_cache_key(&job.canonical_cache_root);
+) -> Result<PreparedConfigureView, String> {
+    #[cfg(any(test, feature = "test-timing-hooks"))]
+    crate::views::semantic_runtime::delay_startup_io_for_test("VIEW_OPEN");
+    let family = input.family.clone();
     let scope = crate::path_identity::project_scope_key(&job.canonical_cache_root);
     let view = crate::views::ViewStore::open(&job.storage_root, &scope)
         .map_err(|error| error.to_string())?;
@@ -7124,10 +7212,9 @@ fn open_view_runtime_for_configure(
     let head_entries = crate::alias::head_tree_entries(&job.canonical_cache_root)
         .map_err(|error| error.to_string())?;
     let desired_head = crate::views::assembly::head_tree_fingerprint(&head_entries);
-    crate::views::cache_head_fingerprint(job.canonical_cache_root.clone(), desired_head.clone());
     let head_metadata = crate::alias::capture_git_head_metadata(
         &job.canonical_cache_root,
-        ctx.git_common_dir().as_deref(),
+        input.git_common_dir.as_deref(),
     )
     .map_err(|error| error.to_string())?;
     let generation = view
@@ -7165,11 +7252,44 @@ fn open_view_runtime_for_configure(
     // A generation published while the call graph was off has no call graph.
     // Once the call graph is on, every path is republished so the graph is
     // built, instead of the call graph staying unavailable indefinitely.
-    let callgraph_missing = ctx.config().indexes.callgraph
+    let callgraph_missing = input.callgraph
         && manifest
             .as_ref()
             .is_some_and(crate::views::assembly::manifest_lacks_callgraph);
-    let pending_paths = if callgraph_missing {
+    // Existing keys do not imply a usable graph: a binary upgrade can change
+    // extraction or resolution without changing HEAD or checkout membership.
+    // Schedule a replacement before the warm reader rejects the old output.
+    let callgraph_unready = input.callgraph
+        && generation.as_deref().is_some_and(|generation| {
+            match crate::callgraph_store::manifest_view_database_ready(
+                view.view_dir(), generation, Instant::now() + crate::db::TOOL_RETRY_BUSY_WAIT,
+            ) {
+                Ok(ready) => !ready,
+                Err(error) if error.is_unreadable_database() => true,
+                Err(error) if error.is_transient_lock_contention() => {
+                    slog_info!(
+                        "content-addressed view callgraph readiness unknown (busy) root={} generation={} reason=busy",
+                        job.canonical_cache_root.display(), generation
+                    );
+                    false
+                }
+                Err(error) => {
+                    slog_warn!(
+                        "content-addressed view callgraph readiness unknown root={} generation={} reason=probe_failed error={}",
+                        job.canonical_cache_root.display(), generation, error
+                    );
+                    false
+                }
+            }
+        });
+    if callgraph_unready {
+        slog_info!(
+            "content-addressed view callgraph rebuild scheduled root={} generation={} reason=derived_not_ready",
+            job.canonical_cache_root.display(),
+            generation.as_deref().unwrap_or_default()
+        );
+    }
+    let pending_paths = if callgraph_missing || callgraph_unready {
         head_paths.clone()
     } else if generation_matches_head {
         BTreeSet::new()
@@ -7203,8 +7323,8 @@ fn open_view_runtime_for_configure(
         .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
         .transpose()
         .map_err(|error| error.to_string())?;
-    ctx.install_view_runtime(
-        ViewRuntimeSnapshot {
+    Ok(PreparedConfigureView {
+        snapshot: ViewRuntimeSnapshot {
             query_pin: None,
             storage: job.storage_root.clone(),
             family,
@@ -7217,8 +7337,94 @@ fn open_view_runtime_for_configure(
             pending_paths,
         },
         pin,
-    );
-    Ok(())
+        import_ready: true,
+    })
+}
+
+#[derive(Debug)]
+struct PreparedConfigureView {
+    snapshot: ViewRuntimeSnapshot,
+    pin: Option<crate::pins::QueryPin>,
+    import_ready: bool,
+}
+
+struct ConfigureViewInput {
+    family: String,
+    git_common_dir: Option<PathBuf>,
+    callgraph: bool,
+    read_only: bool,
+    semantic: SemanticBackendConfig,
+    limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+}
+
+impl ConfigureViewInput {
+    fn capture(ctx: &AppContext, job: &ConfigureMaintenanceJob) -> Self {
+        Self {
+            family: ctx.memoized_artifact_cache_key(&job.canonical_cache_root),
+            git_common_dir: ctx.git_common_dir(),
+            callgraph: ctx.config().indexes.callgraph,
+            read_only: ctx.shared_artifacts_read_only(),
+            semantic: ctx.config().semantic.clone(),
+            limiter: ctx.cold_build_limiter(),
+        }
+    }
+}
+
+fn prepare_configure_view(
+    input: &ConfigureViewInput,
+    job: &ConfigureMaintenanceJob,
+) -> Result<PreparedConfigureView, String> {
+    let mut prepared = open_view_runtime_for_configure(input, job)?;
+    let import_ready = match import_legacy_view_once(input, job, &prepared.snapshot) {
+        Ok(ready) => ready,
+        Err(error) => {
+            slog_warn!("legacy semantic view import failed: {}", error);
+            false
+        }
+    };
+    // An import may have published the first generation. Re-read only in that
+    // case, so the installed pin and manifest refer to the imported generation.
+    if import_ready && prepared.snapshot.generation.is_none() {
+        let store = crate::views::ViewStore::open(&job.storage_root, &prepared.snapshot.scope)
+            .map_err(|error| error.to_string())?;
+        if store
+            .current_generation()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            prepared = open_view_runtime_for_configure(input, job)?;
+        }
+    }
+    prepared.import_ready = import_ready;
+    Ok(prepared)
+}
+
+fn finish_configure_view_load(ctx: &AppContext, result: Result<PreparedConfigureView, String>) {
+    match result {
+        Ok(prepared) => {
+            let publish = prepared.import_ready && !prepared.snapshot.pending_paths.is_empty();
+            if let Some(root) = ctx.canonical_cache_root_opt() {
+                crate::views::cache_head_fingerprint(
+                    root,
+                    prepared.snapshot.head_fingerprint.clone(),
+                );
+            }
+            ctx.install_view_runtime(prepared.snapshot, prepared.pin);
+            if publish {
+                if let Err(error) = crate::executor::view_publication::schedule(
+                    ctx,
+                    BTreeSet::new(),
+                    !ctx.shared_artifacts_read_only(),
+                ) {
+                    slog_warn!("content-addressed initial publication failed: {}", error);
+                }
+            }
+        }
+        Err(error) => {
+            ctx.clear_view_runtime();
+            slog_warn!("content-addressed view load failed: {}", error);
+        }
+    }
 }
 
 fn spawn_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
@@ -8230,6 +8436,304 @@ mod tests {
     }
 
     #[test]
+    fn busy_readiness_does_not_schedule_a_configure_rebuild() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let ctx = test_context();
+        let params = json!({
+            "project_root": project.path(), "storage_dir": storage.path(), "harness": "opencode",
+            "config": [user_tier(json!({ "views": { "enabled": true },
+                "search_index": false, "semantic_search": false, "callgraph_store": true }))]
+        });
+        let root = project.path().canonicalize().unwrap();
+        let scope = crate::path_identity::project_scope_key(&root);
+        crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+            storage: storage.path().to_owned(),
+            family: crate::search_index::artifact_cache_key(&root),
+            scope: scope.clone(),
+            desired_head: crate::views::assembly::head_tree_fingerprint(
+                &crate::alias::head_tree_entries(&root).unwrap(),
+            ),
+            project_root: root,
+            changed_paths: BTreeSet::new(),
+            semantic_keys: Default::default(),
+            require_semantic: false,
+            allow_blob_put: true,
+            callgraph: true,
+        })
+        .unwrap();
+        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
+        let initial = view.current_generation().unwrap();
+        let derived = view.derived_path(initial.as_deref().unwrap()).unwrap();
+        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
+        let writer = crate::db::file_identity::IdentityConnection::open(
+            &derived,
+            "busy_configure_readiness_test",
+        )
+        .unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+
+        assert!(
+            handle_configure_for_test(
+                &configure_request_with_session(params.clone(), "while-locked"),
+                &ctx
+            )
+            .success
+        );
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            ctx.view_runtime_snapshot()
+                .unwrap()
+                .pending_paths
+                .is_empty(),
+            "busy readiness must not schedule a configure rebuild"
+        );
+        assert_eq!(view.current_generation().unwrap(), initial);
+        assert_eq!(
+            crate::views::assembly::cold_build_counts(view.view_dir()),
+            Default::default()
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+
+        assert!(
+            handle_configure_for_test(
+                &configure_request_with_session(params, "after-unlock"),
+                &ctx
+            )
+            .success
+        );
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(view.current_generation().unwrap(), initial);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn views_owner_rebuilds_stale_callgraph_with_multiple_sessions_and_linked_worktrees() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let storage = temp.path().join("storage");
+        init_git_fixture(&main);
+        let main = main.canonicalize().unwrap();
+        for name in ["linked-one", "linked-two"] {
+            assert!(git_command(&main)
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(temp.path().join(name))
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success());
+        }
+        let family = crate::search_index::artifact_cache_key(&main);
+        let scope = crate::path_identity::project_scope_key(&main);
+        let head = crate::views::assembly::head_tree_fingerprint(
+            &crate::alias::head_tree_entries(&main).unwrap(),
+        );
+        let seeded =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: storage.clone(),
+                project_root: main.clone(),
+                family: family.clone(),
+                scope: scope.clone(),
+                desired_head: head,
+                changed_paths: BTreeSet::new(),
+                semantic_keys: Default::default(),
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: true,
+            })
+            .unwrap();
+        let generation = seeded.generation.unwrap();
+        let view = crate::views::ViewStore::open(&storage, &scope).unwrap();
+        let derived = view.derived_path(&generation).unwrap();
+        crate::views::wait_for_derived_checkpoint_for_test(&derived);
+        // An older binary published the same HEAD with callgraph keys, but its
+        // extraction producer and derived build output are no longer readable.
+        let source = fs::read_to_string(main.join("tracked.rs")).unwrap();
+        let old_producer = "ruled-callgraph-v2";
+        let old_key =
+            crate::blob_store::CallgraphKey::from_bytes(source.as_bytes(), "rust", old_producer)
+                .full_key();
+        let old_blob =
+            crate::callgraph_store::join::CallgraphBlob::extract(&source, "rust", old_producer)
+                .unwrap();
+        let mut blobs = crate::blob_store::BlobStore::open(
+            &storage,
+            &family,
+            crate::blob_store::BlobPlane::Callgraph,
+        )
+        .unwrap();
+        blobs.put(&old_key, &old_blob.to_bytes().unwrap()).unwrap();
+        // Leave only old-producer payloads: the owner must extract current
+        // blobs before a read-only worktree can assemble its own graph.
+        let connection = rusqlite::Connection::open(blobs.path()).unwrap();
+        connection
+            .execute(
+                "DELETE FROM blob_payloads WHERE full_key != ?1",
+                [old_key.as_bytes().as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+        let old_manifest =
+            crate::views::Manifest::new(view.load_manifest(&generation).unwrap().entries().map(
+                |(path, entry)| {
+                    let mut entry = entry.clone();
+                    if let crate::views::ManifestEntry::Regular { planes, .. } = &mut entry {
+                        planes.callgraph = Some(old_key.to_hex());
+                    }
+                    (path.clone(), entry)
+                },
+            ))
+            .unwrap();
+        fs::write(
+            view.manifest_path(&generation).unwrap(),
+            old_manifest.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        let connection = rusqlite::Connection::open(&derived).unwrap();
+        connection.execute("UPDATE meta SET v = '9e904a6dac7809c1250e41cc0eb9c1811afc33f707da25d3938c095b6e3bca2c' WHERE k = 'fingerprint'", []).unwrap();
+        drop(connection);
+
+        let params = |root: &Path| {
+            json!({
+                "project_root": root, "storage_dir": storage, "harness": "opencode",
+                "config": [user_tier(json!({ "views": { "enabled": true },
+                    "search_index": false, "semantic_search": false, "callgraph_store": true }))]
+            })
+        };
+        let owner = test_context();
+        for session in ["owner-one", "owner-two", "owner-three"] {
+            let response = handle_configure_for_test(
+                &configure_request_with_session(params(&main), session),
+                &owner,
+            );
+            assert!(response.success, "{}", response.data);
+            assert_eq!(response.data["artifact_owner"]["mode"], "owner");
+        }
+        assert!(owner.callgraph_writer());
+        super::drain_deferred_configure_maintenance(&owner);
+        match owner.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => {
+                assert_eq!(store.reader_kind(), "view");
+                assert!(crate::callgraph_store::CallGraphRead::node_for(
+                    &store,
+                    Path::new("tracked.rs"),
+                    "tracked"
+                )
+                .is_ok());
+            }
+            CallgraphStoreAccess::Error(error) => {
+                panic!("bound owner did not rebuild its stale view: {error}")
+            }
+            _ => panic!("bound owner did not rebuild its stale view"),
+        }
+        assert_ne!(
+            view.current_generation().unwrap().as_deref(),
+            Some(generation.as_str())
+        );
+        // Rebinding a ready owner must not manufacture redundant generations.
+        let ready_generation = view.current_generation().unwrap();
+        assert!(
+            handle_configure_for_test(
+                &configure_request_with_session(params(&main), "owner-four"),
+                &owner
+            )
+            .success
+        );
+        super::drain_deferred_configure_maintenance(&owner);
+        assert_eq!(view.current_generation().unwrap(), ready_generation);
+        for name in ["linked-one", "linked-two"] {
+            let linked = temp.path().join(name);
+            let borrower = test_context();
+            let response = handle_configure_for_test(
+                &configure_request_with_session(params(&linked), name),
+                &borrower,
+            );
+            assert!(response.success, "{}", response.data);
+            assert_eq!(response.data["artifact_owner"]["mode"], "read_only");
+            assert!(!borrower.callgraph_writer());
+            super::drain_deferred_configure_maintenance(&borrower);
+            match borrower.callgraph_store_for_ops() {
+                CallgraphStoreAccess::Ready(store) => {
+                    assert_eq!(store.reader_kind(), "view");
+                    assert!(crate::callgraph_store::CallGraphRead::node_for(
+                        &store,
+                        Path::new("tracked.rs"),
+                        "tracked"
+                    )
+                    .is_ok());
+                }
+                CallgraphStoreAccess::Error(error) => {
+                    panic!("linked worktree could not read the rebuilt graph: {error}")
+                }
+                _ => panic!("linked worktree could not read the rebuilt graph"),
+            }
+            let request = RawRequest {
+                id: "linked-callers".into(),
+                command: "callers".into(),
+                session_id: Some(name.into()),
+                lsp_hints: None,
+                params: json!({ "file": linked.join("tracked.rs"), "symbol": "tracked" }),
+            };
+            let answer = crate::commands::callers::handle_callers(&request, &borrower);
+            assert!(answer.success, "{}", answer.data);
+        }
+    }
+
+    #[test]
+    fn superseded_standalone_view_load_never_installs_its_snapshot() {
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let replacement = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        init_git_fixture(replacement.path());
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config::default(),
+        ));
+        let configure = |root: &Path| {
+            configure_request_with_params(json!({
+                "project_root": root, "harness": "pi", "storage_dir": storage.path(),
+                "config": [user_tier(json!({"views": {"enabled": true}, "indexes": {"trigram": false, "semantic": false, "callgraph": false}}))],
+            }))
+        };
+        assert!(handle_configure_for_test(&configure(root.path()), &ctx).success);
+        let mut state = super::ConfigureMaintenanceState::standalone();
+        state.absorb_enqueued(&ctx);
+        let old = state.jobs.front_mut().unwrap();
+        old.stage = ConfigureMaintenanceStage::ViewLoad;
+        let input = super::ConfigureViewInput::capture(&ctx, &old.job);
+        let prepared = super::open_view_runtime_for_configure(&input, &old.job).unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        old.view_load = Some(rx);
+        tx.send(Ok(prepared)).unwrap();
+        assert!(handle_configure_for_test(&configure(replacement.path()), &ctx).success);
+        super::drain_standalone_configure_unit(&ctx, &mut state);
+        assert!(
+            ctx.view_runtime_snapshot().is_none(),
+            "the previous root's completed load replaced the new root's state"
+        );
+        assert!(state
+            .jobs
+            .iter()
+            .all(|pending| pending.job.generation == ctx.configure_generation()));
+    }
+
+    #[test]
     fn views_gate_on_opens_family_stores_after_ack_and_schedules_fresh_head() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -8627,7 +9131,17 @@ mod tests {
         );
         init_git_fixture(temp.path());
 
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        // Test contexts normally seed a private per-App store. This fixture
+        // deliberately exercises the shared default under its temporary XDG
+        // home, so seed that production-resolved default instead. The configure
+        // request still omits storage_dir, just like a plugin-less consumer.
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(crate::bash_background::storage_dir(None)),
+                ..Config::default()
+            },
+        );
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
@@ -11654,6 +12168,56 @@ mod tests {
     }
 
     #[test]
+    fn evicted_semantic_view_reload_completes_under_bound_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            project_root: Some(root.path().to_path_buf()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        };
+        config.indexes.semantic = true;
+        config.views.enabled = true;
+        config.semantic.backend = SemanticBackend::OpenAiCompatible;
+        config.semantic.base_url = Some("http://127.0.0.1:1/v1".into());
+        let ctx = std::sync::Arc::new(AppContext::from_app(App::default_shared(), config));
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.set_heavy_root_work_allowed(true);
+        *ctx.semantic_index().write().unwrap() =
+            Some(SemanticIndex::new(root.path().to_path_buf(), 3));
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::ready();
+        // Idle eviction leaves a ready status but no resident index or receiver.
+        *ctx.semantic_index().write().unwrap() = None;
+        let generation = ctx.configure_generation();
+        let worker_ctx = std::sync::Arc::clone(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::trigger_semantic_index_reload_if_evicted(&worker_ctx)
+            }));
+            let _ = tx.send(outcome);
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Only join a finished call: the deadline must also fail safely if the
+        // debug lock guard is disabled and the reload really parks forever.
+        assert!(
+            outcome.is_ok(),
+            "semantic view reload exceeded its two-second deadline"
+        );
+        worker.join().unwrap();
+        assert!(outcome
+            .unwrap()
+            .expect("reload recursively acquired lifecycle admission"));
+        assert!(
+            ctx.checkout_semantic().active(),
+            "views-enabled reload must enter the checkout semantic lane"
+        );
+        ctx.checkout_semantic().clear();
+        assert_eq!(ctx.configure_generation(), generation);
+    }
+
+    #[test]
     fn semantic_query_reloads_evicted_index_once_without_reconfigure() {
         let _artifact_guard = artifact_owner_test_lock();
         let _env_lock = home_env_mutex();
@@ -13096,7 +13660,6 @@ mod tests {
         // resolve Ready on the first call. Configure maintenance runs on the
         // transport loop; if it inherited that wait, stdin EOF would not be
         // observed until the cold build finished or the window expired.
-        let _wait_guard = crate::context::override_callgraph_build_wait_ms_for_test(60_000);
         let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -13106,6 +13669,7 @@ mod tests {
         init_git_fixture(root.path());
         std::fs::write(root.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
         let ctx = Arc::new(test_context());
+        let _wait_guard = crate::context::override_callgraph_build_wait_ms_for_test(&ctx, 60_000);
         ctx.isolate_cold_build_limiter_for_test(1);
         let req = configure_request_with_params(json!({
             "project_root": root.path(),

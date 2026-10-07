@@ -4,6 +4,7 @@ const ENTRY_BUDGET: usize = 10_000;
 use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -14,7 +15,9 @@ use crate::context::AppContext;
 use crate::edit;
 use crate::error::AftError;
 use crate::inspect::job::is_test_file;
-use crate::parser::{detect_language, FileParser, LangId, TreeSitterProvider};
+use crate::parser::{
+    detect_language, node_range_with_decorators, node_text, FileParser, LangId, TreeSitterProvider,
+};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol};
 use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
@@ -23,6 +26,7 @@ const MAX_OUTLINE_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 const OUTLINE_FILE_WALK_CAP: usize = 200;
 const OUTLINE_FILE_COLLECTION_CAP: usize = 10_000;
+const TYPE_MEMBER_PREVIEW_CAP: usize = 3;
 
 /// A single entry in the outline tree.
 ///
@@ -100,15 +104,24 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
                 Err(resp) => return resp,
             };
 
-        let text = format_multi_file_tree(&file_outlines, MAX_OUTPUT_BYTES, files.len());
+        let walk_incomplete = discovery.walk_truncated
+            || discovery.collection_truncated
+            || discovery.skipped_foreign_mounts > 0;
+        let rendered = format_multi_file_tree(
+            &file_outlines,
+            MAX_OUTPUT_BYTES,
+            files.len(),
+            walk_incomplete,
+        );
         return Response::success(
             &req.id,
             serde_json::json!({
-                "text": text,
+                "text": rendered.text,
                 "discovered": true,
-                "complete": !discovery.walk_truncated
-                    && !discovery.collection_truncated
-                    && discovery.skipped_foreign_mounts == 0,
+                "complete": !walk_incomplete && !rendered.truncated,
+                "output_truncated": rendered.truncated,
+                "files_shown": rendered.shown,
+                "structure_footer": rendered.footer,
                 "walk_truncated": discovery.walk_truncated,
                 "collection_truncated": discovery.collection_truncated,
                 "skipped_foreign_mounts": discovery.skipped_foreign_mounts,
@@ -131,14 +144,22 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
                 Err(resp) => return resp,
             };
 
-        let text = format_multi_file_tree(&file_outlines, MAX_OUTPUT_BYTES, total_files_requested);
+        let rendered = format_multi_file_tree(
+            &file_outlines,
+            MAX_OUTPUT_BYTES,
+            total_files_requested,
+            false,
+        );
         // Honest reporting: complete only when no requested file was skipped.
         // skipped_files names the gaps (missing/unreadable/unparseable inputs).
         return Response::success(
             &req.id,
             serde_json::json!({
-                "text": text,
-                "complete": skipped_files.is_empty(),
+                "text": rendered.text,
+                "complete": skipped_files.is_empty() && !rendered.truncated,
+                "output_truncated": rendered.truncated,
+                "files_shown": rendered.shown,
+                "structure_footer": rendered.footer,
                 "skipped_files": skipped_files,
             }),
         );
@@ -149,6 +170,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         .params
         .get("file")
         .or_else(|| req.params.get("target"))
+        .or_else(|| req.params.get("url"))
         .and_then(|v| v.as_str())
     {
         Some(f) => f,
@@ -177,6 +199,31 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    if is_http_url(file)
+        && crate::parser::detect_language(&path) == Some(crate::parser::LangId::Json)
+    {
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => return Response::error(&req.id, "url_fetch_failed", error.to_string()),
+        };
+        let mut response = super::url_output::json_preview(req, &source, None);
+        super::url_output::disclose_download(&path, &mut response);
+        let complete = response.data["complete"].as_bool().unwrap_or(false);
+        let mut text = response.data["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        super::url_output::cap_text(
+            &mut text,
+            super::url_output::URL_OUTPUT_BYTES,
+            "a filtered URL",
+        );
+        return Response::success(
+            &req.id,
+            serde_json::json!({"text": text, "complete": complete}),
+        );
+    }
+
     let symbols = match ctx.provider().list_symbols(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -184,16 +231,34 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    let entries = build_outline_tree(&symbols);
+    let mut parser = FileParser::new();
+    let entries = match outline_structure_entries(&path, &symbols, &mut parser, ctx, &req.id, false)
+    {
+        Ok(entries) => entries,
+        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+    };
     let filename = path
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| file.to_string());
-    let text = format_single_file_tree(&filename, &entries);
+    let mut text = format_single_file_tree(&filename, &entries);
+    let mut complete = true;
+    if is_http_url(file) {
+        if let Some(notice) = crate::url_fetch::download_notice(&path) {
+            text = format!("{notice}\n\n{text}");
+            complete = false;
+        }
+        complete &= text.len() <= super::url_output::URL_OUTPUT_BYTES;
+        super::url_output::cap_text(
+            &mut text,
+            super::url_output::URL_OUTPUT_BYTES,
+            "a smaller URL or section",
+        );
+    }
 
     Response::success(
         &req.id,
-        serde_json::json!({ "text": text, "complete": true }),
+        serde_json::json!({ "text": text, "complete": complete }),
     )
 }
 
@@ -365,6 +430,523 @@ fn insert_at_scope_indexed(
 struct FileOutline {
     path: String, // relative path
     entries: Vec<OutlineEntry>,
+    language: Option<LangId>,
+}
+
+struct TestSummary {
+    name: String,
+    range: Range,
+    items: usize,
+    unknown_reason: Option<&'static str>,
+}
+
+struct TestRegion {
+    summary: TestSummary,
+    included_path: Option<String>,
+    implicit_include: bool,
+    module_scope: Vec<String>,
+    standalone: bool,
+}
+
+enum TestNode {
+    Module,
+    Standalone,
+    Block,
+}
+
+/// Classify test code only from syntax nodes, attributes and declaration names.
+/// In particular, a module named `tests` without `cfg(test)`, a string mentioning
+/// `#[test]`, or a product class with a `test_*` method is not a test module.
+fn classify_test_node(node: tree_sitter::Node<'_>, source: &str, lang: LangId) -> Option<TestNode> {
+    match lang {
+        LangId::Rust => match node.kind() {
+            "mod_item"
+                if rust_attributes(node).into_iter().any(|attr| {
+                    attr.named_child(0)
+                        .is_some_and(|name| node_text(source, &name) == "cfg")
+                        && attr
+                            .named_child(1)
+                            .is_some_and(|args| cfg_requires_test(args, source))
+                }) =>
+            {
+                Some(TestNode::Module)
+            }
+            "function_item"
+                if node.parent().is_some_and(|parent| {
+                    parent.kind() == "source_file"
+                        || (parent.kind() == "declaration_list"
+                            && parent
+                                .parent()
+                                .is_some_and(|owner| owner.kind() == "mod_item"))
+                }) && rust_attributes(node).into_iter().any(|attr| {
+                    attr.named_child_count() == 1
+                        && attr
+                            .named_child(0)
+                            .is_some_and(|name| node_text(source, &name) == "test")
+                }) =>
+            {
+                Some(TestNode::Standalone)
+            }
+            _ => None,
+        },
+        LangId::Python => {
+            let declaration = node
+                .parent()
+                .filter(|parent| parent.kind() == "decorated_definition")
+                .unwrap_or(node);
+            if !declaration
+                .parent()
+                .is_some_and(|parent| parent.kind() == "module")
+            {
+                return None;
+            }
+            let name = node.child_by_field_name("name")?;
+            match node.kind() {
+                "class_definition" if node_text(source, &name).starts_with("Test") => {
+                    Some(TestNode::Module)
+                }
+                "function_definition" if node_text(source, &name).starts_with("test_") => {
+                    Some(TestNode::Standalone)
+                }
+                _ => None,
+            }
+        }
+        LangId::Go if node.kind() == "function_declaration" => {
+            let name = node.child_by_field_name("name")?;
+            node_text(source, &name)
+                .starts_with("Test")
+                .then_some(TestNode::Standalone)
+        }
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript
+            if node.kind() == "call_expression" =>
+        {
+            let mut callee = node.child_by_field_name("function")?;
+            loop {
+                match callee.kind() {
+                    "member_expression" => callee = callee.child_by_field_name("object")?,
+                    "call_expression" => callee = callee.child_by_field_name("function")?,
+                    _ => break,
+                }
+            }
+            if callee.kind() != "identifier"
+                || !matches!(node_text(source, &callee), "describe" | "test" | "it")
+            {
+                return None;
+            }
+            let args = node.child_by_field_name("arguments")?;
+            let mut cursor = args.walk();
+            let has_callback = args
+                .named_children(&mut cursor)
+                .any(|arg| matches!(arg.kind(), "arrow_function" | "function_expression"));
+            has_callback.then_some(TestNode::Block)
+        }
+        _ => None,
+    }
+}
+
+fn rust_attributes(node: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut attributes = Vec::new();
+    let mut previous = node.prev_named_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "attribute_item" => {
+                if let Some(attribute) = sibling.named_child(0) {
+                    attributes.push(attribute);
+                }
+            }
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        previous = sibling.prev_named_sibling();
+    }
+    attributes
+}
+
+/// `all(test, ...)` requires test compilation; `any(test, feature = ...)`
+/// and `not(test)` do not. Token-tree identifiers exclude string lookalikes.
+fn cfg_requires_test(args: tree_sitter::Node<'_>, source: &str) -> bool {
+    let mut cursor = args.walk();
+    let children = args.named_children(&mut cursor).collect::<Vec<_>>();
+    match children.as_slice() {
+        [name] => name.kind() == "identifier" && node_text(source, name) == "test",
+        [name, nested] if name.kind() == "identifier" && node_text(source, name) == "all" => {
+            let mut cursor = nested.walk();
+            let requires_test = nested
+                .named_children(&mut cursor)
+                .any(|child| child.kind() == "identifier" && node_text(source, &child) == "test");
+            requires_test
+        }
+        _ => false,
+    }
+}
+
+fn count_test_blocks(node: tree_sitter::Node<'_>, source: &str, lang: LangId) -> usize {
+    let own = usize::from(matches!(
+        classify_test_node(node, source, lang),
+        Some(TestNode::Block)
+    ));
+    let mut cursor = node.walk();
+    own + node
+        .named_children(&mut cursor)
+        .map(|child| count_test_blocks(child, source, lang))
+        .sum::<usize>()
+}
+
+fn collect_test_regions(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    lang: LangId,
+    regions: &mut Vec<TestRegion>,
+) {
+    if let Some(kind) = classify_test_node(node, source, lang) {
+        // Nested suites belong to the outer top-level block, not extra rows.
+        let top_level_block = node.parent().is_some_and(|parent| {
+            parent.kind() == "expression_statement"
+                && parent
+                    .parent()
+                    .is_some_and(|owner| owner.kind() == "program")
+        });
+        if !matches!(kind, TestNode::Block) || top_level_block {
+            let standalone = matches!(kind, TestNode::Standalone);
+            let name = if standalone {
+                "tests".to_string()
+            } else if matches!(kind, TestNode::Block) {
+                let callee = node.child_by_field_name("function").unwrap();
+                let label = node
+                    .child_by_field_name("arguments")
+                    .and_then(|args| args.named_child(0));
+                format!(
+                    "{} {}",
+                    node_text(source, &callee),
+                    label
+                        .map(|label| node_text(source, &label))
+                        .unwrap_or("tests")
+                )
+            } else {
+                node.child_by_field_name("name")
+                    .map(|name| node_text(source, &name))
+                    .unwrap_or("tests")
+                    .to_string()
+            };
+            let external_module = lang == LangId::Rust
+                && node.kind() == "mod_item"
+                && node.child_by_field_name("body").is_none();
+            let explicit_path = if lang == LangId::Rust
+                && node.kind() == "mod_item"
+                && node.child_by_field_name("body").is_none()
+            {
+                rust_attributes(node).into_iter().find_map(|attr| {
+                    let name = attr.named_child(0)?;
+                    if node_text(source, &name) != "path" {
+                        return None;
+                    }
+                    let value = attr.child_by_field_name("value")?;
+                    (value.kind() == "string_literal")
+                        .then(|| node_text(source, &value).trim_matches('"').to_string())
+                })
+            } else {
+                None
+            };
+            let implicit_include = external_module && explicit_path.is_none();
+            let included_path =
+                explicit_path.or_else(|| external_module.then(|| format!("{name}.rs")));
+            let mut module_scope = Vec::new();
+            let mut parent = node.parent();
+            while let Some(ancestor) = parent {
+                if ancestor.kind() == "mod_item" {
+                    if let Some(name) = ancestor.child_by_field_name("name") {
+                        module_scope.push(node_text(source, &name).to_string());
+                    }
+                }
+                parent = ancestor.parent();
+            }
+            module_scope.reverse();
+            regions.push(TestRegion {
+                summary: TestSummary {
+                    name,
+                    range: node_range_with_decorators(&node, source, lang),
+                    // Callback test blocks have no named symbol in the symbol table.
+                    items: if matches!(kind, TestNode::Block) {
+                        count_test_blocks(node, source, lang)
+                    } else {
+                        0
+                    },
+                    unknown_reason: None,
+                },
+                included_path,
+                implicit_include,
+                module_scope,
+                standalone,
+            });
+            return;
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_test_regions(child, source, lang, regions);
+    }
+}
+
+fn range_contains(outer: &Range, inner: &Range) -> bool {
+    (outer.start_line, outer.start_col) <= (inner.start_line, inner.start_col)
+        && (inner.end_line, inner.end_col) <= (outer.end_line, outer.end_col)
+}
+
+/// Collapse only the broad structure map. Single-file outlines and the shared
+/// symbol cache retain every symbol so zoom and other tools still see test code.
+fn outline_structure_entries(
+    path: &Path,
+    symbols: &[Symbol],
+    parser: &mut FileParser,
+    ctx: &AppContext,
+    req_id: &str,
+    collapse_tests: bool,
+) -> Result<Vec<OutlineEntry>, AftError> {
+    let Some(lang) = detect_language(path).filter(|lang| {
+        matches!(
+            lang,
+            LangId::Rust
+                | LangId::Python
+                | LangId::Go
+                | LangId::TypeScript
+                | LangId::Tsx
+                | LangId::JavaScript
+        )
+    }) else {
+        return Ok(build_outline_tree(symbols));
+    };
+    let source = std::fs::read_to_string(path).map_err(|error| AftError::FileNotFound {
+        path: format!("{}: {error}", path.display()),
+    })?;
+    let (tree, _) = parser.parse_cloned(path)?;
+    if collapse_tests && tree.root_node().has_error() {
+        return Err(AftError::ParseError {
+            message: format!("syntax errors in {}", path.display()),
+        });
+    }
+    let mut regions = Vec::new();
+    if collapse_tests {
+        collect_test_regions(tree.root_node(), &source, lang, &mut regions);
+    }
+    let mut product_symbols = Vec::new();
+    for symbol in symbols {
+        if let Some(region) = regions
+            .iter_mut()
+            .find(|region| range_contains(&region.summary.range, &symbol.range))
+        {
+            region.summary.items += 1;
+        } else {
+            product_symbols.push(symbol.clone());
+        }
+    }
+    let mut summaries: Vec<TestSummary> = Vec::new();
+    let mut standalone: Option<TestSummary> = None;
+    for mut region in regions {
+        if let Some(included_path) = region.included_path {
+            let parent = path.parent().unwrap_or(Path::new("."));
+            let mut base = parent.to_path_buf();
+            if region.implicit_include || !region.module_scope.is_empty() {
+                if let Some(stem) = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .filter(|stem| !matches!(*stem, "lib" | "main" | "mod"))
+                {
+                    base.push(stem);
+                }
+            }
+            for module in region.module_scope {
+                base.push(module);
+            }
+            let mut included = base.join(&included_path);
+            let mut label_path = PathBuf::from(&included_path);
+            if region.implicit_include && !included.is_file() {
+                label_path = PathBuf::from(&region.summary.name).join("mod.rs");
+                included = base.join(&label_path);
+            }
+            let included_label = test_module_include_label(parent, &base, &label_path);
+            // A test include is navigation metadata, not a requested file. A
+            // denied or unavailable include must not hide the declaring file's
+            // product API or bypass the project's path restrictions.
+            match ctx.validate_path(req_id, &included) {
+                Ok(included) => {
+                    let count = match outline_skip_reason(&included, Some(&mut *parser)) {
+                        Some(reason) => Err(reason),
+                        None => parser
+                            .extract_symbols(&included)
+                            .map(|symbols| symbols.len())
+                            .map_err(|error| outline_error_reason(&error)),
+                    };
+                    match count {
+                        Ok(items) => region.summary.items = items,
+                        Err(reason) => region.summary.unknown_reason = Some(reason),
+                    }
+                    parser.evict_parse_tree(&included);
+                }
+                Err(_) => region.summary.unknown_reason = Some("path_denied"),
+            }
+            region
+                .summary
+                .name
+                .push_str(&format!(" (path {included_label})"));
+        }
+        if region.standalone {
+            if let Some(summary) = &mut standalone {
+                summary.items += region.summary.items;
+                summary.range.end_line = region.summary.range.end_line;
+                summary.range.end_col = region.summary.range.end_col;
+            } else {
+                standalone = Some(region.summary);
+            }
+        } else {
+            summaries.push(region.summary);
+        }
+    }
+    summaries.extend(standalone);
+    summaries.sort_by_key(|summary| (summary.range.start_line, summary.range.start_col));
+    let mut entries = if lang == LangId::Rust {
+        rust_module_outline(tree.root_node(), &source, &product_symbols, &summaries, &[])
+    } else {
+        build_outline_tree(&product_symbols)
+    };
+    for summary in summaries {
+        let description = match summary.unknown_reason {
+            Some(reason) => format!(
+                "items unknown ({reason}) (lines {}-{})",
+                summary.range.start_line + 1,
+                summary.range.end_line + 1
+            ),
+            None => format!(
+                "{} items (lines {}-{})",
+                summary.items,
+                summary.range.start_line + 1,
+                summary.range.end_line + 1
+            ),
+        };
+        let entry = OutlineEntry {
+            signature: Some(format!("{}: {}", summary.name, description)),
+            name: summary.name,
+            kind: "test_summary".into(),
+            range: summary.range,
+            exported: false,
+            members: Vec::new(),
+        };
+        insert_summary_entry(&mut entries, entry);
+    }
+    Ok(entries)
+}
+
+fn test_module_include_label(parent: &Path, base: &Path, included_path: &Path) -> String {
+    // Joining `..` onto a Windows verbatim path normalizes it immediately,
+    // before a relative label can be recovered. Build the label from the
+    // module's relative base and the declared path instead of its read path.
+    let relative_base = base.strip_prefix(parent).unwrap_or(base);
+    path_to_slash(&relative_base.join(included_path))
+}
+
+fn insert_summary_entry(entries: &mut Vec<OutlineEntry>, entry: OutlineEntry) {
+    if let Some(module) = entries
+        .iter_mut()
+        .find(|module| module.kind == "module" && range_contains(&module.range, &entry.range))
+    {
+        insert_summary_entry(&mut module.members, entry);
+        return;
+    }
+    let position = entries
+        .iter()
+        .position(|existing| existing.range.start_line >= entry.range.start_line)
+        .unwrap_or(entries.len());
+    entries.insert(position, entry);
+}
+
+/// Module containers are absent from the shared symbol table. Keep them in the
+/// outline so nested module functions never masquerade as file-level APIs, and
+/// impl methods attach to the type in their own module rather than a namesake.
+fn rust_module_outline(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    symbols: &[Symbol],
+    tests: &[TestSummary],
+    scope: &[String],
+) -> Vec<OutlineEntry> {
+    fn immediate_modules<'a>(
+        node: tree_sitter::Node<'a>,
+        modules: &mut Vec<tree_sitter::Node<'a>>,
+    ) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "mod_item" {
+                modules.push(child);
+            } else {
+                immediate_modules(child, modules);
+            }
+        }
+    }
+    let mut modules = Vec::new();
+    immediate_modules(root, &mut modules);
+    let modules = modules
+        .into_iter()
+        .filter(|node| {
+            !tests.iter().any(|test| {
+                range_contains(
+                    &test.range,
+                    &node_range_with_decorators(node, source, LangId::Rust),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let ranges = modules
+        .iter()
+        .map(|node| node_range_with_decorators(node, source, LangId::Rust))
+        .collect::<Vec<_>>();
+    let local = symbols
+        .iter()
+        .filter(|symbol| {
+            !ranges
+                .iter()
+                .any(|range| range_contains(range, &symbol.range))
+        })
+        .map(|symbol| {
+            let mut symbol = symbol.clone();
+            if !scope.is_empty() && symbol.scope_chain.starts_with(scope) {
+                symbol.scope_chain.drain(..scope.len());
+                symbol.parent = symbol.scope_chain.last().cloned();
+            }
+            symbol
+        })
+        .collect::<Vec<_>>();
+    let mut entries = build_outline_tree(&local);
+    for (module, range) in modules.into_iter().zip(ranges) {
+        let name = module
+            .child_by_field_name("name")
+            .map(|name| node_text(source, &name))
+            .unwrap_or("module")
+            .to_string();
+        let mut module_scope = scope.to_vec();
+        module_scope.push(name.clone());
+        let module_symbols = symbols
+            .iter()
+            .filter(|symbol| range_contains(&range, &symbol.range))
+            .cloned()
+            .collect::<Vec<_>>();
+        let members = module
+            .child_by_field_name("body")
+            .map(|body| rust_module_outline(body, source, &module_symbols, tests, &module_scope))
+            .unwrap_or_default();
+        let mut cursor = module.walk();
+        let exported = module
+            .named_children(&mut cursor)
+            .any(|child| child.kind() == "visibility_modifier");
+        let entry = OutlineEntry {
+            name: name.clone(),
+            kind: "module".into(),
+            range,
+            signature: Some(format!("{}mod {name}", if exported { "pub " } else { "" })),
+            exported,
+            members,
+        };
+        insert_summary_entry(&mut entries, entry);
+    }
+    entries
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -487,12 +1069,6 @@ struct OutlineFileContentStats {
 }
 
 #[derive(Debug, Clone)]
-struct OutlineWalkOptions {
-    gitignore: Option<Arc<ignore::gitignore::Gitignore>>,
-    gitignore_root: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
 struct OutlineFileDiscovery {
     entries_examined: usize,
     files: Vec<String>,
@@ -500,6 +1076,132 @@ struct OutlineFileDiscovery {
     walk_truncated: bool,
     collection_truncated: bool,
     skipped_foreign_mounts: usize,
+    ignored_entries: usize,
+}
+
+#[derive(Clone, Default)]
+struct OutlineIgnoreStack {
+    matchers: Vec<Arc<ignore::gitignore::Gitignore>>,
+    target_root: PathBuf,
+}
+
+impl OutlineIgnoreStack {
+    fn for_target_root(root: &Path) -> Self {
+        let root = root.to_path_buf();
+        let mut stack = Self {
+            target_root: root.clone(),
+            ..Self::default()
+        };
+
+        // Global excludes and .git/info/exclude are lower priority than every
+        // .gitignore in the target's ancestor chain. Load them once per walk.
+        let (global, _) = ignore::gitignore::GitignoreBuilder::new(&root).build_global();
+        if !global.is_empty() {
+            stack.matchers.push(Arc::new(global));
+        }
+        if let Some((repo_root, exclude_path)) = git_info_exclude_for_target(&root) {
+            if let Some(matcher) = build_outline_gitignore(&repo_root, &exclude_path) {
+                stack.matchers.push(matcher);
+            }
+        }
+
+        let mut ancestors = root.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
+        ancestors.reverse();
+        for directory in ancestors {
+            if let Some(matcher) =
+                build_outline_gitignore(&directory, &directory.join(".gitignore"))
+            {
+                stack.matchers.push(matcher);
+            }
+        }
+        stack
+    }
+
+    fn for_child_directory(&self, directory: &Path) -> Self {
+        let mut child = self.clone();
+        if let Some(matcher) = build_outline_gitignore(directory, &directory.join(".gitignore")) {
+            child.matchers.push(matcher);
+        }
+        child
+    }
+
+    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let mut ignored = false;
+        for matcher in &self.matchers {
+            let mut current = path;
+            let mut current_is_dir = is_dir;
+            // The caller explicitly selected the target. Ancestor exclusions
+            // must not hide its contents, but rules for descendants still apply.
+            while current != self.target_root && current.starts_with(&self.target_root) {
+                let matched = matcher.matched(current, current_is_dir);
+                if matched.is_ignore() {
+                    ignored = true;
+                    break;
+                } else if matched.is_whitelist() {
+                    ignored = false;
+                    break;
+                }
+                let Some(parent) = current.parent() else {
+                    break;
+                };
+                current = parent;
+                current_is_dir = true;
+            }
+        }
+        ignored
+    }
+}
+
+fn build_outline_gitignore(
+    root: &Path,
+    ignore_file: &Path,
+) -> Option<Arc<ignore::gitignore::Gitignore>> {
+    if !ignore_file.is_file() {
+        return None;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    let _ = builder.add(ignore_file);
+    builder.build().ok().map(Arc::new)
+}
+
+pub(crate) fn git_info_exclude_for_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
+    for repository_root in target.ancestors() {
+        let git_entry = repository_root.join(".git");
+        let Ok(metadata) = std::fs::metadata(&git_entry) else {
+            continue;
+        };
+        let git_dir = if metadata.is_dir() {
+            git_entry
+        } else if metadata.is_file() {
+            let contents = std::fs::read_to_string(&git_entry).ok()?;
+            let git_dir = contents.trim().strip_prefix("gitdir:")?.trim();
+            let git_dir = PathBuf::from(git_dir);
+            if git_dir.is_absolute() {
+                git_dir
+            } else {
+                repository_root.join(git_dir)
+            }
+        } else {
+            continue;
+        };
+        let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
+        let common_dir = git_dir.join("commondir");
+        let git_common_dir = if let Ok(common) = std::fs::read_to_string(&common_dir) {
+            let common = PathBuf::from(common.trim());
+            if common.is_absolute() {
+                common
+            } else {
+                git_dir.join(common)
+            }
+        } else {
+            git_dir
+        };
+        return Some((
+            repository_root.to_path_buf(),
+            git_common_dir.join("info/exclude"),
+        ));
+    }
+    None
 }
 
 fn handle_outline_files_mode(
@@ -523,6 +1225,7 @@ fn handle_outline_files_mode(
     let mut walk_truncated = false;
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
+    let mut empty_targets = Vec::new();
 
     for target in targets {
         let dir_path = match ctx.validate_path(&req.id, Path::new(&target)) {
@@ -550,11 +1253,29 @@ fn handle_outline_files_mode(
         } else {
             &dir_path
         };
-        let discovery = discover_outline_files_for_files_mode(&dir_path, ctx);
+        let discovery = discover_outline_files_for_files_mode(&dir_path);
         entries_examined += discovery.entries_examined;
         walk_truncated |= discovery.walk_truncated;
         collection_truncated |= discovery.collection_truncated;
         skipped_foreign_mounts += discovery.skipped_foreign_mounts;
+
+        let empty_reason = if discovery.walk_truncated
+            || discovery.collection_truncated
+            || discovery.skipped_foreign_mounts > 0
+        {
+            "directory walk incomplete"
+        } else if discovery.files.is_empty() {
+            if discovery.ignored_entries > 0 {
+                "all files ignored or excluded"
+            } else if discovery.entries_examined == 0 {
+                "empty folder"
+            } else {
+                "no regular files found"
+            }
+        } else {
+            "test files excluded; set includeTests: true to include them"
+        };
+        let files_before = file_entries.len();
 
         let root = append_outline_directory_tree(
             &dir_path,
@@ -565,6 +1286,12 @@ fn handle_outline_files_mode(
             &mut file_entries,
             &mut directory_nodes,
         );
+        if file_entries.len() == files_before {
+            empty_targets.push(format!(
+                "0 files under {} ({empty_reason})\n",
+                display_path(&dir_path, &target, project_root.as_deref())
+            ));
+        }
         tree_roots.push(root);
     }
 
@@ -575,11 +1302,14 @@ fn handle_outline_files_mode(
         &tree_roots,
         &directory_nodes,
         &file_entries,
-        max_output_bytes,
+        max_output_bytes.saturating_sub(empty_targets.iter().map(String::len).sum::<usize>()),
     );
     populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
     let table = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
     let mut text = table.into_string();
+    for explanation in empty_targets {
+        text.push_str(&explanation);
+    }
     let unknown_lines = file_entries
         .iter()
         .filter(|entry| entry.lines.is_none() && entry.language != "binary")
@@ -714,21 +1444,8 @@ fn outline_files_mode_targets(req: &RawRequest) -> Result<Vec<String>, Response>
     ))
 }
 
-fn discover_outline_files_for_files_mode(
-    directory: &Path,
-    ctx: &AppContext,
-) -> OutlineFileDiscovery {
-    let gitignore = ctx.gitignore();
-    let gitignore_root = ctx
-        .config()
-        .project_root
-        .as_ref()
-        .and_then(|root| std::fs::canonicalize(root).ok());
-    let options = OutlineWalkOptions {
-        gitignore,
-        gitignore_root,
-    };
-    discover_outline_files_with_options(directory, Some(&options), true)
+fn discover_outline_files_for_files_mode(directory: &Path) -> OutlineFileDiscovery {
+    discover_outline_files_with_options(directory, true)
 }
 
 fn append_outline_directory_tree(
@@ -1346,6 +2063,15 @@ fn outline_many_files(
     req_id: &str,
     project_root: Option<&Path>,
 ) -> Result<(Vec<FileOutline>, Vec<SkippedFile>), Response> {
+    let paths = files
+        .iter()
+        .map(|file| ctx.validate_path(req_id, Path::new(file)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let display_root = project_root
+        .filter(|root| paths.iter().all(|path| path.starts_with(root)))
+        .map(Path::to_path_buf)
+        .or_else(|| common_outline_path_ancestor(&paths));
+
     let mut file_outlines: Vec<FileOutline> = Vec::with_capacity(files.len());
     let mut skipped_files: Vec<SkippedFile> = Vec::new();
     // One parser for the whole batch, sharing the provider's symbol cache:
@@ -1357,18 +2083,15 @@ fn outline_many_files(
         .as_any()
         .downcast_ref::<TreeSitterProvider>()
         .map(|provider| FileParser::with_symbol_cache(provider.symbol_cache()));
+    let mut fallback_parser = FileParser::new();
 
-    for file in files {
-        let path = match ctx.validate_path(req_id, Path::new(file)) {
-            Ok(path) => path,
-            Err(resp) => return Err(resp),
-        };
+    for (file, path) in files.iter().zip(paths) {
         if !path.exists() {
             skipped_files.push(SkippedFile::new(file, "file_not_found"));
             continue;
         }
 
-        let rel_path = display_path(&path, file, project_root);
+        let rel_path = display_path(&path, file, display_root.as_deref());
         if let Some(reason) = outline_skip_reason(&path, batch_parser.as_mut()) {
             if let Some(parser) = batch_parser.as_mut() {
                 parser.evict_parse_tree(&path);
@@ -1378,31 +2101,66 @@ fn outline_many_files(
         }
 
         let symbols = match batch_parser.as_mut() {
-            Some(parser) => {
-                let symbols = parser.extract_symbols(&path);
-                // Each file is outlined once; keeping its tree only adds memory.
-                parser.evict_parse_tree(&path);
-                symbols
-            }
+            Some(parser) => parser.extract_symbols(&path),
             None => ctx.provider().list_symbols(&path),
         };
         match symbols {
             Ok(symbols) => {
-                let entries = build_outline_tree(&symbols);
-                file_outlines.push(FileOutline {
-                    path: rel_path,
-                    entries,
-                });
+                let structure = outline_structure_entries(
+                    &path,
+                    &symbols,
+                    batch_parser.as_mut().unwrap_or(&mut fallback_parser),
+                    ctx,
+                    req_id,
+                    true,
+                );
+                match structure {
+                    Ok(mut entries) => {
+                        if detect_language(&path) == Some(LangId::Rust) {
+                            let parser = batch_parser.as_mut().unwrap_or(&mut fallback_parser);
+                            if let (Ok(source), Ok((tree, _))) =
+                                (std::fs::read_to_string(&path), parser.parse(&path))
+                            {
+                                add_trait_member_previews(tree.root_node(), &source, &mut entries);
+                            }
+                        }
+                        file_outlines.push(FileOutline {
+                            path: rel_path,
+                            entries,
+                            language: detect_language(&path),
+                        });
+                    }
+                    Err(error) => {
+                        skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error)))
+                    }
+                }
             }
             Err(e) => skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&e))),
         }
+        // Extraction and test classification share the validated parse tree.
+        if let Some(parser) = batch_parser.as_mut() {
+            parser.evict_parse_tree(&path);
+        }
+        fallback_parser.evict_parse_tree(&path);
     }
 
     Ok((file_outlines, skipped_files))
 }
 
+fn common_outline_path_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut common = paths.first()?.parent()?.to_path_buf();
+    for path in paths.iter().skip(1) {
+        while !path.starts_with(&common) {
+            if !common.pop() {
+                return None;
+            }
+        }
+    }
+    Some(common)
+}
+
 fn discover_outline_files(directory: &Path) -> OutlineFileDiscovery {
-    let mut discovery = discover_outline_files_with_options(directory, None, false);
+    let mut discovery = discover_outline_files_with_options(directory, false);
     if discovery.files.len() > OUTLINE_FILE_WALK_CAP {
         discovery.files.truncate(OUTLINE_FILE_WALK_CAP);
         discovery.walk_truncated = true;
@@ -1412,7 +2170,6 @@ fn discover_outline_files(directory: &Path) -> OutlineFileDiscovery {
 
 fn discover_outline_files_with_options(
     directory: &Path,
-    options: Option<&OutlineWalkOptions>,
     breadth_first: bool,
 ) -> OutlineFileDiscovery {
     let mut files = Vec::new();
@@ -1421,13 +2178,13 @@ fn discover_outline_files_with_options(
     let mut walk_truncated = false;
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
-    // A vanished mounted child can make std::fs::ReadDir::drop panic after
-    // closedir returns ENXIO, aborting the daemon. Fence recursion before opening
-    // such a child instead of trying to catch the uncatchable destructor panic.
+    let mut ignored_entries = 0usize;
+    // Check mount boundaries before opening descendants. A disappearing mounted
+    // child can otherwise make a directory iterator's destructor abort the daemon.
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(directory);
     if let Ok(boundary) = boundary {
-        let mut device_lookup = crate::walk_boundary::filesystem_device_id;
         if breadth_first {
+            let ignore_stack = OutlineIgnoreStack::for_target_root(directory);
             entries_examined = collect_outline_files_breadth_first_with_device_lookup(
                 directory,
                 &mut files,
@@ -1435,9 +2192,9 @@ fn discover_outline_files_with_options(
                 &mut walk_truncated,
                 &mut collection_truncated,
                 &mut skipped_foreign_mounts,
-                options,
                 &boundary,
-                &mut device_lookup,
+                &ignore_stack,
+                &mut ignored_entries,
             );
         } else {
             collect_outline_files_with_device_lookup(
@@ -1447,9 +2204,8 @@ fn discover_outline_files_with_options(
                 &mut walk_truncated,
                 &mut collection_truncated,
                 &mut skipped_foreign_mounts,
-                options,
                 &boundary,
-                &mut device_lookup,
+                crate::walk_boundary::filesystem_device_id,
             );
         }
     } else {
@@ -1465,7 +2221,24 @@ fn discover_outline_files_with_options(
         walk_truncated,
         collection_truncated,
         skipped_foreign_mounts,
+        ignored_entries,
     }
+}
+
+fn outline_target_walk_builder(directory: &Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(directory);
+    // One ignore-aware walker loads the target's nested rules without reopening
+    // each ancestor ignore file for every directory.
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .parents(true)
+        .require_git(false)
+        .follow_links(false)
+        .sort_by_file_name(|left, right| left.cmp(right));
+    builder
 }
 
 fn collect_outline_files_with_device_lookup<F>(
@@ -1475,113 +2248,131 @@ fn collect_outline_files_with_device_lookup<F>(
     walk_truncated: &mut bool,
     collection_truncated: &mut bool,
     skipped_foreign_mounts: &mut usize,
-    options: Option<&OutlineWalkOptions>,
     boundary: &crate::walk_boundary::DeviceBoundary,
-    device_lookup: &mut F,
+    device_lookup: F,
 ) where
-    F: FnMut(&Path) -> std::io::Result<Option<u64>>,
+    F: Fn(&Path) -> std::io::Result<Option<u64>> + Copy + Send + Sync + 'static,
 {
     if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
         *walk_truncated = true;
         return;
     }
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    let mut entries = entries.flatten().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.path());
+    let skipped_mounts = Arc::new(AtomicUsize::new(0));
+    let boundary_failed = Arc::new(AtomicBool::new(false));
+    let mut builder = outline_target_walk_builder(directory);
+    {
+        let skipped_mounts = Arc::clone(&skipped_mounts);
+        let boundary_failed = Arc::clone(&boundary_failed);
+        let boundary = *boundary;
+        builder.filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let Some(file_type) = entry.file_type() else {
+                return false;
+            };
+            if file_type.is_symlink() {
+                return false;
+            }
+            if !file_type.is_dir() {
+                return true;
+            }
+            if should_skip_directory(entry.path()) {
+                return false;
+            }
+            match boundary.should_descend_with(entry.path(), device_lookup) {
+                Ok(true) => true,
+                Ok(false) => {
+                    skipped_mounts.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+                Err(_) => {
+                    boundary_failed.store(true, Ordering::Relaxed);
+                    false
+                }
+            }
+        });
+    }
 
-    for entry in entries {
+    for entry in builder.build() {
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
             *walk_truncated = true;
-            return;
+            break;
         }
-        let Ok(file_type) = entry.file_type() else {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        let Some(file_type) = entry.file_type() else {
             continue;
         };
         if file_type.is_symlink() {
             continue;
         }
-        let path = entry.path();
+        let path = entry.into_path();
         if file_type.is_dir() {
-            if should_skip_directory(&path) || is_ignored_outline_path(&path, true, options) {
-                continue;
-            }
-            match boundary.should_descend_with(&path, |child| device_lookup(child)) {
-                Ok(true) => {}
-                Ok(false) => {
-                    *skipped_foreign_mounts += 1;
-                    continue;
-                }
-                Err(_) => {
-                    *collection_truncated = true;
-                    return;
-                }
-            }
             directories.push(path.to_string_lossy().to_string());
-            collect_outline_files_with_device_lookup(
-                &path,
-                files,
-                directories,
-                walk_truncated,
-                collection_truncated,
-                skipped_foreign_mounts,
-                options,
-                boundary,
-                device_lookup,
-            );
-            if *walk_truncated || *collection_truncated {
-                return;
-            }
         } else if file_type.is_file() {
-            if is_ignored_outline_path(&path, false, options) {
-                continue;
-            }
             files.push(path.to_string_lossy().to_string());
         }
     }
+    *skipped_foreign_mounts += skipped_mounts.load(Ordering::Relaxed);
+    if boundary_failed.load(Ordering::Relaxed) {
+        *collection_truncated = true;
+    }
 }
 
-fn collect_outline_files_breadth_first_with_device_lookup<F>(
+fn collect_outline_files_breadth_first_with_device_lookup(
     directory: &Path,
     files: &mut Vec<String>,
     directories: &mut Vec<String>,
     walk_truncated: &mut bool,
     collection_truncated: &mut bool,
     skipped_foreign_mounts: &mut usize,
-    options: Option<&OutlineWalkOptions>,
     boundary: &crate::walk_boundary::DeviceBoundary,
-    device_lookup: &mut F,
-) -> usize
-where
-    F: FnMut(&Path) -> std::io::Result<Option<u64>>,
-{
-    let mut pending = VecDeque::from([directory.to_path_buf()]);
+    root_ignore_stack: &OutlineIgnoreStack,
+    ignored_entries: &mut usize,
+) -> usize {
+    let root_stack = root_ignore_stack.clone();
+    let mut pending = VecDeque::from([(directory.to_path_buf(), root_stack)]);
     let mut entries_examined = 0usize;
 
-    while let Some(current) = pending.pop_front() {
+    while let Some((current, ignore_stack)) = pending.pop_front() {
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
             *walk_truncated = true;
             return entries_examined;
         }
         let Ok(entries) = std::fs::read_dir(&current) else {
+            *collection_truncated = true;
             continue;
         };
         let remaining = ENTRY_BUDGET.saturating_sub(entries_examined);
-        let mut entries = entries.take(remaining + 1).collect::<Vec<_>>();
+        let mut entries = entries
+            .take(remaining.saturating_add(1))
+            .collect::<Vec<_>>();
         entries_examined += entries.len();
         if entries.len() > remaining {
             entries.truncate(remaining);
             *collection_truncated = true;
         }
-        let mut entries = entries.into_iter().flatten().collect::<Vec<_>>();
+        let mut entries = entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Ok(entry) => Some(entry),
+                Err(_) => {
+                    *collection_truncated = true;
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.path());
         let mut child_directories = Vec::new();
         let mut child_files = Vec::new();
         for entry in entries {
-            // DirEntry::file_type is one metadata lookup; avoid separate is_dir,
-            // is_file, and symlink_metadata calls for every repository entry.
             let Ok(file_type) = entry.file_type() else {
+                *collection_truncated = true;
                 continue;
             };
             if file_type.is_symlink() {
@@ -1594,17 +2385,17 @@ where
             }
         }
 
-        // Discover child directories before counting files. A repository with
-        // one huge schema directory must still expose every sibling at this
-        // breadth level even when the 10k-file safety fence is reached.
+        // Queue directories before counting sibling files so the traversal keeps
+        // its breadth-first coverage when the 10,000-file limit is reached.
         for path in child_directories {
-            if should_skip_directory(&path) || is_ignored_outline_path(&path, true, options) {
+            if should_skip_directory(&path) || ignore_stack.is_ignored(&path, true) {
+                *ignored_entries += 1;
                 continue;
             }
-            match boundary.should_descend_with(&path, |child| device_lookup(child)) {
+            match boundary.should_descend(&path) {
                 Ok(true) => {
                     directories.push(path.to_string_lossy().to_string());
-                    pending.push_back(path);
+                    pending.push_back((path.clone(), ignore_stack.for_child_directory(&path)));
                 }
                 Ok(false) => *skipped_foreign_mounts += 1,
                 Err(_) => {
@@ -1619,40 +2410,17 @@ where
                 *walk_truncated = true;
                 return entries_examined;
             }
-            if is_ignored_outline_path(&path, false, options) {
-                continue;
+            if !ignore_stack.is_ignored(&path, false) {
+                files.push(path.to_string_lossy().to_string());
+            } else {
+                *ignored_entries += 1;
             }
-            files.push(path.to_string_lossy().to_string());
         }
         if *collection_truncated {
             return entries_examined;
         }
     }
     entries_examined
-}
-
-fn is_ignored_outline_path(
-    path: &Path,
-    is_dir: bool,
-    options: Option<&OutlineWalkOptions>,
-) -> bool {
-    let Some(options) = options else {
-        return false;
-    };
-    let Some(gitignore) = options.gitignore.as_ref() else {
-        return false;
-    };
-
-    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if let Some(root) = options.gitignore_root.as_ref() {
-        if !candidate.starts_with(root) {
-            return false;
-        }
-    }
-
-    gitignore
-        .matched_path_or_any_parents(candidate, is_dir)
-        .is_ignore()
 }
 
 fn should_skip_directory(path: &Path) -> bool {
@@ -1683,7 +2451,7 @@ fn should_skip_directory(path: &Path) -> bool {
 fn display_path(path: &Path, fallback: &str, project_root: Option<&Path>) -> String {
     project_root
         .and_then(|root| path.strip_prefix(root).ok())
-        .map(|p| p.to_string_lossy().to_string())
+        .map(path_to_slash)
         .unwrap_or_else(|| fallback.to_string())
 }
 
@@ -1750,6 +2518,9 @@ fn kind_abbrev(kind: &str) -> &str {
 
 /// Format a single entry line for multi-file mode (no signature).
 fn format_entry_compact(entry: &OutlineEntry) -> String {
+    if entry.kind == "test_summary" {
+        return entry.signature.clone().unwrap_or_default();
+    }
     let vis = if entry.exported { 'E' } else { '-' };
     let kind = kind_abbrev(&entry.kind);
     // Range is serialized 1-based, but internal Range is 0-based.
@@ -1802,6 +2573,9 @@ fn signature_has_visibility(sig: &str) -> bool {
 /// When there is no signature (the fallback below), the prefix is the only thing
 /// carrying visibility and kind, so it is retained unchanged.
 pub(crate) fn format_entry_with_sig(entry: &OutlineEntry) -> String {
+    if entry.kind == "test_summary" {
+        return entry.signature.clone().unwrap_or_default();
+    }
     let sl = entry.range.start_line + 1;
     let el = entry.range.end_line + 1;
     if let Some(ref sig) = entry.signature {
@@ -1829,7 +2603,13 @@ fn render_entries(entries: &[OutlineEntry], indent: usize, output: &mut String, 
         }
         if !entry.members.is_empty() {
             for member in &entry.members {
-                if with_sig {
+                if member.kind == "test_summary" {
+                    output.push_str(&format!(
+                        "{}{}\n",
+                        member_prefix,
+                        format_entry_with_sig(member)
+                    ));
+                } else if with_sig {
                     output.push_str(&format!(
                         "{}.{}\n",
                         member_prefix,
@@ -1851,13 +2631,13 @@ fn render_entries(entries: &[OutlineEntry], indent: usize, output: &mut String, 
     }
 }
 
-/// Render only top-level entries. Directory/multi-file outlines are a structure
-/// map; callers can request a specific file when they need methods or fields.
+/// Broad outlines retain module structure and a bounded preview of type APIs.
 fn render_top_level_entries(
     entries: &[OutlineEntry],
     indent: usize,
     output: &mut String,
     with_sig: bool,
+    language: Option<LangId>,
 ) {
     let prefix = "  ".repeat(indent);
     for entry in entries {
@@ -1866,6 +2646,112 @@ fn render_top_level_entries(
         } else {
             output.push_str(&format!("{}{}\n", prefix, format_entry_compact(entry)));
         }
+        if entry.kind == "module" {
+            render_top_level_entries(&entry.members, indent + 1, output, with_sig, language);
+        } else if matches!(
+            entry.kind.as_str(),
+            "struct" | "enum" | "class" | "interface"
+        ) {
+            let mut members = entry
+                .members
+                .iter()
+                .filter(|member| matches!(member.kind.as_str(), "function" | "method"))
+                .collect::<Vec<_>>();
+            members.sort_by_key(|member| {
+                (
+                    !outline_member_is_public(member, language),
+                    member.range.start_line,
+                    member.range.start_col,
+                )
+            });
+            for member in members.iter().take(TYPE_MEMBER_PREVIEW_CAP) {
+                output.push_str(&format!("{}  .{}\n", prefix, format_entry_with_sig(member)));
+            }
+            let remaining = members.len().saturating_sub(TYPE_MEMBER_PREVIEW_CAP);
+            if remaining > 0 {
+                output.push_str(&format!("{}  ({} more)\n", prefix, remaining));
+            }
+        }
+    }
+}
+
+fn outline_member_is_public(member: &OutlineEntry, language: Option<LangId>) -> bool {
+    match language {
+        Some(LangId::Python) => !member.name.starts_with('_'),
+        Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript) => {
+            !member.name.starts_with('#')
+                && !member
+                    .signature
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .any(|token| matches!(token, "private" | "protected"))
+        }
+        _ => member.exported,
+    }
+}
+
+// Trait declarations are containers in the symbol table, but their required
+// signatures have no symbols. Add them only to broad API previews; focused
+// outlines keep their established product-member listing.
+fn add_trait_member_previews(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    entries: &mut [OutlineEntry],
+) {
+    if node.kind() == "trait_item" {
+        let range = node_range_with_decorators(&node, source, LangId::Rust);
+        fn find_trait<'a>(
+            entries: &'a mut [OutlineEntry],
+            range: &Range,
+        ) -> Option<&'a mut OutlineEntry> {
+            for entry in entries {
+                if entry.kind == "interface" && &entry.range == range {
+                    return Some(entry);
+                }
+                if entry.kind == "module" && range_contains(&entry.range, range) {
+                    if let Some(found) = find_trait(&mut entry.members, range) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        if let (Some(entry), Some(body)) = (
+            find_trait(entries, &range),
+            node.child_by_field_name("body"),
+        ) {
+            let mut cursor = body.walk();
+            for method in body
+                .named_children(&mut cursor)
+                .filter(|child| matches!(child.kind(), "function_item" | "function_signature_item"))
+            {
+                let Some(name) = method.child_by_field_name("name") else {
+                    continue;
+                };
+                let text = node_text(source, &method);
+                let first = text.lines().next().unwrap_or(text).trim_end();
+                entry.members.push(OutlineEntry {
+                    name: node_text(source, &name).to_string(),
+                    kind: "method".into(),
+                    range: node_range_with_decorators(&method, source, LangId::Rust),
+                    signature: Some(
+                        first
+                            .strip_suffix('{')
+                            .unwrap_or(first)
+                            .trim_end()
+                            .to_string(),
+                    ),
+                    exported: false,
+                    members: Vec::new(),
+                });
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        add_trait_member_previews(child, source, entries);
     }
 }
 
@@ -1880,16 +2766,55 @@ fn format_single_file_tree(filename: &str, entries: &[OutlineEntry]) -> String {
 ///
 /// Groups files by directory hierarchy and renders symbols under each file.
 /// If output exceeds `max_bytes`, truncates with a narrowing hint.
+struct RenderedOutline {
+    text: String,
+    truncated: bool,
+    shown: usize,
+    footer: String,
+}
+
+fn outline_structure_footer(shown: usize, total: usize, budget: bool, walk: bool) -> String {
+    use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
+    let mut causes = Vec::new();
+    if walk {
+        causes.push(Reason::Walk);
+    }
+    if budget {
+        causes.push(Reason::Budget);
+    }
+    if causes.is_empty() {
+        return String::new();
+    }
+    let total = if walk {
+        Total::AtLeast(total)
+    } else {
+        Total::Exact(total)
+    };
+    crate::subc_format::render_envelope_trailer(&ListEnvelope::new(
+        shown,
+        total,
+        Unit::Files,
+        causes,
+        &["path"],
+    ))
+    .unwrap_or_default()
+}
+
 fn format_multi_file_tree(
     file_outlines: &[FileOutline],
     max_bytes: usize,
     total_requested: usize,
-) -> String {
+    walk_incomplete: bool,
+) -> RenderedOutline {
     // Build a tree of directories → files → symbols
     // Using a simple sorted-path approach with indentation
     let mut output = String::new();
     let mut truncated = false;
     let mut files_shown = 0;
+    // Reserve the real list trailer, not a guessed number of bytes. Rendering
+    // files atomically keeps every shown type's preview and exact remainder.
+    let trailer_reserve =
+        outline_structure_footer(total_requested, total_requested, true, walk_incomplete).len() + 2;
 
     // Sort by path for clean directory grouping
     let mut sorted: Vec<&FileOutline> = file_outlines.iter().collect();
@@ -1899,6 +2824,7 @@ fn format_multi_file_tree(
     let mut prev_parts: Vec<&str> = Vec::new();
 
     for fo in &sorted {
+        let mut file_output = String::new();
         let parts: Vec<&str> = fo.path.split('/').collect();
         let file_name = parts.last().copied().unwrap_or(&fo.path);
         let dir_parts = &parts[..parts.len().saturating_sub(1)];
@@ -1913,38 +2839,50 @@ fn format_multi_file_tree(
         // Emit new directory levels
         for (i, part) in dir_parts.iter().enumerate().skip(common) {
             let indent = "  ".repeat(i);
-            output.push_str(&format!("{}{}/\n", indent, part));
+            file_output.push_str(&format!("{}{}/\n", indent, part));
         }
 
         // Emit file name
         let file_indent = "  ".repeat(dir_parts.len());
-        output.push_str(&format!("{}{}\n", file_indent, file_name));
+        file_output.push_str(&format!("{}{}\n", file_indent, file_name));
 
-        // Emit only top-level symbols under each file. Full nested members stay
-        // available via the single-file outline path.
-        render_top_level_entries(&fo.entries, dir_parts.len() + 1, &mut output, false);
+        // Directory outlines are a structure map; members remain available
+        // from the single-file outline to keep broad results bounded.
+        render_top_level_entries(
+            &fo.entries,
+            dir_parts.len() + 1,
+            &mut file_output,
+            false,
+            fo.language,
+        );
 
-        files_shown += 1;
-        prev_parts = parts.iter().map(|s| *s).collect();
-
-        // Check size cap
-        if output.len() > max_bytes {
+        let reserve = if files_shown + 1 == sorted.len() && !walk_incomplete {
+            0
+        } else {
+            trailer_reserve
+        };
+        if output.len() + file_output.len() + reserve > max_bytes {
             truncated = true;
             break;
         }
+        output.push_str(&file_output);
+
+        files_shown += 1;
+        prev_parts = parts.iter().map(|s| *s).collect();
     }
 
-    if truncated {
-        output.push_str(&format!(
-            "\n... truncated ({}/{} files shown, {}KB limit)\n\
-             Narrow scope with a more specific directory path, or pass a single file as target.\n",
-            files_shown,
-            total_requested,
-            max_bytes / 1024,
-        ));
+    let footer = outline_structure_footer(files_shown, total_requested, truncated, walk_incomplete);
+    if !footer.is_empty() {
+        output.push('\n');
+        output.push_str(&footer);
     }
 
-    output
+    RenderedOutline {
+        text: output,
+        truncated,
+        shown: files_shown,
+        footer,
+    }
 }
 
 pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
@@ -1965,6 +2903,632 @@ pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
 mod tests {
     use super::*;
     use crate::symbols::SymbolKind;
+
+    fn summary_regression_text() -> String {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("members.rs");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/outline_summaries/members.rs"),
+        )
+        .unwrap();
+        multi_file_text(&[path])
+    }
+
+    #[test]
+    fn outline_summary_regression_member_cap() {
+        let text = summary_regression_text();
+        let service = text.split("  E enum Small").next().unwrap();
+        assert_eq!(
+            service
+                .lines()
+                .filter(|line| line.trim_start().starts_with('.'))
+                .count(),
+            3,
+            "{text}"
+        );
+        let members = service
+            .lines()
+            .filter(|line| line.trim_start().starts_with('.'))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            members,
+            vec![
+                "    .pub fn first(&self) {} 4:4",
+                "    .pub fn second(&self) {} 5:5",
+                "    .pub fn third() -> Self { Self } 9:9",
+            ]
+        );
+        assert!(
+            text.contains("    .pub fn only(&self) {} 14:14\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn outline_summary_regression_remainder() {
+        let text = summary_regression_text();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains(" more)"))
+                .collect::<Vec<_>>(),
+            vec!["    (3 more)"]
+        );
+    }
+
+    #[test]
+    fn outline_summary_regression_classification() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("persistence.rs");
+        std::fs::write(&path, "pub fn product() {}\n#[cfg(test)]\npub(crate) mod work_counts {\n    pub fn record() {}\n    pub(crate) fn reset() {}\n    fn get() {}\n}\n").unwrap();
+        assert_eq!(
+            multi_file_text(&[path]),
+            "persistence.rs\n  E fn   product 1:1\n  work_counts: 3 items (lines 2-7)\n"
+        );
+    }
+
+    #[test]
+    fn outline_tests_classifies_attributes_not_strings_or_module_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mixed.rs");
+        std::fs::write(&path, "mod tests { pub fn real() {} }\nconst TEXT: &str = \"#[cfg(test)] mod fake {}\";\n#[cfg(not(test))]\nmod production { pub fn keep() {} }\n#[cfg(any(test, feature = \"normal\"))]\nmod both { pub fn keep_both() {} }\n#[cfg(all(test, unix))]\nmod checks { fn helper() {} }\n#[test]\nfn first() {}\npub fn middle() {}\n#[test]\nfn second() {}\n").unwrap();
+        let text = multi_file_text(&[path]);
+        assert!(
+            text.contains("  - modu tests 1:1\n    E fn   real 1:1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("keep_both") && text.contains("keep") && text.contains("middle"),
+            "{text}"
+        );
+        assert!(text.contains("checks: 1 items (lines 7-8)"), "{text}");
+        assert!(text.contains("tests: 2 items (lines 9-13)"), "{text}");
+        assert!(
+            !text.contains("fn   first") && !text.contains("fn   second"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn outline_tests_included_modules_count_helpers_and_expose_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("lib.rs");
+        std::fs::write(
+            &path,
+            "pub fn product() {}\n#[cfg(test)]\n#[path = \"checks.rs\"]\nmod checks;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("checks.rs"),
+            "struct Helper;\nfn helper() {}\n#[test]\nfn case() {}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            multi_file_text(&[path]),
+            "lib.rs\n  E fn   product 1:1\n  checks (path checks.rs): 3 items (lines 2-4)\n"
+        );
+    }
+
+    #[test]
+    fn outline_tests_implicit_modules_follow_rust_file_and_directory_layouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("product.rs");
+        std::fs::write(&path, "#[cfg(test)]\nmod checks;\nmod outer {\n    #[cfg(test)]\n    #[path = \"custom.rs\"]\n    mod nested;\n}\n").unwrap();
+        std::fs::create_dir_all(temp.path().join("product/checks")).unwrap();
+        std::fs::create_dir_all(temp.path().join("product/outer")).unwrap();
+        std::fs::write(
+            temp.path().join("product/checks/mod.rs"),
+            "#[test]\nfn case() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("product/outer/custom.rs"),
+            "fn helper() {}\n#[test]\nfn case() {}\n",
+        )
+        .unwrap();
+        let text = multi_file_text(&[path]);
+        assert!(
+            text.contains("checks (path product/checks/mod.rs): 1 items (lines 1-2)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    nested (path product/outer/custom.rs): 2 items (lines 4-6)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn outline_tests_typescript_and_javascript_top_level_blocks() {
+        for extension in ["ts", "tsx", "js"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(format!("product.{extension}"));
+            std::fs::write(&path, "export function product() {}\ndescribe('suite', () => {\n  function helper() {}\n  test('case', () => {});\n  describe('nested', () => { it('inner', () => {}); });\n});\nfunction after() {}\ntest.only('standalone', () => {});\nfunction usesDescribe() { describe('product call', () => {}); }\n").unwrap();
+            let text = multi_file_text(&[path]);
+            assert!(
+                text.contains("describe 'suite': 5 items (lines 2-6)"),
+                "{text}"
+            );
+            assert!(
+                text.contains("test.only 'standalone': 1 items (lines 8-8)"),
+                "{text}"
+            );
+            assert!(
+                text.contains("usesDescribe") && text.contains("after"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("helper") && !text.contains("nested"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn outline_tests_python_classes_and_free_tests() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("product.py");
+        std::fs::write(&path, "def product(): pass\nclass TestCache:\n    def test_read(self): pass\n    def helper(self): pass\ndef test_one(): pass\ndef middle(): pass\ndef test_two(): pass\nclass Product:\n    def test_connection(self): pass\n").unwrap();
+        let text = multi_file_text(&[path]);
+        assert!(text.contains("TestCache: 3 items (lines 2-4)"), "{text}");
+        assert!(text.contains("tests: 2 items (lines 5-7)"), "{text}");
+        assert!(
+            text.contains(".def test_connection(self): pass 9:9") && text.contains("middle"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn outline_revision_regression_single_file_keeps_full_product_members_and_lists_tests() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("members.rs");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n#[cfg(test)]\nmod checks {{\n    #[test]\n    fn first_test() {{}}\n    #[test]\n    fn second_test() {{}}\n}}\n",
+                include_str!("../../tests/fixtures/outline_summaries/members.rs")
+            ),
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let req: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"single", "command":"outline", "file":path}),
+        )
+        .unwrap();
+        let response = serde_json::to_value(handle_outline(&req, &ctx)).unwrap();
+        let text = response["text"].as_str().unwrap();
+        assert_eq!(
+            text.split("  mod checks")
+                .next()
+                .unwrap()
+                .lines()
+                .filter(|line| line.trim_start().starts_with('.'))
+                .count(),
+            7,
+            "{text}"
+        );
+        assert!(
+            text.contains("first_test")
+                && text.contains("second_test")
+                && !text.contains("items")
+                && !text.contains("more)"),
+            "{text}"
+        );
+        for params in [
+            serde_json::json!({"files":[path]}),
+            serde_json::json!({"directory":temp.path()}),
+        ] {
+            let req = RawRequest {
+                id: "broad".into(),
+                command: "outline".into(),
+                session_id: None,
+                lsp_hints: None,
+                params,
+            };
+            let response = handle_outline(&req, &ctx);
+            assert!(response.success, "{response:?}");
+            let broad = response.data["text"].as_str().unwrap();
+            assert_eq!(
+                broad
+                    .lines()
+                    .filter(|line| line.trim_start().starts_with('.'))
+                    .count(),
+                4,
+                "{broad}"
+            );
+            assert!(
+                broad.contains("(3 more)") && broad.contains("checks: 2 items"),
+                "{broad}"
+            );
+            assert!(
+                !broad.contains("first_test") && !broad.contains("second_test"),
+                "{broad}"
+            );
+        }
+    }
+
+    fn restricted_outline_context(root: &Path) -> AppContext {
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                restrict_to_project_root: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn outline_included_test_outside_root_has_unknown_items() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("lib.rs");
+        std::fs::write(
+            &path,
+            "pub fn product() {}\n#[cfg(test)]\n#[path = \"../outside.rs\"]\nmod checks;\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("outside.rs"), "fn outside_secret() {}\n").unwrap();
+        let ctx = restricted_outline_context(&root);
+        let req: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"outside-include", "command":"outline", "files":[path]}),
+        )
+        .unwrap();
+        let response = handle_outline(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], true, "{response:?}");
+        assert_eq!(response.data["skipped_files"], serde_json::json!([]));
+        let text = response.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("checks (path ../outside.rs): items unknown (path_denied) (lines 2-4)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("product") && !text.contains("outside_secret"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn outline_missing_and_unparseable_test_includes_have_unknown_items() {
+        for (source, reason) in [(None, "file_not_found"), (Some("fn (\n"), "parse_error")] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("lib.rs");
+            std::fs::write(
+                &path,
+                "pub fn product() {}\n#[cfg(test)]\n#[path = \"checks.rs\"]\nmod checks;\n",
+            )
+            .unwrap();
+            if let Some(source) = source {
+                std::fs::write(temp.path().join("checks.rs"), source).unwrap();
+            }
+            let ctx = restricted_outline_context(temp.path());
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id":"unavailable-include", "command":"outline", "files":[path]})).unwrap();
+            let response = handle_outline(&req, &ctx);
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["complete"], true, "{response:?}");
+            assert_eq!(response.data["skipped_files"], serde_json::json!([]));
+            let text = response.data["text"].as_str().unwrap();
+            assert!(
+                text.contains(&format!(
+                    "checks (path checks.rs): items unknown ({reason}) (lines 2-4)"
+                )),
+                "{text}"
+            );
+            assert!(text.contains("product"), "{text}");
+        }
+    }
+
+    #[test]
+    fn outline_revision_regression_directory_bad_include_keeps_other_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("bad_include.rs"), "pub fn bad_include_product() {}\n#[cfg(test)]\n#[path = \"../outside.rs\"]\nmod checks;\n").unwrap();
+        std::fs::write(root.join("good.rs"), "pub fn good_product() {}\n").unwrap();
+        std::fs::write(temp.path().join("outside.rs"), "fn outside_secret() {}\n").unwrap();
+        let ctx = restricted_outline_context(&root);
+        let req: RawRequest = serde_json::from_value(serde_json::json!({"id":"directory-bad-include", "command":"outline", "directory":root})).unwrap();
+        let response = handle_outline(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], true, "{response:?}");
+        assert_eq!(response.data["skipped_files"], serde_json::json!([]));
+        let text = response.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("bad_include_product") && text.contains("good_product"),
+            "{text}"
+        );
+        assert!(
+            text.contains("checks (path ../outside.rs): items unknown (path_denied)"),
+            "{text}"
+        );
+        assert!(!text.contains("outside_secret"), "{text}");
+    }
+
+    #[test]
+    fn outline_structure_read_and_parse_failures_skip_only_the_affected_file() {
+        // Change a file after syntax validation and symbol extraction, without
+        // relying on scheduling a concurrent writer at exactly the right time.
+        struct ChangingProvider {
+            affected: PathBuf,
+            break_syntax: bool,
+        }
+        impl crate::language::LanguageProvider for ChangingProvider {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn resolve_symbol(
+                &self,
+                file: &Path,
+                name: &str,
+            ) -> Result<Vec<crate::symbols::SymbolMatch>, AftError> {
+                crate::language::LanguageProvider::resolve_symbol(
+                    &TreeSitterProvider::new(),
+                    file,
+                    name,
+                )
+            }
+            fn list_symbols(&self, file: &Path) -> Result<Vec<Symbol>, AftError> {
+                let symbols = FileParser::new().extract_symbols(file)?;
+                if file == self.affected {
+                    if self.break_syntax {
+                        std::fs::write(file, "fn (\n").unwrap();
+                    } else {
+                        std::fs::remove_file(file).unwrap();
+                    }
+                }
+                Ok(symbols)
+            }
+        }
+        for (break_syntax, reason) in [(false, "file_not_found"), (true, "parse_error")] {
+            let temp = tempfile::tempdir().unwrap();
+            let affected = temp.path().join("affected.rs");
+            let good = temp.path().join("good.rs");
+            std::fs::write(&affected, "pub fn affected() {}\n").unwrap();
+            std::fs::write(&good, "pub fn good() {}\n").unwrap();
+            let ctx = AppContext::new(
+                Box::new(ChangingProvider {
+                    affected: affected.clone(),
+                    break_syntax,
+                }),
+                crate::config::Config::default(),
+            );
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id":"changed-file", "command":"outline", "files":[affected,good]})).unwrap();
+            let response = handle_outline(&req, &ctx);
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(
+                response.data["skipped_files"],
+                serde_json::json!([{"file":"affected.rs", "reason":reason}])
+            );
+            let text = response.data["text"].as_str().unwrap();
+            assert!(
+                text.contains("good.rs") && !text.contains("affected.rs"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn outline_modules_keep_namesake_impls_in_their_own_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("modules.rs");
+        std::fs::write(&path, "struct Same;\nimpl Same { fn root(&self) {} }\nmod outer {\n    struct Same;\n    impl Same { pub fn inner(&self) {} }\n    mod nested { pub fn nested_fn() {} }\n}\n").unwrap();
+        let text = multi_file_text(&[path]);
+        assert!(
+            text.contains("  - st   Same 1:1\n    .fn root(&self) {} 2:2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    - st   Same 4:4\n      .pub fn inner(&self) {} 5:5"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    - modu nested 6:6\n      E fn   nested_fn 6:6"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn outline_member_previews_cover_typescript_python_go_and_traits() {
+        let temp = tempfile::tempdir().unwrap();
+        let ts = temp.path().join("product.ts");
+        std::fs::write(&ts, "class Service {\n private hidden() {}\n public first() {}\n second() {}\n third() {}\n fourth() {}\n}\ninterface Port {\n a(): void;\n b(): void;\n}\n").unwrap();
+        let text = multi_file_text(&[ts]);
+        assert!(!text.contains("hidden"), "{text}");
+        assert!(
+            text.contains(".public first() {} 3:3")
+                && text.contains(".third() {} 5:5")
+                && text.contains("(2 more)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(".a(): void 9:9") && text.contains(".b(): void 10:10"),
+            "{text}"
+        );
+
+        let py = temp.path().join("product.py");
+        std::fs::write(&py, "class Service:\n    def _hidden(self): pass\n    def first(self): pass\n    def second(self): pass\n    def third(self): pass\n    def fourth(self): pass\n").unwrap();
+        let text = multi_file_text(&[py]);
+        assert!(
+            !text.contains("_hidden")
+                && text.contains(".def first(self)")
+                && text.contains("(2 more)"),
+            "{text}"
+        );
+
+        let go = temp.path().join("product.go");
+        std::fs::write(&go, "package product\ntype Service struct {}\nfunc (s *Service) hidden() {}\nfunc (s *Service) First() {}\nfunc (s Service) Second() {}\nfunc (s *Service) Third() {}\nfunc (s *Service) Fourth() {}\n").unwrap();
+        let text = multi_file_text(&[go]);
+        assert!(
+            !text.contains("hidden")
+                && text.contains(".E func (s *Service) First() {}")
+                && text.contains("(2 more)"),
+            "{text}"
+        );
+
+        let rs = temp.path().join("product.rs");
+        std::fs::write(&rs, "pub trait Port {\n    fn first(&self);\n    fn second(&self);\n    fn third(&self);\n    fn fourth(&self) {}\n}\n").unwrap();
+        let text = multi_file_text(&[rs]);
+        assert!(
+            text.contains(".fn first(&self); 2:2")
+                && text.contains("(1 more)")
+                && !text.contains("fourth"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn outline_structure_byte_budget_keeps_complete_previews_and_exact_file_trailer() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for i in 0..3 {
+            let path = temp.path().join(format!("file{i}.rs"));
+            std::fs::write(
+                &path,
+                include_str!("../../tests/fixtures/outline_summaries/members.rs"),
+            )
+            .unwrap();
+            files.push(path.display().to_string());
+        }
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let (outlines, _) = outline_many_files(&files, &ctx, "budget", None).unwrap();
+        let rendered = format_multi_file_tree(&outlines, 550, 3, false);
+        assert!(rendered.text.len() <= 550, "{} bytes", rendered.text.len());
+        assert_eq!(rendered.shown, 2, "{}", rendered.text);
+        assert!(rendered.truncated);
+        assert!(
+            rendered
+                .text
+                .contains("shown 2 of 3 files (budget) · narrow: path"),
+            "{}",
+            rendered.text
+        );
+        assert_eq!(rendered.text.matches("(3 more)").count(), 2);
+    }
+
+    #[test]
+    fn multi_file_outline_collapses_cfg_test_modules() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("product.rs");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/outline_summaries/product.rs"),
+        )
+        .unwrap();
+        assert_eq!(
+            multi_file_text(&[path]),
+            "product.rs\n  E fn   product 1:1\n  checks: 5 items (lines 2-13)\n  E fn   after 14:14\n"
+        );
+    }
+
+    #[test]
+    fn outline_summary_regression_test_free_golden_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("test_free.ts");
+        std::fs::write(
+            &path,
+            include_str!("../../tests/fixtures/outline_summaries/test_free.ts"),
+        )
+        .unwrap();
+        assert_eq!(
+            multi_file_text(&[path]),
+            include_str!("../../tests/fixtures/outline_summaries/test_free.txt")
+        );
+    }
+
+    #[test]
+    fn outline_portability_goldens_stay_lf_with_autocrlf() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = format!("{}/", path_to_slash(temp.path()));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for (name, expected) in [
+            (
+                "test_free.txt",
+                include_str!("../../tests/fixtures/outline_summaries/test_free.txt"),
+            ),
+            (
+                "structure.txt",
+                include_str!("../../tests/fixtures/outline_summaries/structure.txt"),
+            ),
+            (
+                "structure_common_root.txt",
+                include_str!("../../tests/fixtures/outline_summaries/structure_common_root.txt"),
+            ),
+        ] {
+            let relative = format!("crates/aft/tests/fixtures/outline_summaries/{name}");
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.autocrlf=true",
+                    "checkout-index",
+                    "--force",
+                    &format!("--prefix={prefix}"),
+                    "--",
+                    &relative,
+                ])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let bytes = std::fs::read(temp.path().join(relative)).unwrap();
+            assert!(
+                !bytes.contains(&b'\r'),
+                "{name} was converted to CRLF during checkout"
+            );
+            assert_eq!(
+                bytes,
+                expected.as_bytes(),
+                "{name} checkout changed its golden bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn outline_portability_include_labels_preserve_parent_segments() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = std::fs::canonicalize(temp.path()).unwrap();
+        assert_eq!(
+            test_module_include_label(&parent, &parent, Path::new("../outside.rs")),
+            "../outside.rs"
+        );
+        assert_eq!(
+            test_module_include_label(
+                &parent,
+                &parent.join("product/outer"),
+                Path::new("../checks.rs")
+            ),
+            "product/outer/../checks.rs"
+        );
+        assert_eq!(
+            test_module_include_label(&parent, &parent.join("product"), Path::new("tests/mod.rs")),
+            "product/tests/mod.rs"
+        );
+    }
+
+    #[test]
+    fn outline_portability_crlf_source_renders_lf_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("test_free.ts");
+        let source = include_str!("../../tests/fixtures/outline_summaries/test_free.ts");
+        std::fs::write(&path, source.replace('\n', "\r\n")).unwrap();
+        let text = multi_file_text(&[path]);
+        assert_eq!(
+            text,
+            include_str!("../../tests/fixtures/outline_summaries/test_free.txt")
+        );
+        assert!(!text.contains('\r'));
+    }
 
     /// Multi-file outline checks each file's syntax and then extracts its
     /// symbols. Both steps must share one parse; the syntax check used to
@@ -2011,6 +3575,395 @@ mod tests {
         assert_eq!(skipped[0]["reason"], "parse_error");
     }
 
+    fn outline_ignore_fixture(root: &Path) {
+        std::fs::create_dir_all(root.join("nested")).expect("create nested directory");
+        std::fs::create_dir_all(root.join("ignored-dir")).expect("create ignored directory");
+        std::fs::write(root.join(".gitignore"), "ignored.ts\nignored-dir/\n")
+            .expect("write root ignore");
+        std::fs::write(root.join("visible.ts"), "export function visible() {}\n")
+            .expect("write visible file");
+        std::fs::write(root.join("ignored.ts"), "export function ignored() {}\n")
+            .expect("write ignored file");
+        std::fs::write(
+            root.join("ignored-dir/dependency.ts"),
+            "export function dependency() {}\n",
+        )
+        .expect("write file in ignored directory");
+        std::fs::write(root.join("nested/.gitignore"), "nested-ignored.ts\n")
+            .expect("write nested ignore");
+        std::fs::write(
+            root.join("nested/nested-ignored.ts"),
+            "export function nestedIgnored() {}\n",
+        )
+        .expect("write nested ignored file");
+        std::fs::write(
+            root.join("nested/nested-visible.ts"),
+            "export function nestedVisible() {}\n",
+        )
+        .expect("write nested visible file");
+    }
+
+    fn outline_add_info_exclude_fixture(root: &Path) {
+        std::fs::write(root.join(".git/info/exclude"), "info-excluded.ts\n")
+            .expect("write repository exclude file");
+        std::fs::write(
+            root.join("info-excluded.ts"),
+            "export function excludedByInfo() {}\n",
+        )
+        .expect("write info-excluded file");
+    }
+
+    fn files_mode_ignore_fixture(root: &Path, rules: &str) {
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(root.join(".git/info/exclude"), rules).unwrap();
+    }
+
+    fn files_mode_fixture_response(root: &Path, target: &Path) -> Response {
+        let ctx = restricted_outline_context(root);
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id":"files-mode-fixture", "command":"outline", "directory":target, "files":true,
+        }))
+        .unwrap();
+        handle_outline(&req, &ctx)
+    }
+
+    #[test]
+    fn files_mode_revision_regression_explicit_ignored_target_lists_files() {
+        let temp = tempfile::tempdir().unwrap();
+        files_mode_ignore_fixture(
+            temp.path(),
+            "ignored-parent/\nignored-parent/evidence/nested/\nignored-parent/evidence/drop.ts\n",
+        );
+        let target = temp.path().join("ignored-parent/evidence");
+        std::fs::create_dir_all(target.join("nested")).unwrap();
+        std::fs::write(target.join("keep.ts"), "export function keep() {}\n").unwrap();
+        std::fs::write(target.join("drop.ts"), "export function drop() {}\n").unwrap();
+        std::fs::write(
+            target.join("nested/private.ts"),
+            "export function private() {}\n",
+        )
+        .unwrap();
+        let response = files_mode_fixture_response(temp.path(), &target);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], true, "{response:?}");
+        let files = response.data["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{response:?}");
+        assert_eq!(files[0]["path"], "keep.ts");
+        let text = response.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("keep.ts") && !text.contains("private.ts") && !text.contains("drop.ts"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn files_mode_revision_regression_nested_ignored_folder_stays_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        files_mode_ignore_fixture(temp.path(), "nested/\n");
+        std::fs::create_dir(temp.path().join("nested")).unwrap();
+        std::fs::write(temp.path().join("keep.ts"), "export function keep() {}\n").unwrap();
+        std::fs::write(
+            temp.path().join("nested/private.ts"),
+            "export function private() {}\n",
+        )
+        .unwrap();
+        let response = files_mode_fixture_response(temp.path(), temp.path());
+        assert!(response.success, "{response:?}");
+        let files = response.data["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{response:?}");
+        assert_eq!(files[0]["path"], "keep.ts");
+        assert_eq!(response.data["complete"], true);
+    }
+
+    #[test]
+    fn files_mode_zero_results_explain_empty_ignored_and_test_only_targets() {
+        for (kind, reason) in [
+            ("empty", "empty folder"),
+            ("ignored", "all files ignored or excluded"),
+            ("tests", "test files excluded"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            match kind {
+                "ignored" => {
+                    files_mode_ignore_fixture(temp.path(), "target/nested/\n");
+                    std::fs::create_dir(target.join("nested")).unwrap();
+                    std::fs::write(
+                        target.join("nested/private.ts"),
+                        "export function private() {}\n",
+                    )
+                    .unwrap();
+                }
+                "tests" => {
+                    std::fs::write(target.join("sample_test.rs"), "#[test]\nfn case() {}\n")
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let response = files_mode_fixture_response(temp.path(), &target);
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["complete"], true, "{response:?}");
+            assert_eq!(response.data["files"], serde_json::json!([]));
+            let text = response.data["text"].as_str().unwrap();
+            assert!(
+                text.contains("0 files under") && text.contains(reason),
+                "{kind}: {text}"
+            );
+        }
+    }
+
+    fn assert_outline_discovery_honors_target_ignore_rules(discovery: OutlineFileDiscovery) {
+        let paths = discovery
+            .files
+            .iter()
+            .map(|path| Path::new(path).file_name().unwrap().to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(paths.iter().any(|path| path == "visible.ts"), "{paths:?}");
+        assert!(
+            paths.iter().any(|path| path == "nested-visible.ts"),
+            "{paths:?}"
+        );
+        assert!(!paths.iter().any(|path| path == "ignored.ts"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|path| path == "info-excluded.ts"),
+            "repository info/exclude rule must apply: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path == "nested-ignored.ts"),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path == "dependency.ts"),
+            "ignored directories must not be traversed: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn directory_outline_honors_target_gitignore_rules() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        let in_project = project.join("src");
+        std::fs::create_dir_all(&in_project).expect("create project directory");
+        outline_ignore_fixture(&in_project);
+        assert_outline_discovery_honors_target_ignore_rules(discover_outline_files(&in_project));
+
+        let external = temp.path().join("external-git");
+        std::fs::create_dir_all(&external).expect("create external repository");
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&external)
+            .status()
+            .expect("run git init");
+        assert!(git.success(), "git init failed: {git}");
+        outline_ignore_fixture(&external);
+        outline_add_info_exclude_fixture(&external);
+        assert_outline_discovery_honors_target_ignore_rules(discover_outline_files(&external));
+
+        let non_git = temp.path().join("standalone");
+        std::fs::create_dir_all(&non_git).expect("create non-git directory");
+        outline_ignore_fixture(&non_git);
+        assert_outline_discovery_honors_target_ignore_rules(discover_outline_files(&non_git));
+    }
+
+    #[test]
+    fn files_mode_outline_honors_target_gitignore_rules() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        let in_project = project.join("src");
+        std::fs::create_dir_all(&in_project).expect("create project directory");
+        outline_ignore_fixture(&in_project);
+        assert_outline_discovery_honors_target_ignore_rules(discover_outline_files_for_files_mode(
+            &in_project,
+        ));
+
+        let external = temp.path().join("external-git");
+        std::fs::create_dir_all(&external).expect("create external repository");
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&external)
+            .status()
+            .expect("run git init");
+        assert!(git.success(), "git init failed: {git}");
+        outline_ignore_fixture(&external);
+        outline_add_info_exclude_fixture(&external);
+        assert_outline_discovery_honors_target_ignore_rules(discover_outline_files_for_files_mode(
+            &external,
+        ));
+
+        let non_git = temp.path().join("standalone");
+        std::fs::create_dir_all(&non_git).expect("create non-git directory");
+        outline_ignore_fixture(&non_git);
+        assert_outline_discovery_honors_target_ignore_rules(discover_outline_files_for_files_mode(
+            &non_git,
+        ));
+    }
+
+    #[test]
+    fn multi_file_outline_keeps_rust_impl_methods_nested_in_structure_map() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = r#"
+pub struct Widget;
+pub trait Render { fn render(&self); }
+impl Widget { pub fn new() -> Self { Self } }
+impl Render for Widget { pub fn render(&self) {} }
+pub struct GenericBox<T> { value: T }
+pub trait Boxed { fn boxed(&self); }
+impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
+"#;
+        let path = temp.path().join("sample.rs");
+        std::fs::write(&path, source).expect("write Rust outline fixture");
+
+        let symbols = parsed_symbols("rs", source);
+        let tree = build_outline_tree(&symbols);
+        let output = multi_file_text(&[path]);
+        for method_name in ["new", "render", "boxed"] {
+            assert!(
+                output
+                    .lines()
+                    .any(|line| line.starts_with("    .") && line.contains(method_name))
+                    && !output
+                        .lines()
+                        .any(|line| line.starts_with("  - mth") && line.contains(method_name)),
+                "structure-map previews must nest {method_name} under its type:\n{output}"
+            );
+        }
+
+        let single_file = format_single_file_tree("sample.rs", &tree);
+        let lines = single_file.lines().collect::<Vec<_>>();
+        for (type_name, method_name) in [
+            ("Widget", "new"),
+            ("Widget", "render"),
+            ("GenericBox", "boxed"),
+        ] {
+            let owner_prefix = format!("  pub struct {type_name}");
+            let owner_index = lines
+                .iter()
+                .position(|line| line.starts_with(&owner_prefix))
+                .unwrap_or_else(|| panic!("missing owner {type_name}:\n{single_file}"));
+            let next_type = lines
+                .iter()
+                .enumerate()
+                .skip(owner_index + 1)
+                .find(|(_, line)| line.starts_with("  ") && !line.starts_with("    "))
+                .map(|(index, _)| index)
+                .unwrap_or(lines.len());
+            assert!(
+                lines[owner_index + 1..next_type]
+                    .iter()
+                    .any(|line| line.starts_with("    .") && line.contains(method_name)),
+                "single-file outline should nest {method_name} under {type_name}:\n{single_file}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_file_outline_does_not_leak_typescript_class_methods() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("sample.ts");
+        std::fs::write(
+            &path,
+            "export class Greeter { greet(name: string) { return name; } }\n",
+        )
+        .expect("write TypeScript outline fixture");
+
+        let output = multi_file_text(&[path]);
+        assert!(output.contains("  E cls  Greeter "), "{output}");
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("    .") && line.contains("greet")),
+            "structure-map output must keep class methods nested:\n{output}"
+        );
+    }
+
+    #[test]
+    fn multi_file_outline_roots_paths_at_their_common_ancestor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let left = temp.path().join("left").join("first.ts");
+        let right = temp.path().join("right").join("second.ts");
+        std::fs::create_dir_all(left.parent().unwrap()).expect("create left directory");
+        std::fs::create_dir_all(right.parent().unwrap()).expect("create right directory");
+        std::fs::write(&left, "export function first() {}\n").unwrap();
+        std::fs::write(&right, "export function second() {}\n").unwrap();
+
+        let output = multi_file_text(&[left, right]);
+        assert!(output.starts_with("left/\n  first.ts\n"), "{output}");
+        assert!(output.contains("right/\n  second.ts\n"), "{output}");
+        assert!(
+            !output.contains(temp.path().to_string_lossy().as_ref()),
+            "{output}"
+        );
+    }
+
+    fn multi_file_text(paths: &[std::path::PathBuf]) -> String {
+        let files = paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let ctx = crate::context::AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let (outlines, skipped) = outline_many_files(&files, &ctx, "outline-fixture", None)
+            .expect("outline fixture files");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        format_multi_file_tree(&outlines, 30 * 1024, files.len(), false).text
+    }
+
+    #[test]
+    fn files_mode_skips_git_and_dependency_directories_before_counting_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(temp.path())
+            .status()
+            .expect("run git init");
+        assert!(git.success(), "git init failed: {git}");
+
+        for path in [
+            "node_modules/package/deep/dependency.ts",
+            "src/index.ts",
+            "src/other.ts",
+        ] {
+            let file = temp.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).expect("create fixture directory");
+            std::fs::write(file, "export function fixture() {}\n").expect("write fixture");
+        }
+
+        let discovery = discover_outline_files_with_options(temp.path(), true);
+        // Compare with forward slashes so the same assertions hold on Windows.
+        let files = discovery
+            .files
+            .iter()
+            .map(|path| path.replace('\\', "/"))
+            .collect::<Vec<_>>();
+        assert!(
+            files.iter().any(|path| path.ends_with("src/index.ts")),
+            "source file missing: {:?}",
+            discovery.files
+        );
+        assert!(
+            files.iter().any(|path| path.ends_with("src/other.ts")),
+            "source file missing: {files:?}"
+        );
+        assert!(
+            files
+                .iter()
+                .all(|path| !path.contains("/.git/") && !path.contains("/node_modules/")),
+            "Git metadata or dependencies were traversed: {files:?}"
+        );
+        assert_eq!(
+            discovery.entries_examined, 5,
+            "count the three root entries and two source files, not skipped directory contents"
+        );
+    }
+
     #[test]
     fn outline_walk_skips_and_reports_injected_foreign_mount() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2028,7 +3981,7 @@ mod tests {
         let mut walk_truncated = false;
         let mut collection_truncated = false;
         let mut skipped_foreign_mounts = 0usize;
-        let mut lookup = |path: &Path| {
+        let lookup = |path: &Path| {
             Ok(Some(
                 if path.file_name().is_some_and(|name| name == "foreign") {
                     99
@@ -2045,9 +3998,8 @@ mod tests {
             &mut walk_truncated,
             &mut collection_truncated,
             &mut skipped_foreign_mounts,
-            None,
             &boundary,
-            &mut lookup,
+            lookup,
         );
 
         assert_eq!(skipped_foreign_mounts, 1, "foreign mount is disclosed");

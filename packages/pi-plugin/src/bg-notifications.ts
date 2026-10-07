@@ -28,6 +28,7 @@ export interface BgCompletion {
   compressed_tokens?: number;
   tokens_skipped?: boolean;
   status_reason?: string;
+  output_incomplete?: boolean;
   live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
   live_descendants_omitted?: number;
   live_descendants_summary?: string;
@@ -870,7 +871,12 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     const bridge = bridgeForDrain(drainContext);
     const params = drainContext.sessionID ? { session_id: drainContext.sessionID } : {};
     const response = await withBgHopTimeout(
-      bridge.send("bash_drain_completions", params, { timeoutMs: bgHopTimeoutMs }),
+      // Replay is a poll, not proof that a bridge is hung. Its deadline stays
+      // bounded, but a slow startup must not be restarted by the delivery hook.
+      bridge.send("bash_drain_completions", params, {
+        timeoutMs: bgHopTimeoutMs,
+        keepBridgeOnTimeout: true,
+      }),
       "bash_drain_completions",
     );
     if (response.success === false) {
@@ -1396,7 +1402,10 @@ function formatCompletion(completion: BgCompletion): string {
   const descendantWarning = completion.live_descendants_summary
     ? `    ${completion.live_descendants_summary}`
     : "";
-  return [header, previewBlock, descendantWarning].filter(Boolean).join("\n");
+  const captureWarning = completion.output_incomplete
+    ? `    [${completion.status_reason || "PTY output may be incomplete"}]`
+    : "";
+  return [header, captureWarning, previewBlock, descendantWarning].filter(Boolean).join("\n");
 }
 
 function formatOutputPreview(completion: BgCompletion): string {

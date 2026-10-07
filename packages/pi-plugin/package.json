@@ -15,12 +15,13 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @earendil-works/pi-coding-agent --external @earendil-works/pi-ai --external @earendil-works/pi-tui --external typebox --external diff && tsc --emitDeclarationOnly",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @earendil-works/pi-coding-agent --external @earendil-works/pi-ai --external @earendil-works/pi-tui --external @oh-my-pi/pi-coding-agent/internal-urls --external typebox --external diff && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "test": "bun test src/__tests__/",
     "lint": "biome check src",
     "prepublishOnly": "bun run build",
-    "test:unit": "bun test src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'"
+    "test:unit": "bun test src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'",
+    "test:e2e": "bun test src/__tests__/e2e/"
   },
   "dependencies": {
     "@cortexkit/aft-bridge": "0.58.2",

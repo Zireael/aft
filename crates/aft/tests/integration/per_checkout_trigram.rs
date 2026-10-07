@@ -359,10 +359,10 @@ fn trigram_import_mutator_records_intent_without_watcher() {
     let plane = index(segment(files), &delta.lock().unwrap(), files);
     let ctx = AppContext::new(
         Box::new(StubProvider),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             ..Config::default()
-        },
+        }),
     );
     let request: RawRequest = serde_json::from_value(serde_json::json!({"id":"intent-import", "command":"add_import", "file": root.join("a.ts"), "module":"needle", "names":["thing"]})).unwrap();
     let result = aft::commands::add_import::handle_add_import(&request, &ctx);
@@ -744,10 +744,10 @@ fn trigram_write_success_and_validation_rollback_without_watcher() {
     let plane = index(segment(files), &delta.lock().unwrap(), files);
     let ctx = AppContext::new(
         Box::new(StubProvider),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             ..Config::default()
-        },
+        }),
     );
     let request = |content: &str| {
         serde_json::from_value::<RawRequest>(serde_json::json!({"id":"intent-write", "command":"write", "file":root.join("a.ts"), "content":content})).unwrap()
@@ -918,10 +918,11 @@ fn trigram_materializer_pins_all_keys_with_one_key_file_write() {
     let (writes_after, syncs_after) = key_file_work();
     // Creating the pin writes an empty key list, the 200 blob keys go in one
     // batch, and the built segment id is pinned last: three key-file writes,
-    // independent of the number of files.
+    // independent of the number of files. Keys need no sync: a sweep consumes
+    // them only while this process lives, and reclaims the pin after its death.
     assert_eq!(
         (writes_after - writes_before, syncs_after - syncs_before),
-        (2, 3),
+        (2, 0),
         "pinning 200 trigram blobs must not rewrite the key file per blob"
     );
     let pinned = fs::read_to_string(materialized.pin.keys_path()).unwrap();

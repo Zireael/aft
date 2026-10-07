@@ -137,10 +137,10 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
-        },
+        }),
     );
     // Libtest runs these independent contexts in one process, whereas nextest
     // gives each test a process and therefore a separate production limiter.
@@ -172,10 +172,10 @@ fn configured_restricted_context(root: &Path) -> AppContext {
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
-        },
+        }),
     );
     ctx.isolate_cold_build_limiter_for_test(2);
     let configure = request(json!({
@@ -201,10 +201,10 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
-        },
+        }),
     );
     ctx.isolate_cold_build_limiter_for_test(2);
     let configure = request(json!({
@@ -1293,7 +1293,11 @@ fn scoped_inspect_does_not_wait_for_blocked_tier2() {
                 "{response:#}"
             );
             assert_eq!(
-                response["summary"]["duplicates"]["complete"], false,
+                response["summary"]["duplicates"]["complete"], true,
+                "{response:#}"
+            );
+            assert_eq!(
+                response["summary"]["duplicates"]["not_computed"], true,
                 "{response:#}"
             );
             assert!(
@@ -1317,7 +1321,10 @@ fn scoped_inspect_does_not_wait_for_blocked_tier2() {
             );
             let text = response["text"].as_str().unwrap();
             assert!(
-                text.contains("Incomplete duplicates: Tier-2 unavailable"),
+                text.contains("duplicates")
+                    && text.contains(
+                        "not computed for scoped inspects; run aft_inspect without scope"
+                    ),
                 "{text}"
             );
             assert!(
@@ -1326,6 +1333,380 @@ fn scoped_inspect_does_not_wait_for_blocked_tier2() {
             );
         }
     });
+}
+
+#[test]
+fn scoped_inspect_building_discloses_progress_and_last_complete() {
+    let _env_lock = env_serial_lock();
+    let (temp, root) = fixture_project();
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    configure_fake_scope_lsp(&ctx);
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let _root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_ROOT", &root.to_string_lossy());
+    let _ready = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_READY", &ready.to_string_lossy());
+    let _release = EnvVarGuard::set(
+        "AFT_TEST_TIER2_REUSE_GATE_RELEASE",
+        &release.to_string_lossy(),
+    );
+    for has_previous in [false, true] {
+        if has_previous {
+            fs::remove_file(&ready).unwrap();
+            fs::remove_file(&release).unwrap();
+            write_file(&root, "src/foo.ts", alternate_duplicate_fixture_source());
+        }
+        let manager = ctx.inspect_manager();
+        let snapshot = tier2_snapshot(&root, &ctx.inspect_dir());
+        let scope = JobScope::for_project(root.clone());
+        let worker = thread::spawn(move || {
+            manager.tier2_run_with_reuse_blocking(snapshot, InspectCategory::Duplicates, scope)
+        });
+        wait_for_path_event(&ready, "Tier-2 gate");
+        let response = inspect_tool_call(
+            &ctx,
+            json!({
+                "id": "building", "command": "inspect", "scope": "src", "sections": "duplicates"
+            }),
+        );
+        let unscoped = if !has_previous {
+            Some(inspect_tool_call(
+                &ctx,
+                json!({
+                    "id": "building-unscoped", "command": "inspect", "sections": "duplicates"
+                }),
+            ))
+        } else {
+            None
+        };
+        // Always release before assertions: a regression must not strand the worker.
+        fs::write(&release, b"release").unwrap();
+        worker.join().unwrap();
+        if let Some(unscoped) = unscoped {
+            assert_eq!(unscoped["success"], true, "{unscoped:#}");
+            assert_eq!(
+                unscoped["summary"]["duplicates"]["building"]["state"], "building",
+                "{unscoped:#}"
+            );
+            assert!(
+                !unscoped["summary"]["duplicates"]["gaps"][0]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("retry"),
+                "{unscoped:#}"
+            );
+        }
+        assert_eq!(response["success"], true, "{response:#}");
+        assert_eq!(response["scope_files"], 1, "{response:#}");
+        let summary = &response["summary"]["duplicates"];
+        assert_eq!(summary["building"]["state"], "building", "{response:#}");
+        assert!(summary["building"]["progress"].is_string(), "{response:#}");
+        assert!(
+            summary["building"].get("estimated_remaining_ms").is_some(),
+            "{response:#}"
+        );
+        let text = response["text"].as_str().unwrap();
+        assert!(
+            text.contains("building") && text.contains("estimate"),
+            "{text}"
+        );
+        let reason = summary["background_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("retry")
+                && !reason.contains("inspect_phase")
+                && !reason.contains("tier2_rescan"),
+            "{reason}"
+        );
+        assert!(
+            !text.contains("no analyzed files under this scope"),
+            "{text}"
+        );
+        if has_previous {
+            assert_eq!(summary["last_complete"]["stale"], true, "{response:#}");
+            assert!(
+                summary["last_complete"]["age_s"].is_number(),
+                "{response:#}"
+            );
+            assert!(
+                summary["last_complete"]["payload"]["items"].is_array(),
+                "{response:#}"
+            );
+            assert!(text.contains("last complete result is stale"), "{text}");
+        } else {
+            assert!(summary.get("last_complete").is_none(), "{response:#}");
+        }
+    }
+}
+
+#[test]
+fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
+    let _env_lock = env_serial_lock();
+    let (temp, owner) = fixture_project();
+    write_file(
+        &owner,
+        "main.ts",
+        "import { used } from './target';\nused();\n",
+    );
+    write_file(&owner, "target.ts", "export function used() {}\n");
+    write_file(
+        &owner,
+        "a_outside.ts",
+        &(0..110)
+            .map(|i| format!("export function outside_{i}() {{}}\n"))
+            .collect::<String>(),
+    );
+    let git = |root: &Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&owner, &["init", "--quiet"]);
+    git(&owner, &["add", "."]);
+    git(
+        &owner,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+    );
+    let linked = temp.path().join("linked");
+    git(
+        &owner,
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+    write_file(
+        &linked,
+        "target.ts",
+        "export function used() {}\nexport function checkoutOnlyDead() {}\n",
+    );
+    let storage = temp.path().join("storage");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage.clone()),
+            ..Config::default()
+        },
+    );
+    ctx.isolate_cold_build_limiter_for_test(2);
+    let configured = handle_configure(
+        &request(json!({
+            "id": "configure-view", "command": "configure", "harness": "opencode",
+            "project_root": linked, "storage_dir": storage,
+            "config": crate::helpers::user_config(json!({
+                "search_index": false, "semantic_search": false, "callgraph_store": true,
+                "views": {"enabled": true}
+            }))
+        })),
+        &ctx,
+    );
+    assert!(configured.success, "{configured:?}");
+    assert!(
+        !ctx.callgraph_writer(),
+        "worktree must remain borrow-only for legacy artifacts"
+    );
+    let publish = aft::views::assembly::AssemblyRequest {
+        storage,
+        project_root: linked.clone(),
+        family: aft::search_index::artifact_cache_key(&linked),
+        scope: aft::path_identity::project_scope_key(&linked),
+        desired_head: aft::views::assembly::head_tree_fingerprint(
+            &aft::alias::head_tree_entries(&linked).unwrap(),
+        ),
+        changed_paths: Default::default(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+        callgraph: true,
+    };
+    aft::views::assembly::publish_checkout(&publish).unwrap();
+    configure_fake_scope_lsp(&ctx);
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "worktree-dead", "command": "inspect", "scope": "target.ts",
+            "sections": ["dead_code", "unused_exports"]
+        }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert!(
+        response["summary"]["dead_code"]
+            .get("unavailable")
+            .is_none(),
+        "{response:#}"
+    );
+    assert!(
+        response["wait_stamp"]["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|phase| phase["id"] == "callgraph_ready"),
+        "{response:#}"
+    );
+    assert!(
+        dead_code_items(&response)
+            .iter()
+            .any(|(_, symbol)| symbol == "checkoutOnlyDead"),
+        "{response:#}"
+    );
+    assert!(
+        !dead_code_items(&response)
+            .iter()
+            .any(|(_, symbol)| symbol == "used"),
+        "{response:#}"
+    );
+    assert!(
+        unused_export_items(&response)
+            .iter()
+            .any(|(_, symbol)| symbol == "checkoutOnlyDead"),
+        "{response:#}"
+    );
+    assert!(!fs::read_to_string(owner.join("target.ts"))
+        .unwrap()
+        .contains("checkoutOnlyDead"));
+    // A view that predates another edit must not be passed off as this checkout.
+    write_file(
+        &linked,
+        "target.ts",
+        "export function used() {}\nexport function nextDead() {}\n",
+    );
+    let pending = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "worktree-view-stale", "command": "inspect", "scope": "target.ts", "sections": "dead_code"
+        }),
+    );
+    assert_eq!(
+        pending["summary"]["dead_code"]["unavailable"], true,
+        "{pending:#}"
+    );
+    assert!(pending["details"]["dead_code"].is_null(), "{pending:#}");
+}
+
+#[test]
+fn inspect_views_owner_persists_and_reuses_tier2_contributions() {
+    let _env_lock = env_serial_lock();
+    crate::helpers::disable_in_process_file_watcher();
+    let (temp, root) = fixture_project();
+    write_file(
+        &root,
+        "main.ts",
+        "import { used } from './target';\nused();\n",
+    );
+    write_file(
+        &root,
+        "target.ts",
+        "export function used() {}\nexport function dead() {}\n",
+    );
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let storage = temp.path().join("storage");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage.clone()),
+            ..Config::default()
+        },
+    );
+    ctx.isolate_cold_build_limiter_for_test(2);
+    let configured = handle_configure(
+        &request(json!({
+            "id": "configure-owner", "command": "configure", "harness": "opencode", "project_root": root, "storage_dir": storage,
+            "config": crate::helpers::user_config(json!({ "search_index": false, "semantic_search": false, "callgraph_store": true, "views": {"enabled": true} }))
+        })),
+        &ctx,
+    );
+    assert!(configured.success, "{configured:?}");
+    assert!(ctx.inspect_writer());
+    ctx.inspect_manager()
+        .set_automatic_tier2_refresh_allowed(false);
+    let publish = aft::views::assembly::AssemblyRequest {
+        storage,
+        project_root: root.clone(),
+        family: aft::search_index::artifact_cache_key(&root),
+        scope: aft::path_identity::project_scope_key(&root),
+        desired_head: aft::views::assembly::head_tree_fingerprint(
+            &aft::alias::head_tree_entries(&root).unwrap(),
+        ),
+        changed_paths: Default::default(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+        callgraph: true,
+    };
+    aft::views::assembly::publish_checkout(&publish).unwrap();
+    configure_fake_scope_lsp(&ctx);
+    let first = inspect_tool_call(
+        &ctx,
+        json!({"id": "owner-first", "command": "inspect", "sections": ["dead_code"]}),
+    );
+    assert_eq!(first["success"], true, "{first:#}");
+    let cache = InspectCache::open_readonly(ctx.inspect_dir(), root.clone())
+        .unwrap()
+        .expect("writer-backed owner cache");
+    let contributions = cache
+        .load_tier2_contributions(InspectCategory::DeadCode)
+        .unwrap();
+    assert_eq!(
+        contributions.len(),
+        2,
+        "owner inspect must persist source contributions"
+    );
+    assert!(cache
+        .last_full_run(InspectCategory::DeadCode)
+        .unwrap()
+        .is_some());
+    let scanned_before = ctx.inspect_manager().source_scan_files_for_test();
+    assert!(scanned_before > 0, "first request must reach the scanner");
+    let second = inspect_tool_call(
+        &ctx,
+        json!({"id": "owner-second", "command": "inspect", "sections": ["dead_code"]}),
+    );
+    assert_eq!(second["success"], true, "{second:#}");
+    assert_eq!(dead_code_items(&first), dead_code_items(&second));
+    assert_eq!(
+        ctx.inspect_manager().source_scan_files_for_test(),
+        scanned_before,
+        "unchanged owner inspect must quick-reuse contributions without scanning source files"
+    );
+    assert_eq!(
+        cache
+            .load_tier2_contributions(InspectCategory::DeadCode)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        ctx.inspect_manager().reuse_start_count_for_test() >= 10,
+        "both requests must use the contribution reuse pipeline"
+    );
 }
 
 #[test]
@@ -1439,7 +1820,25 @@ fn inspect_command_ignores_retired_tier2_deadline_overrides() {
     );
 
     assert_eq!(response["success"], true, "response: {response:#}");
-    assert!(response.get("complete").is_none());
+    // This fixture disables the callgraph. Its unavailable dead-code analysis
+    // makes an unscoped result PARTIAL, independently of the retired deadline.
+    assert_eq!(response["complete"], false, "response: {response:#}");
+    assert!(
+        response["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("PARTIAL — dead code unavailable:")),
+        "response: {response:#}"
+    );
+    assert_eq!(
+        response["summary"]["dead_code"]["reason"],
+        "call graph is disabled (indexes.callgraph=false)"
+    );
+    assert!(
+        response["summary"]["duplicates"]["count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "the retired deadline must not prevent duplicate analysis: {response:#}"
+    );
     assert!(response["summary"]["duplicates"].get("status").is_none());
 }
 
@@ -2471,7 +2870,7 @@ fn inspect_tool_call_multiple_roots_reports_combined_corpus_and_duplicates() {
     assert!(
         combined["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("scope: 2 roots, 4 files\n")),
+            .is_some_and(|text| text.lines().any(|line| line == "scope: 2 roots, 4 files")),
         "response: {combined:#}"
     );
     let alpha_count = alpha["summary"]["duplicates"]["count"]
@@ -2524,7 +2923,7 @@ fn inspect_tool_call_empty_analyzed_scope_uses_zero_denominator() {
     assert_eq!(response["summary"]["duplicates"]["total_analyzed_lines"], 0);
     let text = response["text"].as_str().expect("rendered inspect text");
     assert!(
-        text.starts_with("scope: 1 root, 0 files (no analyzed files under this scope)\n"),
+        text.starts_with("FRESH\nscope: 1 root, 0 files (no analyzed files under this scope)\n"),
         "response: {response:#}"
     );
     assert!(
@@ -3576,9 +3975,10 @@ fn tool_call_aft_inspect_text_is_the_rendered_inspect_text() {
     // `src/main.rs` has no Cargo.toml, so Rust diagnostics are unknown and the
     // rendered text opens with the partial header that names rust.
     let mut lines = text.lines();
-    assert_eq!(
-        lines.next(),
-        Some("PARTIAL: diagnostics unknown for rust (see below)"),
+    assert!(
+        lines.next().is_some_and(|line| line
+            .starts_with("PARTIAL — diagnostics unknown: rust-analyzer")
+            && line.contains("retry aft_inspect")),
         "{text}"
     );
     assert!(
@@ -3906,6 +4306,87 @@ fn scoped_blocking_inspect_pipelined_pulls_stay_within_the_request_budget() {
     );
 }
 
+/// A compiler push after a cancelled pull does not answer rust-analyzer's
+/// native analysis request. Retry the pull and retain both sources.
+#[test]
+fn scoped_blocking_inspect_retries_cancelled_rust_pull_after_compiler_push() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-cancelled-pull");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_CANCEL", "once");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-cancelled-pull", "src/lib.rs");
+    let reported = diagnostic_sources_for(&response, "src/lib.rs");
+    for expected in [
+        ("fake-lsp".to_string(), "test pull diagnostic".to_string()),
+        ("rustc".to_string(), "fake compile error".to_string()),
+    ] {
+        assert!(
+            reported.contains(&expected),
+            "{expected:?} missing: {response:#}"
+        );
+    }
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+    assert_eq!(response["inspect_terminal"], "fresh", "{response:#}");
+}
+
+/// When the retry is cancelled too, compiler results alone cannot certify
+/// the file's diagnostics. Keep the failed native analysis visible as a gap.
+#[test]
+fn scoped_blocking_inspect_marks_cancelled_rust_pull_unknown_despite_compiler_push() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-cancelled-pull-unknown");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_CANCEL", "always");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-cancelled-pull-unknown", "src/lib.rs");
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    let gaps = uncovered_files(&response);
+    assert!(
+        gaps.iter().any(|(file, reason)| {
+            file == "src/lib.rs" && reason.contains("server cancelled the request")
+        }),
+        "cancelled native analysis must be unknown: {response:#}"
+    );
+}
+
+/// A successful pull before the current check can still describe the native
+/// analysis from before a watched-file change. Pull only after that check.
+#[test]
+fn scoped_blocking_inspect_waits_to_pull_native_rust_diagnostics_until_current_check_settles() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-native-after-check");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "600");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_WAIT_FOR_CHECK", "1");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-native-after-check", "src/lib.rs");
+    let messages = diagnostic_messages_for(&response, "src/lib.rs");
+    for expected in ["test pull diagnostic", "fake compile error"] {
+        assert!(
+            messages.iter().any(|message| message == expected),
+            "{expected} missing: {response:#}"
+        );
+    }
+    assert_eq!(response["inspect_terminal"], "fresh", "{response:#}");
+}
+
 /// A scope with more files than one inspect opens reports how many it
 /// examined, and names the rest with that cause instead of opening them.
 #[test]
@@ -3931,11 +4412,11 @@ fn scoped_blocking_inspect_caps_the_files_it_opens() {
         "response: {response:#}"
     );
     let text = response["text"].as_str().expect("rendered text");
-    // The coverage line counts files with authoritative diagnostics: the 1000
-    // opened and answered, but not the one file past the cap, which is the
-    // single uncovered file asserted above.
+    // The cap's unknown file is explained once in the header; exact coverage
+    // remains structured rather than repeating incompleteness in a body line.
     assert!(
-        text.contains("authoritative results for 1000 of 1001 scoped files (1 not examined"),
+        text.starts_with("PARTIAL — diagnostics unknown: rust-analyzer @ .: not examined:")
+            && text.contains("(1 file); retry aft_inspect."),
         "{text}"
     );
 }
@@ -3962,7 +4443,7 @@ fn scoped_blocking_inspect_names_an_unfinished_cargo_check() {
     );
     let text = response["text"].as_str().expect("rendered text");
     assert!(
-        text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry;"),
+        text.starts_with("PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running (1 file); retry aft_inspect."),
         "{text}"
     );
 }
@@ -4755,7 +5236,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
     let server_id = "needs-marker-ls";
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.clone()),
             lsp_servers: vec![aft::config::UserServerDef {
                 id: server_id.to_string(),
@@ -4768,7 +5249,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
                 disabled: false,
             }],
             ..Config::default()
-        },
+        }),
     );
     crate::helpers::disable_in_process_file_watcher();
     let configure = request(json!({
@@ -4889,7 +5370,7 @@ fn inspect_failed_producer_reason_names_exit_code_and_first_stderr_line() {
     .expect("inspect response serializes");
 
     let text = response["text"].as_str().expect("rendered text");
-    assert!(text.contains("diagnostics: unknown"), "{text}");
+    assert!(text.starts_with("PARTIAL — diagnostics unknown:"), "{text}");
     assert!(!text.contains("0 errors"), "{text}");
     assert!(text.contains("rust"), "{text}");
     assert!(response["summary"]["diagnostics"]["errors"].is_null());
@@ -4972,17 +5453,14 @@ fn scoped_files_without_diagnostics_roll_up_to_one_cause_and_top_k_paths() {
     let text = response["text"].as_str().expect("rendered text");
     let group_lines = text
         .lines()
-        .filter(|line| line.starts_with("Incomplete diagnostics: no authoritative diagnostics"))
+        .filter(|line| line.starts_with("PARTIAL — diagnostics unknown:"))
         .collect::<Vec<_>>();
     assert_eq!(group_lines.len(), 1, "one line per cause: {text}");
     assert!(
-        group_lines[0].starts_with(
-            "Incomplete diagnostics: no authoritative diagnostics for 7 files (typescript in web: "
-        ),
+        group_lines[0].starts_with("PARTIAL — diagnostics unknown: typescript @ web: "),
         "{text}"
     );
-    // The remedy is printed once, on the TypeScript producer's failure line;
-    // the group line names that producer instead of repeating the reason.
+    // The status header carries the install remedy exactly once.
     let remedy = "no node_modules in web: the project's dependencies are not installed; \
                   run your package manager's install";
     assert_eq!(
@@ -4992,12 +5470,12 @@ fn scoped_files_without_diagnostics_roll_up_to_one_cause_and_top_k_paths() {
     );
     assert!(
         text.lines().any(|line| line
-            .starts_with("Incomplete diagnostics: producer typescript @ web failed (")
+            .starts_with("PARTIAL — diagnostics unknown: typescript @ web: ")
             && line.contains(remedy)),
         "the producer line must carry the install remedy: {text}"
     );
     assert!(
-        group_lines[0].ends_with("(typescript in web: producer typescript failed, reason above)"),
+        group_lines[0].ends_with("(7 files); retry aft_inspect."),
         "{text}"
     );
     let listed = text
@@ -5084,8 +5562,13 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     // The Rust producer failed, so the completed result is partial and its
     // reason names rust.
     assert_eq!(response["inspect_terminal"], "partial");
-    assert_eq!(
-        response["partial_reason"], "diagnostics unknown for rust",
+    assert!(
+        response["partial_reason"]
+            .as_str()
+            .is_some_and(
+                |reason| reason.starts_with("diagnostics unknown: rust-analyzer @ .:")
+                    && reason.ends_with("retry aft_inspect.")
+            ),
         "{response:#}"
     );
     assert_eq!(response["complete"], false);
@@ -5100,7 +5583,7 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
         .and_then(|gaps| gaps.iter().find(|gap| gap["producer"] == "rust"))
         .unwrap_or_else(|| panic!("Rust producer gap missing: {response:#}"));
     let text = response["text"].as_str().expect("rendered text");
-    assert!(text.contains("diagnostics: unknown"), "{text}");
+    assert!(text.starts_with("PARTIAL — diagnostics unknown:"), "{text}");
     assert!(!text.contains("diagnostics: 0 errors"), "{text}");
     assert!(text.contains("from typescript"), "{text}");
     assert!(text.contains("test diagnostic error"), "{text}");
@@ -5367,7 +5850,9 @@ fn assert_removed_field_reported(response: &Value) {
     if still_checking {
         assert_eq!(response["complete"], false, "{response:#}");
         assert!(
-            text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry"),
+            text.starts_with(
+                "PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running"
+            ),
             "{text}"
         );
         return;
@@ -5551,7 +6036,9 @@ fn reported_check_still_running(response: &Value) -> bool {
         assert_eq!(response["complete"], false, "{response:#}");
         let text = response["text"].as_str().expect("rendered text");
         assert!(
-            text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry"),
+            text.starts_with(
+                "PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running"
+            ),
             "{text}"
         );
     }
@@ -5804,8 +6291,15 @@ fn unscoped_inspect_names_an_unfinished_cargo_check() {
         "{response:#}"
     );
     let text = response["text"].as_str().expect("rendered text");
+    // An unscoped request also reports incomplete dead-code analysis. The
+    // diagnostic cause must remain in the same status line, not necessarily first.
     assert!(
-        text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry)"),
+        text.lines()
+            .next()
+            .is_some_and(|line| line.starts_with("PARTIAL — ")
+                && line
+                    .contains("diagnostics unknown: rust-analyzer @ .: cargo check still running")
+                && line.ends_with("; retry aft_inspect.")),
         "{text}"
     );
     assert!(!text.contains("producer rust failed"), "{text}");

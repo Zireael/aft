@@ -5,6 +5,7 @@ pub mod document;
 pub mod environmental;
 pub mod jsonrpc;
 pub mod manager;
+pub mod pending_changes;
 pub mod position;
 pub mod pull_params;
 pub mod registry;
@@ -12,6 +13,7 @@ pub mod roots;
 pub mod transport;
 pub mod tsconfig_membership;
 pub(crate) mod typescript_project;
+mod writer;
 
 /// LSP subsystem error type.
 #[derive(Debug)]

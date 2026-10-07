@@ -1,0 +1,31 @@
+{
+  "cases": [
+    {
+      "name": "default primary",
+      "started_at_ms": 1700000000000,
+      "now_ms": 1700001080000,
+      "limit_ms": 1800000,
+      "source": "default",
+      "role": "primary",
+      "expected": "AFT kills this task at 2023-11-14 22:43:20Z, when it has run 30 minutes (its default background limit) unless you pass a longer `timeout`; about 12 minutes remain."
+    },
+    {
+      "name": "default worker",
+      "started_at_ms": 1700000000000,
+      "now_ms": 1700001080000,
+      "limit_ms": 1800000,
+      "source": "default",
+      "role": "worker",
+      "expected": "AFT kills this task at 2023-11-14 22:43:20Z, when it has run 30 minutes (its default background limit), but each wait you make on it moves that kill to at least the worker wait limit (`bash.worker_wait_max_ms`) after the wait, so it is not killed while you keep waiting; pass a `timeout` to set your own limit; about 12 minutes remain."
+    },
+    {
+      "name": "explicit timeout",
+      "started_at_ms": 1700000000000,
+      "now_ms": 1700000010000,
+      "limit_ms": 45000,
+      "source": "timeout",
+      "role": "worker",
+      "expected": "AFT kills this task at 2023-11-14 22:14:05Z, when it has run 45s (the `timeout` you passed); about 35s remain."
+    }
+  ]
+}

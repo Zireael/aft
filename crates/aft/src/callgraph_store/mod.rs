@@ -21,6 +21,8 @@ use crate::error::AftError;
 use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, parse_source_with_cached_parser, LangId};
 use crate::symbols::{Range, SymbolKind};
+#[cfg(test)]
+use join::Parser;
 use rayon::prelude::*;
 use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Statement, Transaction,
@@ -35,7 +37,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
+#[cfg(not(test))]
+use tree_sitter::Parser;
 
 const SCHEMA_VERSION: i64 = 1;
 /// Highest callgraph generation schema this build reads (and writes).
@@ -519,6 +523,18 @@ mod root_repair_warning_tests {
 
 #[cfg(test)]
 mod write_amplification_tests {
+    #[test]
+    fn durability_callgraph_pointer_count() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::durability::take();
+        super::publish_pointer(dir.path(), "durability", "generation.sqlite").unwrap();
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        assert_eq!(
+            std::fs::read(super::pointer_path(dir.path(), "durability")).unwrap(),
+            b"generation.sqlite\n"
+        );
+    }
     use super::*;
     use std::fs;
     use tempfile::tempdir;
@@ -553,6 +569,42 @@ mod write_amplification_tests {
             .join()
             .expect("configure thread joined")
             .expect("WAL setup waits for the writer instead of failing locked");
+    }
+
+    #[test]
+    fn busy_readiness_probe_waits_within_its_deadline() {
+        let temp = tempdir().unwrap();
+        let generation = "locked-probe";
+        let path = temp.path().join(format!("derived-{generation}.sqlite"));
+        let writer = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT); BEGIN EXCLUSIVE;").unwrap();
+        let started = Instant::now();
+        let error = manifest_view_database_ready(
+            temp.path(),
+            generation,
+            started + Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(error.is_transient_lock_contention(), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "probe exceeded its bounded wait"
+        );
+
+        // A short-lived writer should clear inside the next attempt's budget,
+        // rather than every attempt immediately observing a busy database.
+        let release = std::thread::spawn(move || {
+            let (_tx, rx) = std::sync::mpsc::channel::<()>();
+            let _ = rx.recv_timeout(Duration::from_millis(50));
+            writer.execute_batch("ROLLBACK").unwrap();
+        });
+        assert!(!manifest_view_database_ready(
+            temp.path(),
+            generation,
+            Instant::now() + Duration::from_secs(2)
+        )
+        .unwrap());
+        release.join().unwrap();
     }
 
     #[test]
@@ -1658,6 +1710,14 @@ pub enum CallGraphStoreError {
 }
 
 impl CallGraphStoreError {
+    pub(crate) fn is_unreadable_database(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(error.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+        )
+    }
+
     pub(crate) fn is_transient_lock_contention(&self) -> bool {
         matches!(
             self,
@@ -2921,6 +2981,17 @@ pub trait CallGraphRead {
         limit: usize,
     ) -> Result<Vec<StoreRefSite>> {
         let _ = (kind, short_name, limit);
+        Ok(Vec::new())
+    }
+    /// Unbound receiver calls of the written member name, excluding sites that
+    /// already have a supplemental edge. An empty reverse graph cannot prove
+    /// these calls do not reach the queried method.
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        let _ = (name, language);
         Ok(Vec::new())
     }
     fn call_tree(
@@ -4563,7 +4634,6 @@ impl CallGraphStore {
             // brand-new and owned by us, so the rename never hits an open file.
             remove_sqlite_file_set(&gen_path);
             crate::fs_lock::rename_over(&temp_path, &gen_path)?;
-            crate::fs_lock::sync_parent(&gen_path);
             remove_sqlite_sidecars(&gen_path);
             // The rename moves the staging database file alone. Its WAL and
             // WAL-index describe the file that just left, and the staging path
@@ -6423,6 +6493,26 @@ impl CallGraphStore {
         self.ensure_ready(&conn)?;
         ref_sites_named(&conn, kind, short_name, limit)
     }
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        let mut stmt = conn.prepare_cached("SELECT r.caller_file, n.scoped_name, r.line FROM refs r JOIN files f ON f.path=r.caller_file LEFT JOIN nodes n ON n.id=r.caller_node WHERE r.kind='call' AND r.short_name=?1 AND f.lang=?2 AND r.status='unresolved' AND r.full_ref LIKE '%.%' AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id=r.ref_id AND e.kind='call') ORDER BY r.caller_file, r.line, r.ref_id")?;
+        let rows = stmt.query_map(params![name, lang_label(language)], |row| {
+            Ok(StoreRefSite {
+                file: row.get(0)?,
+                caller_symbol: row.get(1)?,
+                line: row.get::<_, i64>(2)?.max(0) as u32,
+                local_name: None,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
 
     pub fn call_tree(
         &self,
@@ -6723,15 +6813,7 @@ impl ReadonlyCallGraphStore {
         generation: &str,
         pin: Option<Arc<crate::pins::QueryPin>>,
     ) -> Result<Self> {
-        let generation_path = crate::views::resolve_derived_path(&view_dir, generation)
-            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-        // Older publications used one checkout-wide database. Keep them readable
-        // until the first generation-owned publication replaces their handle.
-        let sqlite_path = if generation_path.is_file() {
-            generation_path
-        } else {
-            view_dir.join("derived.sqlite")
-        };
+        let sqlite_path = manifest_view_database_path(&view_dir, generation)?;
         let conn = open_readonly_connection(&sqlite_path)?;
         ensure_database_ready(&conn)?;
         let mut inner = CallGraphStore::from_connection(
@@ -7067,6 +7149,13 @@ impl CallGraphRead for CallGraphStore {
     ) -> Result<Vec<StoreRefSite>> {
         CallGraphStore::ref_sites_named(self, kind, short_name, limit)
     }
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        CallGraphStore::unresolved_method_sites_named(self, name, language)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -7178,6 +7267,13 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     ) -> Result<Vec<StoreRefSite>> {
         (**self).ref_sites_named(kind, short_name, limit)
     }
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        (**self).unresolved_method_sites_named(name, language)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -7288,6 +7384,13 @@ impl CallGraphRead for ReadonlyCallGraphStore {
         limit: usize,
     ) -> Result<Vec<StoreRefSite>> {
         ReadonlyCallGraphStore::ref_sites_named(self, kind, short_name, limit)
+    }
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        self.inner.unresolved_method_sites_named(name, language)
     }
     fn call_tree(
         &self,
@@ -7439,7 +7542,7 @@ fn nodes_for_file_matching_symbol(
         "SELECT n.id, n.file_path, n.scoped_name, n.name, n.kind, n.start_line, n.end_line,
                 n.signature, n.exported, n.is_callgraph_entry_point, f.lang
          FROM nodes n JOIN files f ON f.path = n.file_path
-         WHERE n.file_path = ?1 AND n.scoped_name = ?2
+          WHERE n.file_path = ?1 AND (n.scoped_name = ?2 OR (f.lang='rust' AND instr(n.scoped_name, ' for ') > 0 AND substr(n.scoped_name, instr(n.scoped_name, ' for ') + 5) = ?2))
          ORDER BY n.scoped_name, n.start_line, n.start_col"
     } else {
         "SELECT n.id, n.file_path, n.scoped_name, n.name, n.kind, n.start_line, n.end_line,
@@ -7450,8 +7553,40 @@ fn nodes_for_file_matching_symbol(
     };
     let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(params![rel_path, symbol], store_node_from_row)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let matched = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    if qualified_query && matched.is_empty() {
+        let short = symbol.rsplit("::").next().unwrap_or(symbol);
+        return Ok(nodes_for_file_matching_symbol(conn, rel_path, short)?
+            .into_iter()
+            .filter(|node| {
+                if node.lang != LangId::Rust {
+                    return false;
+                }
+                let suffix = node
+                    .symbol
+                    .split_once(" for ")
+                    .map(|(_, implementation)| implementation)
+                    .unwrap_or(&node.symbol);
+                let mut depth = 0usize;
+                let normalized = suffix
+                    .chars()
+                    .filter(|ch| match ch {
+                        '<' => {
+                            depth += 1;
+                            false
+                        }
+                        '>' if depth > 0 => {
+                            depth -= 1;
+                            false
+                        }
+                        _ => depth == 0,
+                    })
+                    .collect::<String>();
+                normalized == symbol
+            })
+            .collect());
+    }
+    Ok(matched)
 }
 
 fn nodes_matching_symbol(conn: &Connection, symbol: &str) -> Result<Vec<StoreNode>> {
@@ -7460,7 +7595,7 @@ fn nodes_matching_symbol(conn: &Connection, symbol: &str) -> Result<Vec<StoreNod
         "SELECT n.id, n.file_path, n.scoped_name, n.name, n.kind, n.start_line, n.end_line,
                 n.signature, n.exported, n.is_callgraph_entry_point, f.lang
          FROM nodes n JOIN files f ON f.path = n.file_path
-         WHERE n.scoped_name = ?1
+          WHERE n.scoped_name = ?1 OR (f.lang='rust' AND instr(n.scoped_name, ' for ') > 0 AND substr(n.scoped_name, instr(n.scoped_name, ' for ') + 5) = ?1)
          ORDER BY n.file_path, n.scoped_name, n.start_line, n.start_col"
     } else {
         "SELECT n.id, n.file_path, n.scoped_name, n.name, n.kind, n.start_line, n.end_line,
@@ -8867,7 +9002,6 @@ fn publish_backup_migration(
     }
     destination.execute_batch("PRAGMA optimize;")?;
     drop(destination);
-    sync_file(&temp_path)?;
     fail_after_temp_copy_for_test()?;
 
     let mut source = source.clone();
@@ -8905,7 +9039,6 @@ fn publish_migrated_generation(
         verify_writer_lease(&writer_lease)?;
         remove_sqlite_file_set(&gen_path);
         rename_sqlite_file_set(temp_path, &gen_path)?;
-        crate::fs_lock::sync_parent(&gen_path);
         // A backup copy is written in rollback mode; switch it while no
         // pointer names it, as a cold build does.
         switch_generation_to_wal_before_publication(&gen_path);
@@ -8938,7 +9071,6 @@ fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
         }
         let destination_path = sqlite_file_set_path(destination, suffix);
         std::fs::copy(&source_path, &destination_path)?;
-        sync_file(&destination_path)?;
     }
     Ok(())
 }
@@ -9009,15 +9141,6 @@ fn sqlite_file_set_path(path: &Path, suffix: &str) -> PathBuf {
     }
 }
 
-fn sync_file(path: &Path) -> Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
-    file.sync_all()?;
-    Ok(())
-}
-
 fn fail_after_temp_copy_for_test() -> Result<()> {
     if MIGRATION_FAIL_AFTER_TEMP_COPY.with(|slot| slot.get()) {
         return Err(CallGraphStoreError::Unavailable(
@@ -9074,13 +9197,11 @@ fn write_migration_manifest(
         let mut file = std::fs::File::create(&temp_path)?;
         file.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
         file.write_all(b"\n")?;
-        file.sync_all()?;
     }
     if let Err(error) = crate::fs_lock::rename_over(&temp_path, &manifest_path) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(error.into());
     }
-    crate::fs_lock::sync_parent(&manifest_path);
     Ok(())
 }
 
@@ -9152,7 +9273,6 @@ fn cleanup_incomplete_migrations(callgraph_dir: &Path, project_key: &str) {
             let _ = std::fs::remove_file(migration_manifest_path(callgraph_dir, &name));
         }
     }
-    crate::fs_lock::sync_parent(callgraph_dir);
 }
 
 fn legacy_read_marker_label(path: &Path, generation: Option<&str>) -> String {
@@ -9165,7 +9285,45 @@ fn legacy_read_marker_label(path: &Path, generation: Option<&str>) -> String {
     format!("legacy-{}", &digest[..16])
 }
 
+/// Publication reuse must satisfy the same build-output check as a view reader.
+/// HEAD and manifest equality cannot make output from an older builder readable.
+pub(crate) fn manifest_view_database_ready(
+    view_dir: &Path,
+    generation: &str,
+    deadline: Instant,
+) -> Result<bool> {
+    let path = manifest_view_database_path(view_dir, generation)?;
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    // Use the store's reader opener, not a raw descriptor on its live file set.
+    // Contention that outlasts this job's budget remains an unknown readiness
+    // result (the SQLite busy/locked error), never a definitive negative answer.
+    let conn = open_readonly_connection_before(&path, deadline)?;
+    conn.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
+    database_ready(&conn)
+}
+
+fn manifest_view_database_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {
+    let generation_path = crate::views::resolve_derived_path(view_dir, generation)
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    // Older publications used one checkout-wide database. Keep them readable
+    // until the first generation-owned publication replaces their handle.
+    Ok(if generation_path.is_file() {
+        generation_path
+    } else {
+        view_dir.join("derived.sqlite")
+    })
+}
+
 fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
+    open_readonly_connection_before(path, Instant::now())
+}
+
+fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<TrackedConnection> {
     let uri = sqlite_readonly_uri(path);
     let conn = TrackedConnection::open_with_flags(
         &uri,
@@ -9174,9 +9332,9 @@ fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
     )?;
     // Readers do not change durability or journal settings: even synchronous
     // reads the schema and can block behind an exclusive writer before setup.
-    // Fail fast so repeated readiness probes cannot accumulate busy waits on
-    // the request thread; callers report contention as a retryable build.
-    conn.busy_timeout(Duration::ZERO)?;
+    // Request readers pass an expired deadline and fail fast; maintenance probes
+    // may wait within their bounded budget without changing durability settings.
+    conn.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
 }
@@ -9632,19 +9790,16 @@ pub(crate) fn set_meta_ready(conn: &Connection, ready: bool) -> Result<()> {
 }
 
 fn database_ready(conn: &Connection) -> Result<bool> {
-    let schema_version: Option<String> = conn
-        .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |row| {
-            row.get(0)
-        })
-        .optional()?;
-    let fingerprint: Option<String> = conn
-        .query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
-            row.get(0)
-        })
-        .optional()?;
-    let ready: Option<String> = conn
-        .query_row("SELECT v FROM meta WHERE k = 'ready'", [], |row| row.get(0))
-        .optional()?;
+    // One statement reads one snapshot and consumes at most one busy-timeout
+    // window; three independent queries could each wait the entire job budget.
+    let (schema_version, fingerprint, ready): (Option<String>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT (SELECT v FROM meta WHERE k = 'schema_version'),
+                (SELECT v FROM meta WHERE k = 'fingerprint'),
+                (SELECT v FROM meta WHERE k = 'ready')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
 
     let expected_schema = SCHEMA_VERSION.to_string();
     let expected_fingerprint = schema_fingerprint();
@@ -9678,7 +9833,12 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   workspace crate or an earlier `use`, imported calls follow re-exports to
 ///   the definition, and a file-level function wins over imports from nested
 ///   scopes. Stores built before v11 hold the old, partly unresolved edges.
-const BUILD_OUTPUT_VERSION: &str = "v11-rust-path-resolution";
+/// - v12: receiver contracts preserve name-only trait/interface callers, module
+///   overrides and wildcard imports bind integration harness calls, and member
+///   completion does not duplicate documented methods.
+/// - v13: known interface contracts and their implementation fan-out retain
+///   exact/dispatch provenance; a concrete trait call has only its actual target.
+const BUILD_OUTPUT_VERSION: &str = "v13-typed-dispatch-precision";
 
 fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)
@@ -10361,7 +10521,7 @@ fn refuse_newer_published_format(callgraph_dir: &Path, project_key: &str) -> Res
 }
 
 /// Atomically publish `generation` as the current store by flipping the pointer
-/// file. Writes a temp file, fsyncs, then renames over the pointer — never
+/// file. Writes a temp file, then atomically renames over the pointer — never
 /// replacing an open DB file, so it succeeds cross-platform.
 fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) -> Result<()> {
     // Last line of defence: never move the pointer away from a generation
@@ -10378,13 +10538,13 @@ fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) ->
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(generation.as_bytes())?;
         file.write_all(b"\n")?;
-        file.sync_all()?;
+        // Generations rebuild from source. Atomic replacement is sufficient
+        // for readers; the pointer need not survive power loss.
     }
     if let Err(error) = crate::fs_lock::rename_over(&tmp, &pointer) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error.into());
     }
-    crate::fs_lock::sync_parent(&pointer);
     Ok(())
 }
 
@@ -10719,9 +10879,7 @@ fn sweep_callgraph_root_dirs_with_limits(
             cursors.remove(root_dir);
         }
     }
-    if summary.removed > 0 {
-        crate::fs_lock::sync_parent(root_dir);
-    }
+    if summary.removed > 0 {}
     summary
 }
 
@@ -10860,7 +11018,7 @@ fn callgraph_root_file_stats(
         newest: metadata.modified().ok(),
         bytes: 0,
     };
-    match callgraph_root_file_stats_inner(cache_dir, boundary, deadline, &mut stats) {
+    match callgraph_root_file_stats_inner(cache_dir, cache_dir, boundary, deadline, &mut stats) {
         Ok(()) => CallgraphRootWalk::Complete(stats),
         Err(CallgraphRootWalkError::BudgetExceeded) => CallgraphRootWalk::BudgetExceeded,
         Err(CallgraphRootWalkError::Failed) => CallgraphRootWalk::Failed,
@@ -10874,6 +11032,7 @@ enum CallgraphRootWalkError {
 
 fn callgraph_root_file_stats_inner(
     directory: &Path,
+    cache_dir: &Path,
     boundary: &crate::walk_boundary::DeviceBoundary,
     deadline: Instant,
     stats: &mut CallgraphRootFileStats,
@@ -10894,6 +11053,13 @@ fn callgraph_root_file_stats_inner(
             return Err(CallgraphRootWalkError::Failed);
         }
         let path = entry.path();
+        let relative = path
+            .strip_prefix(cache_dir)
+            .map_err(|_| CallgraphRootWalkError::Failed)?;
+        // Coordination files reflect lease/reader heartbeats, not cache payload
+        // activity. Their liveness is checked separately before deletion. Still
+        // walk them for byte accounting and the same conservative safety checks.
+        let track_mtime = relative != Path::new("writer.lease") && !relative.starts_with("readers");
         if file_type.is_dir() {
             if !boundary
                 .should_descend(&path)
@@ -10904,8 +11070,10 @@ fn callgraph_root_file_stats_inner(
             let metadata = entry
                 .metadata()
                 .map_err(|_| CallgraphRootWalkError::Failed)?;
-            merge_newest_callgraph_root_mtime(stats, metadata.modified().ok());
-            callgraph_root_file_stats_inner(&path, boundary, deadline, stats)?;
+            if track_mtime {
+                merge_newest_callgraph_root_mtime(stats, metadata.modified().ok());
+            }
+            callgraph_root_file_stats_inner(&path, cache_dir, boundary, deadline, stats)?;
             continue;
         }
         if !file_type.is_file() {
@@ -10915,7 +11083,9 @@ fn callgraph_root_file_stats_inner(
             .metadata()
             .map_err(|_| CallgraphRootWalkError::Failed)?;
         stats.bytes = stats.bytes.saturating_add(metadata.len());
-        merge_newest_callgraph_root_mtime(stats, metadata.modified().ok());
+        if track_mtime {
+            merge_newest_callgraph_root_mtime(stats, metadata.modified().ok());
+        }
     }
     Ok(())
 }
@@ -11079,9 +11249,7 @@ fn sweep_orphaned_build_temps_older_than(callgraph_dir: &Path, min_age: Duration
             Err(_) => {}
         }
     }
-    if removed_any {
-        crate::fs_lock::sync_parent(callgraph_dir);
-    }
+    if removed_any {}
 }
 
 /// Bound the cold-build's tree-sitter pass to half the cores (cap 8) instead of
@@ -11989,6 +12157,10 @@ fn extend_rust_imports_with_nested_uses(source: &str, data: &mut FileCallData) {
         return;
     };
 
+    extend_rust_imports_from_tree(source, tree.root_node(), data);
+}
+
+fn extend_rust_imports_from_tree(source: &str, root: Node<'_>, data: &mut FileCallData) {
     let mut seen = data
         .import_block
         .imports
@@ -11996,7 +12168,7 @@ fn extend_rust_imports_with_nested_uses(source: &str, data: &mut FileCallData) {
         .map(|import| (import.byte_range.start, import.byte_range.end))
         .collect::<HashSet<_>>();
     let mut nested_imports = Vec::new();
-    collect_rust_use_imports(source, tree.root_node(), &mut seen, &mut nested_imports);
+    collect_rust_use_imports(source, root, &mut seen, &mut nested_imports);
     if nested_imports.is_empty() {
         return;
     }
@@ -12129,6 +12301,26 @@ fn collect_reexport_refs(
     memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> ReexportRefs {
+    collect_reexport_refs_with_line_index(
+        project_root,
+        abs_path,
+        rel_path,
+        source,
+        memo,
+        facts,
+        &LineIndex::new(source),
+    )
+}
+
+fn collect_reexport_refs_with_line_index(
+    project_root: &Path,
+    abs_path: &Path,
+    rel_path: &str,
+    source: &str,
+    memo: &callgraph::ModuleResolutionMemo,
+    facts: &FactPaths<'_>,
+    line_index: &LineIndex,
+) -> ReexportRefs {
     let mut raw_refs = Vec::new();
     let mut surface_parts = Vec::new();
     let mut search_start = 0usize;
@@ -12149,11 +12341,7 @@ fn collect_reexport_refs(
         };
         ordinal += 1;
         let wildcard = statement.contains('*');
-        let line = source[..start]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count() as u32
-            + 1;
+        let line = line_index.byte_to_line(start);
         let ref_id = ref_id(&[
             rel_path,
             "reexport",
@@ -12338,6 +12526,14 @@ struct SourceLessExportRefs {
 }
 
 fn collect_source_less_export_alias_refs(rel_path: &str, source: &str) -> SourceLessExportRefs {
+    collect_source_less_export_alias_refs_with_line_index(rel_path, source, &LineIndex::new(source))
+}
+
+fn collect_source_less_export_alias_refs_with_line_index(
+    rel_path: &str,
+    source: &str,
+    line_index: &LineIndex,
+) -> SourceLessExportRefs {
     let mut raw_refs = Vec::new();
     let mut surface_parts = Vec::new();
     let mut search_start = 0usize;
@@ -12362,11 +12558,7 @@ fn collect_source_less_export_alias_refs(rel_path: &str, source: &str) -> Source
         // differs between two extractions of the same file.
         let mut aliases = aliases.into_iter().collect::<Vec<_>>();
         aliases.sort();
-        let line = source[..start]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count() as u32
-            + 1;
+        let line = line_index.byte_to_line(start);
         for (exported, source_symbol) in aliases {
             ordinal += 1;
             let ref_id = ref_id(&[
@@ -13013,6 +13205,13 @@ fn rust_target_for_use<I: ResolverIndex>(
         .unwrap_or(&import.module_path)
         .trim()
         .trim_end_matches(';');
+    if let Some(module) = path.strip_suffix("::*") {
+        let segments = module.split("::").collect::<Vec<_>>();
+        let file = rust_use_module_file(index, caller_file, &segments, imports)?;
+        let (file, symbol) =
+            rust_resolve_reexport_if_symbol_missing(index, file, short_name.to_string());
+        return index.has_export(&file, &symbol).then_some((file, symbol));
+    }
     if let Some(brace_start) = path.find("::{") {
         let prefix = &path[..brace_start];
         // `use m::{f as g};` binds `g`; resolve the imported `f`.
@@ -13086,6 +13285,21 @@ fn rust_use_module_file_direct<I: ResolverIndex>(
     caller_file: &str,
     module_segments: &[&str],
 ) -> Option<String> {
+    // Local declarations, including #[path] modules in integration-test
+    // harnesses, take precedence over reconstructing a library-relative path.
+    if let Some((first, rest)) = module_segments.split_first() {
+        if !matches!(*first, "crate" | "self" | "super") {
+            if let Some(mut file) = index
+                .module_target(caller_file, first)
+                .filter(|file| file != caller_file)
+            {
+                for segment in rest {
+                    file = index.module_target(&file, segment)?;
+                }
+                return Some(file);
+            }
+        }
+    }
     if !matches!(
         module_segments.first().copied(),
         Some("crate" | "self" | "super") | None
@@ -19732,28 +19946,60 @@ fn hex_to_bytes(value: &str) -> Option<[u8; 32]> {
 }
 
 #[derive(Debug, Clone)]
-struct LineIndex {
-    newline_offsets: Vec<usize>,
+pub(crate) struct LineIndex {
+    starts: Vec<usize>,
+    ends: Vec<usize>,
     source_len: usize,
 }
 
 impl LineIndex {
-    fn new(source: &str) -> Self {
+    pub(crate) fn new(source: &str) -> Self {
+        #[cfg(test)]
+        join::extraction_work::note(|work| work.position_bytes += source.len());
+        let mut starts = vec![0];
+        let mut ends = Vec::new();
+        for (offset, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                // Call attribution clamps columns before CRLF terminators;
+                // blob ranges retain the older inclusive segment convention.
+                ends.push(if offset > 0 && source.as_bytes()[offset - 1] == b'\r' {
+                    offset - 1
+                } else {
+                    offset
+                });
+                starts.push(offset + 1);
+            }
+        }
+        ends.push(source.len());
         Self {
-            newline_offsets: source
-                .bytes()
-                .enumerate()
-                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset))
-                .collect(),
+            starts,
+            ends,
             source_len: source.len(),
         }
     }
 
     fn byte_to_line(&self, byte_offset: usize) -> u32 {
         let byte_offset = byte_offset.min(self.source_len);
-        self.newline_offsets
-            .partition_point(|offset| *offset < byte_offset) as u32
-            + 1
+        self.starts.partition_point(|start| *start <= byte_offset) as u32
+    }
+
+    pub(crate) fn byte_offset(&self, line: u32, column: u32) -> usize {
+        let Some(&start) = self.starts.get(line as usize) else {
+            return self.source_len;
+        };
+        start + (column as usize).min(self.ends[line as usize] - start)
+    }
+
+    fn inclusive_byte_offset(&self, line: u32, column: u32) -> usize {
+        let Some(&start) = self.starts.get(line as usize) else {
+            return self.source_len;
+        };
+        let end = self
+            .starts
+            .get(line as usize + 1)
+            .copied()
+            .unwrap_or(self.source_len);
+        start + (column as usize).min(end - start)
     }
 }
 
@@ -20979,6 +21225,24 @@ mod cold_build_insert_tests {
         cache_dir
     }
 
+    /// The PID of a process that has already exited. A synthetic value such as
+    /// `u32::MAX` is not provably dead everywhere: on Windows, `process_alive`
+    /// asks `tasklist`, which rejects an out-of-range PID, and an unanswerable
+    /// liveness question is treated as alive.
+    fn exited_process_pid() -> u32 {
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit"]
+            } else {
+                vec![]
+            })
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("wait for short-lived child");
+        pid
+    }
+
     fn age_callgraph_root_tree(path: &Path) {
         let old = SystemTime::now()
             .checked_sub(CALLGRAPH_ROOT_ORPHAN_MIN_AGE + Duration::from_secs(60))
@@ -21017,10 +21281,32 @@ mod cold_build_insert_tests {
         )
         .unwrap();
         age_callgraph_root_tree(&leased);
+        let aged_lease_mtime = fs::metadata(writer_lease.path())
+            .unwrap()
+            .modified()
+            .unwrap();
         let marker = crate::root_cache::ReadMarker::create(&marked, "generation").unwrap();
         // Same-host marker protection is PID-authoritative, so this old mtime
         // proves the reader guard instead of accidentally relying on freshness.
         age_callgraph_root_tree(&marked);
+
+        // Observe a real heartbeat after aging rather than assuming the sweep
+        // runs before the heartbeat thread next refreshes the lease file.
+        let heartbeat_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let modified = fs::metadata(writer_lease.path())
+                .unwrap()
+                .modified()
+                .unwrap();
+            if modified > aged_lease_mtime {
+                break;
+            }
+            assert!(
+                Instant::now() < heartbeat_deadline,
+                "the held writer lease must heartbeat after aging"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
 
         let first = sweep_callgraph_root_dirs_with_limits(
             &callgraph_root,
@@ -21063,6 +21349,97 @@ mod cold_build_insert_tests {
             );
         }
         reset_callgraph_root_sweep_cursor_for_test();
+    }
+
+    #[test]
+    fn callgraph_root_sweep_reaps_dead_writer_despite_recent_lease_mtime() {
+        let storage = tempdir().unwrap();
+        let callgraph_root = storage.path().join("callgraph");
+        let cache_dir = write_aged_callgraph_root(&callgraph_root, "b1c2d3e4f5a69788");
+        let lease_path = crate::root_cache::writer_lease_path(&cache_dir);
+        let lease = crate::fs_lock::try_acquire(&lease_path, Duration::ZERO).unwrap();
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lease_path).unwrap()).unwrap();
+        drop(lease);
+        let dead_pid = exited_process_pid();
+        metadata["pid"] = serde_json::json!(dead_pid);
+        metadata["created_at_ms"] = serde_json::json!(0);
+        metadata["heartbeat_at_ms"] = serde_json::json!(0);
+        fs::write(&lease_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        age_callgraph_root_tree(&cache_dir);
+        // Filesystem mtime is not the lease's heartbeat_at_ms or owner identity.
+        // A recently touched lease from a dead writer must still be reclaimable.
+        filetime::set_file_mtime(
+            &lease_path,
+            filetime::FileTime::from_system_time(SystemTime::now()),
+        )
+        .unwrap();
+        assert!(!crate::fs_lock::process_alive(dead_pid));
+
+        let summary = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            usize::MAX,
+        );
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.skipped_fresh, 0);
+        assert_eq!(summary.skipped_lease, 0);
+        assert!(!cache_dir.exists(), "a dead writer's root must be reaped");
+    }
+
+    #[test]
+    fn callgraph_root_sweep_uses_reader_liveness_not_marker_mtime() {
+        let storage = tempdir().unwrap();
+        let callgraph_root = storage.path().join("callgraph");
+        let cache_dir = write_aged_callgraph_root(&callgraph_root, "a1b2c3d4e5f69788");
+        let marker = crate::root_cache::ReadMarker::create(&cache_dir, "generation").unwrap();
+        age_callgraph_root_tree(&cache_dir);
+        let aged_root_mtime = fs::metadata(&cache_dir).unwrap().modified().unwrap();
+        // A real marker refresh also updates its generation directory's mtime.
+        marker.touch().unwrap();
+        filetime::set_file_mtime(
+            cache_dir.join("readers"),
+            filetime::FileTime::from_system_time(SystemTime::now()),
+        )
+        .unwrap();
+        let first = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            usize::MAX,
+        );
+        assert_eq!(first.skipped_reader, 1, "a live reader marker must win");
+        assert_eq!(first.skipped_fresh, 0);
+        assert!(cache_dir.is_dir());
+
+        let marker_path = marker.path().to_path_buf();
+        let mut metadata = marker.metadata().clone();
+        drop(marker);
+        metadata.pid = exited_process_pid();
+        fs::write(&marker_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert!(!crate::fs_lock::process_alive(metadata.pid));
+        // The replacement marker is fresh too, but a dead same-host PID no
+        // longer protects the payload. Only restore the root directory age,
+        // which the first sweep's writer-lease acquisition changed.
+        filetime::set_file_mtime(
+            &cache_dir,
+            filetime::FileTime::from_system_time(aged_root_mtime),
+        )
+        .unwrap();
+        let second = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            usize::MAX,
+        );
+        assert_eq!(second.removed, 1);
+        assert_eq!(second.skipped_reader, 0);
+        assert_eq!(second.skipped_fresh, 0);
+        assert!(!cache_dir.exists(), "a dead reader's root must be reaped");
     }
 
     #[test]
@@ -21310,7 +21687,9 @@ mod cold_build_insert_tests {
         TOTAL_CALLER_TRAVERSAL_SELECTS.with(|count| count.set(0));
         assert!(store.indexed_file_count().is_err());
         assert!(store.indexed_file_count().is_err());
-        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 6);
+        // An unready store is re-validated on every read: one readiness SELECT
+        // (schema version, fingerprint and ready flag in one statement) each.
+        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 2);
 
         store
             .cold_build(std::slice::from_ref(&file))
@@ -21318,7 +21697,8 @@ mod cold_build_insert_tests {
         TOTAL_CALLER_TRAVERSAL_SELECTS.with(|count| count.set(0));
         assert_eq!(store.indexed_file_count().expect("first ready read"), 1);
         assert_eq!(store.indexed_file_count().expect("cached ready read"), 1);
-        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 5);
+        // The first ready read validates once; the cached read skips validation.
+        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 3);
 
         let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
         conn.trace(None);
@@ -21363,7 +21743,7 @@ mod cold_build_insert_tests {
         assert_eq!(callers.get(&targets[0]).unwrap().len(), 1);
         assert_eq!(CALLER_QUERY_SELECTS.with(Cell::get), 3);
         assert_eq!(BOUNDARY_COUNT_SELECTS.with(Cell::get), 0);
-        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 6);
+        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 4);
     }
 
     #[test]
@@ -21427,7 +21807,8 @@ mod cold_build_insert_tests {
         assert_eq!(result.total_callers, CALLER_COUNT);
         assert_eq!(caller_queries, 1);
         assert_eq!(boundary_queries, 3);
-        assert_eq!(total_selects, 9);
+        // Includes one readiness SELECT, which reads all readiness metadata at once.
+        assert_eq!(total_selects, 7);
     }
 
     #[test]

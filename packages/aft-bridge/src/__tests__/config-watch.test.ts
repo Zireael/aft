@@ -34,6 +34,7 @@ function resolveBash(config: TestConfig): ResolvedBashForLiveReload & Record<str
     subagent_background: object.subagent_background !== false,
     foreground_wait_window_ms: (object.foreground_wait_window_ms as number) ?? 15_000,
     watch_sync_max_ms: (object.watch_sync_max_ms as number) ?? 120_000,
+    worker_wait_max_ms: (object.worker_wait_max_ms as number) ?? 1_800_000,
   };
 }
 

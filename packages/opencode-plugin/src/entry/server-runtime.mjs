@@ -19,7 +19,10 @@ import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
 import { hoistedV2ToolConsumers, v2PromptChannelFor } from "../tools/hoisted/v2.js";
 import { registerV2PromptDetachHook } from "../v2-prompt-detach.js";
+import { registerV2ToolHooks } from "../v2-tool-hooks.js";
+import { registerV2WorkflowHints } from "../v2-workflow-hints.js";
 import { createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
+import { buildHintsForRegisteredTools } from "../workflow-hints.js";
 import {
   buildAftToolDefinitions,
   openCodeHashlineEffective,
@@ -36,6 +39,8 @@ const defaults = {
   registerRpc: registerAftRpc,
   registerConfigErrorRpc: registerAftConfigErrorRpc,
   registerPromptHook: registerV2PromptDetachHook,
+  registerToolHooks: registerV2ToolHooks,
+  registerWorkflowHints: registerV2WorkflowHints,
   // The prompt server comes from the user-only `opencode` block of the
   // Location's config; without it AFT finds the server it runs inside.
   toolConsumers: (context, config) => ({
@@ -119,6 +124,7 @@ async function bootLocation(context, location, dependencies) {
   const { hashlineEditRegistered } = applyToolSurfaceOverrides(pool, config, registeredTools);
   reportHashlineDowngrade(config, registeredTools, notify);
   toolContext.hashlineEffective = hashlineEditRegistered;
+  const hintsBlock = buildHintsForRegisteredTools(config, registeredTools, hashlineEditRegistered);
   // Keep this Location's live config keys current when a config file changes.
   // The finalizer that releases the bridge also stops the watch.
   const liveConfigReload = dependencies.startLiveConfigReload({
@@ -131,7 +137,7 @@ async function bootLocation(context, location, dependencies) {
     },
     notify,
   });
-  return { consumers, pool, tools, liveConfigReload, toolContext, directory };
+  return { consumers, pool, tools, liveConfigReload, toolContext, directory, hintsBlock };
 }
 
 /**
@@ -221,6 +227,7 @@ export function makeServerEffect(overrides = {}) {
         pool: runtime.pool,
         projectRoot: runtime.directory,
         getConfig: () => runtime.toolContext.config,
+        registerSession: runtime.consumers.registerSession,
       });
       yield* dependencies.registerTools(
         context,
@@ -228,6 +235,8 @@ export function makeServerEffect(overrides = {}) {
         runtime.tools,
         runtime.consumers,
       );
+      yield* dependencies.registerToolHooks(context, runtime.toolContext, new Set(Object.keys(runtime.tools)));
+      yield* dependencies.registerWorkflowHints(context, runtime.hintsBlock);
     });
   };
 }

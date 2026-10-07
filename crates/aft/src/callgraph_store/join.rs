@@ -7,14 +7,29 @@
 //! remain in byte-addressed facts but are reported as unbound rather than being
 //! converted lossily; supporting them requires a separate resolver identity change.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 #[path = "dispatch.rs"]
 pub mod dispatch;
 
+#[cfg(test)]
+pub(crate) use extraction_work::CountingParser as Parser;
 use serde::{Deserialize, Serialize};
+#[cfg(not(test))]
 use tree_sitter::Parser;
+
+#[cfg(test)]
+#[path = "extraction_work.rs"]
+pub(crate) mod extraction_work;
+
+#[cfg(test)]
+#[path = "extraction_tests.rs"]
+mod extraction_tests;
+
+#[path = "extraction_index.rs"]
+mod extraction_index;
 
 use super::facts::{BlobKey, FactPaths, ManifestFacts, ProjectFacts};
 use crate::callgraph::{self, FileCallData, SymbolMeta};
@@ -83,7 +98,9 @@ pub trait ManifestBlobReader {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AstPreorderNode {
     pub ordinal: u32,
-    pub kind: String,
+    /// Grammar names are static during extraction; decoding owns the same text
+    /// without changing the persisted JSON representation.
+    pub kind: Cow<'static, str>,
     pub byte_start: usize,
     pub byte_end: usize,
 }
@@ -201,20 +218,31 @@ impl CallgraphBlob {
         let lang = language_id(language)
             .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
         let extractor_version = extractor_version.into();
-        let ast_nodes = ast_preorder_nodes(source, lang)?;
-        let mut data = callgraph::build_file_data_from_source_with_lang(
+        let mut parser = Parser::new();
+        parser
+            .set_language(&grammar_for(lang))
+            .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| ManifestJoinError::Parse("tree-sitter returned no tree".to_string()))?;
+        let root = tree.root_node();
+        let ast_nodes = ast_preorder_nodes(root);
+        let line_index = super::LineIndex::new(source);
+        let mut data = callgraph::build_file_data_from_tree(
             std::path::Path::new("__callgraph_blob__"),
             source,
             lang,
+            &tree,
+            &line_index,
         )
         .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
         if lang == LangId::Rust {
-            super::extend_rust_imports_with_nested_uses(source, &mut data);
+            super::extend_rust_imports_from_tree(source, root, &mut data);
         }
-        let symbols = blob_symbols(source, &data, &ast_nodes);
-        let imports = blob_imports(&data, &ast_nodes);
-        let mut refs = blob_refs(source, &data, &ast_nodes);
-        refs.extend(rust_module_refs(source, lang, &ast_nodes));
+        let mut symbols = blob_symbols(&data);
+        let mut imports = blob_imports(&data);
+        let mut refs = blob_refs(&line_index, &data);
+        refs.extend(rust_module_refs(source, lang, root));
         let empty =
             Manifest::new([]).map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
         let reader = |_: &BlobKey| None;
@@ -227,17 +255,23 @@ impl CallgraphBlob {
             facts: &empty_facts,
         };
         let file = Path::new("/__callgraph_blob__");
-        let mut structural = super::collect_reexport_refs(
+        let mut structural = super::collect_reexport_refs_with_line_index(
             paths.root,
             file,
             "__callgraph_blob__",
             source,
             &crate::callgraph::ModuleResolutionMemo::default(),
             &paths,
+            &line_index,
         )
         .raw_refs;
         structural.extend(
-            super::collect_source_less_export_alias_refs("__callgraph_blob__", source).raw_refs,
+            super::collect_source_less_export_alias_refs_with_line_index(
+                "__callgraph_blob__",
+                source,
+                &line_index,
+            )
+            .raw_refs,
         );
         if lang == LangId::Rust {
             structural.extend(
@@ -246,16 +280,19 @@ impl CallgraphBlob {
                     file,
                     "__callgraph_blob__",
                     &data.import_block.imports,
-                    &super::LineIndex::new(source),
+                    &line_index,
                     &paths,
                 )
                 .raw_refs,
             );
         }
-        refs.extend(
-            structural
-                .into_iter()
-                .map(|raw| structural_ref(raw, &ast_nodes)),
+        refs.extend(structural.into_iter().map(structural_ref));
+        assign_ordinals(
+            &ast_nodes,
+            &line_index,
+            &mut symbols,
+            &mut imports,
+            &mut refs,
         );
         let mut exported_symbols = data.exported_symbols.clone();
         exported_symbols.sort();
@@ -268,6 +305,7 @@ impl CallgraphBlob {
                 left.byte_start,
                 left.byte_end,
                 left.full_ref.as_deref(),
+                left.caller_symbol.as_deref(),
             )
                 .cmp(&(
                     right.ordinal,
@@ -275,6 +313,7 @@ impl CallgraphBlob {
                     right.byte_start,
                     right.byte_end,
                     right.full_ref.as_deref(),
+                    right.caller_symbol.as_deref(),
                 ))
         });
         refs.dedup_by(|left, right| {
@@ -283,6 +322,7 @@ impl CallgraphBlob {
                 && left.byte_start == right.byte_start
                 && left.byte_end == right.byte_end
                 && left.full_ref == right.full_ref
+                && left.caller_symbol == right.caller_symbol
         });
 
         let mut parse = ParseBlob {
@@ -297,8 +337,8 @@ impl CallgraphBlob {
             imports,
             refs,
         };
-        dispatch::complete_members(source, lang, &mut parse)?;
-        parse.dispatch = dispatch::extract(source, lang, &parse)?;
+        dispatch::complete_members(source, lang, root, &mut parse)?;
+        parse.dispatch = dispatch::extract(source, lang, root, &parse)?;
         Ok(Self::Parse(parse))
     }
 
@@ -514,50 +554,32 @@ fn language_id(language: &str) -> Option<LangId> {
     })
 }
 
-fn ast_preorder_nodes(
-    source: &str,
-    lang: LangId,
-) -> Result<Vec<AstPreorderNode>, ManifestJoinError> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar_for(lang))
-        .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| ManifestJoinError::Parse("tree-sitter returned no tree".to_string()))?;
+fn ast_preorder_nodes(root: tree_sitter::Node<'_>) -> Vec<AstPreorderNode> {
     let mut nodes = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
+    for node in extraction_index::preorder(root) {
+        let kind = Cow::Borrowed(node.kind());
+        #[cfg(test)]
+        extraction_work::note(|work| {
+            work.kind_copies += usize::from(matches!(kind, Cow::Owned(_)))
+        });
         nodes.push(AstPreorderNode {
             ordinal: nodes.len() as u32,
-            kind: node.kind().to_string(),
+            kind,
             byte_start: node.start_byte(),
             byte_end: node.end_byte(),
         });
-        let children = node.children(&mut node.walk()).collect::<Vec<_>>();
-        stack.extend(children.into_iter().rev());
     }
-    Ok(nodes)
+    nodes
 }
 
-fn blob_symbols(
-    source: &str,
-    data: &FileCallData,
-    ast_nodes: &[AstPreorderNode],
-) -> Vec<BlobSymbol> {
-    let mut symbols = data
-        .symbol_metadata
+fn blob_symbols(data: &FileCallData) -> Vec<BlobSymbol> {
+    data.symbol_metadata
         .iter()
-        .map(|(scoped_name, meta)| {
-            blob_symbol(
-                source,
-                scoped_name,
-                meta,
-                &data.default_export_symbol,
-                ast_nodes,
-            )
-        })
-        .collect::<Vec<_>>();
+        .map(|(scoped_name, meta)| blob_symbol(scoped_name, meta, &data.default_export_symbol))
+        .collect()
+}
+
+fn sort_blob_symbols(symbols: &mut [BlobSymbol]) {
     symbols.sort_by(|left, right| {
         (
             left.ordinal,
@@ -572,20 +594,15 @@ fn blob_symbols(
                 right.scoped_name.as_str(),
             ))
     });
-    symbols
 }
 
 fn blob_symbol(
-    source: &str,
     scoped_name: &str,
     meta: &SymbolMeta,
     default_export: &Option<String>,
-    ast_nodes: &[AstPreorderNode],
 ) -> BlobSymbol {
-    let byte_start = byte_offset(source, meta.range.start_line, meta.range.start_col);
-    let byte_end = byte_offset(source, meta.range.end_line, meta.range.end_col).max(byte_start);
     BlobSymbol {
-        ordinal: ordinal_for_range(ast_nodes, byte_start, byte_end),
+        ordinal: 0,
         name: unqualified_symbol_name(scoped_name).to_string(),
         scoped_name: scoped_name.to_string(),
         kind: symbol_kind_name(&meta.kind).to_string(),
@@ -599,13 +616,12 @@ fn blob_symbol(
     }
 }
 
-fn blob_imports(data: &FileCallData, ast_nodes: &[AstPreorderNode]) -> Vec<BlobImport> {
-    let mut imports = data
-        .import_block
+fn blob_imports(data: &FileCallData) -> Vec<BlobImport> {
+    data.import_block
         .imports
         .iter()
         .map(|import| BlobImport {
-            ordinal: ordinal_for_range(ast_nodes, import.byte_range.start, import.byte_range.end),
+            ordinal: 0,
             module_path: import.module_path.clone(),
             names: import.names.clone(),
             default_import: import.default_import.clone(),
@@ -616,39 +632,30 @@ fn blob_imports(data: &FileCallData, ast_nodes: &[AstPreorderNode]) -> Vec<BlobI
             type_only: import.kind == ImportKind::Type,
             side_effect: import.kind == ImportKind::SideEffect,
         })
-        .collect::<Vec<_>>();
-    imports.sort_by(|left, right| {
-        (left.ordinal, left.module_path.as_str()).cmp(&(right.ordinal, right.module_path.as_str()))
-    });
-    imports
+        .collect()
 }
 
-fn blob_refs(source: &str, data: &FileCallData, ast_nodes: &[AstPreorderNode]) -> Vec<BlobRef> {
+fn blob_refs(line_index: &super::LineIndex, data: &FileCallData) -> Vec<BlobRef> {
     let mut refs = Vec::new();
-    for (caller_symbol, calls) in &data.calls_by_symbol {
+    for (caller_symbol, calls) in ordered_symbol_sites(&data.calls_by_symbol) {
         for call in calls {
-            refs.push(call_ref(caller_symbol, call, BlobRefKind::Call, ast_nodes));
+            refs.push(call_ref(caller_symbol, call, BlobRefKind::Call));
         }
     }
-    for (caller_symbol, calls) in &data.value_refs_by_symbol {
+    for (caller_symbol, calls) in ordered_symbol_sites(&data.value_refs_by_symbol) {
         for call in calls {
-            refs.push(call_ref(
-                caller_symbol,
-                call,
-                BlobRefKind::ValueRef,
-                ast_nodes,
-            ));
+            refs.push(call_ref(caller_symbol, call, BlobRefKind::ValueRef));
         }
     }
     for import in &data.import_block.imports {
         refs.push(BlobRef {
-            ordinal: ordinal_for_range(ast_nodes, import.byte_range.start, import.byte_range.end),
+            ordinal: 0,
             kind: BlobRefKind::Import,
             caller_symbol: None,
             short_name: None,
             full_ref: Some(import.module_path.clone()),
             module_path: Some(import.module_path.clone()),
-            line: line_for_byte(source, import.byte_range.start),
+            line: line_index.byte_to_line(import.byte_range.start),
             byte_start: import.byte_range.start,
             byte_end: import.byte_range.end,
             path_override: None,
@@ -662,14 +669,23 @@ fn blob_refs(source: &str, data: &FileCallData, ast_nodes: &[AstPreorderNode]) -
     refs
 }
 
-fn call_ref(
-    caller_symbol: &str,
-    call: &callgraph::CallSite,
-    kind: BlobRefKind,
-    ast_nodes: &[AstPreorderNode],
-) -> BlobRef {
+/// Reference construction must not depend on a hash map's randomized order.
+/// One source call can belong to several enclosing symbols, and each caller is
+/// distinct evidence even when the call's AST range is identical.
+fn ordered_symbol_sites(
+    sites: &HashMap<String, Vec<callgraph::CallSite>>,
+) -> Vec<(&str, &[callgraph::CallSite])> {
+    let mut ordered = sites
+        .iter()
+        .map(|(caller, calls)| (caller.as_str(), calls.as_slice()))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|(caller, _)| *caller);
+    ordered
+}
+
+fn call_ref(caller_symbol: &str, call: &callgraph::CallSite, kind: BlobRefKind) -> BlobRef {
     BlobRef {
-        ordinal: ordinal_for_range(ast_nodes, call.byte_start, call.byte_end),
+        ordinal: 0,
         kind,
         caller_symbol: Some(caller_symbol.to_string()),
         short_name: Some(call.callee_name.clone()),
@@ -687,20 +703,12 @@ fn call_ref(
     }
 }
 
-fn rust_module_refs(source: &str, lang: LangId, ast_nodes: &[AstPreorderNode]) -> Vec<BlobRef> {
+fn rust_module_refs(source: &str, lang: LangId, root: tree_sitter::Node<'_>) -> Vec<BlobRef> {
     if lang != LangId::Rust {
         return Vec::new();
     }
-    let mut parser = Parser::new();
-    if parser.set_language(&grammar_for(lang)).is_err() {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
-    };
     let mut refs = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
+    for node in extraction_index::preorder(root) {
         if node.kind() == "mod_item"
             && node
                 .named_children(&mut node.walk())
@@ -709,7 +717,7 @@ fn rust_module_refs(source: &str, lang: LangId, ast_nodes: &[AstPreorderNode]) -
             if let Some(name) = node.child_by_field_name("name") {
                 let module_name = source[name.byte_range()].to_string();
                 refs.push(BlobRef {
-                    ordinal: ordinal_for_range(ast_nodes, node.start_byte(), node.end_byte()),
+                    ordinal: 0,
                     kind: BlobRefKind::Module,
                     caller_symbol: None,
                     short_name: Some(module_name.clone()),
@@ -728,38 +736,48 @@ fn rust_module_refs(source: &str, lang: LangId, ast_nodes: &[AstPreorderNode]) -
                 });
             }
         }
-        let children = node.children(&mut node.walk()).collect::<Vec<_>>();
-        stack.extend(children.into_iter().rev());
     }
     refs
 }
 
-fn ordinal_for_range(ast_nodes: &[AstPreorderNode], byte_start: usize, byte_end: usize) -> u32 {
-    ast_nodes
+fn assign_ordinals(
+    ast_nodes: &[AstPreorderNode],
+    lines: &super::LineIndex,
+    symbols: &mut [BlobSymbol],
+    imports: &mut [BlobImport],
+    refs: &mut [BlobRef],
+) {
+    let ranges = ast_nodes
         .iter()
-        .filter(|node| node.byte_start <= byte_start && node.byte_end >= byte_end)
-        .min_by_key(|node| (node.byte_end.saturating_sub(node.byte_start), node.ordinal))
-        .map(|node| node.ordinal)
-        .unwrap_or(0)
-}
-
-fn byte_offset(source: &str, line: u32, column: u32) -> usize {
-    let mut offset = 0usize;
-    for (index, segment) in source.split_inclusive('\n').enumerate() {
-        if index as u32 == line {
-            return offset + (column as usize).min(segment.len());
-        }
-        offset += segment.len();
+        .map(|n| (n.byte_start, n.byte_end))
+        .collect::<Vec<_>>();
+    let queries = symbols
+        .iter()
+        .map(|symbol| {
+            let start = lines.inclusive_byte_offset(symbol.start_line, symbol.start_col);
+            let end = lines
+                .inclusive_byte_offset(symbol.end_line, symbol.end_col)
+                .max(start);
+            (start, end)
+        })
+        .chain(imports.iter().map(|i| (i.byte_start, i.byte_end)))
+        .chain(refs.iter().map(|r| (r.byte_start, r.byte_end)))
+        .collect::<Vec<_>>();
+    let ordinals =
+        extraction_index::range_minima(&ranges, &queries, extraction_index::LookupWork::Ordinal);
+    for (ordinal, target) in ordinals.into_iter().zip(
+        symbols
+            .iter_mut()
+            .map(|s| &mut s.ordinal)
+            .chain(imports.iter_mut().map(|i| &mut i.ordinal))
+            .chain(refs.iter_mut().map(|r| &mut r.ordinal)),
+    ) {
+        *target = ordinal.map(|i| ast_nodes[i].ordinal).unwrap_or(0);
     }
-    source.len()
-}
-
-fn line_for_byte(source: &str, byte_start: usize) -> u32 {
-    source[..byte_start.min(source.len())]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count() as u32
-        + 1
+    sort_blob_symbols(symbols);
+    imports.sort_by(|left, right| {
+        (left.ordinal, left.module_path.as_str()).cmp(&(right.ordinal, right.module_path.as_str()))
+    });
 }
 
 fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
@@ -788,6 +806,52 @@ fn unqualified_symbol_name(scoped_name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blob_extraction_is_deterministic_for_nested_callers() {
+        let source = include_str!("../../../../benchmarks/aft-search/author_real_query.py");
+        let first = CallgraphBlob::extract(source, "python", "determinism-test-v1").unwrap();
+        let expected = first.to_bytes().unwrap();
+        for attempt in 1..32 {
+            let actual = CallgraphBlob::extract(source, "python", "determinism-test-v1").unwrap();
+            assert!(
+                actual.to_bytes().unwrap() == expected,
+                "serialization changed at attempt {attempt}"
+            );
+        }
+        let call_start = source.find("subprocess.run(command,").unwrap();
+        let callers = first
+            .parse()
+            .unwrap()
+            .refs
+            .iter()
+            .filter(|r| {
+                r.full_ref.as_deref() == Some("subprocess.run") && r.byte_start == call_start
+            })
+            .filter_map(|r| r.caller_symbol.as_deref())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(callers, BTreeSet::from(["at_pin", "pinned_domains"]));
+
+        // Check the construction order as well as final serialization: later
+        // stable sorts preserve input order when several references share a key.
+        // Fresh maps exercise different hash seeds without depending on a seed
+        // exposed by the standard library.
+        let expected = (0..64)
+            .map(|i| format!("caller_{i:02}"))
+            .collect::<Vec<_>>();
+        for _ in 0..16 {
+            let sites = expected
+                .iter()
+                .rev()
+                .map(|name| (name.clone(), Vec::new()))
+                .collect::<HashMap<_, _>>();
+            let actual = ordered_symbol_sites(&sites)
+                .into_iter()
+                .map(|(caller, _)| caller)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+
     #[test]
     fn blob_ordinals_are_tree_sitter_preorder_positions() {
         let source = "export function run() { return helper(); }\nfunction helper() {}\n";
@@ -829,7 +893,7 @@ mod tests {
             let node = cursor.node();
             expected.push(AstPreorderNode {
                 ordinal: expected.len() as u32,
-                kind: node.kind().to_string(),
+                kind: Cow::Borrowed(node.kind()),
                 byte_start: node.start_byte(),
                 byte_end: node.end_byte(),
             });
@@ -846,9 +910,9 @@ mod tests {
     }
 }
 
-fn structural_ref(raw: super::RawRef, nodes: &[AstPreorderNode]) -> BlobRef {
+fn structural_ref(raw: super::RawRef) -> BlobRef {
     BlobRef {
-        ordinal: ordinal_for_range(nodes, raw.byte_start, raw.byte_end),
+        ordinal: 0,
         kind: if raw.kind == "export_alias" {
             BlobRefKind::ExportAlias
         } else {
@@ -1361,6 +1425,108 @@ fn manifest_payloads(
         }
     }
     Ok(loaded)
+}
+
+/// Bind receiver type paths using the same workspace, module and re-export
+/// rules as ordinary Rust paths. All evidence belongs to the immutable manifest.
+pub(crate) fn dispatch_type_targets(
+    manifest: &Manifest,
+    blobs: &impl ManifestBlobReader,
+    parses: &BTreeMap<String, &ParseBlob>,
+) -> Result<BTreeMap<(String, String), (String, String)>, ManifestJoinError> {
+    let loaded = manifest_payloads(manifest, blobs)?;
+    let reader = |key: &BlobKey| loaded.get(key).cloned();
+    let facts = Rc::new(ManifestFacts {
+        manifest,
+        blobs: &reader,
+    });
+    let root = Path::new("/");
+    let paths = FactPaths {
+        root,
+        facts: facts.as_ref(),
+    };
+    let extracts = parses
+        .iter()
+        .map(|(file, parse)| Ok((file.clone(), parse.bind(file, &paths)?)))
+        .collect::<Result<HashMap<_, _>, ManifestJoinError>>()?;
+    let files = extracts
+        .iter()
+        .map(|(file, extract)| {
+            (
+                file.clone(),
+                super::DbFileIndex::from_extract(root, extract, &paths),
+            )
+        })
+        .collect();
+    let index = ManifestProjectIndex::from_parts(
+        root,
+        files,
+        extracts
+            .iter()
+            .map(|(file, extract)| (file.clone(), &extract.data))
+            .collect(),
+        super::WorkspaceCratePrefixCache::default(),
+        facts.clone(),
+    );
+    let mut targets = BTreeMap::new();
+    for (file, parse) in parses {
+        if parse.language != "rust" {
+            continue;
+        }
+        let mut names = BTreeSet::new();
+        for ty in &parse.dispatch.types {
+            names.insert(ty.name.clone());
+            names.extend(ty.bases.iter().cloned());
+        }
+        for method in &parse.dispatch.methods {
+            names.insert(method.owner.clone());
+            names.extend(method.trait_name.iter().cloned());
+        }
+        names.extend(parse.dispatch.fields.iter().map(|f| f.ty.clone()));
+        names.extend(parse.dispatch.returns.iter().map(|r| r.ty.clone()));
+        for site in &parse.dispatch.sites {
+            if let Some(receiver) = &site.receiver {
+                let mut name = receiver.as_str();
+                while let Some(expression) = name.strip_prefix("@field:") {
+                    name = expression
+                        .rsplit_once('|')
+                        .map(|(base, _)| base)
+                        .unwrap_or(expression);
+                }
+                names.insert(name.strip_prefix("@return:").unwrap_or(name).to_string());
+            }
+        }
+        let data = &extracts[file].data;
+        for name in names {
+            let short = name.rsplit("::").next().unwrap_or(&name);
+            let raw = super::RawRef {
+                ref_id: String::new(),
+                caller_node: None,
+                caller_symbol: None,
+                caller_file: file.clone(),
+                kind: "call".into(),
+                short_name: Some(short.into()),
+                full_ref: Some(name.clone()),
+                module_path: None,
+                import_kind: None,
+                local_name: None,
+                requested_name: None,
+                namespace_alias: None,
+                wildcard: false,
+                line: 0,
+                byte_start: 0,
+                byte_end: 0,
+                dependencies: BTreeSet::new(),
+            };
+            let resolved = super::resolve_rust_target(&index, file, &name, short, data, &raw);
+            if let Some((_, target_file, symbol)) = resolved {
+                if super::ResolverIndex::node_for_symbol(&index, &target_file, &symbol).is_some() {
+                    targets.insert((file.clone(), name), (target_file, symbol));
+                }
+            }
+        }
+    }
+    Ok(targets)
 }
 
 #[cfg(test)]

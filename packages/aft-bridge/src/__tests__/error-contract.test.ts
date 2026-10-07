@@ -46,6 +46,10 @@ describe("isBashTransportDeadError", () => {
   const transportDead: Array<[string, Error]> = [
     ["bridge spawn failure", new BridgeTransportUnavailableError("spawn failed")],
     ["standalone bridge shutdown", new BridgeTransportUnavailableError("Bridge is shutting down")],
+    [
+      "released Location lease before dispatch",
+      new BridgeTransportUnavailableError("lease released"),
+    ],
     ["subc transport shutdown", new SubcTransportShuttingDownError()],
     ["managed request rejected before send", new SubcCallError("not_sent", "client down")],
     ["subc client closed before send", new SubcError("client closed")],
@@ -136,6 +140,16 @@ describe("isBashTransportDeadError", () => {
     expect(isBashTransportDeadError(error)).toBe(false);
   });
 
+  test("lifecycle outcome-unknown rejections never enable bash fallback", () => {
+    for (const error of [
+      new BridgeTransportUnknownOutcomeError("Bridge shutting down"),
+      new BridgeTransportUnknownOutcomeError("Bridge restarting with updated binary: /new/aft"),
+    ]) {
+      expect(classifyBashHostFallbackError(error)).toBeUndefined();
+      expect(isBashTransportDeadError(error)).toBe(false);
+    }
+  });
+
   test("rejects a post-execution AFT error response", () => {
     const error = new AftToolError("permission required", "permission_required", {
       success: false,
@@ -179,6 +193,14 @@ describe("isBashTransportDeadError", () => {
     [
       "standalone write with unknown outcome",
       new BridgeTransportUnknownOutcomeError("write failed"),
+    ],
+    [
+      "lifecycle shutdown after dispatch",
+      new BridgeTransportUnknownOutcomeError("Bridge shutting down"),
+    ],
+    [
+      "binary replacement after dispatch",
+      new BridgeTransportUnknownOutcomeError("Bridge restarting with updated binary: /new/aft"),
     ],
     ["live bridge request timeout", new BridgeTransportTimeoutError("bash", 100, "bridge busy")],
     [
@@ -293,6 +315,15 @@ describe("adaptToolError", () => {
     expect(original.message).toContain(BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION);
     expect(original.message).toContain("UNKNOWN");
     expect(original.message).toContain("never blind-retry a mutation");
+    expect(original.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
+  });
+
+  test("a lifecycle shutdown mid-call gets the unknown-outcome disposition", () => {
+    const original = new BridgeTransportUnknownOutcomeError("[aft-plugin] Bridge shutting down");
+
+    adaptToolError("bash", original);
+
+    expect(original.message).toContain(BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION);
     expect(original.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
   });
 

@@ -179,8 +179,41 @@ struct SynapseState {
     circuit_open_until: Option<Instant>,
 }
 
+/// A synchronous client can be released by the async SubC frame loop, including
+/// when its root's detached teardown thread has already released its reference.
+/// Own shutdown here rather than relying on which caller drops the last Arc.
+struct SynapseRuntime(Option<tokio::runtime::Runtime>);
+
+impl SynapseRuntime {
+    fn new() -> Result<Self, SynapseEmbeddingError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|runtime| Self(Some(runtime)))
+            .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))
+    }
+
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.0
+            .as_ref()
+            .expect("live Synapse runtime")
+            .block_on(future)
+    }
+}
+
+impl Drop for SynapseRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            // Cancel transport tasks without waiting for the blocking pool.
+            // Tokio explicitly permits this shutdown from another async runtime;
+            // DNS work already in progress can finish in the background.
+            runtime.shutdown_background();
+        }
+    }
+}
+
 pub struct SynapseEmbeddingClient {
-    runtime: tokio::runtime::Runtime,
+    runtime: SynapseRuntime,
     state: SynapseState,
     metadata: SynapseModelMetadata,
     models_list_envelope: Vec<u8>,
@@ -197,10 +230,7 @@ impl SynapseEmbeddingClient {
         if model.is_empty() {
             return Err(SynapseEmbeddingError::MissingModel);
         }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
+        let runtime = SynapseRuntime::new()?;
         let mut state = SynapseState {
             connection_file,
             route_project_root: config
@@ -991,6 +1021,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedding_client_can_drop_on_async_frame_loop() {
+        let connection = tempfile::NamedTempFile::new().unwrap();
+        let config = SemanticBackendConfig {
+            subc_connection_file: Some(connection.path().to_path_buf()),
+            ..Default::default()
+        };
+        // Discovery is irrelevant to destruction. Reuse the production
+        // constructor's real runtime and state, with recorded model metadata.
+        let transport = SynapseRerankTransport::new(&config).unwrap();
+        let envelope = include_bytes!("../tests/fixtures/synapse/models-list-live-raw.json");
+        let metadata = parse_models_list(envelope).unwrap().remove(0);
+        let client = SynapseEmbeddingClient {
+            runtime: transport.runtime,
+            state: transport.state,
+            metadata,
+            models_list_envelope: envelope.to_vec(),
+        };
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        outer.block_on(async move { drop(client) });
+    }
+
+    #[test]
+    fn synapse_runtime_shutdown_cancels_transport_tasks() {
+        struct NotifyDrop(std::sync::mpsc::Sender<()>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+            }
+        }
+        let inner = SynapseRuntime::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task = inner.block_on(async {
+            let guard = NotifyDrop(tx);
+            let task = tokio::spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+            tokio::task::yield_now().await;
+            task
+        });
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        outer.block_on(async move { drop(inner) });
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(outer.block_on(task).unwrap_err().is_cancelled());
+    }
+
+    #[test]
     fn empty_synapse_capture_directory_is_unset_with_an_injected_lookup() {
         assert_eq!(
             capture_directory_with(|key| {
@@ -1105,7 +1187,7 @@ mod tests {
 /// Uses the embedding transport's daemon connection and management-route identity,
 /// but does not require embedding capabilities or retry an interactive rerank call.
 pub(crate) struct SynapseRerankTransport {
-    runtime: tokio::runtime::Runtime,
+    runtime: SynapseRuntime,
     state: SynapseState,
 }
 
@@ -1116,10 +1198,7 @@ impl SynapseRerankTransport {
             .clone()
             .ok_or(SynapseEmbeddingError::MissingConnectionFile)?;
         validate_connection_file(&connection_file)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
+        let runtime = SynapseRuntime::new()?;
         Ok(Self {
             runtime,
             state: SynapseState {

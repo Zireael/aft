@@ -78,11 +78,20 @@
             "kind": "field",
             "field": "watch_outcome",
             "pattern": "^Waited \\d+ms \\(limit \\d+ms(, the bash\\.watch_sync_max_ms cap)?\\); (?<value>timeout reached without match)\\..*$"
+          },
+          {
+            "kind": "kill_deadline",
+            "clock": "omit"
           }
         ],
         "expected": {
           "task_state": "running",
-          "watch_outcome": "timeout reached without match"
+          "watch_outcome": "timeout reached without match",
+          "kill_deadline": {
+            "limit": "30 minutes",
+            "source": "default",
+            "worker_renewal": false
+          }
         }
       }
     },

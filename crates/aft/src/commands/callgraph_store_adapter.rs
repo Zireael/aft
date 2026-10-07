@@ -90,6 +90,32 @@ pub struct StoreCallersResult {
     /// that could not be parsed, so the caller list may be incomplete.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub macro_note: Option<StoreMacroNote>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<StoreIncompleteNote>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreIncompleteNote {
+    pub complete: bool,
+    pub unresolved_method_calls: usize,
+    pub incomplete_reason: String,
+}
+
+fn empty_receiver_note(
+    store: &impl CallGraphRead,
+    target: &StoreNode,
+    count: usize,
+    include_tests: bool,
+) -> StoreAdapterResult<Option<StoreIncompleteNote>> {
+    if count != 0 {
+        return Ok(None);
+    }
+    let sites = store.unresolved_method_sites_named(&target.name, target.lang)?;
+    let unresolved_method_calls = sites
+        .iter()
+        .filter(|s| include_tests || !is_test_file(&s.file))
+        .count();
+    Ok((unresolved_method_calls > 0).then(|| StoreIncompleteNote { complete: false, unresolved_method_calls, incomplete_reason: format!("Incomplete: {unresolved_method_calls} unresolved method call sites named `{}` could not be linked; use grep for `{}` before concluding there are no callers", target.name, target.name) }))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -165,6 +191,8 @@ pub struct StoreImpactResult {
     pub truncated: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sites_list_envelope: Option<ListEnvelope>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<StoreIncompleteNote>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -620,6 +648,12 @@ pub fn callers_result(
     );
 
     Ok(StoreCallersResult {
+        incomplete: empty_receiver_note(
+            store,
+            &target.representative,
+            total_callers + via_count,
+            include_tests,
+        )?,
         symbol: target.representative.symbol,
         file: target.representative.file,
         callers: groups
@@ -948,6 +982,12 @@ pub fn impact_result(
     });
 
     Ok(StoreImpactResult {
+        incomplete: empty_receiver_note(
+            store,
+            &target.representative,
+            total_affected,
+            include_tests,
+        )?,
         symbol: target.representative.symbol,
         file: target.representative.file,
         signature: target_signature,
@@ -2323,7 +2363,7 @@ pub fn unavailable_response(req_id: &str, operation: &str, worktree: bool) -> Re
             req_id,
             "callgraph_unavailable",
             format!(
-                "{operation}: persisted callgraph store is unavailable in this read-only worktree; run a callgraph operation in the main checkout to build it first"
+                "{operation}: no call graph has been built for this repository yet; it is built when the main checkout is opened; use grep or aft_search with pattern to find references in this checkout"
             ),
             IndexObservation::unavailable(cause::READ_ONLY_STORE_NOT_BUILT),
         );

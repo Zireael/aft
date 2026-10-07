@@ -57,7 +57,7 @@ import type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
-import { WORKER_SESSION_FIELD } from "./transport.js";
+import { callPresetFor, PRESET_FIELD, WORKER_SESSION_FIELD } from "./transport.js";
 
 /** The subc pool is closing and cannot carry another request. */
 export class SubcTransportShuttingDownError extends SubcCallError {
@@ -563,7 +563,7 @@ class BgSubscription {
     private readonly acquireClient: () => Promise<SubcClientLike>,
     private readonly dropClient: (client: SubcClientLike, cause: ClientDropCause) => void,
     private readonly consumerIdentity: ConsumerIdentity | null | undefined,
-    private readonly onNudge: () => void,
+    private readonly onNudge: (observedEvent: boolean) => void,
     private readonly sleep: (ms: number) => Promise<void>,
     private readonly canAttach: () => boolean,
     private readonly onRootAttachFailure: (error: unknown) => boolean,
@@ -641,6 +641,12 @@ class BgSubscription {
     const initial = client.droppedIngressFrames;
     if (typeof initial !== "number") return () => undefined;
 
+    const existing = dispatchProbes.get(client);
+    if (existing) {
+      existing.users += 1;
+      return () => releaseDispatchProbe(client);
+    }
+
     let previous = initial;
     const timer = setInterval(() => {
       const total = client.droppedIngressFrames;
@@ -652,8 +658,10 @@ class BgSubscription {
         `client ingress epoch drops scope=client observed_while_channel=${routeId} delta=${delta} total=${total}`,
       );
     }, this.dispatchProbeIntervalMs);
+    dispatchProbeTimers += 1;
     timer.unref?.();
-    return () => clearInterval(timer);
+    dispatchProbes.set(client, { users: 1, timer });
+    return () => releaseDispatchProbe(client);
   }
 
   private async run(): Promise<void> {
@@ -779,7 +787,7 @@ class BgSubscription {
               `nudge carried by stale subscription; checking current session channel=${routeId}`,
             );
           }
-          this.onNudge();
+          this.onNudge(true);
         });
         this.current = sub;
         this.attached = client;
@@ -800,7 +808,7 @@ class BgSubscription {
 
         // A reconnect may have missed completions, so force a drain after every
         // successful subscribe to replay anything queued while the stream was down.
-        if (!this.stopped && this.isCurrent()) this.onNudge();
+        if (!this.stopped && this.isCurrent()) this.onNudge(false);
 
         await sub.closed;
         this.info("stream-end", `stream ended channel=${routeId}`);
@@ -931,6 +939,24 @@ function abortedRequestError(): Error {
   return error;
 }
 
+// The metric is connection-wide, so observing it needs one timer, not one per
+// session. Last unsubscribe releases the timer, including on a dead socket.
+const dispatchProbes = new Map<
+  SubcClientLike,
+  { users: number; timer: ReturnType<typeof setInterval> }
+>();
+let dispatchProbeTimers = 0;
+function releaseDispatchProbe(client: SubcClientLike): void {
+  const probe = dispatchProbes.get(client);
+  if (!probe || --probe.users > 0) return;
+  clearInterval(probe.timer);
+  dispatchProbeTimers -= 1;
+  dispatchProbes.delete(client);
+}
+export function __dispatchProbeCountForTests(): number {
+  return dispatchProbeTimers;
+}
+
 /** Per-identity session lifecycle state, independent from transient route churn. */
 interface SessionRecord {
   /** Complete identity is retained; the opaque map key is never parsed. */
@@ -948,6 +974,13 @@ interface SessionRecord {
   teardownReason: "root_reaped" | "session_closed" | "shutdown" | null;
   /** Count of in-flight requests on this session's route; used for safe cleanup. */
   inflight: number;
+  lastUsedAt: number;
+  observedFromStart: boolean;
+  readonly backgroundTasks: Map<string, "running" | "terminal" | "unknown">;
+  readonly backgroundWatches: Map<string, string>;
+  unknownBackgroundWork: boolean;
+  pendingBgNudge: boolean;
+  pendingDetach: boolean;
 }
 
 interface DetachedSession {
@@ -1124,6 +1157,7 @@ class SubcTransport implements AftProjectTransport {
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     if (preview === true) body.preview = true;
     if (options?.workerSession === true) body[WORKER_SESSION_FIELD] = true;
+    body[PRESET_FIELD] = callPresetFor(options?.workerSession === true);
     const reply = await this.pool.routeRequest(
       this.identityFor(sessionId),
       body,
@@ -1162,6 +1196,7 @@ class SubcTransport implements AftProjectTransport {
     const { [WORKER_SESSION_FIELD]: workerSession, ...args } = params;
     const body: Record<string, unknown> = { name: command, arguments: args };
     if (workerSession === true) body[WORKER_SESSION_FIELD] = true;
+    body[PRESET_FIELD] = callPresetFor(workerSession === true);
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     const reply = await this.pool.routeRequest(
@@ -1238,6 +1273,10 @@ export class SubcTransportPool implements AftTransportPool {
   private routeReopenRetryMs: number | null = null;
   /** Per-session records keyed by the opaque identity key. */
   private readonly sessions = new Map<IdentityKey, SessionRecord>();
+  // Pending host creation events are bounded. Forgetting one only makes that
+  // session unknown (retained), never falsely eligible for eviction.
+  private readonly observedStarts = new Set<IdentityKey>();
+  private sessionSweep: ReturnType<typeof setInterval> | null = null;
   /**
    * The sole root-scoped session enumeration authority. Keys are opaque and are
    * removed by the same detacher that removes the corresponding session record.
@@ -1667,6 +1706,7 @@ export class SubcTransportPool implements AftTransportPool {
       if (this.lifecycleEnabled() && record.generation !== generation) {
         throw this.generationExpiredError(root, generation ?? asRootGeneration(1));
       }
+      record.lastUsedAt = Date.now();
       return record;
     }
     record = {
@@ -1679,6 +1719,13 @@ export class SubcTransportPool implements AftTransportPool {
       closed: false,
       teardownReason: null,
       inflight: 0,
+      lastUsedAt: Date.now(),
+      observedFromStart: this.observedStarts.delete(key),
+      backgroundTasks: new Map(),
+      backgroundWatches: new Map(),
+      unknownBackgroundWork: false,
+      pendingBgNudge: false,
+      pendingDetach: false,
     };
     this.sessions.set(key, record);
     let keys = this.rootIndex.get(root);
@@ -1687,7 +1734,183 @@ export class SubcTransportPool implements AftTransportPool {
       this.rootIndex.set(root, keys);
     }
     keys.add(key);
+    if (!this.sessionSweep) {
+      this.sessionSweep = setInterval(() => {
+        void this.reapIdleSessions();
+      }, 60_000);
+      this.sessionSweep.unref?.();
+    }
     return record;
+  }
+
+  /** Release only idle carriers, not the daemon's durable session or completion queue.
+   * The next request opens a new route and subscribes again; subscription startup
+   * always nudges a drain, replaying completions queued while no carrier existed.
+   */
+  async reapIdleSessions(now = Date.now()): Promise<void> {
+    for (const [key, state] of this.nudgeDeliveryLogState) {
+      if (now - state.lastEmittedAt >= 15 * 60_000) this.nudgeDeliveryLogState.delete(key);
+    }
+    const detached: DetachedSession[] = [];
+    for (const [key, record] of this.sessions) {
+      if (
+        // The wire has no session-wide background census. A resumed/rebound
+        // session may have tasks or watches this pool never saw, so only a
+        // host-observed creation can establish a complete lifetime history.
+        !record.observedFromStart ||
+        record.backgroundTasks.size > 0 ||
+        record.backgroundWatches.size > 0 ||
+        record.unknownBackgroundWork ||
+        record.pendingBgNudge ||
+        record.pendingDetach ||
+        record.inflight > 0 ||
+        record.routeEntry?.opening ||
+        now - record.lastUsedAt < 15 * 60_000
+      )
+        continue;
+      const owner = this.detachSession(key, "session_closed");
+      if (owner) detached.push(owner);
+    }
+    if (this.sessions.size === 0 && this.sessionSweep) {
+      clearInterval(this.sessionSweep);
+      this.sessionSweep = null;
+    }
+    const cleanup = Promise.allSettled(detached.map((owner) => this.cleanupDetached(owner)));
+    this.pendingRootCleanups.add(cleanup);
+    try {
+      await cleanup;
+    } finally {
+      this.pendingRootCleanups.delete(cleanup);
+    }
+  }
+
+  observeSessionStart(projectRoot: string, session: string): void {
+    if (this.shuttingDown || !session) return;
+    const key = identityKey({
+      project_root: canonicalizeProjectRoot(projectRoot),
+      harness: this.harness,
+      session,
+    });
+    const record = this.sessions.get(key);
+    if (record) {
+      record.observedFromStart = true;
+      return;
+    }
+    if (this.observedStarts.size >= 256)
+      this.observedStarts.delete(this.observedStarts.values().next().value as IdentityKey);
+    this.observedStarts.add(key);
+  }
+
+  __pendingSessionStartsForTests(): number {
+    return this.observedStarts.size;
+  }
+
+  private observeBackgroundReply(
+    record: SessionRecord,
+    body: Record<string, unknown>,
+    reply: unknown,
+  ): void {
+    const name = String(body.name);
+    const args = isRecord(body.arguments) ? body.arguments : {};
+    const data =
+      isRecord(reply) && isRecord(reply.structuredContent) ? reply.structuredContent : null;
+    const affectsBackground =
+      name === "bash" ||
+      name === "powershell" ||
+      [
+        "bash_status",
+        "bash_kill",
+        "bash_write",
+        "bash_promote",
+        "bash_watch",
+        "bash_notify",
+        "bash_unnotify",
+        "bash_wait_detach",
+        "bash_drain_completions",
+        "bash_ack_completions",
+      ].includes(name);
+    if (!data || data.success !== true) {
+      if (affectsBackground) {
+        if (typeof args.task_id === "string") {
+          if (!record.backgroundTasks.has(args.task_id))
+            record.backgroundTasks.set(args.task_id, "unknown");
+        } else record.unknownBackgroundWork = true;
+      }
+      return;
+    }
+    if (typeof data.task_id === "string") {
+      // Terminal tasks remain pinned until the daemon explicitly ACKs them.
+      const terminal = ["completed", "failed", "killed", "timed_out"].includes(String(data.status));
+      const running = ["starting", "running", "killing"].includes(String(data.status));
+      record.backgroundTasks.set(
+        data.task_id,
+        terminal ? "terminal" : running ? "running" : "unknown",
+      );
+      if (name === "bash" || name === "powershell") record.pendingDetach = false;
+    }
+    if (Array.isArray(data.bg_completions)) {
+      for (const completion of data.bg_completions) {
+        if (isRecord(completion) && typeof completion.task_id === "string")
+          record.backgroundTasks.set(completion.task_id, "terminal");
+        else record.unknownBackgroundWork = true;
+      }
+    }
+    if (Array.isArray(data.pending_matches)) {
+      for (const match of data.pending_matches) {
+        if (
+          isRecord(match) &&
+          typeof match.watch_id === "string" &&
+          typeof match.task_id === "string"
+        )
+          record.backgroundWatches.set(match.watch_id, match.task_id);
+        else record.unknownBackgroundWork = true;
+      }
+    }
+    if (
+      name === "bash_drain_completions" &&
+      Array.isArray(data.bg_completions) &&
+      Array.isArray(data.pending_matches)
+    )
+      record.pendingBgNudge = false;
+    if (name === "bash_notify") {
+      if (typeof data.watch_id === "string" && typeof args.task_id === "string")
+        record.backgroundWatches.set(data.watch_id, args.task_id);
+      else record.unknownBackgroundWork = true;
+    }
+    if (name === "bash_unnotify" && data.unregistered === true && typeof args.watch_id === "string")
+      record.backgroundWatches.delete(args.watch_id);
+    if (name === "bash_ack_completions" && Array.isArray(data.acked_task_ids)) {
+      // ACK also acknowledges mid-run pattern matches. It does not prove a
+      // running/unknown task is terminal, so those must keep their carrier.
+      for (const task of data.acked_task_ids)
+        if (typeof task === "string" && record.backgroundTasks.get(task) === "terminal") {
+          record.backgroundTasks.delete(task);
+          // The daemon's terminal ACK also removes every watch on that task.
+          for (const [watch, owner] of record.backgroundWatches) {
+            if (owner === task) record.backgroundWatches.delete(watch);
+          }
+        }
+    }
+    if (name === "bash_wait_detach") {
+      if (typeof data.detached === "boolean") record.pendingDetach = data.detached;
+      else record.unknownBackgroundWork = true;
+    }
+  }
+
+  __retainedSessionCountsForTests(): {
+    sessions: number;
+    roots: number;
+    routes: number;
+    subscriptions: number;
+    sweepTimers: number;
+  } {
+    return {
+      sessions: this.sessions.size,
+      roots: this.rootIndex.size,
+      routes: [...this.sessions.values()].filter((r) => r.routeEntry !== null).length,
+      subscriptions: [...this.sessions.values()].filter((r) => r.bgSub !== null).length,
+      sweepTimers: this.sessionSweep ? 1 : 0,
+    };
   }
 
   private isCurrentSession(key: IdentityKey, record: SessionRecord): boolean {
@@ -1737,6 +1960,11 @@ export class SubcTransportPool implements AftTransportPool {
       this.sessions.get(record.identityKey) === record &&
       !record.closed &&
       record.inflight === 0 &&
+      record.backgroundTasks.size === 0 &&
+      record.backgroundWatches.size === 0 &&
+      !record.unknownBackgroundWork &&
+      !record.pendingBgNudge &&
+      !record.pendingDetach &&
       record.routeEntry === null &&
       record.bgSub === null
     ) {
@@ -1759,6 +1987,9 @@ export class SubcTransportPool implements AftTransportPool {
     record.teardownReason = reason;
     this.sessions.delete(key);
     this.removeIndexMembership(record);
+    for (const logKey of this.nudgeDeliveryLogState.keys()) {
+      if (logKey.endsWith(`\u0000${key}`)) this.nudgeDeliveryLogState.delete(logKey);
+    }
 
     const bgSub = record.bgSub;
     record.bgSub = null;
@@ -2056,6 +2287,7 @@ export class SubcTransportPool implements AftTransportPool {
           this.assertGeneration(record.canonicalRoot, record.generation, "request_completion");
           if (this.client === client) this.transportFailures = 0;
           this.noteClientAlive(client);
+          this.observeBackgroundReply(record, body, reply);
           this.ensureBgSubscription(identity, record);
           return reply;
         } finally {
@@ -2126,9 +2358,13 @@ export class SubcTransportPool implements AftTransportPool {
       }
     } catch (error) {
       if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
+      this.observeBackgroundReply(record, body, null);
+      if (record.backgroundTasks.size > 0 || record.unknownBackgroundWork)
+        this.ensureBgSubscription(identity, record);
       throw error;
     } finally {
       record.inflight -= 1;
+      record.lastUsedAt = Date.now();
       this.deleteSessionIfEmpty(key, record);
     }
   }
@@ -2274,11 +2510,11 @@ export class SubcTransportPool implements AftTransportPool {
   private ensureBgSubscription(identity: BindIdentity, record: SessionRecord): void {
     if (this.shuttingDown || (!this.onBgEventsNudge && !this.onBgEventsNudgeRef)) return;
     if (!this.isCurrentSession(record.identityKey, record)) return;
-    if (!this.rootCanAttach(record.canonicalRoot)) return;
     if (record.bgSub) return;
+    if (!this.rootCanAttach(record.canonicalRoot)) return;
 
     const nudgeRef = this.nudgeRefFor(record);
-    const onNudge = (): void => {
+    const onNudge = (observedEvent: boolean): void => {
       const currentRecord = this.currentSessionForNudge(identity);
       if (!currentRecord) {
         this.logNudgeDelivery(
@@ -2295,6 +2531,8 @@ export class SubcTransportPool implements AftTransportPool {
           `nudge forwarding cause=superseded-carrying-record root=${currentRecord.canonicalRoot}`,
         );
       }
+      currentRecord.lastUsedAt = Date.now();
+      if (observedEvent) currentRecord.pendingBgNudge = true;
 
       const currentRef = this.nudgeRefFor(currentRecord);
       let delivered = false;
@@ -2562,6 +2800,11 @@ export class SubcTransportPool implements AftTransportPool {
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    if (this.sessionSweep) clearInterval(this.sessionSweep);
+    this.sessionSweep = null;
+    this.nudgeDeliveryLogState.clear();
+    this.generationRejections.clear();
+    this.observedStarts.clear();
     this.dormantRoots.clear();
 
     // Deregistration synchronously tombstones all registered roots and invokes

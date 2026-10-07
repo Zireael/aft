@@ -1304,6 +1304,7 @@ fn make_impact_value(count: usize, depth_limited: bool) -> Value {
         depth_limited,
         truncated: 0,
         sites_list_envelope: build_callgraph_envelope(Unit::Sites, count, count, 0),
+        incomplete: None,
     };
     serde_json::to_value(result).expect("impact fixture serialization")
 }
@@ -1332,6 +1333,7 @@ fn make_callers_value(count: usize, depth_limited: bool) -> Value {
         truncated: 0,
         callers_list_envelope: build_callgraph_envelope(Unit::Items, count, count, 0),
         macro_note: None,
+        incomplete: None,
     };
     serde_json::to_value(result).expect("callers fixture serialization")
 }
@@ -1425,6 +1427,7 @@ fn make_capped_impact_value(count: usize) -> Value {
         depth_limited: false,
         truncated: 0,
         sites_list_envelope,
+        incomplete: None,
     };
     serde_json::to_value(result).expect("capped impact fixture serialization")
 }
@@ -1479,6 +1482,7 @@ fn make_capped_callers_value(count: usize) -> Value {
         truncated: 0,
         callers_list_envelope,
         macro_note: None,
+        incomplete: None,
     };
     serde_json::to_value(result).expect("capped callers fixture serialization")
 }

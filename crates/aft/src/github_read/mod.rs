@@ -8,6 +8,7 @@
 mod attachments;
 mod bot_compress;
 mod cache;
+mod diff;
 mod fetch;
 mod model;
 mod normalize;
@@ -25,6 +26,7 @@ pub use cache::{
     GithubReadRequest, GithubReadSelector, GithubReadStart, GithubReadView,
     SqliteGithubReadCacheStore, SystemGithubReadClock,
 };
+pub use diff::{GithubDiff, GithubDiffPage, MAX_DIFF_BYTES};
 pub use fetch::{
     gh_pr_review_comments_args, gh_timeline_args, gh_view_args, redact_gh_error, GhCliFetcher,
     GhCommandError, GhCommandOutput, GhCommandRunner, GithubFetchRequest, GithubFetcher,

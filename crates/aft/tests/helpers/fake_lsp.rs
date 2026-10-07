@@ -66,10 +66,26 @@ pub(crate) fn build_in(root: &Path) -> PathBuf {
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
-        std::fs::copy(
-            binary_cache::executable(&root.join("build").join(target).join("debug"), target),
-            pending,
-        )?;
+        let compiled =
+            binary_cache::executable(&root.join("build").join(target).join("debug"), target);
+        #[cfg(target_os = "linux")]
+        {
+            // Other test threads fork LSP children. Keep the destination's
+            // writable descriptor out of their parent process altogether:
+            // close-on-exec does not prevent inheritance during fork/pre_exec.
+            let output = Command::new("cp")
+                .arg("--")
+                .arg(&compiled)
+                .arg(pending)
+                .output()?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        std::fs::copy(compiled, pending)?;
         Ok(())
     })
     .expect("build shared fake LSP helper")

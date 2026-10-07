@@ -85,6 +85,357 @@ fn foreground(aft: &mut AftProcess, id: &str, command: &str) -> Value {
     )
 }
 
+/// Exercise production spawn planning with a private HOME, including the layout
+/// used by background worktree managers. No fixture path refers to the real HOME.
+struct CortexkitFloorFixture {
+    aft: AftProcess,
+    project: PathBuf,
+    storage: PathBuf,
+    home: PathBuf,
+    connection: PathBuf,
+    _root: tempfile::TempDir,
+}
+
+impl CortexkitFloorFixture {
+    fn new() -> Self {
+        Self::with_private_shim_image(false)
+    }
+
+    fn with_private_shim_image(copy_shim: bool) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap().join("home");
+        let data = home.join(".local/share/cortexkit");
+        let project = data.join("alfonso/worktrees/own");
+        let storage = data.join("aft");
+        let cache = storage.join("cache");
+        let connection = home.join("daemon/connection.json");
+        for path in [&project, &storage, &cache, connection.parent().unwrap()] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(&connection, "daemon-token").unwrap();
+        let shim_image = if copy_shim {
+            let image = data.join("bin/ck-aft");
+            std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+            // The write-denial probe must not risk corrupting the real test
+            // executable if the sandbox regresses or is deliberately mutated.
+            std::fs::copy(env!("CARGO_BIN_EXE_aft"), &image).unwrap();
+            Some(image)
+        } else {
+            None
+        };
+        let mut aft = AftProcess::spawn_with_env(&[
+            ("HOME", home.as_os_str()),
+            ("XDG_DATA_HOME", home.join(".local/share").as_os_str()),
+            ("XDG_STATE_HOME", home.join(".local/state").as_os_str()),
+            ("XDG_CONFIG_HOME", home.join(".config").as_os_str()),
+            ("XDG_CACHE_HOME", home.join(".cache").as_os_str()),
+            ("AFT_CACHE_DIR", cache.as_os_str()),
+            ("SUBC_CONNECTION_FILE", std::ffi::OsStr::new("")),
+        ]);
+        let configured = aft.send(
+            &json!({
+                "id": "configure-cortexkit-floor", "command": "configure",
+                "harness": "opencode", "project_root": project, "storage_dir": storage,
+                "bash_permissions": true,
+                "config": user_config(json!({
+                    "bash": { "background": true, "rewrite": true, "shell": "/bin/bash" },
+                    "sandbox": { "enabled": true },
+                    "subc": { "connection_file": "~/daemon/connection.json" },
+                "github": { "shim": true },
+                "gh_shim": { "binary_path": shim_image },
+                    "git": { "co_author": "Sandbox Test <sandbox@example.invalid>" },
+                })),
+            })
+            .to_string(),
+        );
+        assert_eq!(configured["success"], true, "{configured:?}");
+        Self {
+            aft,
+            project,
+            storage,
+            home,
+            connection,
+            _root: root,
+        }
+    }
+
+    fn denied_read(&mut self, path: PathBuf) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "private-sentinel").unwrap();
+        // First prove the sandbox actually launched and captured a child, rather
+        // than accepting a setup refusal as evidence of a denied file read.
+        let response = foreground(
+            &mut self.aft,
+            "floor-read",
+            &format!("printf child-ready; cat {}", quote(&path)),
+        );
+        assert_eq!(
+            response["status"], "failed",
+            "read was not denied: {response:?}"
+        );
+        let output = response["output"].as_str().unwrap();
+        assert!(
+            output.contains("child-ready"),
+            "child did not launch: {response:?}"
+        );
+        assert!(
+            !output.contains("private-sentinel"),
+            "secret leaked: {response:?}"
+        );
+        assert!(
+            output.contains("Operation not permitted") || output.contains("Permission denied"),
+            "not a kernel denial: {response:?}"
+        );
+    }
+}
+
+#[test]
+fn cortexkit_floor_connection_outside_data_is_denied() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    f.denied_read(f.connection.clone());
+}
+
+#[test]
+fn cortexkit_floor_default_connection_is_denied() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    f.denied_read(
+        f.home
+            .join(".local/share/cortexkit/run/subc-connection.json"),
+    );
+}
+
+#[test]
+fn cortexkit_floor_other_module_store_is_denied() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    f.denied_read(f.home.join(".local/share/cortexkit/another-module/store"));
+}
+
+#[test]
+fn cortexkit_floor_aft_history_is_denied() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    f.denied_read(f.storage.join("undo/private-snapshot"));
+}
+
+#[test]
+fn cortexkit_floor_other_worktree_is_denied() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    f.denied_read(
+        f.home
+            .join(".local/share/cortexkit/alfonso/worktrees/other/private"),
+    );
+}
+
+#[test]
+fn cortexkit_floor_state_is_denied() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    f.denied_read(f.home.join(".local/state/cortexkit/gh-shim/manifest.json"));
+}
+
+#[test]
+fn cortexkit_floor_other_task_io_is_denied() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    let other = foreground(&mut f.aft, "other-task", "printf other-task");
+    assert_eq!(other["status"], "completed", "{other:?}");
+    f.denied_read(PathBuf::from(other["output_path"].as_str().unwrap()));
+}
+
+#[test]
+fn cortexkit_floor_own_worktree_is_readable_and_writable() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    let path = f.project.join("own-file");
+    std::fs::write(&path, "before").unwrap();
+    let response = foreground(
+        &mut f.aft,
+        "own-worktree",
+        &format!(
+            "cat {}; printf after > {}; cat {}",
+            quote(&path),
+            quote(&path),
+            quote(&path)
+        ),
+    );
+    assert_eq!(response["status"], "completed", "{response:?}");
+    assert!(
+        response["output"].as_str().unwrap().contains("beforeafter"),
+        "{response:?}"
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "after");
+}
+
+#[test]
+fn cortexkit_floor_shim_and_managed_hooks_execute_read_only() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::with_private_shim_image(true);
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q", "--template="])
+        .current_dir(&f.project)
+        .env("HOME", &f.home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap()
+        .success());
+    // Linux splits project reads around repository hooks into existing children.
+    // Keep this file present at launch while still testing its sandboxed edit,
+    // git add, and commit through the managed attribution hook.
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::write(f.project.join("tracked"), "before").unwrap();
+        // Keep the original repository hooks outside the worktree so the
+        // existing nested-hook read limitation does not also split Git metadata
+        // into inode-specific grants that git add replaces. The original hooks
+        // directory is still denied; AFT's managed hook remains the dispatcher.
+        let original_hooks = f.home.join("repository-hooks");
+        std::fs::create_dir_all(&original_hooks).unwrap();
+        let output = linux_fixture_git(
+            &f,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                original_hooks.to_str().unwrap(),
+            ],
+        );
+        assert!(output.status.success(), "{output:?}");
+    }
+    // Executing a Mach-O image does not by itself prove file-read access on
+    // Seatbelt. Check the managed bytes too, before exercising both consumers.
+    let response = foreground(&mut f.aft, "governed-child", "cat \"$AFT_GH_SHIMS_DIR/gh\" > /dev/null && gh --status && cat \"$GIT_CONFIG_VALUE_0/prepare-commit-msg\" > /dev/null && git init -q --template= && printf tracked > tracked && git add tracked && git -c user.name='AFT Test' -c user.email=aft@example.invalid commit -qm initial && git log -1 --format=%B");
+    assert_eq!(response["status"], "completed", "{response:?}");
+    let output = response["output"].as_str().unwrap();
+    assert!(output.contains("rung"), "shim status missing: {response:?}");
+    assert!(
+        output.contains("Co-authored-by: Sandbox Test <sandbox@example.invalid>"),
+        "managed hook did not run: {response:?}"
+    );
+    let denied = foreground(&mut f.aft, "governed-writes", "printf tampered >> \"$AFT_GH_SHIMS_DIR/gh\"; printf tampered >> \"$GIT_CONFIG_VALUE_0/prepare-commit-msg\"");
+    assert_eq!(
+        denied["status"], "failed",
+        "managed executables were writable: {denied:?}"
+    );
+    assert_eq!(
+        denied["output"]
+            .as_str()
+            .unwrap()
+            .matches("Operation not permitted")
+            .count()
+            + denied["output"]
+                .as_str()
+                .unwrap()
+                .matches("Permission denied")
+                .count(),
+        2,
+        "{denied:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fixture_git(fixture: &CortexkitFloorFixture, args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new("git");
+    crate::test_helpers::apply_hermetic_git_env(&mut command);
+    command
+        .current_dir(&fixture.project)
+        .env("HOME", &fixture.home)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// This is an observation of an existing Linux policy limitation, not an
+/// assertion that git add/commit must fail. It records success or the exact
+/// kernel/tool error so a real-Landlock CI run can establish current behavior.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_default_hooks_add_then_commit_records_existing_read_limit() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    let initialized = linux_fixture_git(&f, &["init", "-q", "--template="]);
+    assert!(initialized.status.success(), "{initialized:?}");
+    let tracked = f.project.join("tracked");
+    std::fs::write(&tracked, "before").unwrap();
+    let staged = linux_fixture_git(&f, &["add", "tracked"]);
+    assert!(staged.status.success(), "{staged:?}");
+    // Force git add in the sandbox to replace the existing index inode.
+    std::fs::write(&tracked, "after").unwrap();
+    let response = foreground(
+        &mut f.aft,
+        "default-hooks-read-probe",
+        "git add tracked && git -c user.name='AFT Test' -c user.email=aft@example.invalid commit -qm default-hooks-read-probe",
+    );
+    assert_eq!(
+        response["success"], true,
+        "sandbox did not launch: {response:?}"
+    );
+    match response["status"].as_str() {
+        Some("completed") => {
+            let log = linux_fixture_git(&f, &["log", "-1", "--format=%s"]);
+            assert!(log.status.success(), "{log:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&log.stdout).trim(),
+                "default-hooks-read-probe"
+            );
+        }
+        Some("failed") => {
+            assert!(
+                response["exit_code"].as_i64().is_some_and(|code| code != 0),
+                "{response:?}"
+            );
+            assert!(
+                !response["output"].as_str().unwrap().is_empty(),
+                "a failed probe must retain its exact error"
+            );
+        }
+        _ => panic!("probe never reached a terminal Git outcome: {response:?}"),
+    }
+    let record = json!({
+        "probe": "linux_default_hooks_add_then_commit_records_existing_read_limit",
+        "status": response["status"], "exit_code": response["exit_code"], "output": response["output"],
+    });
+    eprintln!("Linux default-hooks Git outcome: {record}");
+    // nextest normally hides output from passing tests. Preserve this deliberate
+    // observation in the CI job summary even when the probe test itself passes.
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        use std::io::Write;
+        let mut summary = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(
+            summary,
+            "\n### Linux default-hooks Git read probe\n```json\n{record}\n```\n"
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn cortexkit_floor_background_output_is_captured() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    let launch = f.aft.send(&json!({
+        "id": "floor-background", "method": "bash", "session_id": "native-sandbox-session",
+        "params": { "command": "printf captured-output; printf captured-error >&2", "background": true, "permissions_requested": true, "compressed": false },
+    }).to_string());
+    assert_eq!(launch["success"], true, "{launch:?}");
+    let task_id = launch["task_id"].as_str().unwrap();
+    let terminal = wait_for_terminal(&mut f.aft, task_id, None);
+    assert_eq!(terminal["status"], "completed", "{terminal:?}");
+    let output = terminal["output_preview"].as_str().unwrap();
+    assert!(
+        output.contains("captured-output") && output.contains("captured-error"),
+        "{terminal:?}"
+    );
+}
+
 fn foreground_with_env(aft: &mut AftProcess, id: &str, command: &str, env: Value) -> Value {
     aft.send(
         &json!({
@@ -283,6 +634,74 @@ fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
     );
     assert_eq!(permission["code"], "permission_required");
 
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
+    skip_if_landlock_absent!();
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let project = fixture.path().join("project");
+    let storage = fixture.path().join("storage");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&storage).unwrap();
+    // Landlock read-deny rules attach to directories, not single files, so the
+    // protected database lives in its own directory and that directory is denied.
+    let private = project.join("private");
+    std::fs::create_dir_all(&private).unwrap();
+    let db = private.join("store.db");
+    let created = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg("CREATE TABLE tasks(id TEXT, kind TEXT)")
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+    let mut aft = AftProcess::spawn();
+    assert_eq!(
+        configure_native(&mut aft, &project, &storage, true)["success"],
+        true
+    );
+    let allowed = foreground(
+        &mut aft,
+        "schema-allowed",
+        "sqlite3 private/store.db 'SELECT substrate FROM tasks'",
+    );
+    assert_eq!(allowed["status"], "failed", "{allowed}");
+    assert!(
+        allowed["output"]
+            .as_str()
+            .unwrap()
+            .contains("tasks: id TEXT, kind TEXT"),
+        "{allowed}"
+    );
+
+    // The command can report an error without reading the protected database.
+    // Its probe must not gain access just because it runs after that command.
+    let binary = project.join("sqlite3");
+    let real_binary = which::which("sqlite3").unwrap();
+    std::fs::write(&binary, format!("#!/bin/sh\nif [ \"$1\" = -readonly ]; then exec {} \"$@\"; fi\nprintf 'Error: in prepare, no such column: substrate\\n' >&2\nexit 1\n", quote(&real_binary))).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        configure_native_policy(
+            &mut aft,
+            &project,
+            &storage,
+            true,
+            &[],
+            std::slice::from_ref(&private)
+        )["success"],
+        true
+    );
+    let denied = foreground(
+        &mut aft,
+        "schema-denied",
+        "./sqlite3 private/store.db 'SELECT substrate FROM tasks'",
+    );
+    assert_eq!(denied["status"], "failed", "{denied}");
+    let output = denied["output"].as_str().unwrap();
+    assert!(output.contains("no such column: substrate"), "{output}");
+    assert!(!output.contains("[aft: no column"), "{output}");
     assert!(aft.shutdown().success());
 }
 

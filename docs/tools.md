@@ -93,6 +93,13 @@ enable them) plus the call graph:
 Plain file reading and directory listing. Pass `path` to read a file, or a directory path to
 list its entries. Paginate large files with `startLine`/`endLine` or `offset`/`limit`.
 
+With `github.read` enabled, use `pr://N/diff` for a live unified diff or
+`pr://N/diff/<path>` for one exact changed path (renames use the new path).
+Both accept `pr://OWNER/REPO/N/diff` forms. Each page names the PR head SHA;
+line ranges select the diff body, not the repeated header. Binary changes get
+one line, and paging or the 4 MiB fetch ceiling is disclosed. Diffs are read-only
+views: use `read`, not `aft_outline` or `aft_zoom`. Diff failures never use cached data.
+
 ```json
 // Read full file
 { "path": "src/app.ts" }
@@ -233,7 +240,7 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | Param | Type | Description |
 |---|---|---|
 | `command` | string | Shell command to execute |
-| `timeout` | number | Hard-kill cap in milliseconds (positive integer). Default 30 minutes when unset, except a delegated (subagent) session's `wait: true` call, which has no hard kill unless one is passed. NOT a polling window — see below. |
+| `timeout` | number | Hard-kill cap in milliseconds (positive integer). Default 30 minutes when unset; while a delegated (subagent) session keeps waiting on the command, each wait pushes that default to at least `bash.worker_wait_max_ms` after the wait. An explicit `timeout` is never extended. NOT a polling window — see below. |
 | `workdir` | string | Working directory for command execution |
 | `description` | string | Short human-readable summary for harness UI metadata |
 | `background` | boolean | Spawn detached and return a `taskId` (requires the background flag) |
@@ -353,8 +360,16 @@ waits are for a short remaining wait on a task (default 30s, max `bash.watch_syn
 by default); for anything longer end the turn on `bash({background:true})` and let the completion
 reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. In a
 delegated (subagent) session, which cannot be woken once its turn ends, a sync wait without
-`timeoutMs` has no deadline and returns when the task exits, and an explicit `timeoutMs` is used
-as given rather than capped. Sync mode
+`timeoutMs` waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default),
+then reports the command is still running with how long it has run and its latest output; the
+worker watches again to keep waiting or kills it. An explicit `timeoutMs` is used as given rather
+than capped. A delegated session's blocking `bash` call (`wait: true`, or any foreground call when
+`bash.subagent_background` is false) is bounded the same way: at the limit the command moves to the
+background, not killed, and the reply gives its task id. The wait limit is not the task's kill
+deadline: every reply that hands a task back (launch, promotion, detach) and every `bash_watch`
+result also names the task's own deadline (for example, "AFT kills this task at 2026-09-10 10:30:00Z, when it has run 30 minutes (its default background limit); about 12 minutes remain", or the `timeout` you passed), and a task killed by it is reported by
+name ("killed by AFT's default background limit of 30 minutes (exit 124)") rather than as a bare
+timeout. Sync mode
 waits until a `pattern` matches, the task exits, `timeoutMs` elapses, a new message arrives, or the
 call is aborted. Async mode (`background: true`)
 registers a pattern watcher that fires a notification when matched and suppresses the default
@@ -960,18 +975,27 @@ first line of the tool output:
 | `inspect_terminal` | Header | Meaning |
 |---|---|---|
 | `fresh` | `FRESH` | Completed, and every diagnostics producer gave an authoritative answer. Carries `wait_stamp` (`text` and `phases`). |
-| `partial` | `PARTIAL: diagnostics unknown for rust, typescript (see below)` | Completed with the same payload and `wait_stamp` as `fresh`, but diagnostics are unknown for the named producers. `partial_reason` holds the header text without the `PARTIAL:` prefix. The body names each producer and its server root, for example `Incomplete diagnostics: producer rust @ spikes/x failed (...)`. |
-| `interrupted` | prose | Cancelled before completion; `completed_phases` lists what finished. |
-| `phase_failed` | prose | A phase failed; `completed_phases`, `failed_phase`, `failure_reason` and `failure_detail` say which and why. |
+| `partial` | `PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running (1 file); retry aft_inspect.` | Completed with the same payload and `wait_stamp` as `fresh`, but some diagnostics are unknown. The header explains each analyzer's reason and affected file count once. `partial_reason` holds the header text without the `PARTIAL — ` prefix. Full reasons and per-file gaps remain structured. |
+| `interrupted` | `INTERRUPTED — ...` | Cancelled before completion; retry the request. `completed_phases` remains in structured data. |
+| `phase_failed` | `PHASE-FAILED — ...` | Inspection could not finish; address the reported reason and retry or narrow the scope. `completed_phases`, `failed_phase`, `failure_reason` and `failure_detail` remain structured. |
 
 `FRESH` never heads a result whose diagnostics summary reads `diagnostics: unknown`. A missing
 language server binary (for example `docker-langserver`) leaves its files' diagnostics unknown and
 the result `partial`; install the server or disable it with `lsp.disabled` to get `fresh`.
 
-The wait stamp counts phases instead of listing each one:
+Wait stamps and phase lists are retained only in structured data, not agent-visible text.
+For example, the structured wait stamp counts phases instead of listing each one:
 `waited: yes; completed: lsp_start ×9 (typescript 3, python 2, bash 1, ...), lsp_quiescence ×9 (...), tier2_rescan ×5 (...)`.
 Repeated TypeScript runtime notes collapse the same way
 (`TypeScript 5.9.3: project installation ×3 (first: ...)`).
+
+With `scope`, all findings, counts, worst offenders, and examples are narrowed to those paths.
+Duplicate groups can cross the boundary: their summary says how many groups touch the scope,
+and their examples show only scoped occurrences. Project-wide duplicate percentages and
+suppression totals are omitted because they cannot be narrowed from the cached aggregate.
+Cross-boundary import cycles likewise show only scoped members and edges, labeled as cycles
+touching the scope rather than claiming a closed cycle entirely within it.
+Without `scope`, the repository-wide summaries are unchanged.
 
 #### Which language servers start
 

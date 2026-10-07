@@ -458,6 +458,15 @@ pub(crate) fn main() -> io::Result<()> {
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
         }
     }
+    // AFT_FAKE_LSP_START_DELAY_MS=<ms>: wait before doing anything, like a
+    // server process that is slow to come up on a loaded machine. Nothing,
+    // not even the pid file below, exists until the delay has passed.
+    if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_START_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
     if let Some(pid_dir) = std::env::var_os("AFT_FAKE_LSP_PID_DIR") {
         std::fs::write(
             std::path::Path::new(&pid_dir).join(std::process::id().to_string()),
@@ -466,6 +475,10 @@ pub(crate) fn main() -> io::Result<()> {
     }
     if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_STARTED_SIGNAL") {
         std::fs::write(signal_path, b"started")?;
+    }
+    if let Some(path) = std::env::var_os("AFT_FAKE_LSP_GIT_OPTIONAL_LOCKS_FILE") {
+        let value = std::env::var("GIT_OPTIONAL_LOCKS").unwrap_or_else(|_| "<unset>".into());
+        std::fs::write(path, value)?;
     }
     let stdout = io::stdout();
     let mut writer = stdout.lock();
@@ -477,11 +490,21 @@ pub(crate) fn main() -> io::Result<()> {
     std::thread::spawn(move || {
         let stdin = io::stdin();
         let mut reader = BufReader::new(stdin.lock());
+        let freeze_release = std::env::var_os("AFT_FAKE_LSP_FREEZE_AFTER_OPEN");
         loop {
             let message = read_message(&mut reader);
+            let freeze = freeze_release.is_some() && matches!(&message,
+                Ok(Some(ServerMessage::Notification { method, .. })) if method == "textDocument/didOpen");
             let last = !matches!(message, Ok(Some(_)));
             if message_tx.send(message).is_err() || last {
                 break;
+            }
+            // Pausing only the analysis loop would still let this thread drain
+            // stdin, hiding a full-pipe write behind an unbounded message queue.
+            if freeze {
+                while !std::path::Path::new(freeze_release.as_ref().unwrap()).exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
         }
     });
@@ -500,6 +523,10 @@ pub(crate) fn main() -> io::Result<()> {
     // the run begins and never ends.
     let flycheck_mode = std::env::var("AFT_FAKE_LSP_FLYCHECK").ok();
     let mut flycheck_running = false;
+    // A cancelled native-diagnostics pull followed by a compiler-only push,
+    // as rust-analyzer can send while applying a watched-file change.
+    let pull_cancel_mode = std::env::var("AFT_FAKE_LSP_PULL_CANCEL").ok();
+    let mut pull_cancelled_once = false;
     // Emulates rust-analyzer's check on save: with
     // AFT_FAKE_LSP_CHECK_ON_SAVE=<ms> the fake asks for save notifications
     // and runs a check <ms> after each trigger: becoming quiescent at
@@ -522,6 +549,7 @@ pub(crate) fn main() -> io::Result<()> {
         .then(|| std::time::Instant::now() + delay)
     };
     let mut check_begins_at: Option<std::time::Instant> = None;
+    let mut check_completed = false;
     // Open documents with their latest version and the diagnostics the fake
     // last published for them from its own analysis, for the emulated check.
     let mut open_documents: std::collections::BTreeMap<String, (Value, Value)> =
@@ -600,6 +628,7 @@ pub(crate) fn main() -> io::Result<()> {
                             )?;
                         }
                         write_flycheck_progress(&mut writer, "end")?;
+                        check_completed = true;
                     }
                     continue;
                 }
@@ -852,6 +881,19 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/hover" => {
+                    // AFT_FAKE_LSP_HOVER_DELAY_SIGNAL=<path> is written when a
+                    // hover arrives and AFT_FAKE_LSP_HOVER_DELAY_MS=<ms> holds
+                    // the reply, so a test can act while AFT waits on a slow
+                    // server.
+                    if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_HOVER_DELAY_SIGNAL") {
+                        let _ = std::fs::write(signal_path, b"hovering");
+                    }
+                    if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_HOVER_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
                     let (line, character) = request_position(&params);
                     if line == 0 && character == 0 {
                         write_response(
@@ -967,7 +1009,37 @@ pub(crate) fn main() -> io::Result<()> {
                         std::process::exit(1);
                     }
 
-                    if force_method_not_found || force_invalid_params {
+                    let cancel_pull = pull_cancel_mode.as_deref() == Some("always")
+                        || (pull_cancel_mode.as_deref() == Some("once") && !pull_cancelled_once);
+                    if cancel_pull {
+                        pull_cancelled_once = true;
+                        write_json_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32802,
+                                    "message": "server cancelled the request",
+                                    "data": { "retriggerRequest": true }
+                                }
+                            }),
+                        )?;
+                        let uri = document_uri(&params);
+                        let version = uri
+                            .as_str()
+                            .and_then(|uri| open_documents.get(uri))
+                            .map(|(_, version)| version.clone())
+                            .unwrap_or(Value::Null);
+                        write_flycheck_progress(&mut writer, "begin")?;
+                        write_publish_diagnostics_versioned(
+                            &mut writer,
+                            uri,
+                            json!([fake_compile_error()]),
+                            version,
+                        )?;
+                        write_flycheck_progress(&mut writer, "end")?;
+                    } else if force_method_not_found || force_invalid_params {
                         let (code, message) = if force_method_not_found {
                             (-32601, "fake-lsp: pull method not found")
                         } else {
@@ -996,6 +1068,14 @@ pub(crate) fn main() -> io::Result<()> {
                                 }
                             }),
                         )?;
+                    } else if std::env::var("AFT_FAKE_LSP_PULL_WAIT_FOR_CHECK").ok().as_deref() == Some("1")
+                        && !check_completed
+                    {
+                        // A successful native pull can describe the old
+                        // workspace before a watched-file change is applied.
+                        write_response(&mut writer, id, json!({
+                            "kind": "full", "resultId": "old-native", "items": []
+                        }))?;
                     } else if force_unchanged {
                         write_response(
                             &mut writer,
@@ -1280,6 +1360,22 @@ pub(crate) fn main() -> io::Result<()> {
                             }));
                         write_publish_diagnostics_versioned(&mut writer, uri, checked, version)?;
                         write_flycheck_progress(&mut writer, "end")?;
+                    }
+                    // Stop reading after a successful handshake and document open.
+                    // The release file lets a test resume the same process without
+                    // relying on platform-specific signals or leaving a stopped child.
+                    if let Some(release) = std::env::var_os("AFT_FAKE_LSP_FREEZE_AFTER_OPEN") {
+                        write_notification(
+                            &mut writer,
+                            &Notification::new("custom/frozen", None),
+                        )?;
+                        while !std::path::Path::new(&release).exists() {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        write_notification(
+                            &mut writer,
+                            &Notification::new("custom/resumed", None),
+                        )?;
                     }
                 }
                 "textDocument/didChange" => {

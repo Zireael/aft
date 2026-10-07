@@ -1,3 +1,6 @@
+#[path = "../helpers/context_storage.rs"]
+mod context_storage;
+
 #[path = "../helpers/mod.rs"]
 mod test_helpers;
 
@@ -12,6 +15,7 @@ mod bash_background_persistence_test;
 mod bash_background_test;
 mod bash_compress_extras_test;
 mod bash_compress_test;
+mod bash_db_hints_test;
 mod bash_drain_completions_test;
 mod bash_foreground_background_architecture_test;
 mod bash_orchestrate_test;
@@ -31,6 +35,7 @@ mod callgraph_rust_bin_targets_test;
 mod callgraph_stale_missing_refresh_test;
 mod callgraph_store_name_match_test;
 mod callgraph_test;
+mod callgraph_worktree_test;
 mod checkpoint_metadata_test;
 mod commands_test;
 mod compress_cli_commands_test;
@@ -138,6 +143,7 @@ mod read_freshness_test;
 mod refresh_watcher_path_status_test;
 mod rename_delete_migration_test;
 mod repeat_breaker_test;
+mod request_watcher_pending_test;
 mod rollback_safety_test;
 mod root_keyed_adversarial_test;
 mod safety_test;

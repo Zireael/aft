@@ -14,6 +14,228 @@ use aft::views::registry::FamilyRegistry;
 use aft::views::snapshot::{DiskState, LiveDelta, LiveEntry, OpenGeneration, Residency, Snapshot};
 use aft::views::RelPath;
 
+const DISABLED: &str = "call graph is disabled (indexes.callgraph=false)";
+
+struct Installed(Snapshot);
+impl QueryState for Installed {
+    fn installed_state(
+        &self,
+        _: &ViewAccess,
+        _: FamilyPlane,
+    ) -> (Snapshot, Vec<std::path::PathBuf>) {
+        (self.0.clone(), Vec::new())
+    }
+}
+
+struct QueryFixture {
+    _storage: tempfile::TempDir,
+    _root: tempfile::TempDir,
+    access: ViewAccess,
+    generation: Arc<OpenGeneration>,
+    plane: Arc<CallgraphPlane>,
+    ctx: aft::context::AppContext,
+}
+
+fn query_fixture(with_graph: bool) -> QueryFixture {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let root_path = std::fs::canonicalize(root.path()).unwrap();
+    let source = b"function target() { return 1; }\nexport function caller() { return target(); }\ncaller();\n";
+    std::fs::write(root_path.join("fixture.ts"), source).unwrap();
+    let registry = FamilyRegistry::open(storage.path(), "query-callgraph-test").unwrap();
+    let access = ViewAccess::Owner(registry.register_view("scope", &root_path).unwrap());
+    let driver = Driver {
+        plane: CallgraphPlane::default(),
+        source: source.to_vec(),
+        revision: Mutex::new(1),
+        installed: Mutex::new(None),
+    };
+    let empty = ManifestV2::new(ManifestHeader {
+        producers: driver.producers(&access),
+        head_tree: None,
+        ignore_fingerprint: None,
+        segment: None,
+    });
+    let generation = if with_graph {
+        let mut live = LiveDelta::new(Arc::new(OpenGeneration::new("empty", empty, None)));
+        for (path, entry) in driver.reconcile(&access).unwrap().entries {
+            live.apply(path, entry);
+        }
+        driver
+            .build_own_generation(&access, &live.snapshot(), false)
+            .unwrap()
+    } else {
+        let mut manifest = empty;
+        let DiskState::Present { content, size } = DiskState::of_bytes(source) else {
+            unreachable!()
+        };
+        manifest
+            .insert(
+                RelPath::new(b"fixture.ts").unwrap(),
+                EntryV2::regular(content, size, EntryPlanes::default()),
+            )
+            .unwrap();
+        let ViewAccess::Owner(view) = &access else {
+            unreachable!()
+        };
+        let views = view.view_store().unwrap();
+        let name = GenerationName::for_manifest(&manifest).unwrap();
+        let database = views.derived_path(&name.to_string()).unwrap();
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let store = view.open_store(FamilyPlane::Callgraph).unwrap();
+        callgraph::materialize(&database, &manifest, &BlobReader(store.reader())).unwrap();
+        let prepared = views.prepare_v2(&name, None, &manifest, None).unwrap();
+        views.commit_v2(prepared, None).unwrap();
+        let marker =
+            aft::root_cache::ReadMarker::create(view.view_dir(), &name.to_string()).unwrap();
+        Arc::new(OpenGeneration::new(
+            name.to_string(),
+            manifest,
+            Some(Residency::Marker(marker)),
+        ))
+    };
+    let plane = Arc::new(driver.plane);
+    let mut config = aft::config::Config::default();
+    config.project_root = Some(root_path);
+    config.storage_dir = Some(storage.path().to_path_buf());
+    config.views.enabled = true;
+    config.indexes.callgraph = true;
+    let ctx = aft::context::AppContext::new(
+        Box::new(aft::parser::TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
+    ctx.install_checkout_query_runtime(Arc::new(
+        aft::views::query_wait::CheckoutQueryRuntime::new(
+            access.clone(),
+            Arc::new(Installed(LiveDelta::new(generation.clone()).snapshot())),
+            plane.clone(),
+        ),
+    ));
+    QueryFixture {
+        _storage: storage,
+        _root: root,
+        access,
+        generation,
+        plane,
+        ctx,
+    }
+}
+
+fn graph_answers(ctx: &aft::context::AppContext) -> Vec<aft::protocol::Response> {
+    let file = ctx
+        .config()
+        .project_root
+        .as_ref()
+        .unwrap()
+        .join("fixture.ts");
+    let request = |command| {
+        serde_json::from_value(serde_json::json!({
+            "id": command,
+            "command": command,
+            "file": file,
+            "symbol": "target",
+            "expression": "1",
+            "toSymbol": "caller",
+            "toFile": file,
+        }))
+        .unwrap()
+    };
+    vec![
+        aft::commands::callers::handle_callers(&request("callers"), ctx),
+        aft::commands::impact::handle_impact(&request("impact"), ctx),
+        aft::commands::trace_to::handle_trace_to(&request("trace_to"), ctx),
+        aft::commands::trace_to_symbol::handle_trace_to_symbol(&request("trace_to_symbol"), ctx),
+        aft::commands::trace_data::handle_trace_data(&request("trace_data"), ctx),
+    ]
+}
+
+#[test]
+fn callgraph_query_runtime_keyless_generation_refuses_navigation_as_disabled() {
+    let fixture = query_fixture(false);
+    let opened = fixture
+        .plane
+        .open_generation(&fixture.access, &fixture.generation);
+    assert!(
+        opened.is_err(),
+        "a keyless generation must not install an empty reader"
+    );
+    assert!(opened.unwrap_err().reason.contains(DISABLED));
+    for answer in graph_answers(&fixture.ctx) {
+        assert!(!answer.success, "{answer:?}");
+        assert_eq!(answer.data["code"], "callgraph_unavailable", "{answer:?}");
+        assert!(
+            answer.data["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(DISABLED),
+            "{answer:?}"
+        );
+    }
+    let ready = query_fixture(true);
+    ready
+        .plane
+        .open_generation(&ready.access, &ready.generation)
+        .unwrap();
+    for answer in graph_answers(&ready.ctx) {
+        assert!(answer.success, "a keyed generation must answer: {answer:?}");
+    }
+    let callers = &graph_answers(&ready.ctx)[0];
+    assert_eq!(callers.data["total_callers"], 1, "{callers:?}");
+}
+
+fn zoom_answer(ctx: &aft::context::AppContext) -> aft::protocol::Response {
+    let request = serde_json::from_value(serde_json::json!({
+        "id": "zoom",
+        "command": "zoom",
+        "file": ctx.config().project_root.as_ref().unwrap().join("fixture.ts"),
+        "symbol": "target",
+        "callgraph": true,
+    }))
+    .unwrap();
+    aft::commands::zoom::handle_zoom(&request, ctx)
+}
+
+#[test]
+fn callgraph_zoom_observes_checkout_plane_instead_of_legacy_resident_store() {
+    let fixture = query_fixture(true);
+    fixture
+        .plane
+        .open_generation(&fixture.access, &fixture.generation)
+        .unwrap();
+    assert!(fixture.ctx.callgraph_store().read().unwrap().is_none());
+    let answer = zoom_answer(&fixture.ctx);
+    assert!(answer.success, "{answer:?}");
+    assert_ne!(
+        answer.data["callgraph"]["status"], "unavailable",
+        "{answer:?}"
+    );
+    assert_eq!(
+        answer.data["annotations"]["called_by"][0]["name"], "caller",
+        "{answer:?}"
+    );
+}
+
+#[test]
+fn callgraph_zoom_keyless_checkout_plane_names_disabled_generation() {
+    let fixture = query_fixture(false);
+    let _ = fixture
+        .plane
+        .open_generation(&fixture.access, &fixture.generation);
+    let answer = zoom_answer(&fixture.ctx);
+    assert!(answer.success, "{answer:?}");
+    assert_eq!(
+        answer.data["callgraph"]["status"], "unavailable",
+        "{answer:?}"
+    );
+    assert!(
+        answer.data["callgraph"]["index"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(DISABLED),
+        "{answer:?}"
+    );
+}
+
 struct Driver {
     plane: CallgraphPlane,
     source: Vec<u8>,

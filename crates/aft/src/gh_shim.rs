@@ -1612,22 +1612,21 @@ fn api_invocation_writes(args: &[OsString]) -> bool {
         return true;
     };
     let method = shape.effective_method();
-    if matches!(method.as_str(), "GET" | "HEAD") {
-        return false;
-    }
-    // A GraphQL call is always a POST; only a mutation changes anything.
     if shape.path == "/graphql" {
         return !graphql_query_is_read_only(args);
+    }
+    if matches!(method.as_str(), "GET" | "HEAD") {
+        return false;
     }
     true
 }
 
-/// True when every `query` field of a `gh api graphql` call is inline text
-/// with no `mutation` in it. A query read from a file or stdin, a call with
-/// `--input`, or a call with no query field cannot be inspected here, so it
-/// counts as a write.
+/// Admit only inline documents consisting entirely of query operations.
+/// External payloads and unknown argv forms cannot establish that the actual
+/// document sent by gh is the one inspected here, so they fail closed.
 fn graphql_query_is_read_only(args: &[OsString]) -> bool {
     let mut queries = Vec::new();
+    let mut endpoint_seen = false;
     let mut index = 1;
     while index < args.len() {
         let Some(value) = args[index].to_str() else {
@@ -1653,14 +1652,123 @@ fn graphql_query_is_read_only(args: &[OsString]) -> bool {
         } else {
             None
         };
-        if let Some(("query", text)) = field.and_then(|field| field.split_once('=')) {
-            queries.push(text);
+        if let Some(field) = field {
+            let Some((key, text)) = field.split_once('=') else {
+                return false;
+            };
+            if key == "query" {
+                // gh expands repository/branch placeholders in typed fields.
+                // A branch name can contain GraphQL punctuation, so the bytes
+                // inspected here would not necessarily be the document sent.
+                let magic =
+                    value == "--field" || value.starts_with("--field=") || value.starts_with("-F");
+                if magic
+                    && ["{owner}", "{repo}", "{branch}"]
+                        .iter()
+                        .any(|placeholder| text.contains(placeholder))
+                {
+                    return false;
+                }
+                queries.push(text);
+            } else if key.starts_with("query[") {
+                // gh's bracket syntax can replace a scalar with an array or
+                // object. Do not let another field overwrite the inspected query.
+                return false;
+            }
+        } else if matches!(value, "graphql" | "/graphql") && !endpoint_seen {
+            endpoint_seen = true;
+        } else if matches!(
+            value,
+            "--method"
+                | "-X"
+                | "--header"
+                | "-H"
+                | "--hostname"
+                | "--cache"
+                | "--jq"
+                | "-q"
+                | "--template"
+                | "-t"
+        ) {
+            if args.get(index).and_then(|arg| arg.to_str()).is_none() {
+                return false;
+            }
+            index += 1;
+        } else if matches!(
+            value,
+            "--paginate" | "--slurp" | "--silent" | "--include" | "-i" | "--verbose"
+        ) || [
+            "--method=",
+            "-X",
+            "--header=",
+            "-H",
+            "--hostname=",
+            "--cache=",
+            "--jq=",
+            "-q",
+            "--template=",
+            "-t",
+        ]
+        .iter()
+        .any(|prefix| {
+            value
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty())
+        }) {
+            // These flags do not supply or replace the request document.
+        } else {
+            return false;
         }
     }
-    !queries.is_empty()
+    endpoint_seen
+        && !queries.is_empty()
         && queries
             .iter()
-            .all(|query| !query.starts_with('@') && !query.contains("mutation"))
+            .all(|query| graphql_document_is_read_only(query))
+}
+
+fn graphql_document_is_read_only(document: &str) -> bool {
+    graphql_document_shape(document).read_only
+}
+
+#[derive(Default)]
+struct GraphqlDocumentShape {
+    read_only: bool,
+    has_mutation: bool,
+}
+
+/// Delegated reads use the operator's credentials, so inspect the complete
+/// syntax tree rather than guessing operation boundaries from delimiters.
+/// Parser recovery trees cannot authorize reads. GitHub still validates fields
+/// against its schema; only queries and fragments may cross this boundary.
+fn graphql_document_shape(document: &str) -> GraphqlDocumentShape {
+    use apollo_parser::{cst::Definition, Parser};
+
+    let parsed = Parser::new(document).parse();
+    if parsed.errors().next().is_some() {
+        return GraphqlDocumentShape::default();
+    }
+
+    let mut shape = GraphqlDocumentShape {
+        read_only: true,
+        has_mutation: false,
+    };
+    let mut has_operation = false;
+    for definition in parsed.document().definitions() {
+        match definition {
+            Definition::OperationDefinition(operation) => {
+                has_operation = true;
+                if let Some(kind) = operation.operation_type() {
+                    shape.read_only &= kind.query_token().is_some();
+                    shape.has_mutation |= kind.mutation_token().is_some();
+                }
+            }
+            Definition::FragmentDefinition(_) => {}
+            _ => shape.read_only = false,
+        }
+    }
+    shape.read_only &= has_operation;
+    shape
 }
 
 /// What a write acts on (see `WriteTarget`), from the same resolver the
@@ -1727,18 +1835,51 @@ fn account_write_description(tuple: &str, named: Option<&str>) -> String {
 
 /// Refusal text for an undeclared invocation.
 ///
-/// It names the verb the classifier decided on, because the decision is made on
-/// the verb alone: a reader who is told only that "this invocation" was refused
-/// cannot tell whether the verb or something in the tail was the problem, and
-/// output flags such as `--json` or `-q` are the usual wrong guess.
+/// Native commands name their verb; API commands name their method and endpoint
+/// or GraphQL operation kind, so an undeclared mutation does not look like a
+/// refusal of all API reads. Output flags are not the classification boundary.
 fn unclassified_refusal_text(args: &[OsString], manifest_version: u64) -> String {
     let subject = match invocation_verb(args) {
+        Some(verb) if verb == "api" => api_refusal_subject(args),
         Some(verb) => format!("verb \"{verb}\""),
         // A non-UTF-8 argument vector has no verb that can be quoted back.
         None => "this invocation".to_string(),
     };
     format!(
         "{subject} is not declared in manifest {manifest_version} (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
+    )
+}
+
+fn api_refusal_subject(args: &[OsString]) -> String {
+    let Some((_, _, index)) = command_head(args) else {
+        return "api (uninspectable endpoint)".into();
+    };
+    let args = &args[index..];
+    let Some(shape) = api_request_shape(args) else {
+        return "api (uninspectable endpoint)".into();
+    };
+    if shape.path != "/graphql" {
+        return format!("api {} {}", shape.effective_method(), shape.path);
+    }
+    let mutation = args.iter().filter_map(|arg| arg.to_str()).any(|arg| {
+        let field = arg
+            .strip_prefix("--field=")
+            .or_else(|| arg.strip_prefix("--raw-field="))
+            .or_else(|| arg.strip_prefix("-f"))
+            .or_else(|| arg.strip_prefix("-F"))
+            .unwrap_or(arg);
+        let Some(document) = field.strip_prefix("query=") else {
+            return false;
+        };
+        graphql_document_shape(document).has_mutation
+    });
+    format!(
+        "api graphql ({})",
+        if mutation {
+            "mutation"
+        } else {
+            "uninspectable query"
+        }
     )
 }
 
@@ -1769,6 +1910,10 @@ fn governed_outcome_status(
     match outcome {
         RouteOutcome::Result(output) => {
             print!("{output}");
+            0
+        }
+        RouteOutcome::ResultStderr(output) => {
+            eprint!("{output}");
             0
         }
         RouteOutcome::StateAppliedCommentFailed(output) => {
@@ -3334,7 +3479,7 @@ fn platform_matches(platforms: &[String], current: &str) -> bool {
 /// contents verbatim; the verifier checks the signature over those bytes
 /// BEFORE parsing them, so the signature contract is "the signer signed the
 /// file it publishes" and no canonicalization rule exists on this side.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct SignedManifest {
     artifact_id: String,
     envelope_version: u64,
@@ -3351,6 +3496,43 @@ struct SignedManifest {
 struct VerifiedManifest {
     manifest: Manifest,
     verified_by_key_id: String,
+}
+
+struct VerifiedEnvelope {
+    envelope: SignedManifest,
+    trust_set: Vec<Option<ManifestTrustKey>>,
+    verified: VerifiedManifest,
+}
+
+thread_local! {
+    // Only cryptographic verification and parsing are memoized, by exact
+    // envelope bytes and trust keys. Disk presence, rollback state, issue time,
+    // and local state repair are checked on every resolution as before.
+    static VERIFIED_ENVELOPE: std::cell::RefCell<Option<VerifiedEnvelope>> = const { std::cell::RefCell::new(None) };
+}
+
+fn verify_manifest_envelope(
+    envelope: &SignedManifest,
+    trust_set: &[Option<ManifestTrustKey>],
+) -> Result<VerifiedManifest, ManifestProblem> {
+    if let Some(verified) = VERIFIED_ENVELOPE.with(|cached| {
+        cached
+            .borrow()
+            .as_ref()
+            .filter(|cached| cached.envelope == *envelope && cached.trust_set == trust_set)
+            .map(|cached| cached.verified.clone())
+    }) {
+        return Ok(verified);
+    }
+    let verified = verify_manifest_signature_with_provenance(envelope, trust_set)?;
+    VERIFIED_ENVELOPE.with(|cached| {
+        *cached.borrow_mut() = Some(VerifiedEnvelope {
+            envelope: envelope.clone(),
+            trust_set: trust_set.to_vec(),
+            verified: verified.clone(),
+        });
+    });
+    Ok(verified)
 }
 
 #[derive(Clone, Debug)]
@@ -3504,7 +3686,7 @@ fn load_manifest_with_trust_set(
     let VerifiedManifest {
         manifest,
         verified_by_key_id,
-    } = verify_manifest_signature_with_provenance(&envelope, trust_set)?;
+    } = verify_manifest_envelope(&envelope, trust_set)?;
     manifest.validate().map_err(ManifestProblem::Invalid)?;
     if manifest.schema_floor < SCHEMA_FLOOR {
         return Err(ManifestProblem::BelowFloor {
@@ -3565,6 +3747,11 @@ fn verify_manifest_signature_with_provenance(
     envelope: &SignedManifest,
     trust_set: &[Option<ManifestTrustKey>],
 ) -> Result<VerifiedManifest, ManifestProblem> {
+    #[cfg(test)]
+    MANIFEST_WORK.with(|count| {
+        let (verifications, writes) = count.get();
+        count.set((verifications + 1, writes));
+    });
     let Some(key) = trust_set
         .iter()
         .flatten()
@@ -3595,7 +3782,7 @@ fn verify_manifest_signature_with_provenance(
 
 /// One trusted manifest signing key: a stable key id plus the Ed25519 public
 /// key bytes that id binds.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct ManifestTrustKey {
     key_id: &'static str,
     public_key: &'static [u8],
@@ -3829,6 +4016,17 @@ fn write_last_valid_manifest(paths: &StatePaths, manifest: &Manifest) {
     let Ok(bytes) = serde_json::to_vec(&record) else {
         return;
     };
+    // Re-check the actual file, rather than remembering that a previous write
+    // succeeded. Deletion, corruption, or another process's replacement still
+    // repairs the last-valid record on the next accepted resolution.
+    if fs::read(&paths.last_valid_manifest).is_ok_and(|existing| existing == bytes) {
+        return;
+    }
+    #[cfg(test)]
+    MANIFEST_WORK.with(|count| {
+        let (verifications, writes) = count.get();
+        count.set((verifications, writes + 1));
+    });
     let _ = fs::create_dir_all(&paths.root);
     let temporary = paths.last_valid_manifest.with_extension("tmp");
     if fs::write(&temporary, bytes).is_ok() {
@@ -4158,6 +4356,16 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     let Some((method, path, has_fields)) = api_method_and_path(args) else {
         return Classification::Unclassified;
     };
+    if path == "/graphql" {
+        // Like a field-free REST GET, an inspected GraphQL read delegates to
+        // the real gh unchanged under the operator's existing login. It never
+        // mints an assertion or routes through the governed-write relay.
+        return if graphql_query_is_read_only(args) {
+            Classification::Mechanical
+        } else {
+            Classification::Unclassified
+        };
+    }
     let matches = manifest
         .api_rules
         .iter()
@@ -4441,7 +4649,9 @@ fn invalidate_successful_github_read_mutation_at(
 ) {
     if !matches!(
         outcome,
-        RouteOutcome::Result(_) | RouteOutcome::StateAppliedCommentFailed(_)
+        RouteOutcome::Result(_)
+            | RouteOutcome::ResultStderr(_)
+            | RouteOutcome::StateAppliedCommentFailed(_)
     ) {
         return;
     }
@@ -6007,6 +6217,8 @@ fn parse_thread_target(target: &str, segment: &str) -> Option<(Option<String>, u
 #[derive(Debug)]
 enum RouteOutcome {
     Result(String),
+    /// Native close/reopen confirmations go to stderr, as upstream gh does.
+    ResultStderr(String),
     StateAppliedCommentFailed(String),
     UpstreamError(String),
     Refusal(String),
@@ -6071,7 +6283,9 @@ fn route_governed(
     );
     if matches!(
         &outcome,
-        RouteOutcome::Result(_) | RouteOutcome::StateAppliedCommentFailed(_)
+        RouteOutcome::Result(_)
+            | RouteOutcome::ResultStderr(_)
+            | RouteOutcome::StateAppliedCommentFailed(_)
     ) && determination.rung == Rung::R3
     {
         let mut updated = determination.clone();
@@ -7090,6 +7304,53 @@ mod tests {
             "../tests/fixtures/gh_shim/initial-manifest-v1.json"
         ))
         .expect("initial manifest fixture")
+    }
+
+    #[test]
+    fn repeated_manifest_resolution_verifies_and_writes_once() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(root.path().to_path_buf());
+        write_signed_manifest(&paths, fixture_manifest(), TEST_NOW);
+        VERIFIED_ENVELOPE.with(|cached| *cached.borrow_mut() = None);
+        MANIFEST_WORK.with(|count| count.set((0, 0)));
+        for _ in 0..3 {
+            load_manifest(&paths, TEST_NOW).unwrap();
+        }
+        assert_eq!(
+            MANIFEST_WORK.with(std::cell::Cell::get),
+            (1, 1),
+            "signature verifications, last-valid rewrites"
+        );
+    }
+
+    #[test]
+    fn manifest_memo_rechecks_live_bytes_rollback_and_repairs_local_state() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(root.path().to_path_buf());
+        write_signed_manifest(&paths, fixture_manifest(), TEST_NOW);
+        let bytes = fs::read(&paths.manifest).unwrap();
+        load_manifest(&paths, TEST_NOW).unwrap();
+        fs::remove_file(&paths.last_valid_manifest).unwrap();
+        load_manifest(&paths, TEST_NOW).unwrap();
+        assert!(paths.last_valid_manifest.is_file());
+        write_version_high_water(&paths, 2);
+        assert!(matches!(
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::RolledBack { .. })
+        ));
+        write_version_high_water(&paths, 1);
+        let mut changed: SignedManifest = serde_json::from_slice(&bytes).unwrap();
+        changed.manifest_bytes.push(' ');
+        fs::write(&paths.manifest, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(matches!(
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::Invalid(_))
+        ));
+        fs::remove_file(&paths.manifest).unwrap();
+        assert!(matches!(
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::Missing)
+        ));
     }
 
     fn v9_fixture_manifest() -> Manifest {
@@ -8772,6 +9033,7 @@ mod tests {
             ("pr status", &["pr", "status"]),
             ("pr checks", &["pr", "checks", "313", "--watch"]),
             ("pr diff", &["pr", "diff", "313"]),
+            ("pr diff", &["pr", "diff", "313", "--repo", "cortexkit/aft"]),
             ("release view", &["release", "view", "v0.56.2"]),
             ("release list", &["release", "list"]),
             (
@@ -8852,6 +9114,373 @@ mod tests {
                 matches_expected,
                 "negative control {raw_args:?} changed from {expected}: {classification:?}"
             );
+        }
+    }
+
+    const GRAPHQL_READ_DOCUMENTS: &[&str] = &[
+        r#"{ repository(owner:"o", name:"r") { pullRequest(number:1) { reviewThreads(first:100){nodes{isResolved}} } } }"#,
+        "query Read($n: Int!) { repository { issue(number: $n) { title } } }",
+        "query First { viewer { login } } query Second { viewer { id } }",
+        r#"{ repository(name:"mutation") { mutationField } }"#,
+        "# mutation is only a comment\n{ viewer { login } }",
+        r#"query Read @skip(if: false) { field(arg: "\"}") }"#,
+        "{ field(arg: \"\"\"mutation { text }\"\"\") }",
+        "query Read { viewer { ...Identity } } fragment Identity on User { login }",
+        "fragment Identity on User { login } { viewer { ...Identity } }",
+    ];
+
+    #[test]
+    fn graphql_reads_delegate_unchanged_as_mechanical_operator_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let manifest = fixture_manifest();
+        let rung =
+            RungDetermination::r3(TEST_NOW, manifest.manifest_version, &test_rung_provenance())
+                .record;
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".into(),
+            agent_id: "bound-agent".into(),
+        };
+        for query in GRAPHQL_READ_DOCUMENTS {
+            let args = os_args(&[
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={query}"),
+                "-F",
+                "n=1",
+            ]);
+            let classification = classify(&args, &manifest, "macos");
+            assert!(
+                matches!(classification, Classification::Mechanical),
+                "{query}: {classification:?}"
+            );
+            assert!(!api_invocation_writes(&args));
+            assert_eq!(
+                dispatch_r3(
+                    &args,
+                    classification,
+                    &manifest,
+                    &paths,
+                    &rung,
+                    &binding,
+                    TEST_NOW,
+                    |forwarded| {
+                        assert_eq!(forwarded, args);
+                        73
+                    }
+                ),
+                73
+            );
+            assert!(!paths.seam_state.exists());
+            assert!(!paths.bypass_audit.exists());
+        }
+    }
+
+    #[test]
+    fn graphql_mutations_subscriptions_and_uninspectable_queries_are_refused() {
+        let manifest = fixture_manifest();
+        for tail in [
+            &[][..],
+            &["-f", "query=mutation { addStar }"],
+            &["-f", "query=subscription { events }"],
+            &[
+                "-f",
+                "query=query Read { viewer { login } } mutation Write { addStar }",
+                "-f",
+                "operationName=Write",
+            ],
+            &["-F", "query=@-"],
+            &["-f", "query=@file"],
+            &["--input", "body.json", "-f", "query={ viewer { login } }"],
+            &["--input=-", "-f", "query={ viewer { login } }"],
+            &[
+                "-f",
+                "query={ viewer { login } }",
+                "-f",
+                "query=mutation { addStar }",
+            ],
+            &[
+                "-f",
+                "query={ viewer { login } }",
+                "-f",
+                "query[]=mutation { addStar }",
+            ],
+            &["-f", "query={ viewer { login }"],
+            &["-f", "query=not_a_document"],
+            &["-f", "query={ field(arg: \"unterminated) }"],
+            &["-f", "query={ field(arg: [1, 2) }"],
+            &[
+                "-f",
+                "query={ field(arg: \"\"\"text\"\"\") } mutation { addStar }",
+            ],
+            &[
+                "-f",
+                "query=query Read($n: Int!) { viewer { login } } subscription Watch { events }",
+            ],
+            &["-f", "query={ viewer { login } }", "--unknown"],
+            &["-X", "GET", "-f", "query=mutation { addStar }"],
+        ] {
+            let mut args = os_args(&["api", "graphql"]);
+            args.extend(os_args(tail));
+            assert!(!graphql_query_is_read_only(&args), "{tail:?}");
+            assert!(api_invocation_writes(&args), "{tail:?}");
+            assert!(
+                matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Unclassified
+                ),
+                "{tail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn graphql_block_string_escape_cannot_hide_a_selected_mutation() {
+        let document = r#"{ f(a: """\\"""X""") } mutation Write { addStar(input:{starrableId:"x"}) { clientMutationId } } # """ ) }"#;
+        let args = os_args(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={document}"),
+            "-f",
+            "operationName=Write",
+        ]);
+        assert!(
+            !graphql_query_is_read_only(&args),
+            "selected mutation must never be admitted: {document}"
+        );
+        assert!(api_invocation_writes(&args));
+        assert!(matches!(
+            classify(&args, &fixture_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+        assert_eq!(api_refusal_subject(&args), "api graphql (mutation)");
+    }
+
+    const GRAPHQL_STRING_VALUES: &[&str] = &[
+        r##""plain""##,
+        r##""\" mutation Write { addStar } #""##,
+        r##""# mutation is string text""##,
+        r##""\\\"""##,
+        r##""\n\r\t\u0022""##,
+        r##""""block # mutation { addStar }""""##,
+        r##""""\""" mutation { addStar } #""""##,
+        r##""""\\"""X""""##,
+        "\"\"\"literal \\n and \\q\r\n# still a string\"\"\"",
+    ];
+
+    #[test]
+    fn graphql_parser_distinguishes_strings_comments_and_operations() {
+        let manifest = fixture_manifest();
+        for prefix in ["", "\u{feff}", "# ignored mutation { addStar }\r\n"] {
+            for value in GRAPHQL_STRING_VALUES {
+                let query = format!("{prefix}query Read {{ field(arg: {value}) }}");
+                let args = os_args(&["api", "graphql", "-f", &format!("query={query}")]);
+                assert!(graphql_query_is_read_only(&args), "{query}");
+                assert!(matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Mechanical
+                ));
+                assert_eq!(
+                    api_refusal_subject(&args),
+                    "api graphql (uninspectable query)",
+                    "{query}"
+                );
+
+                // Even selecting the query must not authorize another operation
+                // in the same document to run with the operator's credentials.
+                let mixed = format!("{query} # comment\r\nmutation Write {{ addStar }}");
+                for selected in ["Read", "Write"] {
+                    let args = os_args(&[
+                        "api",
+                        "graphql",
+                        "-f",
+                        &format!("query={mixed}"),
+                        "-f",
+                        &format!("operationName={selected}"),
+                    ]);
+                    assert!(!graphql_query_is_read_only(&args), "{mixed}");
+                    assert!(api_invocation_writes(&args));
+                    assert!(matches!(
+                        classify(&args, &manifest, "macos"),
+                        Classification::Unclassified
+                    ));
+                    assert_eq!(api_refusal_subject(&args), "api graphql (mutation)");
+                }
+            }
+        }
+    }
+
+    const GRAPHQL_REFUSED_DOCUMENTS: &[&str] = &[
+        "",
+        "# no operation\r\n",
+        "mutation { addStar }",
+        "subscription { events }",
+        "query Read { viewer { login } } mutation Write { addStar }",
+        "query Read($n: Int!) { viewer { login } } subscription Watch { events }",
+        "@-",
+        "@file",
+        "{ viewer { login }",
+        "not_a_document",
+        r#"{ field(arg: "unterminated) }"#,
+        "{ field(arg: [1, 2) }",
+        r#"{ field(arg: """text""") } mutation { addStar }"#,
+        "fragment Only on Query { viewer { login } }",
+        "fragment Only on Mutation { addStar }",
+        "fragment Only on Query { viewer { login } } mutation Write { addStar }",
+        "fragment Only on Query { mutation Write { addStar } }",
+        "{}",
+        "query Read($n Int) { viewer }",
+        "{ field(arg: 01) }",
+        "{ field(arg: 1.) }",
+        r#"{ field(arg: "\q") }"#,
+        r#"{ field(arg: "\uZZZZ") }"#,
+        r#"{ field(arg: """unterminated) }"#,
+    ];
+
+    const GRAPHQL_TYPE_SYSTEM_DOCUMENTS: &[&str] = &[
+        "schema { query: Query }",
+        "scalar Custom",
+        "type Query { viewer: User }",
+        "interface Node { id: ID! }",
+        "union Result = User | Issue",
+        "enum Color { RED GREEN }",
+        "input Filter { name: String }",
+        "directive @custom on FIELD",
+        "extend schema { mutation: Mutation }",
+        "extend scalar Custom @custom",
+        "extend type Query { other: String }",
+        "extend interface Node { name: String }",
+        "extend union Result = PullRequest",
+        "extend enum Color { BLUE }",
+        "extend input Filter { id: ID }",
+    ];
+
+    #[test]
+    fn graphql_parser_refuses_non_query_definitions_and_parse_errors() {
+        let manifest = fixture_manifest();
+        for document in GRAPHQL_REFUSED_DOCUMENTS {
+            let args = os_args(&["api", "graphql", "-f", &format!("query={document}")]);
+            assert!(!graphql_query_is_read_only(&args), "{document}");
+            assert!(api_invocation_writes(&args));
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Unclassified
+            ));
+        }
+        for definition in GRAPHQL_TYPE_SYSTEM_DOCUMENTS {
+            for prefix in ["", "query Read { viewer { login } } "] {
+                let document = format!("{prefix}{definition}");
+                let parsed = apollo_parser::Parser::new(&document).parse();
+                assert_eq!(parsed.errors().count(), 0, "{document}");
+                assert!(!graphql_document_is_read_only(&document), "{document}");
+            }
+        }
+        for document in [
+            "fragment Only on Query { mutation }",
+            "type Mutation { addStar: String }",
+            "query { mutation }",
+            "mutation Write { addStar } ?",
+            "query { viewer } # mutation Write { addStar }",
+        ] {
+            let args = os_args(&["api", "graphql", "-f", &format!("query={document}")]);
+            assert_eq!(
+                api_refusal_subject(&args),
+                "api graphql (uninspectable query)",
+                "{document}"
+            );
+        }
+    }
+
+    #[test]
+    fn graphql_admission_matches_an_independent_full_parse_over_a_corpus() {
+        use graphql_parser::query::{Definition, OperationDefinition};
+
+        let mut corpus: Vec<String> = GRAPHQL_READ_DOCUMENTS
+            .iter()
+            .chain(GRAPHQL_REFUSED_DOCUMENTS)
+            .chain(GRAPHQL_TYPE_SYSTEM_DOCUMENTS)
+            .map(|document| (*document).to_string())
+            .collect();
+        corpus.push(r#"{ f(a: """\\"""X""") } mutation Write { addStar(input:{starrableId:"x"}) { clientMutationId } } # """ ) }"#.into());
+        for prefix in ["", "\u{feff}", "# mutation { ignored }\r\n"] {
+            for value in GRAPHQL_STRING_VALUES {
+                for operation in ["query Read", "mutation Write", "subscription Watch", ""] {
+                    for suffix in [
+                        "",
+                        " # mutation { ignored }\r\n",
+                        "\r\nquery Another { viewer { login } }",
+                        "\r\nmutation WriteAgain { addStar }",
+                        "\r\nsubscription WatchAgain { events }",
+                        "\r\nfragment Fields on Query { viewer { login } }",
+                        "\r\ntype Query { field: String }",
+                        "\r\n{ field(arg: \"\\q\") }",
+                    ] {
+                        corpus.push(format!(
+                            "{prefix}{operation} {{ field(arg: {value}) }}{suffix}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut admitted = 0;
+        let mut refused = 0;
+        for document in &corpus {
+            let args = os_args(&["api", "graphql", "-f", &format!("query={document}")]);
+            if !graphql_query_is_read_only(&args) {
+                refused += 1;
+                continue;
+            }
+            admitted += 1;
+            // Use a second implementation, not the admission summary, to check
+            // the actual document's full grammar and operation kinds.
+            let parsed = graphql_parser::parse_query::<String>(document)
+                .unwrap_or_else(|error| panic!("admitted invalid document {document:?}: {error}"));
+            let mut operations = 0;
+            for definition in parsed.definitions {
+                match definition {
+                    Definition::Operation(OperationDefinition::Query(_))
+                    | Definition::Operation(OperationDefinition::SelectionSet(_)) => {
+                        operations += 1
+                    }
+                    Definition::Fragment(_) => {}
+                    other => panic!("admitted non-query definition in {document:?}: {other:?}"),
+                }
+            }
+            assert!(
+                operations > 0,
+                "admitted fragment-only document: {document}"
+            );
+        }
+        assert!(admitted > 0 && refused > 0);
+        assert!(corpus.len() > 800, "generated corpus did not run");
+    }
+
+    #[test]
+    fn graphql_magic_query_placeholders_are_uninspectable() {
+        let manifest = fixture_manifest();
+        for placeholder in ["{owner}", "{repo}", "{branch}"] {
+            let query = format!("query={{ field(arg: \"{placeholder}\") }}");
+            for tail in [
+                vec!["-F".to_string(), query.clone()],
+                vec!["--field".to_string(), query.clone()],
+                vec![format!("--field={query}")],
+                vec![format!("-F{query}")],
+            ] {
+                let mut args = os_args(&["api", "graphql"]);
+                args.extend(tail.iter().map(OsString::from));
+                assert!(!graphql_query_is_read_only(&args), "{tail:?}");
+                assert!(matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Unclassified
+                ));
+            }
+            // Raw fields are literal: gh does not expand their placeholders.
+            assert!(graphql_query_is_read_only(&os_args(&[
+                "api", "graphql", "-f", &query
+            ])));
         }
     }
 
@@ -11572,7 +12201,7 @@ INHERITED FLAGS
             ),
             "verb \"issue create\" is not declared in manifest 13 (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
         );
-        // One-word verb: a raw API call decides on `api` alone.
+        // Raw API calls name the effective method and normalized endpoint.
         assert_eq!(
             unclassified_refusal_text(
                 &os_args(&[
@@ -11583,8 +12212,43 @@ INHERITED FLAGS
                 ]),
                 9
             ),
-            "verb \"api\" is not declared in manifest 9 (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
+            "api DELETE /repos/cortexkit/aft/actions/runs/123 is not declared in manifest 9 (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
         );
+    }
+
+    #[test]
+    fn unclassified_api_refusal_names_graphql_mutations_and_uninspectable_queries() {
+        for (tail, subject) in [
+            (
+                &["-f", "query=mutation { addStar }"][..],
+                "api graphql (mutation)",
+            ),
+            (
+                &[
+                    "--field=query=query Read { viewer { login } } mutation Write { addStar }",
+                    "-f",
+                    "operationName=Write",
+                ],
+                "api graphql (mutation)",
+            ),
+            (&["-F", "query=@-"], "api graphql (uninspectable query)"),
+            (
+                &["--input", "body.json"],
+                "api graphql (uninspectable query)",
+            ),
+            (
+                &["-f", "query=subscription { events }"],
+                "api graphql (uninspectable query)",
+            ),
+        ] {
+            let mut args = os_args(&["api", "graphql"]);
+            args.extend(os_args(tail));
+            let text = unclassified_refusal_text(&args, 17);
+            assert!(
+                text.starts_with(&format!("{subject} is not declared in manifest 17")),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -14331,6 +14995,11 @@ INHERITED FLAGS
 }
 
 #[cfg(test)]
+thread_local! {
+    static MANIFEST_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
 mod github_read_mutation_tests {
     //! These tests exercise PRIVATE gh_shim internals (GovernedRequest,
     //! GithubReadMutation) and can only compile beside them. They originally
@@ -14430,6 +15099,26 @@ mod github_read_mutation_tests {
             !cached_issue_exists(&conn, "cortexkit/aft", 42, "principal:bob"),
             "a successful comment invalidates every identity's cached issue"
         );
+    }
+
+    #[test]
+    fn stderr_state_confirmation_invalidates_the_changed_thread() {
+        let storage = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
+        write_cached_issue(&conn, "cortexkit/aft", 42, "principal:alice");
+        let request = github_read_mutation_request("issue close", "cortexkit/aft", 42);
+        let mutation = GithubReadMutation::from_governed_request(&request).unwrap();
+        invalidate_successful_github_read_mutation_at(
+            storage.path(),
+            Some(&mutation),
+            &RouteOutcome::ResultStderr("✓ Closed issue cortexkit/aft#42\n".into()),
+        );
+        assert!(!cached_issue_exists(
+            &conn,
+            "cortexkit/aft",
+            42,
+            "principal:alice"
+        ));
     }
 
     #[test]

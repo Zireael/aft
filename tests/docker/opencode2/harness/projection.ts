@@ -23,6 +23,60 @@ import { asRecord } from "./util.js";
 export const TRUNCATION_TRAILER_PATTERN =
   "^shown (?<shown>\\d+) of (?:≥)?(?<total>\\d+) (?<unit>[^ ]+) \\((?<reason>cap|depth|budget|walk)\\)(?: · narrow: (?<narrow>.+))?$";
 
+/**
+ * The kill-deadline line, in each wording the product emits
+ * (`kill_deadline_sentence` in crates/aft/src/commands/bash_orchestrate.rs and
+ * `taskKillDeadlineText` in packages/aft-bridge/src/bash-hints.ts):
+ *
+ * - default limit, primary session: `AFT kills this task at 2026-09-10
+ *   10:30:00Z, when it has run 30 minutes (its default background limit)
+ *   unless you pass a longer \`timeout\`; about 12 minutes remain.`
+ * - default limit, delegated worker: the same deadline and remaining-time
+ *   clauses, with `, but each wait you make on it moves that kill … to set
+ *   your own limit` before the remaining time.
+ * - caller timeout: `AFT kills this task at 2026-09-10 10:30:00Z, when it has
+ *   run 45s (the \`timeout\` you passed); about 12s remain.`
+ * - no deadline: `This task has no kill deadline.`
+ *
+ * A wording outside these fails to match and is reported as unparsed, so a
+ * change to the sentence is caught here rather than swallowed.
+ */
+export const KILL_DEADLINE_PATTERN =
+  "^(?:AFT kills this task at (?<at>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?Z), when it has run (?<limit>\\d+(?:\\.\\d+)?(?: minutes?|s)) \\((?<source>its default background limit|the `timeout` you passed)\\)(?<primary> unless you pass a longer `timeout`)?(?<worker>, but each wait you make on it moves that kill to at least the worker wait limit \\(`bash\\.worker_wait_max_ms`\\) after the wait, so it is not killed while you keep waiting; pass a `timeout` to set your own limit)?(?:; about (?<remaining>\\d+(?:\\.\\d+)?(?: minutes?|s)) remain|(?<expired>; the kill deadline has passed))\\.|(?<none>This task has no kill deadline\\.))$";
+
+/** The typed value of a kill-deadline line. */
+export interface KillDeadline {
+  /** The absolute UTC deadline. Absent only when no deadline exists. */
+  at?: string;
+  /** The limit as printed ("30 minutes", "45s"); absent when there is none. */
+  limit?: string;
+  /** The approximate time remaining, or "expired" if the time is past. */
+  remaining?: string;
+  source: "default" | "timeout" | "none";
+  /** Whether the line says a worker's waits move the default kill. */
+  worker_renewal: boolean;
+}
+
+function killDeadlineValue(groups: Record<string, string | undefined>): KillDeadline {
+  if (groups.none !== undefined) return { source: "none", worker_renewal: false };
+  const source = groups.source === "its default background limit" ? "default" : "timeout";
+  // The default-limit wording always names either the primary or the worker
+  // continuation; the caller-timeout wording names neither.
+  if (source === "default" && groups.primary === undefined && groups.worker === undefined) {
+    throw new Error("kill deadline names the default limit without its continuation");
+  }
+  if (source === "timeout" && (groups.primary !== undefined || groups.worker !== undefined)) {
+    throw new Error("kill deadline names a caller timeout with a default-limit continuation");
+  }
+  return {
+    at: groups.at,
+    limit: groups.limit,
+    remaining: groups.remaining ?? (groups.expired === undefined ? undefined : "expired"),
+    source,
+    worker_renewal: groups.worker !== undefined,
+  };
+}
+
 function convert(value: string, type: "boolean" | "number" | "string" | undefined): unknown {
   if (type === "number") {
     if (!/^-?(?:\d+|\d+\.\d+)$/.test(value))
@@ -42,9 +96,15 @@ function matchRule(
   lines: string[],
   index: number,
 ): { consumed: number; value?: unknown } | undefined {
-  const pattern = rule.kind === "trailer" ? TRUNCATION_TRAILER_PATTERN : rule.pattern;
-  const minLines = rule.kind === "trailer" ? 1 : (rule.min_lines ?? 1);
-  const maxLines = rule.kind === "trailer" ? 1 : (rule.max_lines ?? minLines);
+  const fixedLine = rule.kind === "trailer" || rule.kind === "kill_deadline";
+  const pattern =
+    rule.kind === "trailer"
+      ? TRUNCATION_TRAILER_PATTERN
+      : rule.kind === "kill_deadline"
+        ? KILL_DEADLINE_PATTERN
+        : rule.pattern;
+  const minLines = fixedLine ? 1 : (rule.min_lines ?? 1);
+  const maxLines = fixedLine ? 1 : (rule.max_lines ?? minLines);
   if (
     !Number.isInteger(minLines) ||
     !Number.isInteger(maxLines) ||
@@ -60,6 +120,14 @@ function matchRule(
     if (!match || match.index !== 0 || match[0].length !== match.input.length) continue;
     if (rule.kind === "ignore") return { consumed: count };
     const groups = match.groups ?? {};
+    if (rule.kind === "kill_deadline") {
+      const value = killDeadlineValue(groups);
+      if (rule.clock === "omit") {
+        delete value.at;
+        delete value.remaining;
+      }
+      return { consumed: count, value };
+    }
     const types: ProjectionTypeMap | undefined =
       rule.kind === "field" ? rule.types : { shown: "number", total: "number" };
     const projected = Object.fromEntries(
@@ -72,6 +140,13 @@ function matchRule(
     };
   }
   return undefined;
+}
+
+/** The field a projecting rule writes; `ignore` rules write none. */
+export function projectedField(rule: Exclude<ProjectionRule, { kind: "ignore" }>): string {
+  if (rule.kind === "trailer") return rule.field ?? "trailer";
+  if (rule.kind === "kill_deadline") return rule.field ?? "kill_deadline";
+  return rule.field;
 }
 
 export function projectText(
@@ -87,7 +162,7 @@ export function projectText(
       const match = matchRule(rule, lines, index);
       if (!match) continue;
       if (rule.kind !== "ignore") {
-        const field = rule.kind === "trailer" ? (rule.field ?? "trailer") : rule.field;
+        const field = projectedField(rule);
         if (Object.hasOwn(projected, field)) throw new Error(`projection field repeated: ${field}`);
         projected[field] = match.value;
       }

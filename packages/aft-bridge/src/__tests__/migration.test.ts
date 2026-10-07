@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  __migrationAsyncSpawnsForTests,
   ensureStorageMigrated,
   migrateAftConfigFile,
   resolveCortexKitStorageRoot,
@@ -70,6 +71,23 @@ describe("storage migration bootstrap", () => {
     await expect(
       ensureStorageMigrated({ harness: "opencode", binaryPath: aft }),
     ).resolves.toBeUndefined();
+  }, 30_000);
+
+  test("storage migration leaves the host event loop running", async () => {
+    mkdirSync(resolveLegacyStorageRoot("opencode"), { recursive: true });
+    const aft = binary({ sleepMs: 150, exitCode: 0 });
+    let turns = 0;
+    const before = __migrationAsyncSpawnsForTests();
+    const timer = setInterval(() => {
+      turns += 1;
+    }, 5);
+    try {
+      await ensureStorageMigrated({ harness: "opencode", binaryPath: aft });
+      expect(turns).toBeGreaterThan(0);
+      expect(__migrationAsyncSpawnsForTests() - before).toBe(1);
+    } finally {
+      clearInterval(timer);
+    }
   }, 30_000);
 
   test("ensureStorageMigrated_throws_on_nonzero_exit", async () => {

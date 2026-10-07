@@ -73,6 +73,31 @@ pub(crate) fn process_env_lock() -> ProcessEnvLockGuard {
     ProcessEnvLockGuard
 }
 
+pub(crate) struct StorageOverrideGuard {
+    previous: Option<OsString>,
+    _lock: ProcessEnvLockGuard,
+}
+impl Drop for StorageOverrideGuard {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous {
+            std::env::set_var("AFT_STORAGE_DIR", value);
+        } else {
+            std::env::remove_var("AFT_STORAGE_DIR");
+        }
+    }
+}
+/// Fixtures with explicit temporary namespaces must not inherit a worker's
+/// process-wide override when testing their configured-path behavior.
+pub(crate) fn without_storage_override() -> StorageOverrideGuard {
+    let lock = process_env_lock();
+    let previous = std::env::var_os("AFT_STORAGE_DIR");
+    std::env::remove_var("AFT_STORAGE_DIR");
+    StorageOverrideGuard {
+        previous,
+        _lock: lock,
+    }
+}
+
 struct ScopedEnvVar {
     key: &'static str,
     previous: Option<OsString>,
@@ -96,17 +121,33 @@ impl Drop for ScopedEnvVar {
     }
 }
 
-#[cfg(windows)]
-const HERMETIC_GIT_CONFIG_PATH: &str = "NUL";
-#[cfg(not(windows))]
-const HERMETIC_GIT_CONFIG_PATH: &str = "/dev/null";
+/// An empty git config file. Git for Windows refuses the `NUL` device as a
+/// config path ("unable to access 'NUL': Invalid argument"), so Windows uses
+/// a real empty file; elsewhere `/dev/null` reads as empty.
+fn hermetic_git_config_path() -> &'static OsStr {
+    #[cfg(windows)]
+    {
+        static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| {
+            let path = std::env::temp_dir()
+                .join(format!("aft-test-empty-gitconfig-{}", std::process::id()));
+            std::fs::write(&path, b"").expect("write empty hermetic git config");
+            path
+        })
+        .as_os_str()
+    }
+    #[cfg(not(windows))]
+    {
+        OsStr::new("/dev/null")
+    }
+}
 
 /// Test-only git env overrides that suppress user/system config reads.
 #[allow(dead_code)]
 pub(crate) fn hermetic_git_env() -> [(&'static str, &'static OsStr); 2] {
     [
-        ("GIT_CONFIG_GLOBAL", OsStr::new(HERMETIC_GIT_CONFIG_PATH)),
-        ("GIT_CONFIG_SYSTEM", OsStr::new(HERMETIC_GIT_CONFIG_PATH)),
+        ("GIT_CONFIG_GLOBAL", hermetic_git_config_path()),
+        ("GIT_CONFIG_SYSTEM", hermetic_git_config_path()),
     ]
 }
 

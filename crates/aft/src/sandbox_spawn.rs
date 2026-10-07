@@ -53,19 +53,21 @@ use std::time::{Duration, Instant};
 use portable_pty::CommandBuilder;
 
 use crate::context::AppContext;
+#[cfg(unix)]
+use crate::sandbox_profile::SandboxDataPolicy;
 use crate::sandbox_profile::SandboxProfile;
 
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
 
 /// Server-authenticated trust classification for a route bind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PrincipalTrust {
     FirstParty,
     Untrusted,
 }
 
 /// Principal data supplied by the server-side transport, never by a bash body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AuthenticatedPrincipal {
     /// Standalone NDJSON and first-party plugin bindings have no route identity.
     FirstParty,
@@ -276,6 +278,162 @@ pub enum SpawnPlan {
         message: String,
         mismatch_class: Option<&'static str>,
     },
+}
+
+#[cfg(unix)]
+#[derive(serde::Serialize, serde::Deserialize)]
+enum SavedSpawnPolicy {
+    Unsandboxed,
+    Host {
+        shell_path: PathBuf,
+    },
+    Launcher {
+        profile: SandboxProfile,
+        launcher_path: PathBuf,
+    },
+}
+
+/// Private recovery data, never serialized into agent-readable task metadata.
+/// The environment is exactly the one already in the verified private payload;
+/// memory-only shim tickets and daemon credentials are not added to it.
+#[cfg(unix)]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedLocalLaunch {
+    policy: SavedSpawnPolicy,
+    root: PathBuf,
+    cwd: PathBuf,
+    principal: AuthenticatedPrincipal,
+    shell_path: PathBuf,
+    environment: Vec<(OsString, OsString)>,
+    command: Vec<u8>,
+    payload_digest: [u8; 32],
+    linux_scope: bool,
+}
+
+#[cfg(unix)]
+pub(crate) const REMOTE_LOCAL_LAUNCH: &str = "remote-local-launch";
+
+#[cfg(unix)]
+pub(crate) fn save_local_launch(
+    plan: &SpawnPlan,
+    root: &Path,
+    cwd: &Path,
+    principal: &AuthenticatedPrincipal,
+    shell: &Path,
+    linux_scope: bool,
+) -> Result<String, String> {
+    let prepared = plan
+        .prepared_task()
+        .ok_or("local fallback payload absent")?;
+    let policy = match plan.policy() {
+        SpawnPlan::Unsandboxed => SavedSpawnPolicy::Unsandboxed,
+        SpawnPlan::Host { shell_path, .. } => SavedSpawnPolicy::Host {
+            shell_path: shell_path.clone(),
+        },
+        SpawnPlan::Launcher {
+            profile,
+            launcher_path,
+        } => SavedSpawnPolicy::Launcher {
+            profile: profile.clone(),
+            launcher_path: launcher_path.clone(),
+        },
+        _ => return Err("refused local launch cannot be saved".into()),
+    };
+    let snapshot = SavedLocalLaunch {
+        policy,
+        root: root.into(),
+        cwd: cwd.into(),
+        principal: principal.clone(),
+        shell_path: plan.host_shell_path().unwrap_or(shell).into(),
+        environment: prepared
+            .environment()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        command: prepared.0.command_bytes.as_ref().clone(),
+        payload_digest: *prepared.0.digest.as_bytes(),
+        linux_scope,
+    };
+    let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
+    let mut file = crate::bash_background::persistence::create_control_file(
+        &prepared.0.dirs,
+        REMOTE_LOCAL_LAUNCH,
+        &bytes,
+    )
+    .map_err(|e| e.to_string())?;
+    use std::io::Write;
+    file.flush().map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(prepared.0.paths.task_id.as_bytes());
+    hash.update(&bytes);
+    Ok(hash.finalize().to_hex().to_string())
+}
+
+/// Reopen the frozen launch policy and verify the original payload. A missing
+/// or changed snapshot refuses recovery; current configuration is never used.
+#[cfg(unix)]
+pub(crate) fn restore_local_launch(
+    task: &crate::bash_background::persistence::ResolvedTask,
+    expected: &str,
+) -> Result<(SpawnPlan, PathBuf, HashMap<String, String>, bool), String> {
+    let mut file =
+        crate::bash_background::persistence::open_control_file(task, REMOTE_LOCAL_LAUNCH)
+            .map_err(|e| e.to_string())?;
+    let bytes = read_held_payload(&mut file)?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(task.paths.task_id.as_bytes());
+    hash.update(&bytes);
+    if hash.finalize().to_hex().as_str() != expected {
+        return Err("local fallback snapshot digest mismatch".into());
+    }
+    let snapshot: SavedLocalLaunch = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let environment: ChildEnvironment = snapshot.environment.into_iter().collect();
+    let plan = match snapshot.policy {
+        SavedSpawnPolicy::Unsandboxed => SpawnPlan::Unsandboxed,
+        SavedSpawnPolicy::Host { shell_path } => SpawnPlan::Host {
+            shell_path,
+            environment: environment.clone(),
+        },
+        SavedSpawnPolicy::Launcher {
+            profile,
+            launcher_path,
+        } => SpawnPlan::Launcher {
+            profile,
+            launcher_path,
+        },
+    };
+    let prepared = verify_payload(
+        crate::bash_background::persistence::ResolvedTask {
+            paths: task.paths.clone(),
+            dirs: task.dirs.clone(),
+        },
+        &snapshot.command,
+        &snapshot.root,
+        &snapshot.cwd,
+        &snapshot.principal,
+        &snapshot.shell_path,
+        &environment,
+        Some(blake3::Hash::from_bytes(snapshot.payload_digest)),
+        false,
+    )?;
+    let env = environment
+        .into_iter()
+        .map(|(k, v)| {
+            Ok((
+                k.into_string()
+                    .map_err(|_| "non-Unicode fallback environment key")?,
+                v.into_string()
+                    .map_err(|_| "non-Unicode fallback environment value")?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+    Ok((
+        plan.with_prepared_task(prepared),
+        snapshot.shell_path,
+        env,
+        snapshot.linux_scope,
+    ))
 }
 
 impl SpawnPlan {
@@ -1007,8 +1165,8 @@ pub(crate) fn unsupported_platform_sandbox_refusal(ctx: &AppContext) -> Option<S
 /// Resolve policy for an agent-command process.
 ///
 /// `task_bundle_dir` must be the already-created directory that owns the task's
-/// capture files. The native builder creates a fresh private temp directory
-/// beneath it and includes both directories in the profile.
+/// capture files. The native builder grants a fresh private temp directory
+/// beneath it; capture files themselves use pre-opened descriptors.
 pub fn resolve_sandbox_spawn(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
@@ -1243,7 +1401,6 @@ fn build_native_profile(
     let temp_dir = create_task_temp_dir(&task_io_dir)?;
     let result = (|| {
         let mut writable_roots = project_roots.clone();
-        writable_roots.push(task_io_dir.clone());
         writable_roots.extend(
             ctx.config()
                 .sandbox
@@ -1252,7 +1409,7 @@ fn build_native_profile(
                 .map(|path| expand_home(path, &home)),
         );
 
-        let secret_floor = vec![
+        let mut secret_floor = vec![
             home.join(".ssh"),
             home.join(".aws"),
             home.join(".gnupg"),
@@ -1260,11 +1417,27 @@ fn build_native_profile(
             home.join(".azure"),
             home.join(".config/cortexkit"),
         ];
+        // The resolver retains the trusted user-tier subc setting here even
+        // when semantic search is disabled. Match the bridge's HOME-relative
+        // expansion, not the command's cwd. Deny missing files too.
+        if let Some(path) = &ctx.config().semantic.subc_connection_file {
+            let path = expand_home(path, &home);
+            secret_floor.push(if path.is_absolute() {
+                path
+            } else {
+                home.join(path)
+            });
+        }
+        if let Some(path) = crate::environment::non_empty_os_var("SUBC_CONNECTION_FILE") {
+            secret_floor.push(PathBuf::from(path));
+        }
+        if let Some(path) = crate::environment::non_empty_os_var("XDG_RUNTIME_DIR") {
+            secret_floor.push(PathBuf::from(path).join("subc-connection.json"));
+        }
+        secret_floor.push(home.join(".local/share/cortexkit/run/subc-connection.json"));
         // The credential floor denies both read and write. Linux rejects any
         // writable overlap because Landlock cannot subtract write rights.
-        let write_deny = secret_floor.clone();
-        #[cfg(target_os = "macos")]
-        let mut write_deny = write_deny;
+        let mut write_deny = secret_floor.clone();
         let mut write_deny_nested = Vec::new();
         let mut read_deny = secret_floor;
         for (root, git_policy) in project_roots.iter().zip(&git_policies) {
@@ -1288,6 +1461,45 @@ fn build_native_profile(
                 .iter()
                 .map(|path| expand_home(path, &home)),
         );
+
+        let storage = ctx.storage_dir();
+        let mut data_deny = vec![
+            home.join(".local/share/cortexkit"),
+            home.join(".local/state/cortexkit"),
+            storage.clone(),
+            session_store.clone(),
+        ];
+        for variable in ["XDG_DATA_HOME", "XDG_STATE_HOME"] {
+            if let Some(path) = crate::environment::non_empty_os_var(variable) {
+                let path = PathBuf::from(path);
+                if path.is_absolute() {
+                    data_deny.push(path.join("cortexkit"));
+                }
+            }
+        }
+        let mut data_read_allow = project_roots.clone();
+        data_read_allow.push(temp_dir.clone());
+        // Native launches disable path-based pipeline-status capture. stdout,
+        // stderr and markers use pre-opened descriptors, so only the private
+        // TMPDIR needs path access, not the containing io or session directory.
+        let mut data_write_allow = project_roots.clone();
+        data_write_allow.push(temp_dir.clone());
+        let mut managed_paths = Vec::new();
+        if ctx.config().github.shim {
+            managed_paths.push(storage.join(crate::agent_child_env::SHIMS_DIR_NAME));
+            managed_paths.push(crate::agent_child_env::shim_binary(&ctx.config())?);
+        }
+        if ctx.config().git.co_author != "off" {
+            managed_paths.push(crate::agent_child_env::managed_git_hooks_dir(&storage));
+            if ctx.config().git.co_author == "auto" {
+                managed_paths.push(crate::agent_child_env::shim_binary(&ctx.config())?);
+            }
+        }
+        // Governance injection materializes these before resolving a spawn.
+        // Do not grant a missing shim directory or a broad binary parent.
+        managed_paths.retain(|path| path.exists());
+        write_deny.extend(managed_paths.iter().cloned());
+        data_read_allow.extend(managed_paths);
 
         let mut cache_roots = vec![
             home.join(".cargo/registry"),
@@ -1327,13 +1539,14 @@ fn build_native_profile(
             temp_dir.clone(),
         )
         .map_err(|error| error.to_string())?;
-        // Seatbelt starts from allow-all reads, so it must deny the complete
-        // store. Landlock instead omits the store while splitting read grants,
-        // then adds only the prepared task's exact payload files.
-        #[cfg(target_os = "macos")]
-        if !profile.read_deny.contains(&session_store) {
-            profile.read_deny.push(session_store.clone());
-        }
+        profile.data_policy = SandboxDataPolicy {
+            deny: data_deny,
+            read_allow: data_read_allow,
+            write_allow: data_write_allow,
+        };
+        profile = profile
+            .canonicalize_for_launch()
+            .map_err(|error| error.to_string())?;
         refuse_store_overlap(&profile, &session_store, &task_io_dir)?;
 
         #[cfg(target_os = "linux")]
@@ -1342,12 +1555,7 @@ fn build_native_profile(
                 .iter()
                 .flat_map(|policy| policy.read_roots.iter().cloned())
                 .collect::<Vec<_>>();
-            profile.read_allow = build_linux_read_allow(
-                &profile,
-                &home,
-                &git_read_roots,
-                std::slice::from_ref(&session_store),
-            )?;
+            profile = build_linux_profile(profile, &home, &git_read_roots)?;
             profile = profile
                 .canonicalize_for_launch()
                 .map_err(|error| error.to_string())?;
@@ -1719,15 +1927,11 @@ trait ReadDirectoryLister {
 }
 
 #[cfg(target_os = "linux")]
-fn build_linux_read_allow(
-    profile: &SandboxProfile,
+fn build_linux_profile(
+    profile: SandboxProfile,
     home: &Path,
     git_read_roots: &[PathBuf],
-    omitted_roots: &[PathBuf],
-) -> Result<Vec<PathBuf>, String> {
-    let mandatory_floor = &profile.write_deny;
-    validate_mandatory_floor_overlap(profile.write_allow_roots(), mandatory_floor)?;
-
+) -> Result<SandboxProfile, String> {
     let mut intended = Vec::new();
     for path in [
         "/usr",
@@ -1772,6 +1976,37 @@ fn build_linux_read_allow(
         });
     }
 
+    compute_linux_profile(
+        profile,
+        home,
+        git_read_roots,
+        &intended,
+        &mut SecureReadDirectoryLister,
+    )
+}
+
+/// Compute the exact launcher policy from canonical paths and an injected
+/// directory inventory. Only the wrapper above discovers host filesystem paths;
+/// this policy calculation also runs in tests on hosts without Landlock.
+#[cfg(any(test, target_os = "linux"))]
+fn compute_linux_profile(
+    mut profile: SandboxProfile,
+    home: &Path,
+    git_read_roots: &[PathBuf],
+    base_read_grants: &[IntendedReadGrant],
+    lister: &mut impl ReadDirectoryLister,
+) -> Result<SandboxProfile, String> {
+    validate_mandatory_floor_overlap(profile.write_allow_roots(), &profile.write_deny)?;
+    profile
+        .data_policy
+        .validate_grants(
+            profile.write_allow_roots(),
+            &profile.data_policy.write_allow,
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut intended = base_read_grants.to_vec();
+
     intended.push(IntendedReadGrant {
         path: home.to_path_buf(),
         force_children: true,
@@ -1801,11 +2036,37 @@ fn build_linux_read_allow(
     let split_denies = profile
         .read_deny
         .iter()
-        .chain(omitted_roots)
+        .chain(&profile.data_policy.deny)
         .cloned()
         .collect::<Vec<_>>();
-    let mut lister = SecureReadDirectoryLister;
-    split_read_grants(&intended, &split_denies, &mut lister)
+    let mut grants = split_read_grants(&intended, &split_denies, lister)?;
+    // Reintroduce only explicit private-tree exceptions, still split around
+    // ordinary denies (including the connection file and repository hooks).
+    // A nested repository-hooks deny means reads are granted per existing
+    // project child. Files newly created at the project root after this launch
+    // cannot be read within the same sandboxed command; writes remain allowed.
+    let exceptions = profile
+        .data_policy
+        .read_allow
+        .iter()
+        .map(|path| IntendedReadGrant {
+            path: path.clone(),
+            force_children: false,
+            mandatory: false,
+        })
+        .collect::<Vec<_>>();
+    grants.extend(split_read_grants(&exceptions, &profile.read_deny, lister)?);
+    grants.sort_unstable();
+    grants.dedup();
+    profile
+        .data_policy
+        .validate_grants(
+            grants.iter().map(PathBuf::as_path),
+            &profile.data_policy.read_allow,
+        )
+        .map_err(|error| error.to_string())?;
+    profile.read_allow = grants;
+    Ok(profile)
 }
 
 #[cfg(target_os = "linux")]
@@ -1831,12 +2092,24 @@ fn add_linux_payload_read_grants(
         .collect::<Result<Vec<_>, String>>()?;
     let mut lister = SecureReadDirectoryLister;
     let payload_grants = split_read_grants(&intended, &profile.read_deny, &mut lister)?;
+    // Payload files are exact, daemon-verified objects, not directory grants.
+    profile
+        .data_policy
+        .read_allow
+        .extend(payload_grants.iter().cloned());
 
     let mut final_read_allow = profile.read_allow.clone();
     final_read_allow.extend(payload_grants);
     final_read_allow.sort_unstable();
     final_read_allow.dedup();
     validate_final_read_rules(&final_read_allow, &profile.read_deny)?;
+    profile
+        .data_policy
+        .validate_grants(
+            final_read_allow.iter().map(PathBuf::as_path),
+            &profile.data_policy.read_allow,
+        )
+        .map_err(|error| error.to_string())?;
     assert!(
         validate_final_read_rules(&final_read_allow, &profile.read_deny).is_ok(),
         "final Landlock read grants overlap a denied path after adding payload files"
@@ -1913,7 +2186,11 @@ fn split_read_grant(
         )
     })?;
     for child in children {
-        let child_contains_deny = denies.iter().any(|deny| deny.starts_with(&child.path));
+        // An exact denied file is simply omitted by the recursive call. Only a
+        // strict descendant deny would require traversing this child as a directory.
+        let child_contains_deny = denies
+            .iter()
+            .any(|deny| deny != &child.path && deny.starts_with(&child.path));
         if child_contains_deny && !child.is_dir {
             return Err(format!(
                 "sandbox_unavailable: deny chain crosses non-directory path {}",
@@ -2411,15 +2688,12 @@ pub(crate) fn with_spawn_plan_for_test<R>(plan: SpawnPlan, run: impl FnOnce() ->
 pub(crate) const CHILD_EXIT_FD: RawFd = 3;
 #[cfg(unix)]
 pub(crate) const CHILD_FAILURE_FD: RawFd = 4;
-#[cfg(unix)]
-pub(crate) const CHILD_PIPE_STATUS_FD: RawFd = 5;
 
 #[cfg(unix)]
 pub(crate) fn apply_marker_fd_allowlist(
     command: &mut Command,
     exit_fd: RawFd,
     failure_fd: RawFd,
-    pipeline_status_fd: Option<RawFd>,
 ) -> Result<(RawFd, RawFd), String> {
     use std::os::unix::process::CommandExt;
 
@@ -2441,38 +2715,17 @@ pub(crate) fn apply_marker_fd_allowlist(
                 libc::close(exit_copy);
                 return Err(error);
             }
-            let status_copy =
-                pipeline_status_fd.map(|fd| libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 6));
-            if status_copy.is_some_and(|fd| fd < 0) {
-                let error = std::io::Error::last_os_error();
-                libc::close(exit_copy);
-                libc::close(failure_copy);
-                return Err(error);
-            }
-            let status_copy = status_copy.unwrap_or(-1);
             if libc::dup2(exit_copy, CHILD_EXIT_FD) < 0
                 || libc::dup2(failure_copy, CHILD_FAILURE_FD) < 0
-                || (status_copy >= 0 && libc::dup2(status_copy, CHILD_PIPE_STATUS_FD) < 0)
             {
                 let error = std::io::Error::last_os_error();
                 libc::close(exit_copy);
                 libc::close(failure_copy);
-                if status_copy >= 0 {
-                    libc::close(status_copy);
-                }
                 return Err(error);
             }
             libc::close(exit_copy);
             libc::close(failure_copy);
-            if status_copy >= 0 {
-                libc::close(status_copy);
-            }
-            let first_dynamic_fd = if pipeline_status_fd.is_some() {
-                CHILD_PIPE_STATUS_FD + 1
-            } else {
-                CHILD_PIPE_STATUS_FD
-            };
-            for fd in first_dynamic_fd..fd_limit {
+            for fd in (CHILD_FAILURE_FD + 1)..fd_limit {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags >= 0 {
                     libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
@@ -2727,6 +2980,26 @@ fn command_argv_for_plan(
         #[cfg(unix)]
         SpawnPlan::Prepared { .. } => unreachable!("policy() unwraps prepared plans"),
     }
+}
+
+/// Auxiliary read-only CLI lookups inherit the command's exact launch policy,
+/// rather than resolving a new principal or silently falling back to the host.
+#[cfg(unix)]
+pub(crate) fn probe_command_for_plan(
+    plan: &SpawnPlan,
+    program: &OsStr,
+    args: &[OsString],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> Result<Command, String> {
+    let (program, args, _profile_handle) =
+        command_argv_for_plan(plan, program, args, Path::new(""), None)?;
+    let mut command = crate::effective_path::new_command(program);
+    command.args(args).current_dir(cwd);
+    crate::agent_child_env::apply_to_command(&mut command, env);
+    apply_sandbox_environment(plan, &mut command, env);
+    crate::bash_background::process::start_new_session(&mut command);
+    Ok(command)
 }
 
 #[cfg(unix)]
@@ -3130,13 +3403,8 @@ mod policy_tests {
                     )
                     .unwrap();
                     let mut command = Command::new("/usr/bin/true");
-                    apply_marker_fd_allowlist(
-                        &mut command,
-                        exit.as_raw_fd(),
-                        failure.as_raw_fd(),
-                        None,
-                    )
-                    .unwrap();
+                    apply_marker_fd_allowlist(&mut command, exit.as_raw_fd(), failure.as_raw_fd())
+                        .unwrap();
                     let status = command
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
@@ -3220,6 +3488,13 @@ mod policy_tests {
         std::fs::write(&file, "sandboxed\n").unwrap();
         let ctx = context(project.path().to_path_buf());
         ctx.update_config(|config| config.experimental_bash_rewrite = true);
+        // Capture files belong to the private task store, not the project. Using
+        // the project as task IO would also deny project access on Landlock.
+        let task = crate::bash_background::persistence::allocate_task_layout(
+            &ctx.storage_dir(),
+            "sandbox-predicate-test",
+        )
+        .unwrap();
         let principal = AuthenticatedPrincipal::FirstParty;
         let command = format!("cat {}", file.display());
 
@@ -3230,10 +3505,13 @@ mod policy_tests {
             &principal,
             RequestedSandboxTier::Native,
             SandboxTaskKind::BashForeground,
-            project.path(),
+            &task.paths.io_dir,
             None,
         );
-        assert!(matches!(&sandboxed, SpawnPlan::Launcher { .. }));
+        assert!(
+            matches!(&sandboxed, SpawnPlan::Launcher { .. }),
+            "native sandbox must use the launcher: {sandboxed:?}"
+        );
         sandboxed.cleanup_unspawned();
 
         ctx.update_config(|config| config.sandbox.enabled = false);
@@ -3245,7 +3523,7 @@ mod policy_tests {
                 &principal,
                 RequestedSandboxTier::Native,
                 SandboxTaskKind::BashForeground,
-                project.path(),
+                &task.paths.io_dir,
                 None,
             ),
             SpawnPlan::Unsandboxed
@@ -3953,7 +4231,8 @@ mod read_allow_tests {
     impl ReadDirectoryLister for FakeLister {
         fn children(&mut self, parent: &Path) -> Result<Vec<ListedReadChild>, String> {
             self.entries
-                .remove(parent)
+                .get(parent)
+                .cloned()
                 .unwrap_or_else(|| Err(format!("unexpected enumeration of {}", parent.display())))
         }
     }
@@ -3964,6 +4243,313 @@ mod read_allow_tests {
             force_children,
             mandatory,
         }
+    }
+
+    /// Canonical directory inventory independent of the host filesystem. The
+    /// connection is a regular file outside CortexKit data, just as in the
+    /// production spawn fixture. Private subtrees are intentionally absent from
+    /// the inventory: policy may grant exact exceptions, never enumerate them.
+    fn linux_profile_model() -> (SandboxProfile, FakeLister, Vec<IntendedReadGrant>) {
+        let data = "/home/alice/.local/share/cortexkit";
+        let storage = format!("{data}/aft");
+        let project = format!("{data}/alfonso/worktrees/own");
+        let session = format!("{storage}/opencode/bash-tasks/current");
+        let temp = format!("{session}/bash-own/io/aft-sandbox-own");
+        let shims = format!("{storage}/shims");
+        let hooks = format!("{storage}/cache/git-hooks/current");
+        let binary = format!("{data}/bin/ck-aft");
+        let connection = PathBuf::from("/home/alice/daemon/connection.json");
+        let profile = SandboxProfile {
+            v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
+            data_policy: crate::sandbox_profile::SandboxDataPolicy {
+                deny: vec![
+                    data.into(),
+                    "/home/alice/.local/state/cortexkit".into(),
+                    storage.into(),
+                    session.into(),
+                ],
+                read_allow: vec![
+                    project.clone().into(),
+                    temp.clone().into(),
+                    shims.clone().into(),
+                    hooks.clone().into(),
+                    binary.clone().into(),
+                ],
+                write_allow: vec![project.clone().into(), temp.clone().into()],
+            },
+            writable_roots: vec![project.into()],
+            write_deny: vec![
+                connection.clone(),
+                "/home/alice/.ssh".into(),
+                shims.into(),
+                hooks.into(),
+                binary.into(),
+            ],
+            write_deny_nested: Vec::new(),
+            read_allow: Vec::new(),
+            read_deny: vec![
+                connection,
+                "/home/alice/.ssh".into(),
+                "/run/user".into(),
+                "/run/credentials".into(),
+                "/run/secrets".into(),
+            ],
+            socket_deny: Vec::new(),
+            cache_roots: vec!["/home/alice/.npm".into()],
+            temp_dir: temp.into(),
+        };
+        let inventory = FakeLister::default()
+            .directory(
+                "/home/alice",
+                &[
+                    (".ssh", true),
+                    (".local", true),
+                    ("daemon", true),
+                    ("notes", false),
+                    (".npm", true),
+                ],
+            )
+            .directory(
+                "/home/alice/daemon",
+                &[("connection.json", false), ("readme", false)],
+            )
+            .directory("/home/alice/.local", &[("share", true), ("state", true)])
+            .directory(
+                "/home/alice/.local/share",
+                &[("cortexkit", true), ("other-program", true)],
+            )
+            .directory(
+                "/home/alice/.local/state",
+                &[("cortexkit", true), ("other-state", true)],
+            )
+            .directory(
+                "/run",
+                &[
+                    ("user", true),
+                    ("credentials", true),
+                    ("secrets", true),
+                    ("lock", true),
+                ],
+            );
+        (
+            profile,
+            inventory,
+            vec![grant("/usr", false, true), grant("/run", false, true)],
+        )
+    }
+
+    #[test]
+    fn linux_profile_private_tree_carve_outs_are_exact() {
+        let (profile, mut inventory, base) = linux_profile_model();
+        let profile = compute_linux_profile(
+            profile,
+            Path::new("/home/alice"),
+            &[],
+            &base,
+            &mut inventory,
+        )
+        .expect("a worktree inside private data must produce a usable Linux profile");
+        let mut expected = [
+            "/usr", "/run/lock", "/home/alice/.npm", "/home/alice/notes", "/home/alice/daemon/readme",
+            "/home/alice/.local/share/other-program", "/home/alice/.local/state/other-state",
+            "/home/alice/.local/share/cortexkit/alfonso/worktrees/own",
+            "/home/alice/.local/share/cortexkit/aft/opencode/bash-tasks/current/bash-own/io/aft-sandbox-own",
+            "/home/alice/.local/share/cortexkit/aft/shims",
+            "/home/alice/.local/share/cortexkit/aft/cache/git-hooks/current",
+            "/home/alice/.local/share/cortexkit/bin/ck-aft",
+        ].map(PathBuf::from).to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            profile.read_allow, expected,
+            "read/execute rules must be exact"
+        );
+        let writes = profile.write_allow_roots();
+        assert_eq!(writes, vec![
+            Path::new("/home/alice/.local/share/cortexkit/aft/opencode/bash-tasks/current/bash-own/io/aft-sandbox-own"),
+            Path::new("/home/alice/.local/share/cortexkit/alfonso/worktrees/own"),
+            Path::new("/home/alice/.npm"),
+        ]);
+        for deny in &profile.data_policy.deny {
+            assert!(
+                !profile
+                    .read_allow
+                    .iter()
+                    .any(|grant| deny.starts_with(grant)),
+                "a read grant covers private tree {}",
+                deny.display()
+            );
+            assert!(
+                !writes.iter().any(|grant| deny.starts_with(grant)),
+                "a write grant covers private tree {}",
+                deny.display()
+            );
+        }
+        // These victim paths are deliberately outside every exact exception.
+        for victim in [
+            "/home/alice/daemon/connection.json",
+            "/home/alice/.local/share/cortexkit/other-module/store",
+            "/home/alice/.local/share/cortexkit/aft/undo/history",
+            "/home/alice/.local/share/cortexkit/alfonso/worktrees/other/file",
+            "/home/alice/.local/share/cortexkit/aft/opencode/bash-tasks/other/io/stdout",
+            "/home/alice/.local/state/cortexkit/gh-shim/manifest.json",
+        ] {
+            assert!(
+                !profile
+                    .read_allow
+                    .iter()
+                    .any(|grant| Path::new(victim).starts_with(grant)),
+                "readable victim: {victim}"
+            );
+            assert!(
+                !writes
+                    .iter()
+                    .any(|grant| Path::new(victim).starts_with(grant)),
+                "writable victim: {victim}"
+            );
+        }
+        for managed in [
+            "/home/alice/.local/share/cortexkit/aft/shims",
+            "/home/alice/.local/share/cortexkit/aft/cache/git-hooks/current",
+            "/home/alice/.local/share/cortexkit/bin/ck-aft",
+        ] {
+            assert!(
+                profile.read_allow.contains(&PathBuf::from(managed)),
+                "missing managed read/execute grant: {managed}"
+            );
+            assert!(
+                !writes
+                    .iter()
+                    .any(|grant| paths_overlap(grant, Path::new(managed))),
+                "managed executable writable: {managed}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_profile_repository_hooks_preserve_existing_child_reads() {
+        let (mut profile, mut inventory, base) = linux_profile_model();
+        let project = "/home/alice/.local/share/cortexkit/alfonso/worktrees/own";
+        let git = format!("{project}/.git");
+        profile.read_deny.push(format!("{git}/hooks").into());
+        inventory = inventory
+            .directory(
+                project,
+                &[("tracked", false), ("src", true), (".git", true)],
+            )
+            .directory(
+                &git,
+                &[
+                    ("hooks", true),
+                    ("objects", true),
+                    ("refs", true),
+                    ("index", false),
+                ],
+            );
+        let profile = compute_linux_profile(
+            profile,
+            Path::new("/home/alice"),
+            &[git.into()],
+            &base,
+            &mut inventory,
+        )
+        .expect("nested hooks must not make the entire project unavailable");
+        assert!(profile.write_allow_roots().contains(&Path::new(project)));
+        for readable in ["tracked", "src", ".git/objects", ".git/refs", ".git/index"] {
+            assert!(
+                profile
+                    .read_allow
+                    .contains(&Path::new(project).join(readable)),
+                "missing project child: {readable}"
+            );
+        }
+        for denied in [".git/hooks/pre-commit", "new-at-project-root"] {
+            let denied = Path::new(project).join(denied);
+            assert!(
+                !profile
+                    .read_allow
+                    .iter()
+                    .any(|grant| denied.starts_with(grant)),
+                "unexpected readable path: {}",
+                denied.display()
+            );
+        }
+    }
+
+    #[test]
+    fn linux_profile_broad_base_read_grant_is_split_around_private_data() {
+        let (profile, mut inventory, mut base) = linux_profile_model();
+        // Even another source of read access to the parent must be split, not
+        // emitted wholesale alongside the precise private-tree exceptions.
+        base.push(grant("/home/alice/.local/share", false, true));
+        let profile = compute_linux_profile(
+            profile,
+            Path::new("/home/alice"),
+            &[],
+            &base,
+            &mut inventory,
+        )
+        .expect("a broad base read grant can be split without refusing the worktree");
+        assert!(profile.read_allow.contains(&PathBuf::from(
+            "/home/alice/.local/share/cortexkit/alfonso/worktrees/own"
+        )));
+        assert!(profile
+            .read_allow
+            .contains(&PathBuf::from("/home/alice/.local/share/other-program")));
+        assert!(!profile
+            .read_allow
+            .iter()
+            .any(|grant| Path::new("/home/alice/.local/share/cortexkit").starts_with(grant)));
+    }
+
+    #[test]
+    fn linux_profile_connection_file_inside_project_still_refuses() {
+        let (mut profile, mut inventory, base) = linux_profile_model();
+        let connection = profile.writable_roots[0].join("connection.json");
+        profile.read_deny.push(connection.clone());
+        profile.write_deny.push(connection);
+        let error = compute_linux_profile(
+            profile,
+            Path::new("/home/alice"),
+            &[],
+            &base,
+            &mut inventory,
+        )
+        .expect_err("private-tree exceptions must not override credential denies");
+        assert!(error.contains("overlaps mandatory secret floor"), "{error}");
+    }
+
+    #[test]
+    fn denied_connection_file_is_omitted_without_refusing_readable_siblings() {
+        let mut lister = FakeLister::default().directory(
+            "/home/alice/daemon",
+            &[("connection.json", false), ("ordinary.txt", false)],
+        );
+        let emitted = split_read_grants(
+            &[grant("/home/alice/daemon", false, false)],
+            &[PathBuf::from("/home/alice/daemon/connection.json")],
+            &mut lister,
+        )
+        .expect("an exact denied file must be omitted, not treated as a directory");
+        assert_eq!(
+            emitted,
+            vec![PathBuf::from("/home/alice/daemon/ordinary.txt")]
+        );
+    }
+
+    #[test]
+    fn deny_chain_crossing_regular_file_still_refuses() {
+        let mut lister =
+            FakeLister::default().directory("/home/alice", &[("not-a-directory", false)]);
+        let error = split_read_grants(
+            &[grant("/home/alice", true, false)],
+            &[PathBuf::from("/home/alice/not-a-directory/secret")],
+            &mut lister,
+        )
+        .expect_err("a strict descendant deny cannot be represented through a regular file");
+        assert!(
+            error.contains("deny chain crosses non-directory path"),
+            "{error}"
+        );
     }
 
     #[test]

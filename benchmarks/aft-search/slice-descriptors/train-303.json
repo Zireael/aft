@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "stale-view-callgraph-rebuild"
+  ],
+  "note": "Configure and view assembly apply the reader's call-graph readiness check, rebuild views whose derived call graph an older binary wrote, and treat a busy database as unknown readiness; no ranking-fence file."
+}

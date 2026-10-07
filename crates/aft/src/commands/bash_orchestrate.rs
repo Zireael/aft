@@ -1,17 +1,28 @@
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::bash_background::registry::BgTaskSnapshot;
+use crate::bash_background::registry::{BgTaskSnapshot, HardKillDeadline, HardKillSource};
 use crate::bash_background::BgTaskStatus;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse, PendingResponsePoll};
 
 const TEST_FOREGROUND_WAIT_ENV: &str = "AFT_TEST_FOREGROUND_WAIT_MS";
+/// Test-only override for `bash.worker_wait_max_ms`, read once per call.
+/// Config refuses values under a minute, which integration tests cannot wait
+/// out; they start the engine process with this set instead. Never set
+/// outside tests.
+const TEST_WORKER_WAIT_ENV: &str = "AFT_TEST_WORKER_WAIT_MAX_MS";
 const DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+// Leave room for polling and the kill worker to publish its terminal status.
+const WORKER_KILL_HANDOFF_MARGIN: Duration = Duration::from_secs(5);
+
+pub(crate) fn worker_kill_deadline_within_handoff_margin(remaining: Option<Duration>) -> bool {
+    remaining.is_some_and(|remaining| remaining <= WORKER_KILL_HANDOFF_MARGIN)
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -36,6 +47,12 @@ pub fn format_foreground_result(snapshot: &BgTaskSnapshot) -> String {
     }
     if snapshot.info.status == BgTaskStatus::TimedOut {
         rendered.push_str("\n[command timed out]");
+        // Name the limit that killed it, so AFT's own default limit is not
+        // mistaken for the command failing.
+        if let Some(reason) = snapshot.info.status_reason.as_deref() {
+            rendered.push(' ');
+            rendered.push_str(reason);
+        }
     }
     if let Some(exit) = snapshot.exit_code.filter(|exit| *exit != 0) {
         rendered.push_str(&format!("\n[exit code: {exit}]"));
@@ -53,18 +70,164 @@ pub fn format_seconds(ms: u64) -> String {
 }
 
 /// What happens to a task once it runs in the background, worded for the
-/// caller's role. A primary session is woken by a completion reminder when the
-/// task finishes. A delegated worker (`worker_session`) never is: once its
-/// turn ends it has delivered its result, so it is told to wait for the task
-/// instead of being promised a reminder that would never reach it.
-fn format_background_handoff_tail(task_id: &str, worker_session: bool) -> String {
+/// caller's role and available tools. A primary session is woken by a completion
+/// reminder. A delegated worker (`worker_session`) never is: it is directed to
+/// `bash_watch` only when its catalog includes that tool.
+fn format_background_handoff_tail(
+    task_id: &str,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> String {
     if worker_session {
+        let waiting = if bash_watch_available {
+            "wait for it before you report a result"
+        } else {
+            "check whether it has finished before you report a result"
+        };
         return format!(
-            "{task_id}. It won't wake you when it finishes, so wait for it before you report a result; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate."
+            "{task_id}. It won't wake you when it finishes, so {waiting}; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate."
         );
     }
     format!(
         "{task_id}. A completion reminder will be delivered automatically; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate."
+    )
+}
+
+/// A wait limit in words: whole minutes as minutes, anything else in seconds.
+pub(crate) fn format_wait_limit(ms: u64) -> String {
+    match ms {
+        60_000 => "1 minute".to_string(),
+        ms if ms > 0 && ms % 60_000 == 0 => format!("{} minutes", ms / 60_000),
+        ms => format_seconds(ms),
+    }
+}
+
+/// The sentence naming a task's own kill deadline, for every reply that hands
+/// a task back. It is kept apart from any wait on the task: a worker whose
+/// watch "had no limit" took the task's unseen 30-minute default kill for its
+/// command failing and re-ran it twice. A worker is also told that its waits
+/// move the default kill, so a task it keeps watching is not killed.
+pub(crate) fn kill_deadline_sentence(
+    deadline: Option<HardKillDeadline>,
+    started_at_ms: u64,
+    worker_session: bool,
+) -> String {
+    kill_deadline_sentence_at(deadline, started_at_ms, unix_millis_now(), worker_session)
+}
+
+fn kill_deadline_sentence_at(
+    deadline: Option<HardKillDeadline>,
+    started_at_ms: u64,
+    now_ms: u64,
+    worker_session: bool,
+) -> String {
+    let Some(deadline) = deadline else {
+        return "This task has no kill deadline.".to_string();
+    };
+    let limit = format_wait_limit(deadline.limit_ms);
+    let deadline_at = started_at_ms.saturating_add(deadline.limit_ms);
+    let when = format!(
+        "at {}, when it has run {limit}",
+        crate::subc_format::format_unix_millis_utc(i64::try_from(deadline_at).unwrap_or(i64::MAX))
+    );
+    let source = match deadline.source {
+        HardKillSource::Timeout => "(the `timeout` you passed)".to_string(),
+        HardKillSource::Default if worker_session => "(its default background limit), but each wait you make on it moves that kill to at least the worker wait limit (`bash.worker_wait_max_ms`) after the wait, so it is not killed while you keep waiting; pass a `timeout` to set your own limit".to_string(),
+        HardKillSource::Default => "(its default background limit) unless you pass a longer `timeout`".to_string(),
+    };
+    let remaining = if deadline_at <= now_ms {
+        "; the kill deadline has passed".to_string()
+    } else {
+        format!(
+            "; about {} remain",
+            format_approximate_remaining(deadline_at - now_ms)
+        )
+    };
+    format!("AFT kills this task {when} {source}{remaining}.")
+}
+
+fn format_approximate_remaining(ms: u64) -> String {
+    if ms >= 60_000 {
+        let minutes = ms.saturating_add(30_000) / 60_000;
+        format!(
+            "{} minute{}",
+            minutes.max(1),
+            if minutes == 1 { "" } else { "s" }
+        )
+    } else {
+        format_wait_limit(ms)
+    }
+}
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// [`kill_deadline_sentence`] for a task in `registry`, on its own line.
+pub(crate) fn kill_deadline_note(
+    registry: &crate::bash_background::BgTaskRegistry,
+    task_id: &str,
+    session_id: &str,
+    worker_session: bool,
+) -> String {
+    if let Some(note) = registry.execution_note(task_id, session_id) {
+        // Remote timeouts are enforced from run start, not queue entry; AFT
+        // cannot infer their remaining wall-clock time or renew the runner.
+        return format!("\n{note}");
+    }
+    let Some((deadline, started_at_ms)) =
+        registry.hard_kill_deadline_with_start(task_id, session_id)
+    else {
+        return "\nThis task has no kill deadline.".to_string();
+    };
+    format!(
+        "\n{}",
+        kill_deadline_sentence(Some(deadline), started_at_ms, worker_session)
+    )
+}
+
+/// Reply to a delegated worker whose blocking call (`wait: true`, or
+/// `block_to_completion`) reached the worker wait limit
+/// (`bash.worker_wait_max_ms`). The command was moved to the background,
+/// not killed: a worker must get control back so it can notice a stuck
+/// command, but a long build it still wants must keep running. This names
+/// `bash_watch` only when the caller's catalog includes it; otherwise it points
+/// the caller at `bash_status` to inspect the task. The host plugins append any
+/// additional guidance they provide.
+///
+/// `ran_ms` is how long the command has run and `tail` its most recent
+/// output, so the worker can judge whether it is stuck.
+pub fn format_worker_wait_limit_message(
+    task_id: &str,
+    limit_ms: u64,
+    ran_ms: u64,
+    tail: &str,
+    bash_watch_available: bool,
+) -> String {
+    let limit = format_wait_limit(limit_ms);
+    let ran = format_seconds(ran_ms);
+    let tail = tail.trim_end();
+    let output = if tail.is_empty() {
+        "No output yet.".to_string()
+    } else {
+        format!("Recent output:\n{tail}")
+    };
+    let next_step = if bash_watch_available {
+        format!(
+            "Wait for it again to keep waiting (each wait lasts up to {limit}, and while you keep waiting it is not killed for running long), inspect it with bash_status({{ taskId: \"{task_id}\" }})"
+        )
+    } else {
+        format!(
+            "Use bash_status({{ taskId: \"{task_id}\" }}) to check whether it has finished or inspect output"
+        )
+    };
+    format!(
+        "The command is still running after {limit}, the worker wait limit (bash.worker_wait_max_ms), so it now runs in the background as {task_id}; it was not killed. It has run for {ran}. It won't wake you when it finishes. {next_step}, or stop it with bash_kill({{ taskId: \"{task_id}\" }}) if it should have finished by now. Don't report a result until it finishes.\n{output}"
     )
 }
 
@@ -74,6 +237,7 @@ pub fn format_promotion_message(
     timeout: Option<u64>,
     wait_window_ms: u64,
     worker_session: bool,
+    bash_watch_available: bool,
 ) -> String {
     let waited = timeout
         .map(|timeout| timeout.min(wait_window_ms))
@@ -81,27 +245,40 @@ pub fn format_promotion_message(
     format!(
         "Foreground bash didn't finish within {} and was promoted to background: {}",
         format_seconds(waited),
-        format_background_handoff_tail(task_id, worker_session)
+        format_background_handoff_tail(task_id, worker_session, bash_watch_available)
     )
 }
 
-pub fn format_wait_detach_message(task_id: &str, worker_session: bool) -> String {
+pub fn format_wait_detach_message(
+    task_id: &str,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> String {
     format!(
         "Foreground bash is running in background as {}\nDetached because a user message arrived.",
-        format_background_handoff_tail(task_id, worker_session)
+        format_background_handoff_tail(task_id, worker_session, bash_watch_available)
     )
 }
 
-pub fn format_module_drain_detach_message(task_id: &str, worker_session: bool) -> String {
+pub fn format_module_drain_detach_message(
+    task_id: &str,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> String {
     format!(
         "Foreground bash is running in background as {}\nDetached because AFT is restarting; the command keeps running.",
-        format_background_handoff_tail(task_id, worker_session)
+        format_background_handoff_tail(task_id, worker_session, bash_watch_available)
     )
 }
 
 /// Port of OpenCode `packages/opencode-plugin/src/tools/bash.ts` `formatBackgroundLaunch` (lines 593-601).
 /// Worded per role like [`format_background_handoff_tail`].
-pub fn format_background_launch(task_id: &str, pty: bool, worker_session: bool) -> String {
+pub fn format_background_launch(
+    task_id: &str,
+    pty: bool,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> String {
     if pty {
         let tail = if worker_session {
             "It won't wake you when it exits."
@@ -113,8 +290,13 @@ pub fn format_background_launch(task_id: &str, pty: bool, worker_session: bool) 
         );
     }
     if worker_session {
+        if bash_watch_available {
+            return format!(
+                "Background task started: {task_id}. It won't wake you when it finishes, so wait for it before you report a result."
+            );
+        }
         return format!(
-            "Background task started: {task_id}. It won't wake you when it finishes, so wait for it before you report a result."
+            "Background task started: {task_id}. It won't wake you when it finishes, so use bash_status({{ taskId: \"{task_id}\" }}) to check whether it has finished before you report a result, or bash_kill({{ taskId: \"{task_id}\" }}) to stop it."
         );
     }
     format!(
@@ -149,6 +331,7 @@ pub fn raw_bash_repeat(req: &RawRequest) -> RawBashRepeat {
         &req.command,
         arguments,
         false,
+        req.worker_session(),
         req.worker_session(),
     ))
 }
@@ -224,6 +407,10 @@ pub fn build_bash_outcome(
 
     let params = parse_params(req).unwrap_or_default();
     let worker_session = req.worker_session();
+    // Direct OpenCode/Pi worker requests use the host plugins' own
+    // `bash_watch` tool. Catalog consumers override this on their separate
+    // deferred path with the tool present in their resolved preset.
+    let bash_watch_available = worker_session;
     let Some(task_id) = spawn_response
         .data
         .get("task_id")
@@ -248,6 +435,13 @@ pub fn build_bash_outcome(
             &task_id,
             is_pty,
             worker_session,
+            bash_watch_available,
+            &kill_deadline_note(
+                ctx.bash_background(),
+                &task_id,
+                req.session(),
+                worker_session,
+            ),
         ));
     }
 
@@ -261,13 +455,22 @@ pub fn build_bash_outcome(
         ctx.bash_background()
             .begin_wait_mode_session(&session_id, &task_id);
     }
-    let wait_window_ms = select_foreground_wait_window_ms(
-        ctx.config().foreground_wait_window_ms,
-        params.timeout,
-        params.wait,
+    let worker_cap_ms = worker_wait_cap_ms(
+        worker_session,
+        params.block_to_completion || params.wait,
+        worker_wait_max_ms(ctx),
     );
+    let wait_window_ms = worker_cap_ms.unwrap_or_else(|| {
+        select_foreground_wait_window_ms(
+            ctx.config().foreground_wait_window_ms,
+            params.timeout,
+            params.wait,
+        )
+    });
     let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
-    let block_to_completion = params.block_to_completion || params.wait;
+    // A capped worker wait detaches at its deadline instead of blocking on.
+    let block_to_completion =
+        (params.block_to_completion || params.wait) && worker_cap_ms.is_none();
     let timeout = params.timeout;
     let storage_dir = crate::bash_background::task_storage_dir(ctx);
     let project_root = ctx.config().project_root.clone();
@@ -277,6 +480,16 @@ pub fn build_bash_outcome(
     let session_id_for_cleanup = session_id.clone();
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
+        // A worker blocked on its command is waiting on it: keep its default
+        // hard kill at least one wait limit away, so the kill cannot fire
+        // before the cap hands control back.
+        if let Some(cap_ms) = worker_cap_ms {
+            ctx.bash_background().renew_hard_kill(
+                &task_id_for_poll,
+                &session_id_for_poll,
+                Duration::from_millis(cap_ms),
+            );
+        }
         // Foreground polls only need task state. Terminal snapshots still
         // return cached output.
         let response = if let Some(snapshot) = poll_bash_status(
@@ -300,12 +513,18 @@ pub fn build_bash_outcome(
                     &session_id_for_poll,
                     &request_id_for_poll,
                     worker_session,
+                    bash_watch_available,
                 ))
             } else {
                 match decide_bash_step(
                     snapshot,
                     deadline,
                     block_to_completion,
+                    worker_cap_ms.is_some()
+                        && worker_kill_deadline_within_handoff_margin(
+                            ctx.bash_background()
+                                .hard_kill_remaining(&task_id_for_poll, &session_id_for_poll),
+                        ),
                     Instant::now(),
                     &request_id_for_poll,
                 ) {
@@ -318,6 +537,8 @@ pub fn build_bash_outcome(
                         wait_window_ms,
                         &request_id_for_poll,
                         worker_session,
+                        bash_watch_available,
+                        worker_cap_ms.is_some(),
                     )),
                     BashStep::Wait => None,
                 }
@@ -345,14 +566,14 @@ pub fn build_bash_outcome(
         return DispatchOutcome::Immediate(response);
     }
 
-    DispatchOutcome::Deferred(PendingResponse {
+    // This state-based producer resolves inside its poll, including hand-backs
+    // before the task exits. A task-completion wake alone cannot drive deadlines.
+    DispatchOutcome::Deferred(PendingResponse::polling(
         request_id,
         session_id,
         attach_command,
         poll,
-        cancellation: None,
-        on_shutdown: None,
-    })
+    ))
 }
 
 pub(crate) fn poll_bash_status(
@@ -390,18 +611,25 @@ pub(crate) fn decide_bash_step(
     snapshot: BgTaskSnapshot,
     deadline: Instant,
     block_to_completion: bool,
+    wait_for_kill_terminal: bool,
     now: Instant,
     request_id: &str,
 ) -> BashStep {
     if snapshot.info.status.is_terminal() {
         BashStep::Done(foreground_result_response(request_id, snapshot))
-    } else if !block_to_completion && now >= deadline {
+    } else if !block_to_completion && !wait_for_kill_terminal && now >= deadline {
         BashStep::Promote
     } else {
         BashStep::Wait
     }
 }
 
+/// Moves a foreground command to the background at the end of its wait.
+/// `capped_worker_wait` marks a delegated worker's blocking call that hit the
+/// worker wait limit (`wait_window_ms` is then that limit): it gets its
+/// own reply, and its hard kill is pushed one more limit away so the worker
+/// has time to wait again.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn promote_bash(
     ctx: &AppContext,
     task_id: &str,
@@ -410,9 +638,59 @@ pub(crate) fn promote_bash(
     wait_window_ms: u64,
     request_id: &str,
     worker_session: bool,
+    bash_watch_available: bool,
+    capped_worker_wait: bool,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
-        Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms, worker_session),
+        Ok(_) if capped_worker_wait => {
+            ctx.bash_background().renew_hard_kill(
+                task_id,
+                session_id,
+                Duration::from_millis(wait_window_ms),
+            );
+            let snapshot = ctx.bash_background().observed_status(
+                task_id,
+                session_id,
+                crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES,
+            );
+            let ran_ms = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.elapsed_ms.or(snapshot.info.duration_ms))
+                .unwrap_or(wait_window_ms);
+            let deadline_note =
+                kill_deadline_note(ctx.bash_background(), task_id, session_id, worker_session);
+            let tail = snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.output_preview.as_str())
+                .unwrap_or_default();
+            Response::success(
+                request_id,
+                json!({
+                    "output": format!(
+                        "{}{deadline_note}",
+                        format_worker_wait_limit_message(
+                            task_id,
+                            wait_window_ms,
+                            ran_ms,
+                            tail,
+                            bash_watch_available,
+                        )
+                    ),
+                    "duration_ms": ran_ms,
+                    "task_id": task_id,
+                    "status": "running",
+                }),
+            )
+        }
+        Ok(_) => promotion_response(
+            request_id,
+            task_id,
+            timeout,
+            wait_window_ms,
+            worker_session,
+            bash_watch_available,
+            &kill_deadline_note(ctx.bash_background(), task_id, session_id, worker_session),
+        ),
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",
@@ -428,9 +706,16 @@ pub(crate) fn detach_wait_mode_bash(
     session_id: &str,
     request_id: &str,
     worker_session: bool,
+    bash_watch_available: bool,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
-        Ok(_) => wait_detach_response(request_id, task_id, worker_session),
+        Ok(_) => wait_detach_response(
+            request_id,
+            task_id,
+            worker_session,
+            bash_watch_available,
+            &kill_deadline_note(ctx.bash_background(), task_id, session_id, worker_session),
+        ),
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",
@@ -449,6 +734,7 @@ pub(crate) fn detach_bash_for_module_drain(
     session_id: &str,
     request_id: &str,
     worker_session: bool,
+    bash_watch_available: bool,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => {
@@ -465,7 +751,16 @@ pub(crate) fn detach_bash_for_module_drain(
             Response::success(
                 request_id,
                 json!({
-                    "output": format!("{}\nOutput: {}", format_module_drain_detach_message(task_id, worker_session), output_path.unwrap_or("unavailable")),
+                    "output": format!(
+                        "{}{}\nOutput: {}",
+                        format_module_drain_detach_message(
+                            task_id,
+                            worker_session,
+                            bash_watch_available,
+                        ),
+                        kill_deadline_note(ctx.bash_background(), task_id, session_id, worker_session),
+                        output_path.unwrap_or("unavailable")
+                    ),
                     "task_id": task_id,
                     "status": "running",
                     "output_path": output_path,
@@ -548,11 +843,13 @@ fn background_launch_response(
     task_id: &str,
     is_pty: bool,
     worker_session: bool,
+    bash_watch_available: bool,
+    deadline_note: &str,
 ) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_background_launch(task_id, is_pty, worker_session),
+            "output": format!("{}{deadline_note}", format_background_launch(task_id, is_pty, worker_session, bash_watch_available)),
             "task_id": task_id,
             "status": "running",
             "mode": if is_pty { "pty" } else { "pipes" },
@@ -566,22 +863,39 @@ fn promotion_response(
     timeout: Option<u64>,
     wait_window_ms: u64,
     worker_session: bool,
+    bash_watch_available: bool,
+    deadline_note: &str,
 ) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_promotion_message(task_id, timeout, wait_window_ms, worker_session),
+            "output": format!(
+                "{}{deadline_note}",
+                format_promotion_message(
+                    task_id,
+                    timeout,
+                    wait_window_ms,
+                    worker_session,
+                    bash_watch_available,
+                )
+            ),
             "task_id": task_id,
             "status": "running",
         }),
     )
 }
 
-fn wait_detach_response(request_id: &str, task_id: &str, worker_session: bool) -> Response {
+fn wait_detach_response(
+    request_id: &str,
+    task_id: &str,
+    worker_session: bool,
+    bash_watch_available: bool,
+    deadline_note: &str,
+) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_wait_detach_message(task_id, worker_session),
+            "output": format!("{}{deadline_note}", format_wait_detach_message(task_id, worker_session, bash_watch_available)),
             "task_id": task_id,
             "status": "running",
         }),
@@ -602,6 +916,34 @@ pub(crate) fn resolve_foreground_wait_window_ms(configured: u64) -> u64 {
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(configured)
+}
+
+/// The worker wait limit in force: `bash.worker_wait_max_ms`, or the test
+/// override (see `TEST_WORKER_WAIT_ENV`).
+pub(crate) fn worker_wait_max_ms(ctx: &AppContext) -> u64 {
+    std::env::var(TEST_WORKER_WAIT_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or_else(|| ctx.config().bash.worker_wait_max_ms)
+}
+
+/// How long a foreground bash call may block before it detaches, when the
+/// worker wait limit bounds it: any delegated worker call that would block
+/// until its command finishes, i.e. `wait: true` or `block_to_completion`
+/// (which the plugins send for every worker foreground call when
+/// `bash.subagent_background` is false, so those are never auto-promoted).
+/// `None` for every other call: a primary session's blocking call still
+/// blocks until the command finishes or its hard kill fires, and a
+/// non-blocking foreground call is promoted after the much shorter foreground
+/// wait window anyway. A worker's explicit `timeout` shorter than the limit
+/// simply ends the call first; a longer one no longer holds the worker past
+/// the limit, though the command keeps that timeout as its hard kill.
+pub(crate) fn worker_wait_cap_ms(
+    worker_session: bool,
+    blocking: bool,
+    limit_ms: u64,
+) -> Option<u64> {
+    (worker_session && blocking).then_some(limit_ms)
 }
 
 pub(crate) fn select_foreground_wait_window_ms(
@@ -646,6 +988,7 @@ mod tests {
             output_preview: output_preview.to_string(),
             bash_output_list_envelope: None,
             output_truncated,
+            output_incomplete: false,
             output_path: output_path.map(str::to_string),
             stderr_path: None,
             pty_rows: None,
@@ -659,6 +1002,8 @@ mod tests {
             live_descendants_summary: None,
             kill_signaled: false,
             kill_reached: 0,
+            hard_kill: None,
+            elapsed_ms: None,
         }
     }
 
@@ -719,7 +1064,7 @@ mod tests {
         let snapshot = snapshot("done", false, None, BgTaskStatus::Completed, Some(0));
         let now = Instant::now();
 
-        match decide_bash_step(snapshot, now, false, now, "req-terminal") {
+        match decide_bash_step(snapshot, now, false, false, now, "req-terminal") {
             BashStep::Done(response) => {
                 assert_eq!(response.id, "req-terminal");
                 assert!(response.success);
@@ -736,7 +1081,7 @@ mod tests {
         let snapshot = snapshot("running", false, None, BgTaskStatus::Running, None);
         let now = Instant::now();
 
-        match decide_bash_step(snapshot, now, false, now, "req-promote") {
+        match decide_bash_step(snapshot, now, false, false, now, "req-promote") {
             BashStep::Promote => {}
             BashStep::Done(_) => panic!("running snapshot should not finish"),
             BashStep::Wait => panic!("deadline should promote when not blocking"),
@@ -752,6 +1097,7 @@ mod tests {
             snapshot,
             now + Duration::from_millis(1),
             false,
+            false,
             now,
             "req-wait",
         ) {
@@ -766,7 +1112,7 @@ mod tests {
         let snapshot = snapshot("running", false, None, BgTaskStatus::Running, None);
         let now = Instant::now();
 
-        match decide_bash_step(snapshot, now, true, now, "req-block") {
+        match decide_bash_step(snapshot, now, true, false, now, "req-block") {
             BashStep::Wait => {}
             BashStep::Done(_) => panic!("running snapshot should not finish"),
             BashStep::Promote => panic!("block_to_completion should suppress promotion"),
@@ -783,6 +1129,204 @@ mod tests {
             select_foreground_wait_window_ms(8_000, None, true),
             DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS
         );
+    }
+
+    /// Every blocking call from a delegated worker is capped by the worker
+    /// wait limit; a primary's blocking call and a worker's non-blocking call
+    /// (promoted after the foreground window) are not.
+    #[test]
+    fn worker_wait_cap_applies_only_to_a_worker_blocking_call() {
+        assert_eq!(worker_wait_cap_ms(true, true, 90_000), Some(90_000));
+        assert_eq!(worker_wait_cap_ms(false, true, 90_000), None);
+        assert_eq!(worker_wait_cap_ms(true, false, 90_000), None);
+    }
+
+    #[test]
+    fn worker_wait_cap_waits_for_timeout_when_kill_deadline_is_at_the_cap() {
+        assert!(worker_kill_deadline_within_handoff_margin(Some(
+            Duration::ZERO
+        )));
+    }
+
+    #[test]
+    fn worker_wait_cap_hands_off_when_timeout_is_beyond_the_margin() {
+        let remaining = Some(WORKER_KILL_HANDOFF_MARGIN + Duration::from_millis(1));
+        assert!(!worker_kill_deadline_within_handoff_margin(remaining));
+        let running = snapshot("still running", false, None, BgTaskStatus::Running, None);
+        let now = Instant::now();
+        match decide_bash_step(
+            running,
+            now,
+            false,
+            worker_kill_deadline_within_handoff_margin(remaining),
+            now,
+            "req-handoff",
+        ) {
+            BashStep::Promote => {}
+            BashStep::Done(_) => panic!("running task should not finish"),
+            BashStep::Wait => panic!("deadline beyond the margin should hand off"),
+        }
+    }
+
+    #[test]
+    fn worker_wait_cap_returns_timeout_terminal_instead_of_handoff() {
+        let now = Instant::now();
+        let running = snapshot("still running", false, None, BgTaskStatus::Running, None);
+        match decide_bash_step(
+            running,
+            now,
+            false,
+            worker_kill_deadline_within_handoff_margin(Some(Duration::ZERO)),
+            now,
+            "req-timeout-terminal",
+        ) {
+            BashStep::Wait => {}
+            BashStep::Done(_) => panic!("running task must wait for its timeout terminal"),
+            BashStep::Promote => panic!("nearby kill deadline must not hand off"),
+        }
+
+        let timed_out = snapshot("timed out", false, None, BgTaskStatus::TimedOut, Some(124));
+        match decide_bash_step(
+            timed_out,
+            now,
+            false,
+            worker_kill_deadline_within_handoff_margin(Some(Duration::ZERO)),
+            now,
+            "req-timeout-terminal",
+        ) {
+            BashStep::Done(response) => {
+                let output = response.data["output"].as_str().unwrap();
+                assert_eq!(response.data["status"], json!("timed_out"));
+                assert_eq!(response.data["exit_code"], json!(124));
+                assert!(output.contains("timed out"), "{output}");
+                assert!(!output.contains("worker wait limit"), "{output}");
+            }
+            BashStep::Promote => panic!("timed-out task must not hand off"),
+            BashStep::Wait => panic!("terminal snapshot must return immediately"),
+        }
+    }
+
+    /// The reply names the configured limit, says the command was not killed,
+    /// and offers the way to stop it.
+    #[test]
+    fn worker_wait_limit_message_names_the_configured_limit() {
+        let text = format_worker_wait_limit_message(
+            "bash-cap",
+            5_400_000,
+            5_401_000,
+            "line 1\nline 2\n",
+            true,
+        );
+        assert!(text.contains("It has run for 5401s"), "{text}");
+        assert!(text.ends_with("Recent output:\nline 1\nline 2"), "{text}");
+        assert!(
+            format_worker_wait_limit_message("bash-cap", 60_000, 60_000, "", true)
+                .ends_with("No output yet.")
+        );
+        assert!(text.contains("still running after 90 minutes"), "{text}");
+        assert!(text.contains("bash.worker_wait_max_ms"), "{text}");
+        assert!(text.contains("it was not killed"), "{text}");
+        assert!(text.contains("won't wake you"), "{text}");
+        assert!(
+            text.contains("bash_kill({ taskId: \"bash-cap\" })"),
+            "{text}"
+        );
+        assert!(text.contains("Wait for it again to keep waiting"), "{text}");
+        assert!(!text.contains("completion reminder"), "{text}");
+        assert_eq!(format_wait_limit(1_800_000), "30 minutes");
+        assert_eq!(format_wait_limit(60_000), "1 minute");
+        assert_eq!(format_wait_limit(1_500), "1.5s");
+    }
+
+    #[test]
+    fn kill_deadline_message_uses_command_start_and_names_its_source() {
+        let started_at_ms = 1_700_000_000_000;
+        let now_ms = started_at_ms + 18 * 60_000;
+        let deadline_at =
+            crate::subc_format::format_unix_millis_utc((started_at_ms + 30 * 60_000) as i64);
+        let default_text = kill_deadline_sentence_at(
+            Some(HardKillDeadline {
+                limit_ms: 30 * 60_000,
+                source: HardKillSource::Default,
+            }),
+            started_at_ms,
+            now_ms,
+            false,
+        );
+        assert!(
+            default_text.contains(&format!("at {deadline_at}, when it has run 30 minutes")),
+            "{default_text}"
+        );
+        assert!(
+            default_text.contains("its default background limit"),
+            "{default_text}"
+        );
+        assert!(
+            default_text.contains("about 12 minutes remain"),
+            "{default_text}"
+        );
+
+        let explicit_text = kill_deadline_sentence_at(
+            Some(HardKillDeadline {
+                limit_ms: 30 * 60_000,
+                source: HardKillSource::Timeout,
+            }),
+            started_at_ms,
+            now_ms,
+            false,
+        );
+        assert!(
+            explicit_text.contains("(the `timeout` you passed)"),
+            "{explicit_text}"
+        );
+        assert!(
+            !explicit_text.contains("default background limit"),
+            "{explicit_text}"
+        );
+        assert!(
+            explicit_text.contains("about 12 minutes remain"),
+            "{explicit_text}"
+        );
+    }
+
+    #[test]
+    fn kill_deadline_sentence_matches_the_typescript_shared_fixture() {
+        #[derive(Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+        #[derive(Deserialize)]
+        struct Case {
+            name: String,
+            started_at_ms: u64,
+            now_ms: u64,
+            limit_ms: u64,
+            source: String,
+            role: String,
+            expected: String,
+        }
+
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../../../../spec/fixtures/bash-kill-deadline-parity.json"
+        ))
+        .expect("shared kill-deadline fixture parses");
+        for case in fixture.cases {
+            let source = match case.source.as_str() {
+                "default" => HardKillSource::Default,
+                "timeout" => HardKillSource::Timeout,
+                other => panic!("unknown hard-kill source: {other}"),
+            };
+            let actual = kill_deadline_sentence_at(
+                Some(HardKillDeadline {
+                    limit_ms: case.limit_ms,
+                    source,
+                }),
+                case.started_at_ms,
+                case.now_ms,
+                case.role == "worker",
+            );
+            assert_eq!(actual, case.expected, "{}", case.name);
+        }
     }
 
     #[test]
@@ -811,7 +1355,7 @@ mod tests {
     #[test]
     fn promotion_message_matches_opencode_copy() {
         assert_eq!(
-            format_promotion_message("bash-123", Some(5_500), 8_000, false),
+            format_promotion_message("bash-123", Some(5_500), 8_000, false, false),
             "Foreground bash didn't finish within 5.5s and was promoted to background: bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-123\" }) to inspect output or bash_kill({ taskId: \"bash-123\" }) to terminate."
         );
     }
@@ -819,7 +1363,7 @@ mod tests {
     #[test]
     fn wait_detach_message_mentions_user_message() {
         assert_eq!(
-            format_wait_detach_message("bash-123", false),
+            format_wait_detach_message("bash-123", false, false),
             "Foreground bash is running in background as bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-123\" }) to inspect output or bash_kill({ taskId: \"bash-123\" }) to terminate.\nDetached because a user message arrived."
         );
     }
@@ -827,11 +1371,11 @@ mod tests {
     #[test]
     fn background_launch_messages_match_opencode_copy() {
         assert_eq!(
-            format_background_launch("bash-bg", false, false),
+            format_background_launch("bash-bg", false, false, false),
             "Background task started: bash-bg. A completion reminder will be delivered automatically; don't poll bash_status."
         );
         assert_eq!(
-            format_background_launch("bash-pty", true, false),
+            format_background_launch("bash-pty", true, false, false),
             "PTY task started: bash-pty. Use bash_status({ taskId: \"bash-pty\", outputMode: \"screen\" }) to see the visible terminal, bash_write({ taskId: \"bash-pty\", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits."
         );
     }
@@ -842,11 +1386,12 @@ mod tests {
     #[test]
     fn hand_off_texts_are_worded_per_role() {
         let worker = [
-            format_background_launch("bash-bg", false, true),
-            format_background_launch("bash-pty", true, true),
-            format_promotion_message("bash-123", None, 8_000, true),
-            format_wait_detach_message("bash-123", true),
-            format_module_drain_detach_message("bash-123", true),
+            format_background_launch("bash-bg", false, true, true),
+            format_background_launch("bash-pty", true, true, true),
+            format_promotion_message("bash-123", None, 8_000, true, true),
+            format_wait_detach_message("bash-123", true, true),
+            format_module_drain_detach_message("bash-123", true, true),
+            format_worker_wait_limit_message("bash-123", 1_800_000, 1_800_000, "", true),
         ];
         for text in &worker {
             assert!(!text.contains("completion reminder"), "{text}");
@@ -854,14 +1399,82 @@ mod tests {
             assert!(text.contains("won't wake you"), "{text}");
         }
         let primary = [
-            format_background_launch("bash-bg", false, false),
-            format_background_launch("bash-pty", true, false),
-            format_promotion_message("bash-123", None, 8_000, false),
-            format_wait_detach_message("bash-123", false),
-            format_module_drain_detach_message("bash-123", false),
+            format_background_launch("bash-bg", false, false, false),
+            format_background_launch("bash-pty", true, false, false),
+            format_promotion_message("bash-123", None, 8_000, false, false),
+            format_wait_detach_message("bash-123", false, false),
+            format_module_drain_detach_message("bash-123", false, false),
         ];
         for text in &primary {
             assert!(text.contains("completion reminder"), "{text}");
         }
+    }
+
+    #[test]
+    fn worker_handoffs_name_bash_watch_only_when_the_catalog_serves_it() {
+        let without_watch = [
+            format_background_launch("bash-1", false, true, false),
+            format_promotion_message("bash-1", None, 15_000, true, false),
+            format_wait_detach_message("bash-1", true, false),
+            format_module_drain_detach_message("bash-1", true, false),
+            format_worker_wait_limit_message("bash-1", 1_800_000, 1_800_000, "", false),
+        ];
+        for text in &without_watch {
+            assert!(!text.contains("bash_watch"), "{text}");
+            assert!(
+                text.contains("bash_status({ taskId: \"bash-1\" })"),
+                "{text}"
+            );
+            assert!(text.contains("bash_kill({ taskId: \"bash-1\" })"), "{text}");
+        }
+
+        assert!(
+            without_watch[0].contains("use bash_status"),
+            "{}",
+            without_watch[0]
+        );
+        for text in &without_watch[1..4] {
+            assert!(
+                text.contains("check whether it has finished before you report a result"),
+                "{text}"
+            );
+        }
+        assert!(
+            without_watch[4].contains("Use bash_status"),
+            "{}",
+            without_watch[4]
+        );
+
+        let with_watch = [
+            format_background_launch("bash-1", false, true, true),
+            format_promotion_message("bash-1", None, 15_000, true, true),
+            format_wait_detach_message("bash-1", true, true),
+            format_module_drain_detach_message("bash-1", true, true),
+            format_worker_wait_limit_message("bash-1", 1_800_000, 1_800_000, "", true),
+        ];
+        for text in &with_watch {
+            assert!(!text.contains("completion reminder"), "{text}");
+        }
+        assert_eq!(
+            with_watch[0],
+            "Background task started: bash-1. It won't wake you when it finishes, so wait for it before you report a result."
+        );
+        assert!(
+            with_watch[2].starts_with(
+                "Foreground bash is running in background as bash-1. It won't wake you when it finishes, so wait for it before you report a result; use bash_status"
+            ),
+            "{}",
+            with_watch[2]
+        );
+        assert!(
+            with_watch[2].ends_with("Detached because a user message arrived."),
+            "{}",
+            with_watch[2]
+        );
+        assert!(
+            with_watch[4].contains("Wait for it again to keep waiting"),
+            "worker wait-cap wording changed: {}",
+            with_watch[4]
+        );
     }
 }

@@ -1,0 +1,12 @@
+{
+  "bash": {
+    "worker_wait_max_ms": 600000
+  },
+  "harnesses": {
+    "pi": {
+      "bash": {
+        "worker_wait_max_ms": 2700000
+      }
+    }
+  }
+}

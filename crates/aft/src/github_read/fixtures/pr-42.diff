@@ -1,0 +1,20 @@
+diff --git a/src/main.rs b/src/main.rs
+index 1111111..2222222 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1 @@
+-old main
++new main
+diff --git a/src/old.rs b/src/new.rs
+similarity index 80%
+rename from src/old.rs
+rename to src/new.rs
+index 3333333..4444444 100644
+--- a/src/old.rs
++++ b/src/new.rs
+@@ -1 +1 @@
+-old name
++new name
+diff --git a/assets/logo.png b/assets/logo.png
+index 5555555..6666666 100644
+Binary files a/assets/logo.png and b/assets/logo.png differ

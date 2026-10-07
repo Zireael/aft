@@ -43,6 +43,8 @@ import {
   getManualInstallHint,
   getOnnxRuntimeInstallFailure,
   isHomeDirectoryRoot,
+  observeFreshSessionStart,
+  RevivableTransportPool,
   resolveCortexKitStorageRoot,
   resolveIndexes,
   setActiveLogger,
@@ -95,6 +97,7 @@ import { interruptBashWaitsForInput } from "./bash-wait-detach.js";
 import { registerPiConfigErrorState, resolvePiBootstrapConfig } from "./config-error-state.js";
 import { startPiLiveConfigReload } from "./config-live-reload.js";
 import { recordActiveExtensionApi } from "./harness.js";
+import { loadOmpInternalUrlRouter } from "./omp-internal-urls.js";
 import { MAGIC_CONTEXT_SUBAGENT_ENV, skipsEagerStartup } from "./session-kind.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { registerAftStatusObservability } from "./status-observability.js";
@@ -419,56 +422,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   log(`AFT extension loading (plugin v${PLUGIN_VERSION})`);
 
-  // Never execute a binary on the host thread. `findBinarySync` only accepts
-  // binaries whose identity is known without running them (a versioned-cache
-  // entry with a matching identity sidecar, or the npm platform package by its
-  // manifest version). When it misses, a download starts in the background
-  // while `findBinary` checks the remaining candidates on a worker thread. The
-  // resolver and first-tool-call path share ensureBinary's in-process promise;
-  // its filesystem lock also coordinates a second Pi/OpenCode process without
-  // duplicate fetches. An explicit AFT_BINARY_PATH goes straight to
-  // `findBinary`, which verifies its version off-thread.
-  //
-  // With a subc connection file the daemon runs the binary and the plugin never
-  // spawns one (the transport factory fails loud instead of falling back to a
-  // standalone bridge), so no local binary is resolved at all.
+  // Resolving an uncached binary can download it. A host may load this factory
+  // only to validate the extension, without ever starting a session, so defer
+  // binary resolution and storage migration until actual transport demand.
   const usesSubc = Boolean(config.subc?.connection_file?.trim());
-  const explicitBinary = Boolean(process.env.AFT_BINARY_PATH?.trim());
-  const trustedBinaryPath = usesSubc || explicitBinary ? null : findBinarySync(PLUGIN_VERSION);
-  if (!usesSubc && !explicitBinary && !trustedBinaryPath) {
-    void ensureBinary(PLUGIN_VERSION).then(
-      (path) => {
-        if (path) log(`Background binary warmup ready at ${path}`);
-      },
-      (err) => {
-        warn(
-          `Background binary warmup failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      },
-    );
-  }
-
-  // Resolve the AFT binary. On first run this downloads the platform binary to
-  // ~/.cache/aft/bin/vX.Y.Z/aft; failures are reported through Pi's plugin loader.
-  let binaryPath: string | null = null;
-  if (!usesSubc) {
-    try {
-      binaryPath = trustedBinaryPath ?? (await findBinary(PLUGIN_VERSION));
-    } catch (err) {
-      warn(
-        `Failed to resolve AFT binary: ${err instanceof Error ? err.message : String(err)}. ` +
-          "Tools will not be registered.",
-      );
-      return;
-    }
-  }
-
-  await ensureStorageMigrated({
-    harness: "pi",
-    binaryPath: binaryPath ?? undefined,
-    logger: bridgeLogger,
-  });
-
   const storageDir = resolveCortexKitStorageRoot();
 
   // Which sessions skip, and why a plain headless run does not, is decided in
@@ -573,37 +530,61 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // SINGLE transport injection point (B-FINAL S4): standalone NDJSON bridge
   // (default) OR the subc daemon, selected by the USER-tier subc.connection_file.
   // Fails loud if subc is selected but its connection file is absent.
-  pool = await createAftTransportPool({
-    harness: "pi",
-    binaryPath,
-    poolOptions,
-    configOverrides,
-    subcConnectionFile: config.subc?.connection_file,
-    // Reaping-disabled pools have no root generation, so their nudges cannot carry
-    // BgNudgeRef provenance. Keep the root/session callback wired as the delivery
-    // path for those pools; bg-notifications coalesces it with provenance callbacks.
-    onBgEventsNudge: (directory, sessionID) => {
-      void handleSubcBgEventsNudge({
-        ctx,
-        directory,
-        sessionID,
-        runtime: pi,
-      }).catch((err) => {
-        warn(`[aft-pi] bg nudge rejected: ${err instanceof Error ? err.message : String(err)}`);
+  let replacementBinaryPath: string | undefined;
+  pool = new RevivableTransportPool(
+    null,
+    async () => {
+      log("Initializing AFT transport on first session/tool demand");
+      let binaryPath: string | null = null;
+      if (!usesSubc) {
+        const explicitBinary = Boolean(process.env.AFT_BINARY_PATH?.trim());
+        binaryPath =
+          replacementBinaryPath ??
+          (!explicitBinary ? findBinarySync(PLUGIN_VERSION) : null) ??
+          (await findBinary(PLUGIN_VERSION));
+      }
+      log("AFT binary resolved; checking storage migration");
+      await ensureStorageMigrated({
+        harness: "pi",
+        binaryPath: binaryPath ?? undefined,
+        logger: bridgeLogger,
+      });
+      return createAftTransportPool({
+        harness: "pi",
+        binaryPath,
+        poolOptions,
+        configOverrides,
+        subcConnectionFile: config.subc?.connection_file,
+        // Reaping-disabled pools have no root generation, so their nudges cannot carry
+        // BgNudgeRef provenance. Keep the root/session callback wired as the delivery
+        // path for those pools; bg-notifications coalesces it with provenance callbacks.
+        onBgEventsNudge: (directory, sessionID) => {
+          void handleSubcBgEventsNudge({
+            ctx,
+            directory,
+            sessionID,
+            runtime: pi,
+          }).catch((err) => {
+            warn(`[aft-pi] bg nudge rejected: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        },
+        onBgEventsNudgeRef: (ref) => {
+          void handleSubcBgEventsNudge({
+            ctx,
+            directory: ref.canonicalRoot,
+            sessionID: ref.session,
+            nudgeRef: ref,
+            runtime: pi,
+          }).catch((err) => {
+            warn(`[aft-pi] bg nudge rejected: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        },
       });
     },
-    onBgEventsNudgeRef: (ref) => {
-      void handleSubcBgEventsNudge({
-        ctx,
-        directory: ref.canonicalRoot,
-        sessionID: ref.session,
-        nudgeRef: ref,
-        runtime: pi,
-      }).catch((err) => {
-        warn(`[aft-pi] bg nudge rejected: ${err instanceof Error ? err.message : String(err)}`);
-      });
+    (path) => {
+      replacementBinaryPath = path;
     },
-  });
+  );
   pool.setConfigureOverride("harness", "pi");
   const surface = resolvePiToolSurface(config, pi);
   // Hashline needs the tagged read slot as well as the edit slot: without it
@@ -927,6 +908,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     );
   }
 
+  ctx.ompRouter = await loadOmpInternalUrlRouter(pi);
   registerPiToolSurface(pi, ctx, surface);
 
   // Pi binds its live tool registry after extension factories run. A modern Pi
@@ -940,6 +922,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     ) => void
   )("session_start", (_event, extCtx) => {
     const sessionID = extCtx ? resolveSessionId(extCtx as ExtensionContext) : undefined;
+    observeFreshSessionStart(
+      pool,
+      (extCtx as ExtensionContext | undefined)?.cwd ?? projectRoot,
+      sessionID,
+      (_event as { reason?: unknown } | undefined)?.reason,
+    );
     setActiveSessionId(sessionID);
     startSessionWork();
     if (powershellRegistered) return;

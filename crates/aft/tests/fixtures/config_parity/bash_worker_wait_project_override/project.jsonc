@@ -1,0 +1,5 @@
+{
+  "bash": {
+    "worker_wait_max_ms": 120000
+  }
+}

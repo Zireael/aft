@@ -964,7 +964,23 @@ impl CheckpointStore {
             if !meta_path.exists() {
                 continue;
             }
-            let checkpoint = read_checkpoint_from_disk(&checkpoint_dir, session, &name)?;
+            let checkpoint = match read_checkpoint_from_disk(&checkpoint_dir, session, &name) {
+                Ok(checkpoint) => checkpoint,
+                Err(AftError::IoError { path, message })
+                    if message.starts_with("failed to parse durable checkpoint metadata:") =>
+                {
+                    // A torn metadata file damages one checkpoint, not its
+                    // neighbours. Keep the bytes for diagnosis and report why
+                    // this name was omitted; newer formats still fail closed.
+                    crate::slog_warn!("checkpoint {name} skipped: reason=corrupt_metadata path={path} error={message}");
+                    crate::durability::record(
+                        crate::durability::EventKind::CorruptCheckpointSkipped,
+                        &meta_path,
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             hydrated.insert(name, checkpoint);
         }
         if hydrated.is_empty() {
@@ -984,7 +1000,7 @@ impl CheckpointStore {
         let Some(checkpoint_dir) = self.durable_checkpoint_dir(session, &checkpoint.name) else {
             return Ok(());
         };
-        crate::backup::create_private_dir_all(&checkpoint_dir).map_err(|error| {
+        crate::backup::create_private_durable_dir(&checkpoint_dir).map_err(|error| {
             AftError::IoError {
                 path: checkpoint_dir.display().to_string(),
                 message: format!("failed to create durable checkpoint directory: {error}"),
@@ -1025,10 +1041,6 @@ impl CheckpointStore {
                 ),
             });
         }
-        fsync_dir(&checkpoint_dir).map_err(|error| AftError::IoError {
-            path: checkpoint_dir.display().to_string(),
-            message: format!("failed to sync durable checkpoint blobs: {error}"),
-        })?;
 
         let meta = DiskCheckpointMeta {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
@@ -1135,7 +1147,7 @@ fn migrate_unbound_checkpoint_namespace(storage_dir: &Path, harness: &str) {
     let target = storage_dir.join(harness).join("checkpoints");
     if !target.exists() {
         if let Some(parent) = target.parent() {
-            if let Err(error) = crate::backup::create_private_dir_all(parent) {
+            if let Err(error) = crate::backup::create_private_durable_dir(parent) {
                 crate::slog_warn!(
                     "failed to create durable checkpoint harness directory {}: {}",
                     parent.display(),
@@ -1461,14 +1473,14 @@ fn write_temp_fsync_rename(dir: &Path, final_name: &str, bytes: &[u8]) -> io::Re
         }
         let mut file = options.open(&tmp_path)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        crate::durability::sync_file(&file, &final_path)?;
     }
     fs::rename(tmp_path, final_path)
 }
 
 #[cfg(unix)]
 fn fsync_dir(path: &Path) -> io::Result<()> {
-    fs::File::open(path)?.sync_all()
+    crate::durability::sync_dir(path)
 }
 
 #[cfg(not(unix))]
@@ -1893,6 +1905,124 @@ mod tests {
     fn checkpoint_store() -> (CheckpointStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         (fresh_checkpoint_store(dir.path()), dir)
+    }
+
+    #[test]
+    fn durability_checkpoint_create_list_restore_counts() {
+        let (path, _files) = temp_file("durability.txt", "original");
+        let (mut store, _storage) = checkpoint_store();
+        crate::durability::take();
+        store
+            .create_for_files(DEFAULT_SESSION_ID, "snap", vec![path.clone()])
+            .unwrap();
+        let events = crate::durability::take();
+        // Two data syncs, one directory commit and four first-use directories.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.0 == crate::durability::EventKind::DirectoryCreated)
+                .count(),
+            4
+        );
+        assert_eq!(
+            crate::durability::sync_count(&events),
+            if cfg!(unix) { 7 } else { 2 },
+            "{events:?}"
+        );
+        // Replacing an existing checkpoint needs no new-directory flush.
+        store
+            .create_for_files(DEFAULT_SESSION_ID, "snap", vec![path.clone()])
+            .unwrap();
+        let events = crate::durability::take();
+        assert_eq!(
+            crate::durability::sync_count(&events),
+            if cfg!(unix) { 3 } else { 2 },
+            "{events:?}"
+        );
+        assert_eq!(store.list(DEFAULT_SESSION_ID).unwrap().len(), 1);
+        assert_eq!(crate::durability::sync_count(&crate::durability::take()), 0);
+        fs::write(&path, "edited").unwrap();
+        store.restore(DEFAULT_SESSION_ID, "snap").unwrap();
+        assert_eq!(crate::durability::sync_count(&crate::durability::take()), 0);
+        assert_eq!(fs::read_to_string(path).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durability_checkpoint_parent_order() {
+        use crate::durability::EventKind;
+        let (path, _files) = temp_file("durability.txt", "original");
+        let (mut store, _storage) = checkpoint_store();
+        crate::durability::take();
+        let info = store
+            .create_for_files(DEFAULT_SESSION_ID, "snap", vec![path])
+            .unwrap();
+        let events = crate::durability::take();
+        let dir = info.storage_path.unwrap();
+        let created = events
+            .iter()
+            .position(|e| *e == (EventKind::DirectoryCreated, dir.clone()))
+            .unwrap();
+        let parent = events
+            .iter()
+            .position(|e| {
+                *e == (
+                    EventKind::DirectorySync,
+                    dir.parent().unwrap().to_path_buf(),
+                )
+            })
+            .unwrap();
+        let meta = events
+            .iter()
+            .position(|e| *e == (EventKind::FileSync, dir.join("meta.json")))
+            .unwrap();
+        assert!(created < parent && parent < meta, "{events:?}");
+    }
+
+    #[test]
+    fn durability_corrupt_checkpoint_does_not_poison_session() {
+        let (path, _files) = temp_file("durability.txt", "original");
+        let (mut store, storage) = checkpoint_store();
+        let good = store
+            .create_for_files(DEFAULT_SESSION_ID, "good", vec![path.clone()])
+            .unwrap();
+        let bad = store
+            .create_for_files(DEFAULT_SESSION_ID, "bad", vec![path.clone()])
+            .unwrap();
+        for bytes in [&b"{"[..], &b""[..]] {
+            fs::write(bad.storage_path.as_ref().unwrap().join("meta.json"), bytes).unwrap();
+            let mut restarted = fresh_checkpoint_store(storage.path());
+            crate::durability::take();
+            let names: Vec<_> = restarted
+                .list(DEFAULT_SESSION_ID)
+                .unwrap()
+                .into_iter()
+                .map(|i| i.name)
+                .collect();
+            assert_eq!(names, vec!["good"]);
+            assert!(crate::durability::take().iter().any(|e| *e
+                == (
+                    crate::durability::EventKind::CorruptCheckpointSkipped,
+                    bad.storage_path.as_ref().unwrap().join("meta.json")
+                )));
+            fs::write(&path, "changed").unwrap();
+            restarted.restore(DEFAULT_SESSION_ID, "good").unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+            restarted
+                .create_for_files(DEFAULT_SESSION_ID, "another", vec![path.clone()])
+                .unwrap();
+            assert!(restarted.delete(DEFAULT_SESSION_ID, "another"));
+            assert!(good
+                .storage_path
+                .as_ref()
+                .unwrap()
+                .join("meta.json")
+                .is_file());
+            assert_eq!(
+                fs::read(bad.storage_path.as_ref().unwrap().join("meta.json")).unwrap(),
+                bytes
+            );
+        }
     }
 
     fn checkpoint_file(content: &str) -> CheckpointFile {

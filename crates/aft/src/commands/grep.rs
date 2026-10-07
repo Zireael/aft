@@ -26,7 +26,7 @@ pub(crate) const GREP_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
 /// Text note for a grep or glob whose search path holds no searchable file.
 pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
-    "(No searchable files exist under the searched path, so nothing was searched.)";
+    "(No files were found after default directory skips (.git, node_modules, target, etc.); nothing was searched.)";
 
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|value| value.as_str()) {
@@ -125,22 +125,39 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         path_exclusion: None,
     };
     // A parent folder session answers from its child repositories' indexes.
-    let (result, phases, parent_gaps) =
-        match crate::views::parent::grep_fan_out(ctx, &compiled, &scope, &params, &filters) {
-            Some(answer) => answer,
-            None => {
-                let (result, phases) = grep_executor::execute_profiled_with_filters(
-                    ctx, &compiled, &scope, &params, &filters,
-                );
-                (result, phases, Vec::new())
-            }
-        };
+    // Child indexes intentionally omit ignored targets, just like the local
+    // index. An explicitly named ignored root must use the direct walk instead.
+    let parent_answer = if scope.roots.iter().any(|root| root.ignored_target) {
+        None
+    } else {
+        crate::views::parent::grep_fan_out(ctx, &compiled, &scope, &params, &filters)
+    };
+    let (result, phases, parent_gaps) = match parent_answer {
+        Some(answer) => answer,
+        None => {
+            let (result, phases) = grep_executor::execute_profiled_with_filters(
+                ctx, &compiled, &scope, &params, &filters,
+            );
+            (result, phases, Vec::new())
+        }
+    };
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     let scope_probe_started = std::time::Instant::now();
     let scope_presence = phases
         .indexed_scope_has_files
+        .or_else(|| {
+            phases.walk_counts.and_then(|counts| {
+                (!result.walk_truncated && result.skipped_foreign_mounts == 0)
+                    .then_some(counts.eligible > 0)
+            })
+        })
         .or_else(|| grep_executor::scope_has_files(&scope, &filters));
     let scope_has_files = scope_presence != Some(false);
+    let empty_counts = if !scope_has_files {
+        grep_executor::scope_file_counts(&scope, &filters)
+    } else {
+        None
+    };
     let scope_probe = scope_probe_started.elapsed();
     let format_started = std::time::Instant::now();
     let page_matches: Vec<&GrepMatch> =
@@ -165,6 +182,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut body = serde_json::json!({
         "text": text,
         "complete": scope_presence.is_some() && !result.walk_truncated
+            && (scope_has_files || empty_counts.is_some())
             && !result.scan_deadline_reached
             && result.skipped_foreign_mounts == 0
             && result.missing_on_disk == 0,
@@ -223,8 +241,14 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         body["text"] = serde_json::Value::String(format!(
             "{}\n\n{}",
             body["text"].as_str().unwrap_or_default(),
-            NO_FILES_IN_SCOPE_NOTE
+            empty_counts.map(|counts| counts.empty_note(!params.include.is_empty() && params.exclude.is_empty()))
+                .unwrap_or_else(|| "(0 files searched: the bounded walk could not determine why no files matched the scope; nothing was searched.)".to_string())
         ));
+        if let Some(counts) = empty_counts {
+            body["files_examined"] = serde_json::json!(counts.examined);
+            body["ignored_items"] = serde_json::json!(counts.ignored);
+            body["files_excluded_by_patterns"] = serde_json::json!(counts.filtered);
+        }
     }
     if result.skipped_foreign_mounts > 0 {
         body["text"] = serde_json::Value::String(format!(

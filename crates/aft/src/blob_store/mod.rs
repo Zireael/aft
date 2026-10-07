@@ -84,7 +84,7 @@ pub(crate) fn publication_durability_barrier() -> MutexGuard<'static, ()> {
 pub const SEMANTIC_PAYLOAD_SCHEMA: u32 = 1;
 pub const SEMANTIC_PRODUCER_VERSION: &str = "semantic-v1";
 pub const CALLGRAPH_PAYLOAD_SCHEMA: u32 = 1;
-pub const CALLGRAPH_PRODUCER_VERSION: &str = "callgraph-v1";
+pub const CALLGRAPH_PRODUCER_VERSION: &str = "callgraph-v2";
 
 const BLOB_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS blob_payloads (
@@ -845,7 +845,7 @@ mod tests {
                 (SEMANTIC_PAYLOAD_SCHEMA, SEMANTIC_PRODUCER_VERSION),
                 (CALLGRAPH_PAYLOAD_SCHEMA, CALLGRAPH_PRODUCER_VERSION),
             ],
-            [(1, "semantic-v1"), (1, "callgraph-v1")],
+            [(1, "semantic-v1"), (1, "callgraph-v2")],
             "a payload encoding change must bump its producer key version in the same edit"
         );
     }

@@ -53,6 +53,8 @@ import {
 } from "./_shared.js";
 import { formatDiffForPi } from "./diff-format.js";
 import {
+  asRecord,
+  asString,
   collapsibleResult,
   normalizeTerminalText,
   type RenderResultOptionsLike,
@@ -112,7 +114,7 @@ function formatReadAttachmentText(attachment: ReadAttachment): string {
 }
 
 const ISSUE_AND_PR_READ_DESCRIPTION =
-  "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).";
+  "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`). Use `pr://NUMBER/diff` for the whole diff or `pr://NUMBER/diff/<path>` for an exact changed path (also with OWNER/REPO). Diff pages name the head SHA; use read, not outline or zoom.";
 
 /** Reuse the user-tier github.read description gate across every GitHub-capable tool. */
 export function whenGhReadEnabled(enabled: boolean, description: string): string {
@@ -499,12 +501,12 @@ interface FileMutationDetails {
   noOp?: boolean;
 }
 
-function readPathArg(args: { path?: unknown }): string | undefined {
-  return typeof args.path === "string" ? args.path : undefined;
+function readPathArg(args: unknown): string | undefined {
+  return asString(asRecord(args)?.path);
 }
 
-function mutationFilePathArg(args: { path?: unknown }): string | undefined {
-  return typeof args.path === "string" ? args.path : undefined;
+function mutationFilePathArg(args: unknown): string | undefined {
+  return asString(asRecord(args)?.path);
 }
 
 function hasOwn(record: Record<string, unknown>, key: string): boolean {
@@ -561,13 +563,9 @@ function validateBatchEdits(edits: unknown): void {
   });
 }
 
-function renderReadCall(
-  args: { path?: unknown; filePath?: unknown } | undefined,
-  theme: Theme,
-  context: RenderContextLike,
-): Text {
+function renderReadCall(args: unknown, theme: Theme, context: RenderContextLike): Text {
   const text = reuseText(context.lastComponent);
-  const filePath = args ? readPathArg(args) : undefined;
+  const filePath = readPathArg(args);
   const pathDisplay = filePath
     ? theme.fg("accent", shortenPath(filePath))
     : theme.fg("toolOutput", "...");

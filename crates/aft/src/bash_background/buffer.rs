@@ -146,13 +146,28 @@ impl BgBuffer {
         head_bytes: usize,
         tail_bytes: usize,
     ) -> BoundedRead {
+        self.read_combined_head_tail_with_boundary(max_bytes, head_bytes, tail_bytes)
+            .0
+    }
+
+    /// Keep the stdout boundary for compression. The captures are concatenated,
+    /// not chronological: stderr's last build message may precede stdout's
+    /// final script verdict in real time.
+    pub(crate) fn read_combined_head_tail_with_boundary(
+        &self,
+        max_bytes: usize,
+        head_bytes: usize,
+        tail_bytes: usize,
+    ) -> (BoundedRead, usize) {
         match self {
             Self::Pipes { stdout, stderr } => {
                 read_two_file_head_tail(stdout, stderr, max_bytes, head_bytes, tail_bytes)
             }
             Self::Pty { combined } => {
-                read_single_file_head_tail(combined, max_bytes, head_bytes, tail_bytes)
-                    .unwrap_or_else(|_| empty_bounded_read())
+                let read = read_single_file_head_tail(combined, max_bytes, head_bytes, tail_bytes)
+                    .unwrap_or_else(|_| empty_bounded_read());
+                let boundary = read.text.len();
+                (read, boundary)
             }
         }
     }
@@ -366,7 +381,7 @@ fn read_two_file_head_tail(
     max_bytes: usize,
     head_bytes: usize,
     tail_bytes: usize,
-) -> BoundedRead {
+) -> (BoundedRead, usize) {
     let first_len = first.open().and_then(|file| file.len()).unwrap_or(0);
     let second_len = second.open().and_then(|file| file.len()).unwrap_or(0);
     let total_bytes = first_len.saturating_add(second_len);
@@ -379,14 +394,16 @@ fn read_two_file_head_tail(
             .open()
             .and_then(|mut file| file.read_all())
             .unwrap_or_default();
-        let mut bytes = Vec::with_capacity(total_bytes as usize);
-        bytes.extend_from_slice(&first_bytes);
-        bytes.extend_from_slice(&second_bytes);
-        return BoundedRead {
-            text: String::from_utf8_lossy(&bytes).into_owned(),
-            truncated: false,
-            total_bytes,
-        };
+        let first_text = String::from_utf8_lossy(&first_bytes);
+        let boundary = first_text.len();
+        return (
+            BoundedRead {
+                text: format!("{first_text}{}", String::from_utf8_lossy(&second_bytes)),
+                truncated: false,
+                total_bytes,
+            },
+            boundary,
+        );
     }
     let head_budget = head_bytes.min(max_bytes);
     let (first_head, second_head) = split_stream_budget(first_len, second_len, head_budget);
@@ -401,11 +418,15 @@ fn read_two_file_head_tail(
     let second_read =
         read_single_file_head_tail(second, second_head + second_tail, second_head, second_tail)
             .unwrap_or_else(|_| empty_bounded_read());
-    BoundedRead {
-        text: combine_streams(&first_read.text, &second_read.text),
-        truncated: true,
-        total_bytes,
-    }
+    let boundary = first_read.text.len();
+    (
+        BoundedRead {
+            text: combine_streams(&first_read.text, &second_read.text),
+            truncated: true,
+            total_bytes,
+        },
+        boundary,
+    )
 }
 
 fn read_two_file_tails(
@@ -757,6 +778,10 @@ stderr final
         assert!(read.truncated);
         assert!(read.text.contains("ERROR: stdout final"));
         assert!(read.text.contains("stderr final"));
+        let (split_read, boundary) = buffer.read_combined_head_tail_with_boundary(256, 64, 192);
+        assert_eq!(split_read, read);
+        assert!(split_read.text[..boundary].ends_with("ERROR: stdout final\n"));
+        assert!(split_read.text[boundary..].ends_with("stderr final\n"));
     }
 
     #[test]

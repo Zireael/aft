@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  buildSubcToolPresetsJson,
   buildSubcToolSchemasJson,
   CONSUMER_ONLY_MARKER,
   SUBC_BARE_TOOL_NAMES,
@@ -10,6 +11,7 @@ import {
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const ARTIFACT_PATH = path.join(REPO_ROOT, "crates", "aft", "src", "subc_tool_schemas.json");
+const PRESETS_PATH = path.join(REPO_ROOT, "crates", "aft", "src", "subc_tool_presets.json");
 
 const PLACEHOLDER = JSON.stringify({ type: "object" });
 
@@ -18,6 +20,30 @@ describe("subc tool schemas artifact", () => {
     const committed = fs.readFileSync(ARTIFACT_PATH, "utf8");
     const fresh = buildSubcToolSchemasJson();
     expect(fresh).toBe(committed);
+  });
+
+  test("committed preset artifact matches in-memory generation byte-for-byte", () => {
+    expect(buildSubcToolPresetsJson()).toBe(fs.readFileSync(PRESETS_PATH, "utf8"));
+  });
+
+  test("worker preset texts never promise a wake-up or tell the worker to end its turn", () => {
+    const presets = JSON.parse(fs.readFileSync(PRESETS_PATH, "utf8")) as Record<
+      string,
+      Record<string, Record<string, unknown>>
+    >;
+    expect(Object.keys(presets.worker).sort()).toEqual([
+      "bash",
+      "bash_status",
+      "bash_watch",
+      "powershell",
+    ]);
+    for (const [tool, schema] of Object.entries(presets.worker)) {
+      const text = JSON.stringify(schema).toLowerCase();
+      for (const phrase of ["completion reminder", "end the turn", "end your turn", "remind you"]) {
+        expect(text.includes(phrase), `${tool}: ${phrase}`).toBe(false);
+      }
+    }
+    expect(presets.worker.bash_watch.description as string).toContain("never wakes you");
   });
 
   test("all bare names present with object schemas", () => {

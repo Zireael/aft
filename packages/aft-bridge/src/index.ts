@@ -21,25 +21,33 @@ export {
   abortableSleep,
   commandInvokesCodeSearch,
   DEFAULT_PRIMARY_WATCH_TIMEOUT_MS,
+  DEFAULT_WORKER_WAIT_MAX_MS,
+  formatWaitDuration,
   formatWatchWaited,
   interruptedWatchTail,
   LONGEST_TIMER_DELAY_MS,
   MAX_WATCH_TIMEOUT_MS,
+  MIN_WORKER_WAIT_MAX_MS,
   maxWatchTimeoutMs,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
+  outputTail,
   resolveWatchTimeoutMs,
   runningTaskStatusHint,
+  taskKillDeadlineText,
+  taskKillDeadlineWithinHandoffMargin,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
   WATCH_UNAVAILABLE_GIVE_UP_MS,
   type WatchCallerRole,
   WORKER_KEEP_WAITING,
+  WORKER_WAIT_LIMIT_PHRASE,
   watchClock,
   watchPollDelayMs,
   watchTimeoutSteer,
   watchUnavailableSteer,
   workerBackgroundTaskNote,
+  workerWatchStillRunning,
 } from "./bash-hints.js";
 export {
   BASH_HOST_FALLBACK_BANNER,
@@ -54,10 +62,14 @@ export {
 // --- binary identity (no-exec cache trust) ---
 export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
 export {
+  __fileDigestWorkForTests,
+  cachedFileSha256,
+  cachedFileSha256Sync,
   checkBinaryIdentity,
   identitySidecarPath,
   isTrustedCachedBinary,
   readBinaryIdentity,
+  writeStampedFileDigest,
 } from "./binary-identity.js";
 export type {
   BashCompletedPayload,
@@ -350,7 +362,12 @@ export type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
-export { WORKER_SESSION_FIELD } from "./transport.js";
+export {
+  callPresetFor,
+  observeFreshSessionStart,
+  PRESET_FIELD,
+  WORKER_SESSION_FIELD,
+} from "./transport.js";
 export {
   type AftTransportFactoryOptions,
   createAftTransportPool,

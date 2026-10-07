@@ -151,7 +151,7 @@ describe("Pi bash.subagent_background", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("false turns a worker's async bash_watch into a sync wait with no deadline", async () => {
+  test("false turns a worker's async bash_watch into a sync wait up to the worker wait limit", async () => {
     const { calls, watch } = bashTools(
       (command) =>
         command === "bash_status"
@@ -166,9 +166,10 @@ describe("Pi bash.subagent_background", () => {
     );
     expect(calls.map(([command]) => command)).not.toContain("bash_notify");
     expect(result.content[0]?.text).not.toContain("Watch registered");
-    // A worker's sync watch waits until the task exits rather than for the
-    // configured cap: it cannot be woken after its turn ends.
-    expect(result.details.effectiveWaitMs).toBeUndefined();
-    expect(result.content[0]?.text).toContain("no limit: waits until the command finishes");
+    // A worker's sync watch waits up to the worker wait limit rather than the
+    // primary cap: it cannot be woken after its turn ends, but a stuck task
+    // must not hold it forever either.
+    expect(result.details.effectiveWaitMs).toBe(1_800_000);
+    expect(result.content[0]?.text).toContain("(limit 1800000ms)");
   });
 });

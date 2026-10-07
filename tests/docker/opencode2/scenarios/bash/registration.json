@@ -866,11 +866,20 @@
             "kind": "field",
             "field": "detach_reason",
             "pattern": "^(?<value>Detached because a user message arrived)\\.$"
+          },
+          {
+            "kind": "kill_deadline",
+            "clock": "omit"
           }
         ],
         "expected": {
           "handoff": "background",
-          "detach_reason": "Detached because a user message arrived"
+          "detach_reason": "Detached because a user message arrived",
+          "kill_deadline": {
+            "limit": "30 minutes",
+            "source": "default",
+            "worker_renewal": false
+          }
         }
       },
       "metadata": {
@@ -969,10 +978,19 @@
             "kind": "field",
             "field": "watch_outcome",
             "pattern": "^Sync watch for task bash-[0-9a-f]+ was (?<value>interrupted because you sent a message) after \\d+ms of waiting\\. The task is still running in the background\\..*$"
+          },
+          {
+            "kind": "kill_deadline",
+            "clock": "omit"
           }
         ],
         "expected": {
-          "watch_outcome": "interrupted because you sent a message"
+          "watch_outcome": "interrupted because you sent a message",
+          "kill_deadline": {
+            "limit": "30 minutes",
+            "source": "default",
+            "worker_renewal": false
+          }
         }
       },
       "metadata": {

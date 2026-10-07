@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, BufReader, BufWriter};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -12,6 +12,7 @@ use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use super::writer::LspWriter;
 use crate::lsp::child_registry::LspChildRegistry;
 use crate::lsp::jsonrpc::{
     Notification, Request, RequestId, Response as JsonRpcResponse, ServerMessage,
@@ -21,7 +22,7 @@ use crate::lsp::registry::ServerKind;
 use crate::lsp::{transport, LspError};
 
 /// Default timeout for interactive LSP requests (hover, goto-def, references, rename).
-const INTERACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const INTERACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Longer budget for one-shot handshake requests (initialize, shutdown).
 pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -663,7 +664,7 @@ pub struct LspClient {
     /// PID from the shared registry; we capture once rather than reading
     /// `child.id()` later because Drop ordering with the Child can race.
     child_pid: u32,
-    writer: Arc<Mutex<BufWriter<std::process::ChildStdin>>>,
+    writer: LspWriter,
 
     /// Pending request responses, keyed by request ID.
     pending: Arc<Mutex<PendingMap>>,
@@ -826,7 +827,11 @@ impl LspClient {
             .stdout(Stdio::piped())
             // Drain stderr on a background thread so failed shims/crashes have
             // actionable diagnostics without risking pipe-buffer deadlock.
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Git status may run in server descendants such as build scripts.
+            // Disable its optional index lock so killing a check cannot leave
+            // a stale lock behind; per-server env entries below may override it.
+            .env("GIT_OPTIONAL_LOCKS", "0");
         for (key, value) in env {
             #[cfg(windows)]
             if is_batch_file && crate::windows_command::is_batch_internal_env(key, args.len()) {
@@ -907,11 +912,19 @@ impl LspClient {
         let stderr_closed = Arc::new(AtomicBool::new(false));
         spawn_stderr_drain_thread(stderr, Arc::clone(&stderr_tail), Arc::clone(&stderr_closed));
 
-        let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
+        let writer = match LspWriter::spawn(stdin) {
+            Ok(writer) => writer,
+            Err(err) => {
+                kill_lsp_child_group(&mut child);
+                let _ = child.wait();
+                child_registry.untrack(child_pid);
+                return Err(err);
+            }
+        };
         let pending = Arc::new(Mutex::new(PendingMap::new()));
         let watched_file_registrations = Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = Arc::clone(&pending);
-        let reader_writer = Arc::clone(&writer);
+        let reader_writer = writer.clone();
         let reader_watched_file_registrations = Arc::clone(&watched_file_registrations);
         let reader_kind = kind.clone();
         let reader_root = root.clone();
@@ -923,6 +936,7 @@ impl LspClient {
             loop {
                 match transport::read_message(&mut reader) {
                     Ok(Some(ServerMessage::Response(response))) => {
+                        reader_writer.note_received();
                         if let Ok(mut guard) = reader_pending.lock() {
                             if let Some(tx) = guard.remove(&response.id) {
                                 if tx.send(response).is_err() {
@@ -940,6 +954,7 @@ impl LspClient {
                         }
                     }
                     Ok(Some(ServerMessage::Notification { method, params })) => {
+                        reader_writer.note_received();
                         if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
                             reader_check_begins.fetch_add(1, Ordering::SeqCst);
                         }
@@ -951,6 +966,7 @@ impl LspClient {
                         });
                     }
                     Ok(Some(ServerMessage::Request { id, method, params })) => {
+                        reader_writer.note_received();
                         record_watched_file_registration(
                             &reader_watched_file_registrations,
                             &method,
@@ -974,12 +990,10 @@ impl LspClient {
                         } else {
                             serde_json::Value::Null
                         };
-                        if let Ok(mut w) = reader_writer.lock() {
-                            let response = super::jsonrpc::OutgoingResponse::success(
-                                id.clone(),
-                                response_value,
-                            );
-                            let _ = transport::write_response(&mut *w, &response);
+                        let response =
+                            super::jsonrpc::OutgoingResponse::success(id.clone(), response_value);
+                        if let Ok(payload) = serde_json::to_string(&response) {
+                            reader_writer.send_response(payload);
                         }
                         // Also forward as event for any interested handlers
                         let _ = event_tx.send(LspEvent::ServerRequest {
@@ -1205,12 +1219,31 @@ impl LspClient {
     /// Whether diagnostics from this server instance should be treated as
     /// provisional because rust-analyzer is warming or reported failed analysis.
     pub fn diagnostics_are_provisional(&self) -> bool {
-        matches!(&self.kind, ServerKind::Rust)
-            && (!self.rust_analyzer_quiescent || self.rust_analyzer_failure.is_some())
+        self.is_unresponsive()
+            || (matches!(&self.kind, ServerKind::Rust)
+                && (!self.rust_analyzer_quiescent || self.rust_analyzer_failure.is_some()))
     }
 
     pub(crate) fn diagnostic_failure(&self) -> Option<&str> {
-        self.rust_analyzer_failure.as_deref()
+        if self.is_unresponsive() {
+            Some("server not responding")
+        } else {
+            self.rust_analyzer_failure.as_deref()
+        }
+    }
+
+    /// A timed-out server stays alive but is not consulted until its reader
+    /// observes another message. A suspended process may belong to the user.
+    pub fn is_unresponsive(&self) -> bool {
+        self.writer.is_unresponsive()
+    }
+
+    pub(crate) fn received_message_count(&self) -> u64 {
+        self.writer.received_count()
+    }
+
+    pub(crate) fn mark_unresponsive_if_silent(&self, observed: u64) {
+        self.writer.mark_unresponsive_if_silent(observed);
     }
 
     /// Recovery must reach healthy quiescence before reports regain authority.
@@ -1478,6 +1511,34 @@ impl LspClient {
         }
     }
 
+    /// The earliest moment after `now` at which [`Self::rust_check_state`]
+    /// or [`Self::take_rust_save_to_send`] can give a different answer with
+    /// no new message from the server. Every other change follows an event.
+    pub(crate) fn rust_check_next_timed_change(
+        &self,
+        now: Instant,
+        publish_settle: Duration,
+    ) -> Option<Instant> {
+        if !matches!(&self.kind, ServerKind::Rust) {
+            return None;
+        }
+        let mut times = Vec::with_capacity(4);
+        if let Some(save) = &self.rust_save {
+            times.extend(save.due_at);
+            if let Some(sent) = save.last_sent_at {
+                times.push(sent + SAVE_RESEND_AFTER);
+                times.push(sent + SAVE_CHECK_START_GRACE);
+            }
+        }
+        if let Some(owed_since) = self.rust_workspace_check_owed_since {
+            times.push(owed_since + WORKSPACE_CHECK_START_DEADLINE);
+        }
+        if let Some(finished) = self.rust_flycheck_finished_at {
+            times.push(finished + publish_settle);
+        }
+        times.into_iter().filter(|time| *time > now).min()
+    }
+
     /// Authority for a clean whole-workspace compiler result without reports.
     /// Current alone also describes absence of progress, so require a real
     /// matching begin/end after the latest load. Current additionally proves
@@ -1634,15 +1695,9 @@ impl LspClient {
         }
 
         let request = Request::new(id.clone(), method, Some(serde_json::to_value(params)?));
-        {
-            let mut writer = self
-                .writer
-                .lock()
-                .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
-            if let Err(err) = transport::write_request(&mut *writer, &request) {
-                self.remove_pending(&id);
-                return Err(err.into());
-            }
+        if let Err(err) = self.writer.send(serde_json::to_string(&request)?) {
+            self.remove_pending(&id);
+            return Err(err);
         }
         Ok(PendingLspRequest {
             id,
@@ -1650,7 +1705,7 @@ impl LspClient {
             kind: self.kind.clone(),
             rx,
             pending: Arc::clone(&self.pending),
-            writer: Arc::clone(&self.writer),
+            writer: self.writer.clone(),
         })
     }
 
@@ -1662,12 +1717,38 @@ impl LspClient {
     {
         self.ensure_can_send()?;
         let notification = Notification::new(N::METHOD, Some(serde_json::to_value(params)?));
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
-        transport::write_notification(&mut *writer, &notification)?;
-        Ok(())
+        self.writer.send(serde_json::to_string(&notification)?)
+    }
+
+    /// Write an already serialized notification.
+    fn send_serialized_notification(&mut self, json: &str) -> Result<(), LspError> {
+        self.ensure_can_send()?;
+        self.writer.send(json.to_string())
+    }
+
+    /// Send `textDocument/didChange` carrying the whole document (see
+    /// [`full_did_change_message`]).
+    pub(crate) fn send_full_did_change(
+        &mut self,
+        uri: &lsp_types::Uri,
+        version: i32,
+        text: &str,
+    ) -> Result<(), LspError> {
+        self.ensure_can_send()?;
+        let json = full_did_change_message(uri, version, text)?;
+        self.send_serialized_notification(&json)
+    }
+
+    /// Send `textDocument/didSave`, with the borrowed text when given (see
+    /// [`did_save_message`]).
+    pub(crate) fn send_did_save_borrowed(
+        &mut self,
+        uri: &lsp_types::Uri,
+        text: Option<&str>,
+    ) -> Result<(), LspError> {
+        self.ensure_can_send()?;
+        let json = did_save_message(uri, text)?;
+        self.send_serialized_notification(&json)
     }
 
     /// Graceful shutdown: send shutdown request, then exit notification.
@@ -1868,12 +1949,7 @@ impl LspClient {
     // Used only by the Unix-gated child-spawning test modules.
     #[cfg(all(test, unix))]
     pub(crate) fn poison_writer_for_test(&self) {
-        let writer = Arc::clone(&self.writer);
-        let _ = thread::spawn(move || {
-            let _guard = writer.lock().expect("writer lock");
-            panic!("poison lsp writer for test");
-        })
-        .join();
+        self.writer.poison_for_test();
     }
 
     pub fn state(&self) -> ServerState {
@@ -1889,6 +1965,9 @@ impl LspClient {
     }
 
     fn ensure_can_send(&self) -> Result<(), LspError> {
+        if self.is_unresponsive() {
+            return Err(LspError::ServerNotReady("server not responding".into()));
+        }
         if matches!(self.state, ServerState::ShuttingDown | ServerState::Exited) {
             return Err(LspError::ServerNotReady(format!(
                 "language server {:?} is not ready (state: {:?})",
@@ -1911,6 +1990,80 @@ impl LspClient {
     }
 }
 
+#[derive(serde::Serialize)]
+struct BorrowedNotification<'a, P> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    params: &'a P,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FullDidChangeParams<'a> {
+    text_document: VersionedDocument<'a>,
+    content_changes: [FullText<'a>; 1],
+}
+
+#[derive(serde::Serialize)]
+struct VersionedDocument<'a> {
+    uri: &'a lsp_types::Uri,
+    version: i32,
+}
+
+#[derive(serde::Serialize)]
+struct FullText<'a> {
+    text: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DidSaveParams<'a> {
+    text_document: SavedDocument<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct SavedDocument<'a> {
+    uri: &'a lsp_types::Uri,
+}
+
+/// The `textDocument/didChange` message for a whole-document change, the
+/// same JSON as the typed `DidChangeTextDocumentParams` produce. The text is
+/// serialized once from the borrowed string; the typed params copied the
+/// document into the params and again into a JSON value first, for every
+/// server the document is open in.
+pub(crate) fn full_did_change_message(
+    uri: &lsp_types::Uri,
+    version: i32,
+    text: &str,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&BorrowedNotification {
+        jsonrpc: "2.0",
+        method: <lsp_types::notification::DidChangeTextDocument as lsp_types::notification::Notification>::METHOD,
+        params: &FullDidChangeParams {
+            text_document: VersionedDocument { uri, version },
+            content_changes: [FullText { text }],
+        },
+    })
+}
+
+/// The `textDocument/didSave` message, serialized from borrowed text like
+/// [`full_did_change_message`].
+pub(crate) fn did_save_message(
+    uri: &lsp_types::Uri,
+    text: Option<&str>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&BorrowedNotification {
+        jsonrpc: "2.0",
+        method: <lsp_types::notification::DidSaveTextDocument as lsp_types::notification::Notification>::METHOD,
+        params: &DidSaveParams {
+            text_document: SavedDocument { uri },
+            text,
+        },
+    })
+}
+
 /// A request written to a language server whose response has not been read
 /// yet (see [`LspClient::start_request`]).
 pub(crate) struct PendingLspRequest {
@@ -1919,7 +2072,7 @@ pub(crate) struct PendingLspRequest {
     kind: ServerKind,
     rx: crossbeam_channel::Receiver<JsonRpcResponse>,
     pending: Arc<Mutex<PendingMap>>,
-    writer: Arc<Mutex<BufWriter<std::process::ChildStdin>>>,
+    writer: LspWriter,
 }
 
 impl PendingLspRequest {
@@ -1933,11 +2086,10 @@ impl PendingLspRequest {
                 self.remove_pending();
                 let notification =
                     Notification::new("$/cancelRequest", Some(json!({ "id": self.id })));
-                let mut writer = self
-                    .writer
-                    .lock()
-                    .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
-                transport::write_notification(&mut *writer, &notification)?;
+                self.writer
+                    .mark_unresponsive_if_silent(self.writer.received_count());
+                self.writer
+                    .send_best_effort(serde_json::to_string(&notification)?);
                 return Err(LspError::Timeout(format!(
                     "timed out waiting for '{}' response from {:?}",
                     self.method, self.kind
@@ -2282,6 +2434,50 @@ mod tests {
         let caps = parse_diagnostic_capabilities(&value);
         assert!(caps.pull_diagnostics);
         assert!(!caps.workspace_diagnostics);
+    }
+
+    #[test]
+    fn borrowed_document_messages_match_the_typed_notifications() {
+        use lsp_types::notification::{
+            DidChangeTextDocument, DidSaveTextDocument, Notification as _,
+        };
+        let uri: lsp_types::Uri = "file:///work/src/main.rs".parse().expect("uri");
+        let text = "fn main() {\n    println!(\"\\u{1F600} \\t\");\n}\n";
+        let typed = |method: &str, params: serde_json::Value| {
+            serde_json::to_value(crate::lsp::jsonrpc::Notification::new(method, Some(params)))
+                .expect("typed notification")
+        };
+        let change = typed(
+            DidChangeTextDocument::METHOD,
+            serde_json::to_value(lsp_types::DidChangeTextDocumentParams {
+                text_document: lsp_types::VersionedTextDocumentIdentifier::new(uri.clone(), 7),
+                content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.to_string(),
+                }],
+            })
+            .expect("change params"),
+        );
+        let borrowed: serde_json::Value =
+            serde_json::from_str(&full_did_change_message(&uri, 7, text).expect("message"))
+                .expect("borrowed change parses");
+        assert_eq!(borrowed, change);
+
+        for with_text in [Some(text), None] {
+            let save = typed(
+                DidSaveTextDocument::METHOD,
+                serde_json::to_value(lsp_types::DidSaveTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
+                    text: with_text.map(str::to_string),
+                })
+                .expect("save params"),
+            );
+            let borrowed: serde_json::Value =
+                serde_json::from_str(&did_save_message(&uri, with_text).expect("message"))
+                    .expect("borrowed save parses");
+            assert_eq!(borrowed, save);
+        }
     }
 
     #[test]

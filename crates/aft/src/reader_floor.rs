@@ -257,7 +257,7 @@ fn write_atomic(path: &Path, floor: &ReaderFloor) -> Result<(), FloorError> {
         let mut text = serde_json::to_vec_pretty(&floor.to_json()).map_err(io::Error::other)?;
         text.push(b'\n');
         file.write_all(&text)?;
-        file.sync_all()?;
+        crate::durability::sync_file(&file, path)?;
         drop(file);
         #[cfg(test)]
         tests::crash_before_rename_hook(&tmp)?;
@@ -273,9 +273,7 @@ fn write_atomic(path: &Path, floor: &ReaderFloor) -> Result<(), FloorError> {
 
 #[cfg(unix)]
 fn sync_dir(dir: &Path) {
-    if let Ok(handle) = fs::File::open(dir) {
-        let _ = handle.sync_all();
-    }
+    let _ = crate::durability::sync_dir(dir);
 }
 
 #[cfg(not(unix))]
@@ -389,6 +387,26 @@ fn prepare_uncached(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn durability_reader_floor_keeps_two_syncs() {
+        let storage = tempfile::tempdir().unwrap();
+        crate::durability::take();
+        let version = PersistedStore::SemanticIndex.supported();
+        raise(storage.path(), &[(PersistedStore::SemanticIndex, version)]).unwrap();
+        let events = crate::durability::take();
+        assert_eq!(
+            crate::durability::sync_count(&events),
+            if cfg!(unix) { 2 } else { 1 },
+            "{events:?}"
+        );
+        assert_eq!(
+            read(storage.path())
+                .unwrap()
+                .unwrap()
+                .get(PersistedStore::SemanticIndex),
+            Some(u64::from(version))
+        );
+    }
     use std::cell::RefCell;
 
     thread_local! {

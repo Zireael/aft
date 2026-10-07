@@ -1,6 +1,6 @@
 # Durability per store: measured syncs and a proposal
 
-Status: proposal, nothing implemented. Base commit `c7ecd5490`. Measured on an
+Status: implemented (portable full-sync commit points; no macOS-specific plain-fsync refinement). Base commit `c7ecd5490`. Measured on an
 Apple M5 Max (Mac17,6) running macOS 27.0.1, internal APFS SSD. The machine was
 shared with other build workers the whole time (load average about 48), so wall
 times are noisy. The sync counts are exact and were the same on every repeat.
@@ -25,6 +25,8 @@ about **4 ms** (p50 3.99 ms, p90 5.0 ms). A plain `fsync()` costs 0.024 ms.
 | Pins (live pin) | 4 at create, 2 per `protect`/`trim` call (so 2 per key for per-key callers), 1 at release | **1 at create, 0 per protect, 0 at release** | Unchanged: keys are read only while their owner is alive. | Low. |
 | `aft.db` (SQLite) | 0 per op; plain `fsync()` at WAL checkpoints | **Keep** | Atomic and consistent after any crash; recent commits can be lost on power loss (today too). | None. Documented, not changed. |
 | Shared: `fs_lock` lease | 2 per acquire (file + dir), inside every backup, undo, checkpoint, semantic and cache op | **0** | Unchanged: a lease from before a crash is dead by identity, and a torn lease is treated as stale. | Low; contract test changes. |
+
+Implemented correction: the table describes steady-state commits; first use also syncs each newly created ancestor directory into its parent, so a returned backup or checkpoint cannot vanish with its namespace.
 
 Per-op saving at about 4 ms per removed sync: bash about 32 ms per command
 (about half the measured response), edit about 36–44 ms of 52–62 ms, undo about
@@ -296,6 +298,7 @@ and does not sync it (`backup.rs:4695`; trace order: lease → user file →
 3. **One** directory sync after both renames: they are in the same directory.
    Drop the extra dir sync after content and the one after prune.
 4. Post-state pass: temp + rename, **no sync**. It is a best-effort annotation.
+   Implemented correction: fingerprints use a private `post-state.json` sidecar overlaid on reads; an unsynced replacement of durable `meta.json` could tear and lose the whole undo stack, not just fingerprints.
    Alternatively fold it into the next snapshot write.
 5. Leases: no sync (see shared section).
 6. **Add:** when `<path-hash>/` is new, sync the session directory (+1). When the
@@ -600,12 +603,13 @@ at the same time.
     `:8817`, `:10124`);
   - inspect pointer (`inspect/cache.rs:1625`);
   - symbol cache (`symbol_cache_disk.rs:188`, `:413`);
-  - the reader floor (`reader_floor.rs:260`, `:277`);
+  - the reader floor (`reader_floor.rs:260`, `:277`): its file + directory syncs are retained and count-pinned because it is a monotonic rollback-safety guard, not a cache; it must never lag newer durable data after a crash.
   - artifact owner manifests (`artifact_owner.rs`);
   - the root cache (`root_cache.rs:896`).
 
   These are mostly caches or pointers to rebuildable generations, and they would
   follow principle 2. They were not analysed one by one here.
+  Implemented: callgraph/inspect/symbol artifacts and live artifact-owner/read markers now have no extra drive flushes; SQLite's own policy, the reader floor, audit/logging syncs and view publication remain unchanged.
 - The gh shim (`gh_shim.rs:6177`, `:6511`) and logging's terminal line
   (`logging.rs:999`) sync on purpose, for audit and crash diagnostics. They are
   rare, so keep them.

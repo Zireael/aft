@@ -1611,6 +1611,52 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("Ignoring bridge from project config");
   });
 
+  // Below the one-minute minimum is a config error, not a silent clamp: the
+  // invalid bash block is dropped with a message naming the key, and the rest
+  // of the file still loads.
+  test("bash rejects worker_wait_max_ms below 60000", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify(
+        { bash: { worker_wait_max_ms: 59_999, compress: false }, format_on_edit: true },
+        null,
+        2,
+      ),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(config.bash).toBeUndefined();
+    expect(config.format_on_edit).toBe(true);
+    expect(result.stderr).toContain("Partial config loaded");
+    expect(result.stderr).toContain("bash.worker_wait_max_ms must be at least 60000");
+  });
+
+  test("project config may set worker_wait_max_ms", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ bash: { worker_wait_max_ms: 600_000 } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ bash: { worker_wait_max_ms: 120_000 } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as { bash?: { worker_wait_max_ms?: number } };
+    expect(config.bash?.worker_wait_max_ms).toBe(120_000);
+  });
+
   test("bridge rejects request_timeout_ms below 1000 and hang_threshold below 1", () => {
     const fixture = createConfigFixture();
     writeFileSync(

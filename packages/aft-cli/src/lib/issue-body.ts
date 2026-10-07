@@ -201,19 +201,25 @@ export function capBodyToGithubLimit(
   const removed = new Set<number>();
   const render = () =>
     `${head}${truncationMarker}${lines.filter((_, i) => !removed.has(i)).join("\n")}${tail}`;
-  let result = render();
+  // Track the rendered size arithmetically and render once at the end.
+  // Re-rendering the whole body after every dropped line made this
+  // quadratic in the log size (seconds for a few thousand lines).
+  let size = Buffer.byteLength(render(), "utf8");
   for (const index of payload) {
-    if (Buffer.byteLength(result, "utf8") <= maxBytes) break;
-    const excess = Buffer.byteLength(result, "utf8") - maxBytes;
+    if (size <= maxBytes) break;
+    const excess = size - maxBytes;
     const bytes = Buffer.byteLength(lines[index], "utf8");
     if (index === payload.at(-1) && bytes > excess) {
-      lines[index] = truncateToByteBudget(lines[index], bytes - excess);
+      const kept = truncateToByteBudget(lines[index], bytes - excess);
+      size -= bytes - Buffer.byteLength(kept, "utf8");
+      lines[index] = kept;
     } else {
       removed.add(index);
+      // The line and the newline that joined it to a neighbour both go.
+      size -= bytes + 1;
     }
-    result = render();
   }
-  return result;
+  return render();
 }
 
 /**

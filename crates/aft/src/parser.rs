@@ -4,8 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::SystemTime;
 
+#[cfg(test)]
+use crate::callgraph_store::join::Parser;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Node, Parser, Query, QueryCursor, Tree};
+#[cfg(not(test))]
+use tree_sitter::Parser;
+use tree_sitter::{Language, Node, Query, QueryCursor, Tree};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::resolve_module_path;
@@ -997,6 +1001,7 @@ pub(crate) mod work_counters {
         pub(crate) static PARSED_FILE_READS: Cell<usize> = const { Cell::new(0) };
         /// Copies of a cached symbol list handed out by `FileParser`.
         pub(crate) static CACHED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static FILE_PARSE_READS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn tree_parses() -> usize {
@@ -1303,11 +1308,22 @@ impl SymbolCache {
         content_hash: blake3::Hash,
         symbols: Vec<Symbol>,
     ) -> bool {
+        self.insert_shared(path, mtime, size, content_hash, Arc::new(symbols))
+    }
+
+    fn insert_shared(
+        &mut self,
+        path: PathBuf,
+        mtime: SystemTime,
+        size: u64,
+        content_hash: blake3::Hash,
+        symbols: Arc<Vec<Symbol>>,
+    ) -> bool {
         let entry = CachedSymbols {
             mtime,
             size,
             content_hash,
-            symbols: Arc::new(symbols),
+            symbols,
         };
         if self.entries.get(&path) == Some(&entry) {
             return false;
@@ -1581,7 +1597,7 @@ impl FileParser {
     /// per-language `Parser`, and most callers build a fresh `FileParser` per
     /// request (the language provider does it per call), so each call paid a
     /// parser allocation and grammar load before parsing.
-    fn parse_source(path: &Path, source: &str, lang: LangId) -> Result<Tree, AftError> {
+    pub(crate) fn parse_source(path: &Path, source: &str, lang: LangId) -> Result<Tree, AftError> {
         #[cfg(test)]
         work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
         parse_source_with_cached_parser(path, source, lang).inspect_err(|_| {
@@ -1641,6 +1657,8 @@ impl FileParser {
         };
 
         if needs_reparse {
+            #[cfg(test)]
+            work_counters::FILE_PARSE_READS.with(|count| count.set(count.get() + 1));
             let source = std::fs::read_to_string(path).map_err(|e| AftError::FileNotFound {
                 path: format!("{}: {}", path.display(), e),
             })?;
@@ -1745,6 +1763,25 @@ impl FileParser {
         &mut self,
         path: &Path,
     ) -> Result<(Vec<Symbol>, bool), AftError> {
+        let (symbols, changed, hit) = self.extract_symbols_shared_inner(path)?;
+        #[cfg(test)]
+        if hit {
+            work_counters::CACHED_SYMBOL_COPIES.with(|count| count.set(count.get() + 1));
+        }
+        let _ = hit;
+        Ok((Arc::unwrap_or_clone(symbols), changed))
+    }
+
+    /// Borrow the immutable cached table without copying every symbol string.
+    pub fn extract_symbols_shared(&mut self, path: &Path) -> Result<Arc<Vec<Symbol>>, AftError> {
+        self.extract_symbols_shared_inner(path)
+            .map(|(symbols, _, _)| symbols)
+    }
+
+    fn extract_symbols_shared_inner(
+        &mut self,
+        path: &Path,
+    ) -> Result<(Arc<Vec<Symbol>>, bool, bool), AftError> {
         let canon = path.to_path_buf();
         let current_mtime = std::fs::metadata(path)
             .and_then(|m| m.modified())
@@ -1795,16 +1832,14 @@ impl FileParser {
                             // A concurrent writer replaced the snapshot while we hashed.
                             // Retry rather than returning superseded symbols.
                             drop(cache);
-                            return self.extract_symbols_with_cache_status(path);
+                            return self.extract_symbols_shared_inner(path);
                         }
                     } else {
                         drop(cache);
-                        return self.extract_symbols_with_cache_status(path);
+                        return self.extract_symbols_shared_inner(path);
                     }
                 }
-                #[cfg(test)]
-                work_counters::CACHED_SYMBOL_COPIES.with(|count| count.set(count.get() + 1));
-                return Ok((Arc::unwrap_or_clone(cached.symbols), false));
+                return Ok((cached.symbols, false, true));
             }
         }
 
@@ -1814,13 +1849,13 @@ impl FileParser {
         let size = source.len() as u64;
         let content_hash = content_hash_for_source(&source);
 
-        let symbols = {
+        let symbols = Arc::new({
             // Reuse the source we just read instead of letting parse() read the
             // same file a second time.
             let (tree, lang) =
                 self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
             extract_symbols_from_tree(&source, tree, lang)?
-        };
+        });
 
         let mut symbol_cache = self
             .symbol_cache
@@ -1829,19 +1864,25 @@ impl FileParser {
                 message: "symbol cache lock poisoned".to_string(),
             })?;
         let cache_changed = if let Some(generation) = self.symbol_cache_generation {
-            symbol_cache.insert_for_generation(
-                generation,
+            symbol_cache.generation == generation
+                && symbol_cache.insert_shared(
+                    canon,
+                    current_mtime,
+                    size,
+                    content_hash,
+                    Arc::clone(&symbols),
+                )
+        } else {
+            symbol_cache.insert_shared(
                 canon,
                 current_mtime,
                 size,
                 content_hash,
-                symbols.clone(),
+                Arc::clone(&symbols),
             )
-        } else {
-            symbol_cache.insert(canon, current_mtime, size, content_hash, symbols.clone())
         };
 
-        Ok((symbols, cache_changed))
+        Ok((symbols, cache_changed, false))
     }
 
     /// Drop one local parse tree while preserving its shared extracted symbols.
@@ -2437,6 +2478,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
     } = collect_exports(source, root);
 
     let mut symbols = Vec::new();
+    let mut variable_names = VariableNameIndex::default();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, *root, source.as_bytes());
 
@@ -2727,11 +2769,10 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             } else {
                 lexical_declaration_has_function_value(&def_node)
             };
-            let name = node_text(source, &name_node).to_string();
-            let already_captured = symbols.iter().any(|s| s.name == name);
-            if is_top_level && !is_function_like && !already_captured {
+            let name = node_text(source, &name_node);
+            if variable_names.should_capture(&symbols, name, is_top_level && !is_function_like) {
                 symbols.push(Symbol {
-                    name,
+                    name: name.to_string(),
                     kind: SymbolKind::Variable,
                     range: node_range_with_decorators(&range_node, source, lang),
                     signature: Some(extract_signature(source, &def_node)),
@@ -2750,6 +2791,52 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
     Ok(symbols)
 }
 
+/// Name membership in the append-only query result, before final deduplication.
+#[derive(Default)]
+struct VariableNameIndex {
+    names: HashSet<String>,
+    indexed: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static VARIABLE_NAME_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LEGACY_VARIABLE_NAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl VariableNameIndex {
+    fn should_capture(&mut self, symbols: &[Symbol], name: &str, eligible: bool) -> bool {
+        #[cfg(test)]
+        if LEGACY_VARIABLE_NAMES.with(|legacy| legacy.get()) {
+            return Self::legacy_capture(symbols, name, eligible);
+        }
+        // Local and function-valued declarations cannot add a variable symbol.
+        if !eligible {
+            return false;
+        }
+        // Query captures append several kinds of symbols. Index only the new
+        // suffix so name-only suppression preserves the original query order.
+        for symbol in &symbols[self.indexed..] {
+            #[cfg(test)]
+            VARIABLE_NAME_WORK.with(|work| work.set(work.get() + 1));
+            self.names.insert(symbol.name.clone());
+        }
+        self.indexed = symbols.len();
+        #[cfg(test)]
+        VARIABLE_NAME_WORK.with(|work| work.set(work.get() + 1));
+        !self.names.contains(name)
+    }
+
+    #[cfg(test)]
+    fn legacy_capture(symbols: &[Symbol], name: &str, eligible: bool) -> bool {
+        let captured = symbols.iter().any(|symbol| {
+            VARIABLE_NAME_WORK.with(|work| work.set(work.get() + 1));
+            symbol.name == name
+        });
+        eligible && !captured
+    }
+}
+
 /// Extract symbols from JavaScript source.
 fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::JavaScript;
@@ -2761,6 +2848,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
     } = collect_exports(source, root);
 
     let mut symbols = Vec::new();
+    let mut variable_names = VariableNameIndex::default();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, *root, source.as_bytes());
 
@@ -2880,11 +2968,10 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             } else {
                 lexical_declaration_has_function_value(&def_node)
             };
-            let name = node_text(source, &name_node).to_string();
-            let already_captured = symbols.iter().any(|s| s.name == name);
-            if is_top_level && !is_function_like && !already_captured {
+            let name = node_text(source, &name_node);
+            if variable_names.should_capture(&symbols, name, is_top_level && !is_function_like) {
                 symbols.push(Symbol {
-                    name,
+                    name: name.to_string(),
                     kind: SymbolKind::Variable,
                     range: node_range_with_decorators(&range_node, source, lang),
                     signature: Some(extract_signature(source, &def_node)),
@@ -3403,6 +3490,18 @@ thread_local! {
 /// invisible. Code bases that group whole runtimes of methods inside macro
 /// bodies depend on seeing them, so each such body is parsed again on its own
 /// and contributes its items when, and only when, it parses cleanly as Rust.
+/// The type an impl block's methods belong to, as outlines name it: generic
+/// arguments and path qualifiers are dropped, so `impl<T> Trait for a::Box<T>`
+/// nests its methods under the `Box` struct instead of a name no symbol has.
+fn rust_impl_parent_name(impl_target: &str) -> String {
+    let base_type = impl_target.split('<').next().unwrap_or(impl_target).trim();
+    base_type
+        .rsplit("::")
+        .next()
+        .unwrap_or(base_type)
+        .to_string()
+}
+
 fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
     let mut symbols = Vec::new();
     let mut macro_bodies = Vec::new();
@@ -3618,7 +3717,10 @@ fn extract_rs_symbols_from_root(
                 } else {
                     type_names.first().cloned().unwrap_or_default()
                 };
-                let parent_name = type_names.last().cloned().unwrap_or_default();
+                let parent_name = type_names
+                    .last()
+                    .map(|name| rust_impl_parent_name(name))
+                    .unwrap_or_default();
 
                 let mut child_cursor = node.walk();
                 if child_cursor.goto_first_child() {
@@ -4373,6 +4475,7 @@ fn extract_zig_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<S
     let capture_names = query.capture_names();
 
     let mut symbols = Vec::new();
+    let mut variable_names = VariableNameIndex::default();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, *root, source.as_bytes());
 
@@ -4475,11 +4578,10 @@ fn extract_zig_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<S
                 || signature.contains("= union")
                 || signature.contains("= opaque");
             let is_const = signature.trim_start().starts_with("const ");
-            let name = node_text(source, &name_node).to_string();
-            let already_captured = symbols.iter().any(|symbol| symbol.name == name);
-            if is_const && !is_container && !already_captured {
+            let name = node_text(source, &name_node);
+            if variable_names.should_capture(&symbols, name, is_const && !is_container) {
                 symbols.push(Symbol {
-                    name,
+                    name: name.to_string(),
                     kind: SymbolKind::Variable,
                     range: node_range_with_decorators(&def_node, source, lang),
                     signature: Some(signature),
@@ -8208,6 +8310,19 @@ pub struct TreeSitterProvider {
     symbol_cache: SharedSymbolCache,
 }
 
+/// Share the production provider's immutable table, while retaining the owned
+/// trait API for alternate providers and callers that need to modify symbols.
+pub(crate) fn list_symbols_shared(
+    provider: &dyn crate::language::LanguageProvider,
+    file: &Path,
+) -> Result<Arc<Vec<Symbol>>, AftError> {
+    if let Some(provider) = provider.as_any().downcast_ref::<TreeSitterProvider>() {
+        FileParser::with_symbol_cache(provider.symbol_cache()).extract_symbols_shared(file)
+    } else {
+        provider.list_symbols(file).map(Arc::new)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReExportTarget {
     file: PathBuf,
@@ -8255,10 +8370,19 @@ impl TreeSitterProvider {
             return Ok(Vec::new());
         }
 
-        let symbols = parser.extract_symbols(file)?;
+        let symbols = parser.extract_symbols_shared(file)?;
         let local_matches = symbol_matches_in_file(file, &symbols, name);
         if !local_matches.is_empty() {
             return Ok(local_matches);
+        }
+
+        // Only JS-family modules have default exports and re-export clauses.
+        // Other languages cannot resolve a missing local name by reparsing.
+        if !matches!(
+            detect_language(file),
+            Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript)
+        ) {
+            return Ok(Vec::new());
         }
 
         // Both the default-export lookup and the re-export scan need the
@@ -8761,6 +8885,99 @@ mod tests {
         extract_symbols_from_tree(source, &tree, lang).unwrap()
     }
 
+    #[test]
+    fn variable_name_membership_is_linear_and_byte_identical() {
+        for (lang, count) in [
+            (LangId::TypeScript, 4000),
+            (LangId::JavaScript, 400),
+            (LangId::Zig, 400),
+        ] {
+            let mut source = String::new();
+            for i in 0..count {
+                source.push_str(&format!("const generated_{i} = {i};\n"));
+            }
+            if lang != LangId::Zig {
+                source.push_str("function local() {\n");
+                for i in 0..count {
+                    source.push_str(&format!("const local_{i} = {i};\n"));
+                }
+                source.push_str("}\nconst callback = () => 1;\nclass C { generated_0() {} }\n");
+            }
+            LEGACY_VARIABLE_NAMES.with(|legacy| legacy.set(true));
+            VARIABLE_NAME_WORK.with(|work| work.set(0));
+            let reference = symbols_from_source(&source, lang);
+            let before = VARIABLE_NAME_WORK.with(|work| work.get());
+            LEGACY_VARIABLE_NAMES.with(|legacy| legacy.set(false));
+            VARIABLE_NAME_WORK.with(|work| work.set(0));
+            let actual = symbols_from_source(&source, lang);
+            let after = VARIABLE_NAME_WORK.with(|work| work.get());
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&reference).unwrap()
+            );
+            assert!(actual.len() >= count);
+            eprintln!("{lang:?}: variable membership work {before} -> {after}");
+            assert!(
+                after <= 2 * actual.len(),
+                "{after} name operations for {} symbols",
+                actual.len()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_symbol_hits_and_resolution_do_not_copy_the_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("generated.ts");
+        let source: String = (0..1000)
+            .map(|i| format!("export const c{i} = {i};\n"))
+            .collect();
+        std::fs::write(&file, source).unwrap();
+        let provider = TreeSitterProvider::new();
+        let original = list_symbols_shared(&provider, &file).unwrap();
+        let serialized = serde_json::to_vec(original.as_ref()).unwrap();
+        let before = work_counters::CACHED_SYMBOL_COPIES.with(|count| count.get());
+        for _ in 0..10 {
+            let hit = list_symbols_shared(&provider, &file).unwrap();
+            assert!(
+                Arc::ptr_eq(&original, &hit),
+                "a cache hit must share the table allocation"
+            );
+            assert_eq!(serde_json::to_vec(hit.as_ref()).unwrap(), serialized);
+            let resolved = provider.resolve_symbol(&file, "c500").unwrap();
+            assert_eq!(resolved[0].symbol, original[500]);
+        }
+        assert_eq!(
+            work_counters::CACHED_SYMBOL_COPIES.with(|count| count.get()) - before,
+            0
+        );
+        // The owned compatibility API still returns the exact same symbols.
+        assert_eq!(
+            serde_json::to_vec(&provider.list_symbols(&file).unwrap()).unwrap(),
+            serialized
+        );
+    }
+
+    #[test]
+    fn non_js_symbol_miss_does_not_read_or_parse_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.rs");
+        std::fs::write(&file, "pub fn present() {}\n").unwrap();
+        let provider = TreeSitterProvider::new();
+        provider.list_symbols(&file).unwrap();
+        let reads = work_counters::PARSED_FILE_READS.with(|count| count.get());
+        let parses = work_counters::tree_parses();
+        assert!(matches!(
+            provider.resolve_symbol(&file, "missing"),
+            Err(AftError::SymbolNotFound { .. })
+        ));
+        assert_eq!(
+            work_counters::PARSED_FILE_READS.with(|count| count.get()) - reads,
+            0
+        );
+        assert_eq!(work_counters::tree_parses() - parses, 0);
+    }
+
     /// Export detection reads export statements from one tree walk and finds
     /// the containing statement by binary search. It must agree, for every
     /// node, with the old method: a full query pass for `@export.stmt`
@@ -9189,11 +9406,8 @@ mod tests {
 
             if let Some(impl_node) = impl_node {
                 let scope_name = rust_impl_scope_name(&impl_node, source);
-                let parent_name = scope_name
-                    .rsplit(" for ")
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
+                let parent_name =
+                    rust_impl_parent_name(scope_name.rsplit(" for ").next().unwrap_or_default());
                 let mut impl_cursor = impl_node.walk();
                 if impl_cursor.goto_first_child() {
                     loop {

@@ -1274,8 +1274,10 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let _publication_gate = aft::executor::standalone_request_gate();
     #[cfg(test)]
     dispatch_config_probe_for_test(ctx);
+    let watcher_pending = aft::response_finalize::watcher_query_pending(ctx, &req.command);
     let mut response = dispatch_command(req, ctx);
     aft::response_finalize::attach_checkout_query_gaps(&mut response, ctx);
+    aft::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
     // Every mutation this request made is on disk now; record what it left so
     // a later undo can tell AFT's own result from a change made outside AFT.
     ctx.backup().lock().record_post_mutation_states();
@@ -1510,24 +1512,26 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
         wake_standalone_loop_for_deferred_response();
     });
 
-    DispatchOutcome::Deferred(PendingResponse {
-        request_id,
-        session_id,
-        attach_command,
-        poll: Box::new(move |_| match rx.try_recv() {
-            Ok(response) => Some(response),
-            Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => Some(Response::error(
-                &disconnected_request_id,
-                "internal_error",
-                "deferred request worker disconnected before producing a response",
-            )),
-        }),
-        cancellation: Some(cancellation),
-        on_shutdown: Some(Box::new(move |_| {
+    DispatchOutcome::Deferred(
+        PendingResponse::polling(
+            request_id,
+            session_id,
+            attach_command,
+            Box::new(move |_| match rx.try_recv() {
+                Ok(response) => Some(response),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Response::error(
+                    &disconnected_request_id,
+                    "internal_error",
+                    "deferred request worker disconnected before producing a response",
+                )),
+            }),
+        )
+        .with_cancellation(cancellation)
+        .with_shutdown(Box::new(move |_| {
             cancelled_deferred_response(&shutdown_request_id, &shutdown_command)
         })),
-    })
+    )
 }
 
 fn cancel_request_target(req: &RawRequest) -> Option<&str> {
@@ -1765,11 +1769,12 @@ fn offloaded_validation_pending(
     let poll_command = attach_command.clone();
     let shutdown_request_id = request_id.clone();
     let shutdown_command = attach_command.clone();
-    DispatchOutcome::Deferred(PendingResponse {
+    DispatchOutcome::Deferred(
+        PendingResponse::polling(
         request_id,
         session_id,
         attach_command,
-        poll: Box::new(move |_| {
+        Box::new(move |_| {
             let rx = poll_rx
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1781,13 +1786,13 @@ fn offloaded_validation_pending(
                 }
             }
         }),
+    )
         // The file is already written; cancelling the checker would only hide
         // its result, so the edit is not cancellable once deferred.
-        cancellation: None,
         // At shutdown, wait for the checker (bounded by
         // `type_checker_timeout_secs`) so the client still receives the real
         // edit result instead of a cancellation for a write that happened.
-        on_shutdown: Some(Box::new(move |_| {
+        .with_shutdown(Box::new(move |_| {
             let rx = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
                 if let Some(response) =
@@ -1797,7 +1802,7 @@ fn offloaded_validation_pending(
                 }
             }
         })),
-    })
+    )
 }
 
 fn handle_echo(req: &RawRequest) -> Response {
@@ -2081,11 +2086,11 @@ mod pending_response_tests {
         let mut pending = PendingResponses::default();
         let poll_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_poll = Arc::clone(&poll_calls);
-        pending.register(PendingResponse {
-            request_id: "pending-registry".to_string(),
-            session_id: session_id.to_string(),
-            attach_command: "read".to_string(),
-            poll: Box::new(move |_| {
+        pending.register(PendingResponse::polling(
+            "pending-registry".to_string(),
+            session_id.to_string(),
+            "read".to_string(),
+            Box::new(move |_| {
                 let next = calls_for_poll.fetch_add(1, Ordering::SeqCst) + 1;
                 if next <= 2 {
                     None
@@ -2096,9 +2101,7 @@ mod pending_response_tests {
                     ))
                 }
             }),
-            cancellation: None,
-            on_shutdown: None,
-        });
+        ));
 
         let mut writer = Vec::new();
         for expected_calls in 1..=2 {
@@ -2213,6 +2216,14 @@ mod pending_response_tests {
         assert_eq!(response["status"], serde_json::json!("running"));
         assert!(output.contains(&task_id));
         assert!(output.contains("Detached because a user message arrived."));
+        assert!(output.contains("AFT kills this task at "), "{output}");
+        assert!(
+            output.contains("when it has run 10s (the `timeout` you passed)"),
+            "{output}"
+        );
+        // That detaching never extends an explicit timeout is asserted on the
+        // registry in commands::bash tests; its test-only accessor is not
+        // visible to this binary's tests.
         assert!(pending.is_empty());
 
         let running = wait_for_snapshot(
@@ -2283,17 +2294,15 @@ mod pending_response_tests {
         let mut pending = PendingResponses::default();
         let poll_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_poll = Arc::clone(&poll_calls);
-        pending.register(PendingResponse {
-            request_id: "pending-drain".to_string(),
-            session_id: "session-drain".to_string(),
-            attach_command: "read".to_string(),
-            poll: Box::new(move |_| {
+        pending.register(PendingResponse::polling(
+            "pending-drain".to_string(),
+            "session-drain".to_string(),
+            "read".to_string(),
+            Box::new(move |_| {
                 calls_for_poll.fetch_add(1, Ordering::SeqCst);
                 None
             }),
-            cancellation: None,
-            on_shutdown: None,
-        });
+        ));
         let mut writer = Vec::new();
 
         assert_eq!(
@@ -2335,17 +2344,15 @@ mod pending_response_tests {
 
         let events_for_pending = Arc::clone(&events);
         let mut pending = PendingResponses::default();
-        pending.register(PendingResponse {
-            request_id: "pending-order".to_string(),
-            session_id: "session-order".to_string(),
-            attach_command: "bash".to_string(),
-            poll: Box::new(move |_| {
+        pending.register(PendingResponse::polling(
+            "pending-order".to_string(),
+            "session-order".to_string(),
+            "bash".to_string(),
+            Box::new(move |_| {
                 events_for_pending.lock().unwrap().push("pending");
                 Some(Response::success("pending-order", serde_json::json!({})))
             }),
-            cancellation: None,
-            on_shutdown: None,
-        });
+        ));
         let mut writer = Vec::new();
 
         assert_eq!(
@@ -2365,11 +2372,11 @@ mod pending_response_tests {
         let mut pending = PendingResponses::default();
         let poll_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_poll = Arc::clone(&poll_calls);
-        pending.register(PendingResponse {
-            request_id: "pending-long".to_string(),
-            session_id: "session-long".to_string(),
-            attach_command: "read".to_string(),
-            poll: Box::new(move |_| {
+        pending.register(PendingResponse::polling(
+            "pending-long".to_string(),
+            "session-long".to_string(),
+            "read".to_string(),
+            Box::new(move |_| {
                 let next = calls_for_poll.fetch_add(1, Ordering::SeqCst) + 1;
                 if next <= 50 {
                     None
@@ -2380,9 +2387,7 @@ mod pending_response_tests {
                     ))
                 }
             }),
-            cancellation: None,
-            on_shutdown: None,
-        });
+        ));
         let mut writer = Vec::new();
 
         for expected_calls in 1..=50 {
@@ -2412,24 +2417,22 @@ mod pending_response_tests {
         let second_ready = Arc::new(AtomicBool::new(false));
         let second_ready_for_poll = Arc::clone(&second_ready);
         let mut pending = PendingResponses::default();
-        pending.register(PendingResponse {
-            request_id: "pending-ready".to_string(),
-            session_id: "session-multi".to_string(),
-            attach_command: "read".to_string(),
-            poll: Box::new(|_| {
+        pending.register(PendingResponse::polling(
+            "pending-ready".to_string(),
+            "session-multi".to_string(),
+            "read".to_string(),
+            Box::new(|_| {
                 Some(Response::success(
                     "pending-ready",
                     serde_json::json!({"which": "ready"}),
                 ))
             }),
-            cancellation: None,
-            on_shutdown: None,
-        });
-        pending.register(PendingResponse {
-            request_id: "pending-later".to_string(),
-            session_id: "session-multi".to_string(),
-            attach_command: "read".to_string(),
-            poll: Box::new(move |_| {
+        ));
+        pending.register(PendingResponse::polling(
+            "pending-later".to_string(),
+            "session-multi".to_string(),
+            "read".to_string(),
+            Box::new(move |_| {
                 if second_ready_for_poll.load(Ordering::SeqCst) {
                     Some(Response::success(
                         "pending-later",
@@ -2439,9 +2442,7 @@ mod pending_response_tests {
                     None
                 }
             }),
-            cancellation: None,
-            on_shutdown: None,
-        });
+        ));
         let mut writer = Vec::new();
 
         assert_eq!(
@@ -2471,20 +2472,18 @@ mod pending_response_tests {
         let poll_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_poll = Arc::clone(&poll_calls);
         let mut pending = PendingResponses::default();
-        pending.register(PendingResponse {
-            request_id: "pending-shutdown".to_string(),
-            session_id: "session-shutdown".to_string(),
-            attach_command: "read".to_string(),
-            poll: Box::new(move |_| {
+        pending.register(PendingResponse::polling(
+            "pending-shutdown".to_string(),
+            "session-shutdown".to_string(),
+            "read".to_string(),
+            Box::new(move |_| {
                 calls_for_poll.fetch_add(1, Ordering::SeqCst);
                 Some(Response::success(
                     "pending-shutdown",
                     serde_json::json!({"should_not_write": true}),
                 ))
             }),
-            cancellation: None,
-            on_shutdown: None,
-        });
+        ));
         let mut writer = Vec::new();
 
         pending.drain_on_shutdown();
@@ -2737,7 +2736,7 @@ mod deferred_semantic_search_tests {
             &ctx,
         ));
         started
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(30))
             .expect("query embedding starts");
 
         let cancel_started_at = Instant::now();
@@ -2808,7 +2807,7 @@ mod deferred_semantic_search_tests {
                 .expect("send cancelled wait response");
         });
         started_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(30))
             .expect("semantic-ready wait starts");
         thread::sleep(Duration::from_millis(20));
         cancellation.request_cancel();
@@ -3463,12 +3462,25 @@ mod watcher_filter_tests {
     use aft::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use aft::response_finalize::finalize_response;
     use aft::runtime_drain::{
-        drain_semantic_refresh_events, drain_watcher_events,
+        drain_semantic_refresh_events, drain_watcher_events_bounded,
         record_semantic_refresh_transient_failure, schedule_semantic_refresh_retry,
         semantic_refresh_circuit_is_open, semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_path_is_callgraph_indexed,
-        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
+        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS, WATCHER_PATH_DRAIN_BATCH_CAP,
     };
+
+    /// Apply every queued watcher event. One drain call applies a single slice
+    /// with a 250 ms budget, so on a slow runner it can stop before the later
+    /// index phases; production finishes the rest on later turns.
+    fn drain_watcher_events(ctx: &AppContext) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher drain never finished"
+            );
+        }
+    }
     use aft::semantic_index::SemanticIndex;
     use aft::watcher_filter::{
         watcher_event_invalidates, FilteredWatcherPaths, WatcherDispatchEvent, WatcherFilterConfig,

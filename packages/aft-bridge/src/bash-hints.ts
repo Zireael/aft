@@ -21,12 +21,32 @@ export const DEFAULT_PRIMARY_WATCH_TIMEOUT_MS = 30_000;
 export const MAX_WATCH_TIMEOUT_MS = 1_800_000;
 
 /**
+ * Default `bash.worker_wait_max_ms`: the longest a delegated worker's wait on
+ * one command blocks before control returns to it. Mirrors
+ * `DEFAULT_BASH_WORKER_WAIT_MAX_MS` in the engine's `config.rs`. A worker that
+ * blocked with no limit once sat behind a stuck test run for fifteen hours;
+ * with the limit it gets control back, sees the command is still running, and
+ * decides whether to wait again or kill it.
+ */
+export const DEFAULT_WORKER_WAIT_MAX_MS = 1_800_000;
+
+/** Smallest accepted `bash.worker_wait_max_ms`; mirrors `MIN_BASH_WORKER_WAIT_MAX_MS`. */
+export const MIN_WORKER_WAIT_MAX_MS = 60_000;
+
+/**
  * Longest delay a JavaScript timer accepts (2^31 - 1 ms, about 24.8 days); a
- * larger one fires almost at once. A bridge request that must wait for a
- * command with no hard-kill timeout uses it as its transport timeout, which
- * in practice means no transport timeout.
+ * larger one fires almost at once. Bridge transport timeouts derived from a
+ * configured limit are clamped to it.
  */
 export const LONGEST_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * How a delegated worker's waits are bounded, worded once for every tool
+ * description. It names the setting, not its value, so the prompt prefix is
+ * the same for every user.
+ */
+export const WORKER_WAIT_LIMIT_PHRASE =
+  "the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default)";
 
 /**
  * Description of the bash_watch tool's sync-wait defaults, embedded in both
@@ -34,34 +54,35 @@ export const LONGEST_TIMER_DELAY_MS = 2_147_483_647;
  * has to state both roles' real behaviour.
  */
 export const WATCH_SYNC_DEFAULTS_DESCRIPTION =
-  "Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits until the command finishes";
+  "Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting";
 
 /**
  * Description of the bash_watch timeout parameter. Every caller sees the same
  * schema, so it has to be true for both roles.
  */
 export const WATCH_TIMEOUT_PARAM_DESCRIPTION =
-  "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait until the command finishes; a value you pass is used as given.";
+  "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is used as given.";
 
 /**
- * Effective sync bash_watch deadline in milliseconds, or `undefined` for a
- * wait with no deadline, which lasts until the task exits, a pattern matches,
- * a new message arrives, or the call is aborted.
+ * Effective sync bash_watch deadline in milliseconds.
  *
  * A delegated worker cannot be woken once its turn ends, so it has nothing
- * useful to do while its command runs except wait. Any deadline only makes it
- * call bash_watch again, and every such call re-reads its whole context. It
- * therefore waits with no deadline by default, and a timeout it passes is
- * honoured as given rather than clamped to the configured cap. A primary keeps
- * the short default and the cap because it can do other work or end its turn
- * and be woken by the completion reminder.
+ * useful to do while its command runs except wait, and a short deadline only
+ * makes it call bash_watch again, re-reading its whole context each time. It
+ * therefore waits up to the worker wait limit (`workerWaitMaxMs`,
+ * `bash.worker_wait_max_ms`) by default: long enough that re-watching is
+ * rare, short enough that a stuck command cannot hold it forever. A timeout
+ * it passes is honoured as given rather than clamped to the primary cap. A
+ * primary keeps the short default and the cap because it can do other work
+ * or end its turn and be woken by the completion reminder.
  */
 export function resolveWatchTimeoutMs(
   requestedMs: number | undefined,
   role: WatchCallerRole,
   capMs: number,
-): number | undefined {
-  if (role === "worker") return requestedMs;
+  workerWaitMaxMs: number,
+): number {
+  if (role === "worker") return requestedMs ?? workerWaitMaxMs;
   return Math.min(requestedMs ?? DEFAULT_PRIMARY_WATCH_TIMEOUT_MS, capMs);
 }
 
@@ -131,7 +152,7 @@ export function formatWatchWaited(
   capMs: number | undefined,
 ): string {
   let limit: string;
-  if (limitMs === undefined) limit = "no limit: waits until the command finishes";
+  if (limitMs === undefined) limit = "no wait limit";
   else if (capMs !== undefined && limitMs >= capMs)
     limit = `limit ${limitMs}ms, the bash.watch_sync_max_ms cap`;
   else limit = `limit ${limitMs}ms`;
@@ -139,22 +160,159 @@ export function formatWatchWaited(
 }
 
 /**
- * Appended to a bash_watch reply whose sync deadline passed without a match.
- * The deadline is a property of the watch, not of the command: a delegated
- * worker that read the bare "timeout reached" line as its own execution being
- * interrupted declared a failed result while its long-running command was
- * still going. Each role gets only the move that applies to it: a worker must
- * keep watching and not report, while a primary may end its turn because the
- * completion reminder wakes it. A worker only reaches this with a timeout it
- * passed itself, so it is told that leaving the timeout out waits until the
- * command finishes. `timeoutParam` is the host's spelling of the bash_watch
- * timeout argument, so the worker is told a name it can pass.
+ * Appended to a primary's bash_watch reply whose sync deadline passed without
+ * a match. The deadline is a property of the watch, not of the command, so the
+ * caller is told the command is still running and that the completion
+ * reminder wakes it. A worker gets {@link workerWatchStillRunning} instead.
  */
-export function watchTimeoutSteer(role: WatchCallerRole, timeoutParam = "timeoutMs"): string {
-  if (role === "worker") {
-    return `The command is still running; this is not a failure. Watch again and don't report a result until it finishes; a bash_watch without ${timeoutParam} waits until the command finishes.`;
-  }
+export function watchTimeoutSteer(): string {
   return "The command is still running; this is not a failure. Watch again, do other work, or end your turn: the completion reminder wakes you.";
+}
+
+/** A duration in words: whole minutes as minutes, anything else in seconds. */
+export function formatWaitDuration(ms: number): string {
+  const rounded = Math.max(0, Math.round(ms));
+  if (rounded === 60_000) return "1 minute";
+  if (rounded > 0 && rounded % 60_000 === 0) return `${rounded / 60_000} minutes`;
+  const seconds = (rounded / 1000).toFixed(1).replace(/\.0$/, "");
+  return `${seconds}s`;
+}
+
+/**
+ * The sentence naming a task's own kill deadline, from the `hard_kill` field
+ * and `started_at` of the engine's task status (`{ limit_ms, source }`), or how
+ * the task was killed when its hard kill fired (`status_reason`). It reports an
+ * absolute UTC deadline measured from command start and the approximate time
+ * remaining. Mirrors `kill_deadline_sentence` in the engine.
+ */
+export function taskKillDeadlineText(
+  data: Record<string, unknown>,
+  role: WatchCallerRole,
+  nowMs = Date.now(),
+): string {
+  if (data.status === "timed_out") {
+    const reason = typeof data.status_reason === "string" ? data.status_reason : "";
+    return reason === ""
+      ? "The task was killed by its time limit (exit 124)."
+      : `The task was ${reason}.`;
+  }
+  // A terminal task's deadline no longer matters; an unknown state (the
+  // bridge stayed busy) has none to report.
+  if (isTerminalTaskStatus(data.status) || typeof data.status !== "string") return "";
+  if (data.status === "unknown") return "";
+  const hardKill = data.hard_kill as { limit_ms?: unknown; source?: unknown } | undefined;
+  if (!hardKill || typeof hardKill.limit_ms !== "number") {
+    return "This task has no kill deadline.";
+  }
+  const startedAtMs = data.started_at;
+  if (typeof startedAtMs !== "number" || !Number.isSafeInteger(startedAtMs)) {
+    return "This task has no kill deadline.";
+  }
+  const limitMs = hardKill.limit_ms;
+  const limit = formatWaitDuration(limitMs);
+  const deadlineAt = startedAtMs + limitMs;
+  const when = `at ${formatKillDeadlineUtc(deadlineAt)}, when it has run ${limit}`;
+  let source: string;
+  if (hardKill.source === "timeout") {
+    source = "(the `timeout` you passed)";
+  } else if (role === "worker") {
+    source =
+      "(its default background limit), but each wait you make on it moves that kill to at least the worker wait limit (`bash.worker_wait_max_ms`) after the wait, so it is not killed while you keep waiting; pass a `timeout` to set your own limit";
+  } else {
+    source = "(its default background limit) unless you pass a longer `timeout`";
+  }
+  const remaining =
+    deadlineAt <= nowMs
+      ? "; the kill deadline has passed"
+      : `; about ${formatApproximateRemaining(deadlineAt - nowMs)} remain`;
+  return `AFT kills this task ${when} ${source}${remaining}.`;
+}
+
+/**
+ * A wait should not hand back a still-running task just before its own kill
+ * deadline. Five seconds covers the slowest status poll and kill publication.
+ */
+export function taskKillDeadlineWithinHandoffMargin(data: Record<string, unknown>): boolean {
+  if (typeof data.status !== "string" || isTerminalTaskStatus(data.status)) return false;
+  const hardKill = data.hard_kill as { limit_ms?: unknown } | undefined;
+  const limitMs = hardKill?.limit_ms;
+  const elapsedMs = data.elapsed_ms;
+  return (
+    typeof limitMs === "number" &&
+    Number.isSafeInteger(limitMs) &&
+    typeof elapsedMs === "number" &&
+    Number.isSafeInteger(elapsedMs) &&
+    limitMs - elapsedMs <= 5_000
+  );
+}
+
+function formatKillDeadlineUtc(unixMs: number): string {
+  const date = new Date(unixMs);
+  if (!Number.isFinite(date.getTime())) throw new Error("invalid bash task start time");
+  const year = String(date.getUTCFullYear()).padStart(4, "0");
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  const hour = String(date.getUTCHours()).padStart(2, "0");
+  const minute = String(date.getUTCMinutes()).padStart(2, "0");
+  const second = String(date.getUTCSeconds()).padStart(2, "0");
+  const millis = date.getUTCMilliseconds();
+  const fraction = millis === 0 ? "" : `.${String(millis).padStart(3, "0")}`;
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}${fraction}Z`;
+}
+
+function formatApproximateRemaining(ms: number): string {
+  if (ms >= 60_000) {
+    const minutes = Math.max(1, Math.floor((ms + 30_000) / 60_000));
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  return formatWaitDuration(ms);
+}
+
+function isTerminalTaskStatus(status: unknown): boolean {
+  return (
+    status === "completed" ||
+    status === "failed" ||
+    status === "killed" ||
+    status === "timed_out" ||
+    status === "fate_unknown"
+  );
+}
+
+/** Most lines of a still-running command's output shown to a worker. */
+const WORKER_OUTPUT_TAIL_LINES = 20;
+
+/** The last lines of `output`, so a worker can judge whether a command is stuck. */
+export function outputTail(output: string | undefined): string {
+  const lines = (output ?? "").replace(/\s+$/, "").split("\n");
+  return lines.slice(-WORKER_OUTPUT_TAIL_LINES).join("\n");
+}
+
+/**
+ * Appended to a delegated worker's bash_watch reply whose deadline passed
+ * while the command still runs (by default the worker wait limit). The
+ * deadline is a property of the watch, not of the command: a worker that read
+ * a bare "timeout reached" line as its own execution failing declared a
+ * failed result while its command was still going. So it is told plainly that
+ * the command is still running, how long it has run, and its latest output,
+ * then given both moves by name: watch again to keep waiting, or kill a
+ * command that should have finished. `taskIdArg` and `timeoutParam` are the
+ * host's spellings of the bash_watch arguments.
+ */
+export function workerWatchStillRunning(options: {
+  taskId: string;
+  waitedMs: number;
+  ranMs: number | undefined;
+  output: string | undefined;
+  taskIdArg?: string;
+  timeoutParam?: string;
+}): string {
+  const taskIdArg = options.taskIdArg ?? "taskId";
+  const timeoutParam = options.timeoutParam ?? "timeoutMs";
+  const ran =
+    options.ranMs === undefined ? "" : ` It has run for ${formatWaitDuration(options.ranMs)}.`;
+  const tail = outputTail(options.output);
+  const output = tail === "" ? "No output yet." : `Recent output:\n${tail}`;
+  return `The command is still running after ${formatWaitDuration(options.waitedMs)} of watching; this is not a failure.${ran} Call bash_watch({ ${taskIdArg}: "${options.taskId}" }) again to keep waiting (without ${timeoutParam} a watch waits up to the worker wait limit, then reports it is still running), or bash_kill({ ${taskIdArg}: "${options.taskId}" }) if it should have finished by now. Don't report a result until it finishes.\n${output}`;
 }
 
 /**
@@ -188,12 +346,12 @@ export function interruptedWatchTail(role: WatchCallerRole, primaryTail: string)
  * command now runs in the background. AFT's own reply already says the task
  * won't wake the worker; this names the plugin-owned bash_watch tool, which
  * AFT cannot assume a host has. The suggested call passes no timeout on
- * purpose: a worker's watch without one waits until the command finishes, so
- * any number would only make it wake and watch again. `taskIdArg` is the
- * host's spelling of the task id argument.
+ * purpose: a worker's watch without one waits up to the worker wait limit,
+ * the longest it may, so any number would only make it wake sooner and watch
+ * again. `taskIdArg` is the host's spelling of the task id argument.
  */
 export function workerBackgroundTaskNote(taskId: string, taskIdArg = "taskId"): string {
-  return `\n\nNOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ ${taskIdArg}: "${taskId}" }) to wait for completion before returning to the parent; without a timeout it waits until the command finishes. Subagents don't survive turn-end and won't be woken when the command finishes.`;
+  return `\n\nNOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ ${taskIdArg}: "${taskId}" }) to wait for completion before returning to the parent; without a timeout it waits up to ${WORKER_WAIT_LIMIT_PHRASE}, then reports it is still running; watch again to keep waiting, or call bash_kill({ ${taskIdArg}: "${taskId}" }) if it should have finished by now. Subagents don't survive turn-end and won't be woken when the command finishes.`;
 }
 
 /**

@@ -8,7 +8,6 @@ import {
   type BridgePool,
   type BridgeRequestOptions,
   BridgeTransportUnavailableError,
-  LONGEST_TIMER_DELAY_MS,
   watchClock,
   watchTimeoutSteer,
 } from "@cortexkit/aft-bridge";
@@ -1213,6 +1212,31 @@ describe("bash_status tool", () => {
     };
   }
 
+  test("PTY incomplete capture status preserves command outcome and shows warning", async () => {
+    const reason = "PTY output may be incomplete: output drain deadline expired before EOF";
+    for (const exitCode of [0, 17]) {
+      for (const outputMode of ["screen", "raw", "both"]) {
+        const status = exitCode === 0 ? "completed" : "failed";
+        const { statusTool } = makeCtx(() => ({
+          success: true,
+          status,
+          exit_code: exitCode,
+          mode: "pty",
+          output_incomplete: true,
+          status_reason: reason,
+          pty_screen: "captured prefix",
+          pty_raw: "captured prefix",
+        }));
+        const text = await statusTool.execute(
+          { taskId: "bash-incomplete", outputMode },
+          createMockSdkContext(),
+        );
+        expect(text).toContain(`Task bash-incomplete: ${status} (exit ${exitCode})`);
+        expect(text).toContain(reason);
+      }
+    }
+  });
+
   test("default sync cap rejects 120001 with the config knob in the error", async () => {
     const { watchTool } = makeCtx(() => ({ success: true, status: "completed", exit_code: 0 }));
 
@@ -1553,7 +1577,7 @@ describe("bash_status tool", () => {
     _resetSubagentCacheForTest();
     // Only a primary session is bounded by the cap: it asks for longer than
     // the cap and is clamped to it. (A delegated worker's watch without a
-    // timeout has no deadline at all.)
+    // timeout is bounded by the worker wait limit instead.)
     const { watchTool } = makeCtx(() => ({ success: true, status: "running" }), {
       bash: { watch_sync_max_ms: 1_000 },
     } as PluginContext["config"]);
@@ -1568,18 +1592,26 @@ describe("bash_status tool", () => {
 
   test("bash_watch timeout gives a delegated worker only the worker steer, with no cap", async () => {
     _resetSubagentCacheForTest();
-    const { ctx, watchTool } = makeCtx(() => ({ success: true, status: "running" }), {
-      bash: { watch_sync_max_ms: 90_000 },
-    } as PluginContext["config"]);
+    const { ctx, watchTool } = makeCtx(
+      () => ({ success: true, status: "running", duration_ms: 4_000, output_preview: "tick\n" }),
+      {
+        bash: { watch_sync_max_ms: 90_000 },
+      } as PluginContext["config"],
+    );
     ctx.client = createSubagentClient();
     const result = await watchTool.execute(
       { taskId: "bash-worker-timeout", timeoutMs: 1 },
       createMockSdkContext({ sessionID: "ses_watch_worker_text" }),
     );
     expect(result).toContain("timeout reached without match");
-    expect(result).toContain(watchTimeoutSteer("worker"));
-    expect(result).toContain("a bash_watch without timeoutMs waits until the command finishes");
-    expect(result).not.toContain("up to");
+    expect(result).toContain("The command is still running after");
+    expect(result).toContain(
+      'Call bash_watch({ taskId: "bash-worker-timeout" }) again to keep waiting',
+    );
+    expect(result).toContain("without timeoutMs a watch waits up to the worker wait limit");
+    expect(result).toContain("It has run for 4s.");
+    expect(result).toContain("Recent output:\ntick");
+    expect(result).not.toContain("waits until the command finishes");
     expect(result).not.toContain("90000");
     expect(result).not.toContain("end your turn");
     expect(result).not.toContain("completion reminder");
@@ -1593,12 +1625,16 @@ describe("bash_status tool", () => {
       createMockSdkContext({ sessionID: "ses_watch_primary_text" }),
     );
     expect(result).toContain("timeout reached without match");
-    expect(result).toContain(watchTimeoutSteer("primary"));
+    expect(result).toContain(watchTimeoutSteer());
     expect(result).not.toContain("don't report a result");
   });
 
-  test("bash_watch without timeoutMs has no deadline for a worker and 30000 for a primary", async () => {
-    const effectiveFor = async (subagent: boolean, sessionID: string) => {
+  test("bash_watch without timeoutMs waits up to the worker wait limit for a worker and 30000 for a primary", async () => {
+    const effectiveFor = async (
+      subagent: boolean,
+      sessionID: string,
+      config?: PluginContext["config"],
+    ) => {
       _resetSubagentCacheForTest();
       let polls = 0;
       const { ctx, watchTool } = makeCtx(() => {
@@ -1606,7 +1642,7 @@ describe("bash_status tool", () => {
         return polls === 1
           ? { success: true, status: "running" }
           : { success: true, status: "completed", exit_code: 0 };
-      });
+      }, config);
       if (subagent) ctx.client = createSubagentClient();
       const metadata = mock((_data: Record<string, unknown>) => {});
       await watchTool.execute(
@@ -1615,7 +1651,13 @@ describe("bash_status tool", () => {
       );
       return metadata.mock.calls.at(-1)?.[0].effectiveWaitMs;
     };
-    expect(await effectiveFor(true, "ses_watch_worker_default")).toBeUndefined();
+    expect(await effectiveFor(true, "ses_watch_worker_default")).toBe(1_800_000);
+    // A configured limit is honoured.
+    expect(
+      await effectiveFor(true, "ses_watch_worker_configured", {
+        bash: { worker_wait_max_ms: 300_000 },
+      } as PluginContext["config"]),
+    ).toBe(300_000);
     expect(await effectiveFor(false, "ses_watch_primary_default")).toBe(30_000);
   });
 
@@ -1871,12 +1913,12 @@ describe("bash_status tool", () => {
     expect(result).not.toContain("interrupted");
   });
 
-  // ─── delegated worker: a watch without timeoutMs has no deadline ───
+  // ─── delegated worker: a watch without timeoutMs waits up to the worker wait limit ───
   //
   // These run on simulated time (useFakeWatchClock), so a wait of several
   // minutes finishes in milliseconds.
 
-  test("a worker's bash_watch without timeoutMs returns only when the task exits, past 120 s", async () => {
+  test("a worker's bash_watch without timeoutMs returns when the task exits, past 120 s and before the limit", async () => {
     _resetSubagentCacheForTest();
     __resetSyncWatchAbortForTests();
     const clock = useFakeWatchClock();
@@ -1894,7 +1936,7 @@ describe("bash_status tool", () => {
         createMockSdkContext({ sessionID: "ses_worker_long_watch" }),
       );
       expect(result).toContain("task exited (completed, exit 0)");
-      expect(result).toContain("no limit: waits until the command finishes");
+      expect(result).toContain("(limit 1800000ms)");
       expect(result).not.toContain("timeout reached");
       const waited = Number(/Waited (\d+)ms/.exec(result)?.[1]);
       expect(waited).toBeGreaterThanOrEqual(150_000);
@@ -1906,7 +1948,161 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("a new message ends a worker's watch that has no deadline", async () => {
+  // The worker wait limit: a stuck command once held a worker for fifteen
+  // hours behind a watch with no deadline. At the limit the watch hands
+  // control back, says the command is still running, and how to go on.
+  test("a worker's bash_watch without timeoutMs returns still-running at the worker wait limit", async () => {
+    _resetSubagentCacheForTest();
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    try {
+      const { ctx, watchTool } = makeCtx(() => ({
+        success: true,
+        status: "running",
+        mode: "pipes",
+        duration_ms: Math.round(clock.now()) + 20_000,
+        output_preview: "(pass) one\n(pass) two\n",
+      }));
+      ctx.client = createSubagentClient();
+      const result = await watchTool.execute(
+        { taskId: "bash-worker-stuck" },
+        createMockSdkContext({ sessionID: "ses_worker_watch_cap" }),
+      );
+      expect(result).toMatch(/Waited 1800000ms \(limit 1800000ms\); timeout reached without match/);
+      expect(result).toContain("The command is still running after 30 minutes of watching");
+      expect(result).toMatch(/It has run for 18\d\d(\.\d)?s\./);
+      expect(result).toContain(
+        'Call bash_watch({ taskId: "bash-worker-stuck" }) again to keep waiting',
+      );
+      expect(result).toContain('bash_kill({ taskId: "bash-worker-stuck" })');
+      expect(result).toContain("Recent output:\n(pass) one\n(pass) two");
+      expect(clock.now()).toBeLessThan(1_802_000);
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("a worker bash_watch at its cap waits for a timeout just inside the handoff margin", async () => {
+    _resetSubagentCacheForTest();
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    const killAtMs = 1_802_000;
+    const reason = "killed by the explicit timeout (exit 124)";
+    try {
+      const { ctx, watchTool } = makeCtx(() =>
+        clock.now() < killAtMs
+          ? {
+              success: true,
+              status: "running",
+              mode: "pipes",
+              started_at: Date.now(),
+              hard_kill: { limit_ms: killAtMs, source: "timeout" },
+              elapsed_ms: Math.round(clock.now()),
+            }
+          : { success: true, status: "timed_out", exit_code: 124, status_reason: reason },
+      );
+      ctx.client = createSubagentClient();
+      const result = await watchTool.execute(
+        { taskId: "bash-worker-timeout-at-cap" },
+        createMockSdkContext({ sessionID: "ses_worker_timeout_at_cap" }),
+      );
+      expect(result).toContain("task exited (timed_out, exit 124)");
+      expect(result).toContain("The task was killed by the explicit timeout (exit 124).");
+      expect(result).not.toContain("timeout reached without match");
+      expect(result).not.toContain("The command is still running");
+      expect(clock.now()).toBeGreaterThanOrEqual(killAtMs);
+    } finally {
+      clock.restore();
+    }
+  });
+
+  // A worker once watched a background task with "no limit", never learned
+  // the task had AFT's 30-minute default kill, and took the kill for its
+  // command failing. Every watch result names the task's own deadline, and a
+  // kill by that default is named as such.
+  test("a worker's watch names the task's kill deadline and, once it fires, the default limit that killed it", async () => {
+    _resetSubagentCacheForTest();
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    const reason =
+      "killed by AFT's default background limit of 30 minutes (exit 124); the command itself did not fail, pass a longer `timeout` if it needs more time";
+    try {
+      const { ctx, watchTool } = makeCtx(() =>
+        clock.now() < 1_000_000
+          ? {
+              success: true,
+              status: "running",
+              started_at: Date.now(),
+              hard_kill: { limit_ms: 1_800_000, source: "default" },
+            }
+          : { success: true, status: "timed_out", exit_code: 124, status_reason: reason },
+      );
+      ctx.client = createSubagentClient();
+      const context = createMockSdkContext({ sessionID: "ses_worker_watch_deadline" });
+      const running = await watchTool.execute(
+        { taskId: "bash-worker-deadline", timeoutMs: 60_000 },
+        context,
+      );
+      expect(running).toContain("when it has run 30 minutes (its default background limit)");
+      expect(running).toContain("remain.");
+      expect(running).toContain("each wait you make on it moves that kill");
+      const killed = await watchTool.execute({ taskId: "bash-worker-deadline" }, context);
+      expect(killed).toContain("task exited (timed_out, exit 124)");
+      expect(killed).toContain(
+        "The task was killed by AFT's default background limit of 30 minutes (exit 124); the command itself did not fail",
+      );
+      expect(killed).not.toContain("no limit");
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("a worker's second bash_watch keeps waiting and returns the result", async () => {
+    _resetSubagentCacheForTest();
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    try {
+      // The task finishes 10 minutes into the second watch.
+      const { ctx, watchTool } = makeCtx(() =>
+        clock.now() < 2_400_000
+          ? { success: true, status: "running" }
+          : { success: true, status: "completed", exit_code: 0, output_preview: "all green\n" },
+      );
+      ctx.client = createSubagentClient();
+      const context = createMockSdkContext({ sessionID: "ses_worker_watch_twice" });
+      const first = await watchTool.execute({ taskId: "bash-worker-twice" }, context);
+      expect(first).toContain("The command is still running after 30 minutes of watching");
+      const second = await watchTool.execute({ taskId: "bash-worker-twice" }, context);
+      expect(second).toContain("task exited (completed, exit 0)");
+      expect(second).toContain("all green");
+      expect(second).not.toContain("timeout reached");
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("a worker's bash_watch honours a configured worker_wait_max_ms", async () => {
+    _resetSubagentCacheForTest();
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    try {
+      const { ctx, watchTool } = makeCtx(() => ({ success: true, status: "running" }), {
+        bash: { worker_wait_max_ms: 300_000 },
+      } as PluginContext["config"]);
+      ctx.client = createSubagentClient();
+      const result = await watchTool.execute(
+        { taskId: "bash-worker-configured" },
+        createMockSdkContext({ sessionID: "ses_worker_watch_configured" }),
+      );
+      expect(result).toMatch(/Waited 300000ms \(limit 300000ms\); timeout reached without match/);
+      expect(result).toContain("still running after 5 minutes of watching");
+      expect(result).toContain("No output yet.");
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("a new message ends a worker's watch before its limit", async () => {
     _resetSubagentCacheForTest();
     __resetBgNotificationStateForTests();
     __resetSyncWatchAbortForTests();
@@ -1932,7 +2128,7 @@ describe("bash_status tool", () => {
     }
   });
 
-  test("an aborted tool call ends a worker's watch that has no deadline", async () => {
+  test("an aborted tool call ends a worker's watch before its limit", async () => {
     _resetSubagentCacheForTest();
     __resetSyncWatchAbortForTests();
     const clock = useFakeWatchClock();
@@ -1966,7 +2162,7 @@ describe("bash_status tool", () => {
         createMockSdkContext({ sessionID: "ses_worker_watch_explicit" }),
       );
       expect(result).toMatch(/Waited 600000ms \(limit 600000ms\); timeout reached without match/);
-      expect(result).toContain(watchTimeoutSteer("worker"));
+      expect(result).toContain("The command is still running after 10 minutes of watching");
     } finally {
       clock.restore();
     }
@@ -1983,7 +2179,7 @@ describe("bash_status tool", () => {
         createMockSdkContext({ sessionID: "ses_primary_watch_default" }),
       );
       expect(result).toMatch(/Waited 30000ms \(limit 30000ms\); timeout reached without match/);
-      expect(result).toContain(watchTimeoutSteer("primary"));
+      expect(result).toContain(watchTimeoutSteer());
     } finally {
       clock.restore();
     }
@@ -2207,7 +2403,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
   });
 
-  test("subagent wait:true without a timeout asks the engine for no default hard kill", async () => {
+  test("subagent wait:true without a timeout gets a transport budget of the worker wait limit", async () => {
     _resetSubagentCacheForTest();
     const { calls, tool: bash } = createSubagentHarness(() => ({
       success: true,
@@ -2223,9 +2419,23 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(calls[0].params.wait).toBe(true);
     expect(calls[0].params.timeout).toBeUndefined();
     expect(calls[0].params.worker_session).toBe(true);
-    // The 30-minute default no longer bounds the call, so the transport
-    // timeout is the longest delay a JavaScript timer supports.
-    expect(calls[0].options?.transportTimeoutMs).toBe(LONGEST_TIMER_DELAY_MS);
+    // The engine hands the call back at the worker wait limit (30 minutes
+    // by default), so the transport waits that long plus its margin.
+    expect(calls[0].options?.transportTimeoutMs).toBe(1_800_000 + 10_000);
+  });
+
+  test("subagent wait:true transport budget follows a configured worker_wait_max_ms", async () => {
+    _resetSubagentCacheForTest();
+    const { calls, tool: bash } = createSubagentHarness(
+      () => ({ success: true, status: "completed", task_id: "bash-sub-cfg", exit_code: 0 }),
+      undefined,
+      { bash: { worker_wait_max_ms: 7_200_000 } } as PluginContext["config"],
+    );
+    await bash.execute(
+      { command: "long-build", wait: true },
+      createMockSdkContext({ sessionID: "ses_subagent_wait_cfg" }),
+    );
+    expect(calls[0].options?.transportTimeoutMs).toBe(7_200_000 + 10_000);
   });
 
   test("subagent wait:true with an explicit timeout keeps it and a matching transport budget", async () => {
@@ -2359,11 +2569,13 @@ describe("OpenCode bash adapter — subagent gating", () => {
     );
     expect(result as string).toContain("Background task started: bash-sub-bg");
     // The bash_watch call suggested to the subagent must omit timeoutMs: a
-    // subagent's watch without one waits until the command finishes, and any
-    // value only makes it return sooner.
+    // subagent's watch without one waits up to the worker wait limit, the
+    // longest it may, and any value only makes it return sooner.
     expect(result as string).toContain('bash_watch({ taskId: "bash-sub-bg" })');
-    expect(result as string).toContain("without a timeout it waits until the command finishes");
-    expect(result as string).not.toContain("waits up to");
+    expect(result as string).toContain(
+      "without a timeout it waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting",
+    );
+    expect(result as string).not.toContain("waits until the command finishes");
     // A subagent is never woken after its turn ends, so nothing may promise
     // it a completion reminder or tell it to end its turn.
     expect(result as string).not.toContain("completion reminder will be delivered");
@@ -2472,7 +2684,7 @@ describe("bash tool description (agent-facing wording)", () => {
     // One description serves both roles, so it states both defaults.
     expect(desc).toContain("default to 30s in a main session");
     expect(desc).toContain(
-      "in a delegated session a sync wait without a timeout waits until the command finishes",
+      "in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting",
     );
     expect(desc).toContain("bash({background:true})");
     expect(desc).toContain("Never loop bash_status");
@@ -2512,7 +2724,7 @@ describe("bash tool description (agent-facing wording)", () => {
       "In a main session: default 30000",
     );
     expect(jsonSchema.properties?.timeoutMs?.description).toContain(
-      "In a delegated session: omit it to wait until the command finishes",
+      "In a delegated session: omit it to wait up to the worker wait limit",
     );
     expect(jsonSchema.properties?.timeoutMs?.description).not.toContain(
       "the configured maximum for delegated sessions",

@@ -26,6 +26,8 @@ import {
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
+  asRecordOrEmpty,
+  asString,
   collapsibleResult,
   extractStructuredPayload,
   type RenderContextLike,
@@ -86,26 +88,30 @@ function navigateParamsSchema() {
 type NavigateArgs = Static<ReturnType<typeof navigateParamsSchema>>;
 
 /** Exported for renderer unit tests. */
-export function buildNavigateSections(
-  args: NavigateArgs,
-  payload: unknown,
-  theme: Theme,
-): string[] {
+export function buildNavigateSections(args: unknown, payload: unknown, theme: Theme): string[] {
+  const safeArgs = asRecordOrEmpty(args);
+  const operation = asString(safeArgs.op);
+  if (!operation) return [theme.fg("muted", "No navigation result.")];
   const themeAdapter = {
     fg: (role: string, s: string) => theme.fg(role as Parameters<Theme["fg"]>[0], s),
   };
-  return formatCallgraphSections(args.op, payload, themeAdapter, {
-    includeUnresolved: coerceBoolean(args.includeUnresolved),
+  return formatCallgraphSections(operation, payload, themeAdapter, {
+    includeUnresolved: coerceBoolean(safeArgs.includeUnresolved),
   });
 }
 
 /** Exported for renderer unit tests. */
-export function renderNavigateCall(args: NavigateArgs, theme: Theme, context: RenderContextLike) {
+export function renderNavigateCall(args: unknown, theme: Theme, context: RenderContextLike) {
+  const safeArgs = asRecordOrEmpty(args);
+  const operation = asString(safeArgs.op);
+  const path = asString(safeArgs.path);
+  const symbol = asString(safeArgs.symbol);
+  const toSymbol = asString(safeArgs.toSymbol);
   const summary = [
-    theme.fg("accent", args.op),
-    accentPath(theme, args.path),
-    theme.fg("toolOutput", args.symbol),
-    args.toSymbol ? theme.fg("toolOutput", `→ ${args.toSymbol}`) : undefined,
+    operation ? theme.fg("accent", operation) : undefined,
+    path ? accentPath(theme, path) : undefined,
+    symbol ? theme.fg("toolOutput", symbol) : undefined,
+    toSymbol ? theme.fg("toolOutput", `→ ${toSymbol}`) : undefined,
   ]
     .filter(Boolean)
     .join(" ");
@@ -115,15 +121,16 @@ export function renderNavigateCall(args: NavigateArgs, theme: Theme, context: Re
 /** Exported for renderer unit tests. */
 export function renderNavigateResult(
   result: AgentToolResult<unknown>,
-  args: NavigateArgs,
+  args: unknown,
   theme: Theme,
   context: RenderContextLike,
   options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) return renderErrorResult(result, "navigate failed", theme, context);
   const sections = buildNavigateSections(args, extractStructuredPayload(result), theme);
+  const operation = asString(asRecordOrEmpty(args).op) ?? "callgraph";
   return collapsibleResult({
-    summary: sections[0] ?? `${args.op} completed`,
+    summary: sections[0] ?? `${operation} completed`,
     full: renderSections(sections, context),
     expanded: options.expanded,
     context,

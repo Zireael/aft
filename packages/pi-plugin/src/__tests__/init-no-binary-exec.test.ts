@@ -103,7 +103,7 @@ describe.serial.skipIf(process.platform === "win32")(
       } as Parameters<PiPlugin>[0];
     }
 
-    test("a cached binary with a matching identity sidecar is used without running it", async () => {
+    test("a warm-cache factory registers tools without executing the cached binary", async () => {
       writeBinaryIdentitySidecar(cachedAft, PLUGIN_VERSION, "0".repeat(64));
       const tools: string[] = [];
       const pi = makePi();
@@ -113,7 +113,7 @@ describe.serial.skipIf(process.platform === "win32")(
 
       await (await loadPlugin())(pi);
 
-      // Tools registered means init resolved a binary and finished.
+      // Tool registration must not require resolving or executing the binary.
       expect(tools.length).toBeGreaterThan(0);
       // Pi's eager warmup may legitimately spawn the bridge process (the
       // stub logs that as an exec with no arguments): whether it is skipped
@@ -154,14 +154,110 @@ describe.serial.skipIf(process.platform === "win32")(
         throw new Error("stop after the transport choice");
       });
 
-      await expect((await loadPlugin())(makePi())).rejects.toThrow(
-        "stop after the transport choice",
-      );
+      const pi = makePi();
+      let read: any;
+      pi.registerTool = (tool) => {
+        if (tool.name === "read") read = tool;
+      };
+      await (await loadPlugin())(pi);
+      expect(poolBinaryPath).toBeUndefined();
+      expect(read).toBeDefined();
+      await expect(
+        read.execute("call", { path: "file.txt" }, undefined, undefined, {
+          cwd: process.cwd(),
+          hasUI: false,
+        }),
+      ).rejects.toThrow("stop after the transport choice");
 
       expect(poolSubcFile).toBe(join(tempDir, "subc-connection.json"));
       expect(poolBinaryPath).toBeNull();
       expect(resolverCalls).toEqual([]);
       expect(existsSync(execLog)).toBe(false);
+    });
+
+    test("a cold-cache factory registers tools without binary resolution, downloads or migration", async () => {
+      rmSync(join(tempDir, "cache", "aft", "bin"), { recursive: true, force: true });
+      const started: string[] = [];
+      spyOn(bridge, "findBinarySync").mockImplementation(() => {
+        started.push("findBinarySync");
+        return null;
+      });
+      spyOn(bridge, "findBinary").mockImplementation(async () => {
+        started.push("findBinary");
+        throw new Error("network disabled");
+      });
+      spyOn(bridge, "ensureBinary").mockImplementation(async () => {
+        started.push("ensureBinary");
+        throw new Error("network disabled");
+      });
+      spyOn(bridge, "ensureStorageMigrated").mockImplementation(async () => {
+        started.push("migration");
+      });
+      spyOn(bridge, "createAftTransportPool").mockImplementation(async () => {
+        started.push("pool");
+        throw new Error("transport must remain lazy");
+      });
+      const tools: string[] = [];
+      const pi = makePi();
+      pi.registerTool = (tool) => {
+        tools.push(tool.name);
+      };
+      await (await loadPlugin())(pi);
+      expect(tools).toContain("read");
+      expect(tools).toContain("write");
+      expect(started).toEqual([]);
+    });
+
+    test("Pi fresh-session hooks signal only new and fork lifetimes", async () => {
+      writeBinaryIdentitySidecar(cachedAft, PLUGIN_VERSION, "0".repeat(64));
+      let channel = 0;
+      const pool = new bridge.SubcTransportPool({
+        connectionFile: "/fake",
+        harness: "pi",
+        connect: async () => ({
+          routeOpen: async () => ({ channel: ++channel, epoch: channel }) as never,
+          request: async () => ({ structuredContent: { success: true, text: "status" } }),
+          subscribe: () => {
+            throw new Error("no background callbacks in this fixture");
+          },
+          closeRouteChannel: async () => undefined,
+          close: () => undefined,
+        }),
+      });
+      spyOn(bridge, "createAftTransportPool").mockImplementation(async () => pool);
+      // The plugin's pool is created lazily on first demand, so session_start
+      // hints land on the revivable wrapper first; its own test covers the
+      // replay into the pool it creates. Here: only new and fork are forwarded.
+      const starts = spyOn(bridge.RevivableTransportPool.prototype, "observeSessionStart");
+      const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+      const pi = makePi();
+      (
+        pi as unknown as {
+          on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => void;
+        }
+      ).on = (name, handler) => {
+        const group = handlers.get(name) ?? [];
+        group.push(handler);
+        handlers.set(name, group);
+      };
+      try {
+        await (await loadPlugin())(pi);
+        for (const reason of ["startup", "reload", "resume", "new", "fork"]) {
+          for (const handler of handlers.get("session_start") ?? []) {
+            await handler(
+              { type: "session_start", reason },
+              { cwd: home, sessionManager: { getSessionId: () => `session-${reason}` } },
+            );
+          }
+        }
+        expect(starts.mock.calls).toEqual([
+          [home, "session-new"],
+          [home, "session-fork"],
+        ]);
+      } finally {
+        starts.mockRestore();
+        await pool.shutdown();
+      }
     });
   },
 );

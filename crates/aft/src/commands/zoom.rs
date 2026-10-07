@@ -111,6 +111,7 @@ thread_local! {
     static ZOOM_CALL_NAME_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ZOOM_ENRICHMENT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ZOOM_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LEGACY_ZOOM_PARSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Files a multi-target zoom already resolved and read, keyed by the target's
@@ -123,7 +124,7 @@ struct ZoomTargetMemo {
 }
 
 struct ZoomEnrichment {
-    symbols: Vec<Symbol>,
+    symbols: std::sync::Arc<Vec<Symbol>>,
     source: String,
     tree: tree_sitter::Tree,
     calls: Vec<RawCall>,
@@ -135,6 +136,22 @@ struct RawCall {
     line: u32,
     start_byte: usize,
     end_byte: usize,
+}
+
+fn zoom_parse_source(
+    path: &Path,
+    source: &str,
+) -> Result<(tree_sitter::Tree, LangId), crate::error::AftError> {
+    #[cfg(test)]
+    if LEGACY_ZOOM_PARSE.with(|legacy| legacy.get()) {
+        return FileParser::new().parse_cloned(path);
+    }
+    let lang = detect_language(path).ok_or_else(|| crate::error::AftError::InvalidRequest {
+        message: format!("unsupported file extension: {}", path.display()),
+    })?;
+    // Zoom already read these bytes. Parse the displayed source, not a second
+    // disk snapshot that can differ if an editor saves during the request.
+    Ok((FileParser::parse_source(path, source, lang)?, lang))
 }
 
 fn resolve_file_or_url(
@@ -394,6 +411,10 @@ fn same_file_zoom_targets(req: &RawRequest, file: &str) -> Vec<serde_json::Value
 /// context, and walks ASTs for call annotations. For code files, a whitespace-separated
 /// top-level `symbol`/`symbols` string is split into multiple same-file lookups.
 pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
+    super::url_output::cap_zoom_response(req, handle_zoom_inner(req, ctx))
+}
+
+fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let context_lines = req
         .params
         .get("context_lines")
@@ -473,6 +494,14 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(file) => file,
         Err(resp) => return resp,
     };
+
+    if is_http_url(file)
+        && detect_language(&path) == Some(LangId::Json)
+        && (start_line.is_some() || end_line.is_some())
+    {
+        return Response::error(&req.id, "invalid_request",
+            "JSON URL zoom requires a top-level key in symbols; line ranges can select the entire JSON body. Use outline to list available keys, or narrow the URL with server-side filters.");
+    }
 
     let lines: Vec<&str> = source.lines().collect();
 
@@ -559,7 +588,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             };
             let end_col = lines[end_idx].chars().count() as u32;
 
-            return Response::success(
+            let mut response = Response::success(
                 &req.id,
                 serde_json::json!({
                     "name": format!("lines {}-{}", start, clamped_end),
@@ -579,6 +608,10 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
                     },
                 }),
             );
+            if is_http_url(file) {
+                super::url_output::disclose_download(&path, &mut response);
+            }
+            return response;
         }
         (Some(_), None) | (None, Some(_)) => {
             return Response::error(
@@ -974,6 +1007,61 @@ fn zoom_one_symbol(
     include_callgraph: bool,
     enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
 ) -> Response {
+    let mut response = if is_http_url(_file) && detect_language(path) == Some(LangId::Json) {
+        super::url_output::json_preview(req, source, Some(symbol_name))
+    } else {
+        zoom_one_symbol_inner(
+            req,
+            ctx,
+            path,
+            _file,
+            source,
+            lines,
+            symbol_name,
+            context_lines,
+            include_callgraph,
+            enrichments,
+        )
+    };
+    if is_http_url(_file) {
+        if !response.success
+            && response.data["code"] == "symbol_not_found"
+            && is_heading_zoom_language(detect_language(path))
+        {
+            if let Ok(symbols) = ctx.provider().list_symbols(path) {
+                let mut message = format!("Requested heading {symbol_name:?} not found. Available headings in downloaded prefix:\n");
+                if symbols.is_empty() {
+                    message.push_str("No headings available. Narrow with a Markdown or HTML URL containing headings.");
+                }
+                for symbol in symbols {
+                    message.push_str(&format!(
+                        "- {} (lines {}-{})\n",
+                        symbol.name,
+                        symbol.range.start_line + 1,
+                        symbol.range.end_line + 1
+                    ));
+                }
+                response.data["message"] = message.into();
+            }
+        }
+        super::url_output::disclose_download(path, &mut response);
+    }
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+fn zoom_one_symbol_inner(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &Path,
+    _file: &str,
+    source: &str,
+    lines: &[&str],
+    symbol_name: &str,
+    context_lines: usize,
+    include_callgraph: bool,
+    enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
+) -> Response {
     // Keep raw heading labels for outline display. Zoom resolves heading names in tiers:
     // exact raw text, normalized text, case-insensitive normalized text, then anchor slugs.
     // Code symbols continue through the provider's exact resolver.
@@ -1038,7 +1126,7 @@ fn zoom_one_symbol(
     }
 
     if matches.is_empty() {
-        let msg = match ctx.provider().list_symbols(path) {
+        let msg = match crate::parser::list_symbols_shared(ctx.provider(), path) {
             Ok(all_symbols) => symbol_not_found_message(symbol_name, &all_symbols, is_heading),
             Err(_) => deterministic_zoom_refusal(
                 format!("symbol '{symbol_name}' not found"),
@@ -1159,19 +1247,15 @@ fn zoom_one_symbol(
         if !enrichments.contains_key(resolved_file_path) {
             #[cfg(test)]
             ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(count.get() + 1));
-            let symbols = match ctx.provider().list_symbols(resolved_file_path) {
-                Ok(symbols) => symbols,
+            let symbols =
+                match crate::parser::list_symbols_shared(ctx.provider(), resolved_file_path) {
+                    Ok(symbols) => symbols,
+                    Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+                };
+            let resolved_source = resolved_source.as_deref().unwrap_or(source).to_string();
+            let (tree, lang) = match zoom_parse_source(resolved_file_path, &resolved_source) {
+                Ok(parsed) => parsed,
                 Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
-            };
-            let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
-            let (tree, lang) = match parser.parse(resolved_file_path) {
-                Ok((tree, lang)) => (tree.clone(), lang),
-                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
-            };
-            let resolved_source = if resolved_file_path != path {
-                std::fs::read_to_string(resolved_file_path).unwrap_or_else(|_| source.to_string())
-            } else {
-                source.to_string()
             };
             let calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
             let line_starts = zoom_line_starts(&resolved_source);
@@ -1237,7 +1321,7 @@ fn zoom_one_symbol(
             })
             .collect();
         let mut called_by: Vec<CallRef> = Vec::new();
-        for sym in all_symbols {
+        for sym in all_symbols.iter() {
             if sym.name == target.name && sym.range.start_line == target.range.start_line {
                 continue; // skip self
             }
@@ -1308,8 +1392,29 @@ fn zoom_one_symbol(
 /// the index is ready. Zoom's own call lists are file-local and unaffected.
 /// Observing the index never starts a build.
 fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
-    use crate::feature_status::{observed_index_status, IndexEffective, IndexPlane};
-    let observation = observed_index_status(ctx, IndexPlane::Callgraph);
+    use crate::feature_status::{
+        callgraph_access_observation, observed_index_status, IndexEffective, IndexObservation,
+        IndexPlane,
+    };
+    // Only roots already served by a view use this zero-wait access. It opens
+    // their pinned plane, never the legacy cold-build path; observing a legacy
+    // root below stays passive. The view refusal also names keyless generations.
+    let served_by_view = ctx.checkout_query_runtime_active()
+        || (ctx.config().views.enabled
+            && ctx
+                .pinned_view_runtime()
+                .is_some_and(|view| view.manifest.is_some()));
+    let observation = if served_by_view {
+        let access = ctx.schedule_callgraph_store_warm();
+        match &access {
+            crate::context::CallgraphStoreAccess::Error(error) => {
+                IndexObservation::unavailable(error.to_string())
+            }
+            _ => callgraph_access_observation(ctx, &access),
+        }
+    } else {
+        observed_index_status(ctx, IndexPlane::Callgraph)
+    };
     let code = match observation.effective {
         IndexEffective::Ready => return None,
         IndexEffective::Off => "callgraph_off",
@@ -1479,8 +1584,7 @@ fn resolve_json_zoom(
     context_lines: usize,
     include_callgraph: bool,
 ) -> Response {
-    let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
-    let (tree, _) = match parser.parse(path) {
+    let (tree, _) = match zoom_parse_source(path, source) {
         Ok(parsed) => parsed,
         Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
     };
@@ -1838,13 +1942,12 @@ fn render_json_zoom(
         None
     };
     let (calls_out, called_by) = if include_callgraph {
-        let all_symbols = match ctx.provider().list_symbols(path) {
+        let all_symbols = match crate::parser::list_symbols_shared(ctx.provider(), path) {
             Ok(s) => s,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         };
         let known_names: Vec<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
-        let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
-        let (tree, lang) = match parser.parse(path) {
+        let (tree, lang) = match zoom_parse_source(path, source) {
             Ok(r) => r,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
         };
@@ -1968,10 +2071,10 @@ fn resolve_heading_symbols(
     path: &Path,
     query: &str,
 ) -> Result<Vec<SymbolMatch>, crate::error::AftError> {
-    let headings: Vec<SymbolMatch> = provider
-        .list_symbols(path)?
-        .into_iter()
+    let headings: Vec<SymbolMatch> = crate::parser::list_symbols_shared(provider, path)?
+        .iter()
         .filter(|symbol| symbol.kind == SymbolKind::Heading)
+        .cloned()
         .map(|symbol| SymbolMatch {
             file: path.display().to_string(),
             symbol,
@@ -2737,6 +2840,29 @@ function helper(value: number): number {
         let indexed_bytes = ZOOM_COORD_BYTES_SCANNED.with(|count| count.get());
         assert!(old_prefix_bytes > indexed_bytes * 70);
         eprintln!("coordinate prefix bytes: baseline {old_prefix_bytes}, indexed {indexed_bytes}");
+    }
+
+    #[test]
+    fn zoom_enrichment_reuses_source_bytes_and_matches_legacy_output() {
+        let ctx = make_ctx();
+        let path = fixture_path("calls.ts");
+        ctx.provider().list_symbols(&path).unwrap();
+        let req = make_zoom_request_cg("source", path.to_str().unwrap(), "compute");
+        let reads = || crate::parser::work_counters::FILE_PARSE_READS.with(|count| count.get());
+        LEGACY_ZOOM_PARSE.with(|legacy| legacy.set(true));
+        let before = reads();
+        let reference = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+        assert_eq!(reads() - before, 1);
+        LEGACY_ZOOM_PARSE.with(|legacy| legacy.set(false));
+        let before = reads();
+        let actual = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+        assert_eq!(actual, reference);
+        assert_eq!(actual["success"], true);
+        assert_eq!(
+            reads() - before,
+            0,
+            "enrichment must parse the already-read source"
+        );
     }
 
     #[test]

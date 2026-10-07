@@ -90,8 +90,13 @@ pub(crate) fn start(registry: BgTaskRegistry) {
                     .state
                     .lock()
                     .ok()
-                    .and_then(|state| state.metadata.timeout_ms)
-                    .map(|timeout_ms| task.started.elapsed() >= Duration::from_millis(timeout_ms))
+                    .map(|state| {
+                        state.metadata.remote.is_none()
+                            && state.metadata.timeout_ms.is_some_and(|timeout_ms| {
+                                task.elapsed_for_metadata(&state.metadata)
+                                    >= Duration::from_millis(timeout_ms)
+                            })
+                    })
                     .unwrap_or(false);
                 if timeout_expired {
                     let _ = registry.kill_for_timeout(&task.task_id, &task.session_id);

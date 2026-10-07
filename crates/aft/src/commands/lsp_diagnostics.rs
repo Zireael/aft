@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -9,7 +8,7 @@ use crate::context::AppContext;
 use crate::lsp::client::RustCheckState;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::manager::{
-    EnsureServerOutcomes, PullFileOutcome, PullFileResult, ServerAttemptResult,
+    EnsureServerOutcomes, PreEditSnapshot, PullFileOutcome, PullFileResult, ServerAttemptResult,
 };
 use crate::lsp::registry::ServerKind;
 use crate::lsp::roots::ServerKey;
@@ -122,10 +121,12 @@ fn handle_file_mode(
     // Step 1: figure out what servers are registered for this file and try
     // to spawn them. The structured outcomes let us tell the agent honestly
     // which servers couldn't be brought up.
-    let outcomes: EnsureServerOutcomes = {
-        let mut lsp = ctx.lsp();
-        lsp.ensure_server_for_file_detailed(&canonical, &ctx.config())
-    };
+    let outcomes: EnsureServerOutcomes =
+        crate::lsp::manager::ensure_server_for_file_detailed_unlocked(
+            || ctx.lsp(),
+            &canonical,
+            &ctx.config(),
+        );
 
     let mut server_status: Vec<ServerStatusEntry> = outcomes
         .attempts
@@ -213,7 +214,8 @@ fn handle_file_mode(
     // the requested wait_ms. Empty publishes are preserved as "checked
     // clean" so we can read them back.
     if needs_push_wait(&pull_results) && wait_ms > 0 {
-        wait_for_push(ctx, wait_ms);
+        let push_servers = servers_needing_push(&outcomes.successful, &pull_results);
+        wait_for_push(ctx, &canonical, &push_servers, &pre_push_snapshot, wait_ms);
     }
 
     // Step 5: read the cache and build the response.
@@ -291,6 +293,10 @@ fn handle_file_mode(
     }
     let diagnostics =
         collect_file_diagnostics_for_servers(ctx, &canonical, severity_filter, &proven_servers);
+    // Documents opened only to answer this query are closed again; their
+    // diagnostics stay stored.
+    ctx.lsp()
+        .close_documents_opened_for_pulls(&canonical, &pull_results);
     let mut response = build_response(
         &diagnostics,
         server_status,
@@ -334,9 +340,12 @@ fn handle_directory_mode(
         lsp.active_server_keys()
     };
 
-    for key in &server_keys_to_pull {
-        let pull_result =
-            crate::lsp::manager::pull_workspace_diagnostics_unlocked(|| ctx.lsp(), key, None);
+    let pull_results = crate::lsp::manager::pull_workspace_diagnostics_many_unlocked(
+        || ctx.lsp(),
+        &server_keys_to_pull,
+        None,
+    );
+    for (key, pull_result) in server_keys_to_pull.iter().zip(pull_results) {
         match pull_result {
             Ok(result) => {
                 let status = if !result.supports_workspace {
@@ -459,16 +468,19 @@ fn wait_for_rust_check(
     servers: &[ServerKey],
     deadline: Instant,
 ) -> Vec<(ServerKey, &'static str)> {
-    {
+    let wait = {
         let mut lsp = ctx.lsp();
         for key in servers {
             lsp.rearm_unreported_rust_check(key);
         }
-    }
+        lsp.subscribe_events()
+    };
+    let mut event = None;
     loop {
-        let (busy, waiting) = {
+        note_wait_wakeup();
+        let (busy, waiting, next_timed_change) = {
             let mut lsp = ctx.lsp();
-            lsp.drain_events();
+            lsp.handle_waited_event(event);
             let mut busy = Vec::new();
             let mut waiting = false;
             for key in servers {
@@ -490,17 +502,23 @@ fn wait_for_rust_check(
                     }
                 }
             }
-            (busy, waiting)
+            let next_timed_change = servers
+                .iter()
+                .filter_map(|key| lsp.rust_check_next_timed_change(key))
+                .min();
+            wait.clear_pending_wake();
+            (busy, waiting, next_timed_change)
         };
-        let now = Instant::now();
-        if !waiting || now >= deadline {
+        if !waiting || Instant::now() >= deadline {
+            ctx.lsp().unsubscribe_events(wait);
             return busy;
         }
-        thread::sleep(
-            deadline
-                .saturating_duration_since(now)
-                .min(Duration::from_millis(50)),
-        );
+        // Sleep until something can change: an event from a server (a
+        // progress report, a publish, a status change) or a timed
+        // transition of the check state. Polling at a fixed interval
+        // instead took the manager lock every 50 ms for the whole wait.
+        let until = next_timed_change.map_or(deadline, |change| change.min(deadline));
+        event = wait.next_event(until);
     }
 }
 
@@ -509,20 +527,83 @@ fn wait_for_rust_check(
 /// have not covered the files.
 const RUST_INDEXING_REASON: &str = "rust-analyzer: still indexing; retry";
 
-fn wait_for_push(ctx: &AppContext, wait_ms: u64) {
+/// Wait up to `wait_ms` for each server that answers this file only through
+/// `publishDiagnostics` to publish for the document's current version, and
+/// return as soon as every one of them has (or has exited). The manager lock
+/// is held only to handle events and check, never while waiting; the wait
+/// wakes when an event arrives instead of sleeping out the whole budget.
+fn wait_for_push(
+    ctx: &AppContext,
+    canonical: &Path,
+    push_servers: &[ServerKey],
+    pre_push_snapshot: &HashMap<ServerKey, PreEditSnapshot>,
+    wait_ms: u64,
+) {
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    let wait = ctx.lsp().subscribe_events();
+    let mut event = None;
     loop {
-        {
+        note_wait_wakeup();
+        let all_published = {
             let mut lsp = ctx.lsp();
-            lsp.drain_events();
-        }
-        let now = Instant::now();
-        if now >= deadline {
+            lsp.handle_waited_event(event);
+            let all_published = push_servers.iter().all(|key| {
+                !lsp.has_client(key) || {
+                    let pre = pre_push_snapshot.get(key).copied().unwrap_or_default();
+                    lsp.diagnostic_entry_is_fresh_for_document(canonical, key, pre)
+                }
+            });
+            wait.clear_pending_wake();
+            all_published
+        };
+        if all_published || Instant::now() >= deadline {
             break;
         }
-        let remaining = deadline.saturating_duration_since(now);
-        thread::sleep(remaining.min(Duration::from_millis(100)));
+        event = wait.next_event(deadline);
     }
+    ctx.lsp().unsubscribe_events(wait);
+}
+
+/// The servers whose diagnostics for this file can only arrive by push: no
+/// pull support, or a pull that fell back to push. With no pull results at
+/// all, every started server.
+fn servers_needing_push(
+    successful: &[ServerKey],
+    pull_results: &[PullFileResult],
+) -> Vec<ServerKey> {
+    successful
+        .iter()
+        .filter(|key| {
+            match pull_results
+                .iter()
+                .find(|result| &result.server_key == *key)
+            {
+                None => true,
+                Some(result) => match &result.outcome {
+                    PullFileOutcome::PullNotSupported => true,
+                    PullFileOutcome::RequestFailed { reason } => request_failure_needs_push(reason),
+                    _ => false,
+                },
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+thread_local! {
+    static WAIT_WAKEUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_wait_wakeup() {
+    WAIT_WAKEUPS.with(|count| count.set(count.get() + 1));
+}
+
+/// How many times the diagnostics waits run on this thread re-checked under
+/// the manager lock. Tests compare it before and after a request to prove a
+/// wait woke on arrival rather than polling.
+#[doc(hidden)]
+pub fn wait_wakeups_for_test() -> u64 {
+    WAIT_WAKEUPS.with(std::cell::Cell::get)
 }
 
 fn needs_push_wait(pull_results: &[PullFileResult]) -> bool {

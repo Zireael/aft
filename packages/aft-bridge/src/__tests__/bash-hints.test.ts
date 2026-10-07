@@ -5,11 +5,17 @@ import * as path from "node:path";
 import {
   abortableSleep,
   commandInvokesCodeSearch,
+  formatWaitDuration,
   formatWatchWaited,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
   resolveWatchTimeoutMs,
+  taskKillDeadlineText,
+  taskKillDeadlineWithinHandoffMargin,
+  type WatchCallerRole,
   watchPollDelayMs,
+  workerBackgroundTaskNote,
+  workerWatchStillRunning,
 } from "../bash-hints.js";
 
 const AFT_SEARCH_HINT =
@@ -28,9 +34,9 @@ describe("formatWatchWaited", () => {
     );
   });
 
-  test("says a wait without a deadline has no limit", () => {
+  test("says a wait without a deadline has no wait limit", () => {
     expect(formatWatchWaited(150_000, undefined, undefined)).toBe(
-      "Waited 150000ms (no limit: waits until the command finishes)",
+      "Waited 150000ms (no wait limit)",
     );
   });
 
@@ -40,15 +46,177 @@ describe("formatWatchWaited", () => {
 });
 
 describe("resolveWatchTimeoutMs", () => {
-  test("a worker without a timeout gets no deadline; its own timeout is not capped", () => {
-    expect(resolveWatchTimeoutMs(undefined, "worker", 120_000)).toBeUndefined();
-    expect(resolveWatchTimeoutMs(600_000, "worker", 120_000)).toBe(600_000);
+  // A worker's watch without a timeout is bounded by the worker wait limit
+  // (it used to have no deadline, and a stuck command held a worker for
+  // fifteen hours); its own timeout is not capped by the primary cap.
+  test("a worker without a timeout waits up to the worker wait limit", () => {
+    expect(resolveWatchTimeoutMs(undefined, "worker", 120_000, 1_800_000)).toBe(1_800_000);
+    expect(resolveWatchTimeoutMs(undefined, "worker", 120_000, 300_000)).toBe(300_000);
+    expect(resolveWatchTimeoutMs(600_000, "worker", 120_000, 1_800_000)).toBe(600_000);
   });
 
   test("a primary keeps the 30 s default and the cap", () => {
-    expect(resolveWatchTimeoutMs(undefined, "primary", 120_000)).toBe(30_000);
-    expect(resolveWatchTimeoutMs(600_000, "primary", 120_000)).toBe(120_000);
-    expect(resolveWatchTimeoutMs(undefined, "primary", 10_000)).toBe(10_000);
+    expect(resolveWatchTimeoutMs(undefined, "primary", 120_000, 1_800_000)).toBe(30_000);
+    expect(resolveWatchTimeoutMs(600_000, "primary", 120_000, 1_800_000)).toBe(120_000);
+    expect(resolveWatchTimeoutMs(undefined, "primary", 10_000, 1_800_000)).toBe(10_000);
+  });
+});
+
+describe("taskKillDeadlineText", () => {
+  const startedAtMs = 1_700_000_000_000;
+  const defaultNowMs = startedAtMs + 18 * 60_000;
+  const running = (hardKill?: Record<string, unknown>) => ({
+    status: "running",
+    started_at: startedAtMs,
+    ...(hardKill ? { hard_kill: hardKill } : {}),
+  });
+
+  test("names the default background limit, and for a worker that its waits move it", () => {
+    const def = { limit_ms: 1_800_000, source: "default" };
+    expect(taskKillDeadlineText(running(def), "primary", defaultNowMs)).toBe(
+      "AFT kills this task at 2023-11-14 22:43:20Z, when it has run 30 minutes (its default background limit) unless you pass a longer `timeout`; about 12 minutes remain.",
+    );
+    const worker = taskKillDeadlineText(running(def), "worker", defaultNowMs);
+    expect(worker).toContain("when it has run 30 minutes (its default background limit)");
+    expect(worker).toContain("each wait you make on it moves that kill");
+    expect(worker).toContain("about 12 minutes remain.");
+  });
+
+  test("names an explicit timeout as the caller's, and a missing deadline as none", () => {
+    expect(
+      taskKillDeadlineText(
+        running({ limit_ms: 45_000, source: "timeout" }),
+        "worker",
+        startedAtMs + 10_000,
+      ),
+    ).toBe(
+      "AFT kills this task at 2023-11-14 22:14:05Z, when it has run 45s (the `timeout` you passed); about 35s remain.",
+    );
+    expect(taskKillDeadlineText(running(), "worker", defaultNowMs)).toBe(
+      "This task has no kill deadline.",
+    );
+  });
+
+  test("matches the Rust renderer's shared deadline wording fixture", () => {
+    const fixture = JSON.parse(
+      fs.readFileSync(
+        new URL("../../../../spec/fixtures/bash-kill-deadline-parity.json", import.meta.url),
+        "utf8",
+      ),
+    ) as {
+      cases: Array<{
+        name: string;
+        started_at_ms: number;
+        now_ms: number;
+        limit_ms: number;
+        source: string;
+        role: WatchCallerRole;
+        expected: string;
+      }>;
+    };
+    for (const entry of fixture.cases) {
+      expect(
+        taskKillDeadlineText(
+          {
+            status: "running",
+            started_at: entry.started_at_ms,
+            hard_kill: { limit_ms: entry.limit_ms, source: entry.source },
+          },
+          entry.role,
+          entry.now_ms,
+        ),
+      ).toBe(entry.expected);
+    }
+  });
+
+  test("names the limit that killed a timed-out task, and says nothing for other ends", () => {
+    expect(
+      taskKillDeadlineText(
+        {
+          status: "timed_out",
+          status_reason: "killed by AFT's default background limit of 30 minutes (exit 124)",
+        },
+        "worker",
+      ),
+    ).toBe("The task was killed by AFT's default background limit of 30 minutes (exit 124).");
+    expect(taskKillDeadlineText({ status: "completed" }, "worker")).toBe("");
+    expect(taskKillDeadlineText({ status: "unknown" }, "worker")).toBe("");
+  });
+});
+
+describe("taskKillDeadlineWithinHandoffMargin", () => {
+  test("keeps a worker waiting at or within five seconds of the task kill", () => {
+    expect(
+      taskKillDeadlineWithinHandoffMargin({
+        status: "running",
+        hard_kill: { limit_ms: 1_800_000 },
+        elapsed_ms: 1_795_000,
+      }),
+    ).toBe(true);
+    expect(
+      taskKillDeadlineWithinHandoffMargin({
+        status: "running",
+        hard_kill: { limit_ms: 1_800_000 },
+        elapsed_ms: 1_794_999,
+      }),
+    ).toBe(false);
+    expect(
+      taskKillDeadlineWithinHandoffMargin({
+        status: "timed_out",
+        hard_kill: { limit_ms: 1_800_000 },
+        elapsed_ms: 1_800_000,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("worker still-running texts", () => {
+  test("a worker watch that ran out says the command still runs, for how long, and its tail", () => {
+    const output = Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join("\n");
+    const text = workerWatchStillRunning({
+      taskId: "bash-1",
+      waitedMs: 1_800_000,
+      ranMs: 1_830_000,
+      output: `${output}\n`,
+    });
+    expect(text).toContain("still running after 30 minutes of watching");
+    expect(text).toContain("It has run for 1830s.");
+    expect(text).toContain('Call bash_watch({ taskId: "bash-1" }) again to keep waiting');
+    expect(text).toContain('bash_kill({ taskId: "bash-1" }) if it should have finished');
+    expect(text).toContain("without timeoutMs a watch waits up to the worker wait limit");
+    // Only the last 20 lines are shown.
+    expect(text).toContain("Recent output:\nline 11\n");
+    expect(text).not.toContain("line 10\n");
+    expect(text.endsWith("line 30")).toBe(true);
+  });
+
+  test("Pi spellings and an empty output are honoured", () => {
+    const text = workerWatchStillRunning({
+      taskId: "bash-2",
+      waitedMs: 90_000,
+      ranMs: undefined,
+      output: "",
+      taskIdArg: "task_id",
+      timeoutParam: "timeout_ms",
+    });
+    expect(text).toContain("after 90s of watching");
+    expect(text).toContain('bash_watch({ task_id: "bash-2" })');
+    expect(text).toContain("without timeout_ms");
+    expect(text).not.toContain("It has run for");
+    expect(text.endsWith("No output yet.")).toBe(true);
+  });
+
+  test("durations read as minutes when whole, else seconds", () => {
+    expect(formatWaitDuration(60_000)).toBe("1 minute");
+    expect(formatWaitDuration(2_700_000)).toBe("45 minutes");
+    expect(formatWaitDuration(1_500)).toBe("1.5s");
+  });
+
+  test("the background note names the limit, not a promise to wait until the end", () => {
+    const note = workerBackgroundTaskNote("bash-3");
+    expect(note).toContain("waits up to the worker wait limit (`bash.worker_wait_max_ms`");
+    expect(note).toContain("watch again to keep waiting");
+    expect(note).not.toContain("waits until the command finishes");
   });
 });
 

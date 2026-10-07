@@ -399,8 +399,103 @@ resolve_default_branch() {
 resolve_ci_run() {
   local sha="$1"
   "$OPERATOR_GH" run list --repo "$repo_slug" --workflow "$tests_workflow_name" \
-    --event "${WATCH_CI_EVENT:-push}" --limit 40 --json databaseId,headSha \
-    --jq ".[] | select(.headSha==\"$sha\") | .databaseId" 2>/dev/null | head -1
+    --event "${WATCH_CI_EVENT:-push}" --limit 40 --json databaseId,headSha,headBranch \
+    --jq ".[] | select(.headSha==\"$sha\" and .headBranch==\"$train_ref\") | .databaseId" 2>/dev/null | head -1
+}
+
+ci_run_attempt() {
+  "$OPERATOR_GH" run view "$1" --repo "$repo_slug" --json attempt --jq '.attempt' 2>/dev/null
+}
+
+wait_for_new_run_attempt() {
+  local run_id="$1"
+  local previous_attempt="$2"
+  local attempts="${TRAIN_PUSH_RERUN_ATTEMPTS:-30}"
+  local wait_seconds="${TRAIN_PUSH_RERUN_SLEEP:-2}"
+  local current_attempt
+  for _ in $(seq 1 "$attempts"); do
+    current_attempt="$(ci_run_attempt "$run_id" || true)"
+    if [[ "$current_attempt" =~ ^[0-9]+$ ]] && [ "$current_attempt" -gt "$previous_attempt" ]; then
+      printf '%s\n' "$current_attempt"
+      return 0
+    fi
+    sleep "$wait_seconds"
+  done
+  printf 'train-push: rerun request for %s did not advance its attempt beyond %s\n' \
+    "$run_id" "$previous_attempt" >&2
+  return 1
+}
+
+wait_for_run_attempt_completion() {
+  local run_id="$1"
+  local attempt="$2"
+  local attempts="${TRAIN_PUSH_RERUN_WAIT_ATTEMPTS:-360}"
+  local wait_seconds="${TRAIN_PUSH_RERUN_WAIT_SLEEP:-10}"
+  local status
+  for _ in $(seq 1 "$attempts"); do
+    status="$("$OPERATOR_GH" run view "$run_id" --repo "$repo_slug" --attempt "$attempt" \
+      --json status --jq '.status' 2>/dev/null || true)"
+    [ "$status" = "completed" ] && return 0
+    sleep "$wait_seconds"
+  done
+  printf 'train-push: rerun attempt %s for run %s did not complete before the wait limit\n' \
+    "$attempt" "$run_id" >&2
+  return 1
+}
+
+rerun_existing_run() {
+  local run_id="$1"
+  local old_attempt="$2"
+  local bad_jobs line conclusion job_id
+  local current_attempt="$old_attempt"
+  local remaining_actions
+  local -a failed_job_ids=() cancelled_job_ids=()
+
+  bad_jobs="$("$OPERATOR_GH" run view "$run_id" --repo "$repo_slug" --json jobs \
+    --jq '[.jobs[] | select(.conclusion=="failure" or .conclusion=="cancelled") | .conclusion + "|" + (.databaseId|tostring)] | .[]' 2>/dev/null || true)"
+  while IFS='|' read -r conclusion job_id; do
+    [ -n "$job_id" ] || continue
+    case "$job_id" in *[!0-9]*) continue ;; esac
+    case "$conclusion" in
+      failure) failed_job_ids+=("$job_id") ;;
+      cancelled) cancelled_job_ids+=("$job_id") ;;
+    esac
+  done <<< "$bad_jobs"
+
+  if [ "${#failed_job_ids[@]}" -eq 0 ] && [ "${#cancelled_job_ids[@]}" -eq 0 ]; then
+    printf 'train-push: completed run %s has no failed or cancelled jobs to rerun; refusing to treat its old conclusion as this push result\n' \
+      "$run_id" >&2
+    return 1
+  fi
+  remaining_actions=$(( ${#failed_job_ids[@]} > 0 ? 1 : 0 ))
+  remaining_actions=$((remaining_actions + ${#cancelled_job_ids[@]}))
+
+  if [ "${#failed_job_ids[@]}" -gt 0 ]; then
+    GH_SHIM_BYPASS=operator "$OPERATOR_GH" run rerun "$run_id" --failed >&2 || {
+      printf 'train-push: could not rerun failed jobs for run %s\n' "$run_id" >&2
+      return 1
+    }
+    current_attempt="$(wait_for_new_run_attempt "$run_id" "$current_attempt")" || return 1
+    remaining_actions=$((remaining_actions - 1))
+    if [ "$remaining_actions" -gt 0 ]; then
+      wait_for_run_attempt_completion "$run_id" "$current_attempt" || return 1
+    fi
+  fi
+  if [ "${#cancelled_job_ids[@]}" -gt 0 ]; then
+    for job_id in "${cancelled_job_ids[@]}"; do
+      # `--failed` does not include cancelled jobs, so each is rerun explicitly.
+      GH_SHIM_BYPASS=operator "$OPERATOR_GH" run rerun "$run_id" --job "$job_id" >&2 || {
+        printf 'train-push: could not rerun cancelled job %s for run %s\n' "$job_id" "$run_id" >&2
+        return 1
+      }
+      current_attempt="$(wait_for_new_run_attempt "$run_id" "$current_attempt")" || return 1
+      remaining_actions=$((remaining_actions - 1))
+      if [ "$remaining_actions" -gt 0 ]; then
+        wait_for_run_attempt_completion "$run_id" "$current_attempt" || return 1
+      fi
+    done
+  fi
+  printf '%s\n' "$current_attempt"
 }
 
 ci_run_url() {
@@ -542,6 +637,7 @@ if [ "$recover_existing" -eq 1 ]; then
   run_url=""
   run_status=""
   run_conclusion=""
+  rerun_attempt=""
 
   if [ -n "$run_id" ]; then
     verdict="$("$OPERATOR_GH" run view "$run_id" --repo "$repo_slug" \
@@ -551,15 +647,22 @@ if [ "$recover_existing" -eq 1 ]; then
   fi
 
   if [ "$run_status" = "completed" ] && [ "$run_conclusion" != "success" ]; then
-    report_existing_red "$verified_sha" "$run_url"
-    exit 1
+    old_attempt="$(ci_run_attempt "$run_id" || true)"
+    if ! [[ "$old_attempt" =~ ^[0-9]+$ ]]; then
+      refuse "could not read the current attempt for completed run $run_id"
+    fi
+    rerun_attempt="$(rerun_existing_run "$run_id" "$old_attempt")" || exit 1
+    say "sha already ran in ${run_url:-run $run_id} ($run_conclusion); rerunning its failed and cancelled jobs (attempt $rerun_attempt)"
   fi
 
-  if [ "$run_status" != "completed" ]; then
+  if [ "$run_status" != "completed" ] || [ -n "$rerun_attempt" ]; then
     watch_target="${run_id:-$verified_sha}"
-    say "attaching to CI for existing $remote/$train_ref at $verified_sha"
+    if [ -z "$rerun_attempt" ]; then
+      say "attaching to CI for existing $remote/$train_ref at $verified_sha"
+    fi
     set +e
-    (cd "$REPO" && REPO="$repo_slug" WATCH_CI_HEARTBEAT="$watch_heartbeat" \
+    (cd "$REPO" && REPO="$repo_slug" WATCH_CI_BRANCH="$train_ref" WATCH_CI_HEARTBEAT="$watch_heartbeat" \
+      WATCH_CI_ATTEMPT="$rerun_attempt" \
       "$script_dir/watch-ci.sh" "$watch_target") 2>&1 | tee "$watch_log"
     watch_rc="${PIPESTATUS[0]}"
     set -e
@@ -822,6 +925,12 @@ if [ -n "$(git -C "$REPO" status --porcelain)" ]; then
   refuse "working tree is not clean (commit or stash before pushing a train)"
 fi
 
+# A train must not add local dependency paths that escape the repository. CI
+# runs the same check, and this catches the problem before spending a push run.
+if ! python3 "$REPO/scripts/check-path-deps.py"; then
+  refuse "dependency path resolves outside the repository"
+fi
+
 # A local main behind origin/main means the train was built on a stale base:
 # CI would test it green and the land would still be refused in step 5.
 if git -C "$REPO" rev-parse --verify -q refs/heads/"$default_branch" >/dev/null; then
@@ -1052,7 +1161,7 @@ while true; do
   verified_sha=""
   say "watching CI for $head_sha on $train_ref in $repo_slug (round $round of $max_rounds)"
   set +e
-  (cd "$REPO" && REPO="$repo_slug" WATCH_CI_HEARTBEAT="$watch_heartbeat" \
+  (cd "$REPO" && REPO="$repo_slug" WATCH_CI_BRANCH="$train_ref" WATCH_CI_HEARTBEAT="$watch_heartbeat" \
     "$script_dir/watch-ci.sh" "$head_sha") 2>&1 | tee "$watch_log"
   watch_rc="${PIPESTATUS[0]}"
   set -e

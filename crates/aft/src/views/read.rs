@@ -6,6 +6,207 @@ use std::sync::Arc;
 use crate::callgraph_store::{ReadonlyCallGraphStore, Result};
 use crate::pins::QueryPin;
 
+// Keep the first refusal on the calling test thread so a failed assertion names
+// the branch and its observed values without rerunning a potentially racy read.
+#[cfg(test)]
+thread_local! {
+    static CHECKOUT_VIEW_REFUSAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn record_checkout_view_refusal(reason: String) {
+    CHECKOUT_VIEW_REFUSAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_checkout_view_refusal() -> Option<String> {
+    CHECKOUT_VIEW_REFUSAL.with(|slot| slot.borrow_mut().take())
+}
+
+macro_rules! note_checkout_verification_refusal {
+    ($($arg:tt)*) => {
+        #[cfg(test)]
+        record_checkout_view_refusal(format!($($arg)*));
+    };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VerificationIo {
+    pub files_statd: usize,
+    pub files_read: usize,
+    pub bytes_hashed: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static VERIFICATION_IO: std::cell::Cell<VerificationIo> = const {
+        std::cell::Cell::new(VerificationIo { files_statd: 0, files_read: 0, bytes_hashed: 0 })
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_verification_io() -> VerificationIo {
+    VERIFICATION_IO.with(|io| io.replace(VerificationIo::default()))
+}
+
+fn read_verification_source(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let source = std::fs::read(path)?;
+    #[cfg(test)]
+    VERIFICATION_IO.with(|io| {
+        let mut count = io.get();
+        count.files_read += 1;
+        io.set(count);
+    });
+    Ok(source)
+}
+
+fn verification_key(source: &[u8], language: String, producer: &str) -> String {
+    #[cfg(test)]
+    VERIFICATION_IO.with(|io| {
+        let mut count = io.get();
+        count.bytes_hashed += source.len();
+        io.set(count);
+    });
+    crate::blob_store::CallgraphKey::from_bytes(source, language, producer)
+        .full_key()
+        .to_hex()
+}
+
+#[derive(Clone)]
+pub(crate) struct VerifiedCallgraphFile {
+    size: u64,
+    modified: std::time::SystemTime,
+    expected_key: String,
+}
+
+fn verification_stat(path: &std::path::Path) -> std::io::Result<(u64, std::time::SystemTime)> {
+    #[cfg(test)]
+    VERIFICATION_IO.with(|io| {
+        let mut count = io.get();
+        count.files_statd += 1;
+        io.set(count);
+    });
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.len(), metadata.modified()?))
+}
+
+/// Stat-first verification of an immutable manifest. The owner clears `verified`
+/// on the same watcher invalidation ticket used by search verification, so an
+/// event always rechecks content even if a writer preserved size and mtime.
+/// Blocking inspect can reuse its already collected root stats instead of
+/// issuing another metadata walk just for this reader.
+pub(crate) fn callgraph_paths_match_cached(
+    manifest: &super::Manifest,
+    root: &std::path::Path,
+    paths: &[PathBuf],
+    observed: Option<&[(PathBuf, u64, std::time::SystemTime)]>,
+    verified: &mut std::collections::BTreeMap<PathBuf, VerifiedCallgraphFile>,
+) -> super::Result<bool> {
+    let observed = observed.map(|files| {
+        files
+            .iter()
+            .map(|(path, size, modified)| (path.as_path(), (*size, *modified)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    });
+    for path in paths {
+        let Ok(relative) = path.strip_prefix(root) else {
+            note_checkout_verification_refusal!(
+                "verification_root_mismatch: path={path:?} root={root:?}"
+            );
+            return Ok(false);
+        };
+        let key = super::RelPath::from_os_path(relative).map_err(|error| {
+            note_checkout_verification_refusal!("verification_relative_path_invalid: path={path:?} relative={relative:?} error={error}");
+            error
+        })?;
+        let language = if super::assembly::is_resolution_input(key.as_bytes()) {
+            Some("config".to_string())
+        } else {
+            crate::parser::detect_language(path).map(|lang| format!("{lang:?}").to_lowercase())
+        };
+        let Some(language) = language else { continue };
+        let Some(super::ManifestEntry::Regular { planes, .. }) = manifest.get(&key) else {
+            note_checkout_verification_refusal!(
+                "verification_regular_entry_missing: path={path:?} key={key:?} entry={:?}",
+                manifest.get(&key)
+            );
+            return Ok(false);
+        };
+        let Some(expected_key) = planes.callgraph.as_ref() else {
+            note_checkout_verification_refusal!(
+                "verification_callgraph_key_missing: path={path:?} key={key:?} planes={planes:?}"
+            );
+            return Ok(false);
+        };
+        let stats = match observed
+            .as_ref()
+            .and_then(|files| files.get(path.as_path()))
+            .copied()
+            .map(Ok)
+            .unwrap_or_else(|| verification_stat(path))
+        {
+            Ok(stats) => stats,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                note_checkout_verification_refusal!(
+                    "verification_stat_not_found: path={path:?} error={error}"
+                );
+                return Ok(false);
+            }
+            Err(error) => {
+                note_checkout_verification_refusal!(
+                    "verification_stat_error: path={path:?} error={error}"
+                );
+                return Err(error.into());
+            }
+        };
+        if verified.get(path).is_some_and(|previous| {
+            previous.size == stats.0
+                && previous.modified == stats.1
+                && previous.expected_key == *expected_key
+        }) {
+            continue;
+        }
+        let source = read_verification_source(path).map_err(|error| {
+            note_checkout_verification_refusal!(
+                "verification_source_read_error: path={path:?} stats={stats:?} error={error}"
+            );
+            error
+        })?;
+        let actual_key = verification_key(&source, language, super::callgraph::PRODUCER);
+        if actual_key != *expected_key {
+            note_checkout_verification_refusal!("verification_source_key_mismatch: path={path:?} expected_key={expected_key} actual_key={actual_key} stats={stats:?} source_bytes={}", source.len());
+            verified.remove(path);
+            return Ok(false);
+        }
+        // Do not associate verified bytes with metadata from before an edit.
+        let after_stats = verification_stat(path).map_err(|error| {
+            note_checkout_verification_refusal!(
+                "verification_post_read_stat_error: path={path:?} before={stats:?} error={error}"
+            );
+            error
+        })?;
+        if after_stats != stats {
+            note_checkout_verification_refusal!("verification_post_read_stat_changed: path={path:?} before={stats:?} after={after_stats:?}");
+            return Ok(false);
+        }
+        verified.insert(
+            path.clone(),
+            VerifiedCallgraphFile {
+                size: stats.0,
+                modified: stats.1,
+                expected_key: expected_key.clone(),
+            },
+        );
+    }
+    Ok(true)
+}
+
 /// Why a view generation published with the call graph off is not served.
 pub(crate) const CALLGRAPH_DISABLED: &str = "call graph is disabled (indexes.callgraph=false): this view generation was published without call graph data";
 
@@ -15,8 +216,9 @@ pub(crate) const CALLGRAPH_DISABLED: &str = "call graph is disabled (indexes.cal
 ///
 /// A generation published with the call graph off has an empty derived
 /// database; serving it would answer "no callers" and "no dead code" for a
-/// graph that was never built. Every reader of a view's call graph opens it
-/// here, so it is refused here, as unavailable with [`CALLGRAPH_DISABLED`].
+/// graph that was never built. Published v1 readers refuse it here, as unavailable
+/// with [`CALLGRAPH_DISABLED`]; the checkout plane applies the same manifest guard
+/// before opening a pinned v2 reader.
 /// A manifest that cannot be read is refused too, rather than assumed to
 /// carry a call graph.
 pub(crate) fn open_published_callgraph(
@@ -135,7 +337,7 @@ fn callgraph_paths_match_with_producer(
         };
         let Some(language) = language else { continue };
         let entry = manifest.get(&key);
-        let source = match std::fs::read(path) {
+        let source = match read_verification_source(path) {
             Ok(source) => source,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if entry.is_some() {
@@ -149,9 +351,7 @@ fn callgraph_paths_match_with_producer(
         // still be scanned, but they cannot change this published graph.
         let Some(entry) = entry else { continue };
         if let super::ManifestEntry::Regular { planes, .. } = entry {
-            let current = crate::blob_store::CallgraphKey::from_bytes(&source, language, producer)
-                .full_key()
-                .to_hex();
+            let current = verification_key(&source, language, producer);
             if planes.callgraph.as_deref() != Some(current.as_str()) {
                 return Ok(false);
             }
@@ -233,5 +433,85 @@ mod producer_tests {
         assert!(callgraph_paths_match_v2(&manifest, root.path(), &[absolute.clone()]).unwrap());
         std::fs::write(&absolute, b"fn changed() {}").unwrap();
         assert!(!callgraph_paths_match_v2(&manifest, root.path(), &[absolute]).unwrap());
+    }
+
+    #[test]
+    #[ignore = "manual source-verification IO measurement on the worker checkout"]
+    fn inspect_repository_source_verification_io_profile() {
+        let root = std::fs::canonicalize(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        let mut paths = Vec::new();
+        let mut stats = Vec::new();
+        for path in files {
+            let relative =
+                super::super::RelPath::from_os_path(path.strip_prefix(&root).unwrap()).unwrap();
+            let language = if super::super::assembly::is_resolution_input(relative.as_bytes()) {
+                Some("config".to_string())
+            } else {
+                crate::parser::detect_language(&path).map(|lang| format!("{lang:?}").to_lowercase())
+            };
+            let Some(language) = language else { continue };
+            let bytes = std::fs::read(&path).unwrap();
+            let metadata = std::fs::metadata(&path).unwrap();
+            let key = crate::blob_store::CallgraphKey::from_bytes(
+                &bytes,
+                language,
+                super::super::callgraph::PRODUCER,
+            )
+            .full_key()
+            .to_hex();
+            entries.push((
+                relative,
+                super::super::ManifestEntry::Regular {
+                    mode: 0o100644,
+                    planes: super::super::RegularPlanes {
+                        semantic: None,
+                        callgraph: Some(key),
+                    },
+                    resolution_input: false,
+                },
+            ));
+            stats.push((path.clone(), metadata.len(), metadata.modified().unwrap()));
+            paths.push(path);
+        }
+        let manifest = super::super::Manifest::new(entries).unwrap();
+        // This is the source-verification part of the reader, not a fabricated
+        // cold callgraph benchmark. Generation assembly is deliberately excluded.
+        take_verification_io();
+        for _ in 0..2 {
+            assert!(callgraph_paths_match(&manifest, &root, &paths).unwrap());
+        }
+        let before = take_verification_io();
+        let mut verified = std::collections::BTreeMap::new();
+        assert!(callgraph_paths_match_cached(
+            &manifest,
+            &root,
+            &paths,
+            Some(&stats),
+            &mut verified
+        )
+        .unwrap());
+        let cold = take_verification_io();
+        assert!(callgraph_paths_match_cached(
+            &manifest,
+            &root,
+            &paths,
+            Some(&stats),
+            &mut verified
+        )
+        .unwrap());
+        let warm = take_verification_io();
+        eprintln!("inspect_repo_source_verification root={} source_files={} previous_per_call={before:?} revised_cold={cold:?} revised_warm={warm:?}", root.display(), paths.len());
+        assert_eq!(warm, VerificationIo::default());
+        assert_eq!(before.files_read, paths.len() * 2);
+        assert_eq!(cold.files_read, paths.len());
     }
 }

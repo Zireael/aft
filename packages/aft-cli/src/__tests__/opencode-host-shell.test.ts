@@ -11,14 +11,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { OpenCodeAdapter } from "../adapters/opencode.js";
-import { hostShellDoctorLine } from "../commands/doctor.js";
-import { HOST_SHELL_QUESTION, offerHostShellDisable } from "../commands/setup.js";
+import { hostShellDoctorLine, hostToolDoctorLine } from "../commands/doctor.js";
+import {
+  HOST_SHELL_QUESTION,
+  offerHostShellDisable,
+  offerHostToolDisable,
+} from "../commands/setup.js";
 import type { OpenCodeHostDetection } from "../setup/host-generation.js";
 import {
   aftBashEnabled,
+  aftHostReplacementEnabled,
   hostShellPluginDisabled,
+  hostToolPluginDisabled,
   OPENCODE_HOST_SHELL_DISABLE_ENTRY,
   setHostShellPluginDisabled,
+  setHostToolPluginDisabled,
 } from "../setup/opencode-config.js";
 
 function detection(status: "v1" | "v2"): OpenCodeHostDetection {
@@ -76,6 +83,33 @@ describe("the -opencode.tool.shell entry", () => {
     expect(aftBashEnabled({ bash: { enabled: false } })).toBe(false);
     expect(aftBashEnabled({ disabled_tools: ["bash"] })).toBe(false);
     expect(aftBashEnabled({ enabled: false })).toBe(false);
+  });
+});
+
+describe("the -opencode.tool.patch entry", () => {
+  test("patch removal deduplicates without changing shell or other entries", () => {
+    const config: Record<string, unknown> = {
+      plugins: ["-opencode.tool.patch", "x", "-opencode.tool.shell", "-opencode.tool.patch"],
+    };
+    expect(setHostToolPluginDisabled(config, "patch", true)).toEqual({ changed: true });
+    expect(config.plugins).toEqual(["-opencode.tool.patch", "x", "-opencode.tool.shell"]);
+    expect(hostToolPluginDisabled(config, "patch")).toBe(true);
+    expect(setHostToolPluginDisabled(config, "patch", true)).toEqual({ changed: false });
+    expect(setHostToolPluginDisabled(config, "patch", false)).toEqual({ changed: true });
+    expect(config.plugins).toEqual(["x", "-opencode.tool.shell"]);
+    expect(hostToolPluginDisabled(config, "patch")).toBe(false);
+    expect(setHostToolPluginDisabled(config, "patch", false)).toEqual({ changed: false });
+    const empty = {};
+    expect(setHostToolPluginDisabled(empty, "patch", false)).toEqual({ changed: false });
+    expect(empty).toEqual({});
+  });
+
+  test("AFT apply_patch enabled state is independent of the bash runtime gate", () => {
+    expect(aftHostReplacementEnabled(null, "patch")).toBe(true);
+    expect(aftHostReplacementEnabled({ bash: false }, "patch")).toBe(true);
+    expect(aftHostReplacementEnabled({ disabled_tools: ["edit"] }, "patch")).toBe(true);
+    expect(aftHostReplacementEnabled({ disabled_tools: ["apply_patch"] }, "patch")).toBe(false);
+    expect(aftHostReplacementEnabled({ enabled: false }, "patch")).toBe(false);
   });
 });
 
@@ -208,4 +242,81 @@ describe("setup and doctor offer to disable OpenCode's own shell tool", () => {
       text: expect.stringContaining("OpenCode's own shell tool: disabled"),
     });
   });
+
+  test("setup adds the literal patch removal entry once beside AFT apply_patch", async () => {
+    const instance = adapter("v2", { plugins: ["x", "-opencode.tool.shell"] });
+    const asked: Array<[string, boolean]> = [];
+    for (let i = 0; i < 2; i++) {
+      expect(
+        await offerHostToolDisable(instance, "patch", [], {
+          interactive: true,
+          confirmHostTool: async (message, defaultYes) => {
+            asked.push([message, defaultYes]);
+            return defaultYes;
+          },
+        }),
+      ).toBe("ok");
+    }
+    expect(asked).toEqual([
+      ["OpenCode's own patch tool: disable it so agents use AFT's apply_patch?", true],
+      ["OpenCode's own patch tool: disable it so agents use AFT's apply_patch?", true],
+    ]);
+    expect(serverConfig(instance).plugins).toEqual([
+      "x",
+      "-opencode.tool.shell",
+      "-opencode.tool.patch",
+    ]);
+  });
+
+  for (const [hostTool, aftTool] of [
+    ["shell", "bash"],
+    ["patch", "apply_patch"],
+  ] as const) {
+    test(`setup keeps host ${hostTool} by default with AFT ${aftTool} disabled`, async () => {
+      const instance = adapter(
+        "v2",
+        { plugins: [`-opencode.tool.${hostTool}`] },
+        {
+          disabled_tools: [aftTool],
+        },
+      );
+      const defaults: boolean[] = [];
+      await offerHostToolDisable(instance, hostTool, [], {
+        interactive: true,
+        confirmHostTool: async (_message, defaultYes) => {
+          defaults.push(defaultYes);
+          return defaultYes;
+        },
+      });
+      expect(defaults).toEqual([false]);
+      expect(serverConfig(instance).plugins).toEqual([]);
+      expect(hostToolDoctorLine(instance, hostTool)).toEqual({
+        level: "info",
+        text: `OpenCode's own ${hostTool} tool: enabled (AFT's ${aftTool} is disabled, so it stays)`,
+      });
+    });
+
+    test(`doctor reports enabled and already disabled host ${hostTool}`, () => {
+      expect(hostToolDoctorLine(adapter("v2", { plugins: [] }), hostTool)).toEqual({
+        level: "warn",
+        text: expect.stringContaining(
+          `OpenCode's own ${hostTool} tool: enabled beside AFT's ${aftTool}`,
+        ),
+      });
+      expect(
+        hostToolDoctorLine(adapter("v2", { plugins: [`-opencode.tool.${hostTool}`] }), hostTool),
+      ).toEqual({
+        level: "info",
+        text: `OpenCode's own ${hostTool} tool: disabled (-opencode.tool.${hostTool} is set); agents use AFT's ${aftTool}`,
+      });
+      expect(hostToolDoctorLine(adapter("v1", { plugin: [] }), hostTool)).toBeNull();
+    });
+
+    test(`setup skips host ${hostTool} on OpenCode 1`, async () => {
+      const original = { plugin: ["x"] };
+      const instance = adapter("v1", original);
+      expect(await offerHostToolDisable(instance, hostTool, ["--yes"])).toBe("skipped");
+      expect(serverConfig(instance)).toEqual(original);
+    });
+  }
 });

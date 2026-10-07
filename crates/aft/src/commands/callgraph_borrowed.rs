@@ -1689,7 +1689,14 @@ mod tests {
         ]);
         // A file the graph has but this checkout deleted is skipped silently.
         files.push("src/deleted.ts".to_string());
-        let roomy = SearchBounds::DEFAULT;
+        // The production 250 ms deadline is real wall time, and a loaded CI
+        // runner can spend it parsing the first file. This case is about the
+        // file and match bounds, so give the clock room; the deadline bound
+        // has its own case below with a zero deadline.
+        let roomy = SearchBounds {
+            deadline: Duration::from_secs(60),
+            ..SearchBounds::DEFAULT
+        };
         let search = search_differing_files(&provider, temp.path(), &files, "target", &roomy);
         let found: Vec<(&str, u32, &str, bool)> = search
             .matches

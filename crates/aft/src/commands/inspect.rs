@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Condvar, LazyLock, Mutex};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Map, Value};
@@ -26,6 +28,9 @@ use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
+// The remaining reasons stay in the body and structured gaps. This is a
+// presentation limit, not a limit on analysis or completion accounting.
+const MAX_INSPECT_HEADER_PARTS: usize = 3;
 // Give each waiting phase at most half the remaining work time so a slow
 // producer leaves room for other categories and final freshness verification.
 // The cap avoids turning large configured budgets into equally long waits.
@@ -347,7 +352,7 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_inspect_payload(req, ctx, false, false, &[], &[], &[], &[], None, None)
+    handle_inspect_payload(req, ctx, false, false, &[], &[], &[], &[], None, None, None)
 }
 
 /// Resolve the language servers an inspect should start, within the request
@@ -395,6 +400,7 @@ pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Respo
         &[],
         &[],
         Some(&phase_log),
+        None,
         None,
     )
 }
@@ -472,6 +478,7 @@ fn handle_inspect_payload(
     indexing_gaps: &[(ServerKey, String)],
     phase_log: Option<&InspectPhaseLog>,
     request_deadline: Option<InspectRequestDeadline>,
+    observed_stats: Option<&InspectRootStatSnapshot>,
 ) -> Response {
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
@@ -516,6 +523,18 @@ fn handle_inspect_payload(
         None
     };
     let manager = ctx.inspect_manager();
+    // A writer-backed unscoped request must retain contribution reuse. Only
+    // requests the legacy scanner cannot serve need an ephemeral view scan.
+    let needs_ephemeral_view = scope_was_provided || !ctx.inspect_writer();
+    let checkout_store =
+        if needs_ephemeral_view && snapshot.config.views.enabled && !checkout_routed {
+            manager.current_checkout_view(&snapshot, observed_stats.map(|stats| stats.0.as_slice()))
+        } else {
+            checkout_store
+        };
+    let use_checkout_view = needs_ephemeral_view
+        && snapshot.config.views.enabled
+        && (checkout_routed || checkout_store.is_some());
     let blocking_tier1_deadline = phase_log.map(|_| {
         request_deadline.map_or_else(
             || Instant::now() + inspect_request_timeout(snapshot.config.as_ref()),
@@ -546,7 +565,7 @@ fn handle_inspect_payload(
         .copied()
         .filter(|category| category.is_tier2())
     {
-        if scope_was_provided || !ctx.inspect_writer() {
+        if (scope_was_provided || !ctx.inspect_writer()) && !use_checkout_view {
             continue;
         }
         if request_deadline.is_some_and(|deadline| !deadline.has_work_budget()) {
@@ -590,7 +609,7 @@ fn handle_inspect_payload(
         let cancellation = crate::executor::current_job_cancellation();
         std::thread::spawn(move || {
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
-            let outcome = if checkout_routed {
+            let outcome = if use_checkout_view {
                 manager.tier2_run_with_pinned_view(snapshot, category, scope, checkout_store)
             } else if force_root_diagnostics {
                 manager.tier2_run_with_reuse_blocking_fresh(snapshot, category, scope)
@@ -686,21 +705,32 @@ fn handle_inspect_payload(
     // than reading as zero.
     refresh_status_bar_counts(ctx, &outcomes);
 
-    // Scoped inspection never schedules or joins project-wide Tier-2 work.
-    // Missing or stale cached results are gaps, not verified zero counts.
+    // A cache-only scoped request deliberately skips missing or unverified
+    // Tier-2 results. A view scan that actually ran, or an incomplete result
+    // served from cache, still contributes real gaps to request completion.
     if scope_was_provided {
         for (category, outcome) in &mut outcomes {
             if category.is_tier2() && !matches!(outcome, JobOutcome::Fresh { .. }) {
                 let reason = match &*outcome {
                     JobOutcome::Failed { message } => message.clone(),
-                    JobOutcome::Stale { .. } => "cached analysis could not be stat-verified".into(),
+                    JobOutcome::Stale { .. } => "cached source contributions, file set, or analysis configuration changed; freshness could not be verified".into(),
+                    _ if snapshot.config.views.enabled => "checkout call graph view is not ready; no legacy or borrowed analysis was substituted".into(),
                     _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
                     _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
                 };
-                *outcome = JobOutcome::Fresh {
-                    payload: serde_json::json!({"unavailable": true, "complete": false,
-                        "gaps": [{"kind": "tier2_unavailable", "reason": reason}]}),
-                };
+                let mut payload = manager.tier2_incomplete_payload(
+                    &snapshot,
+                    *category,
+                    &scope,
+                    "tier2_unavailable",
+                    reason,
+                );
+                // Enabling checkout views requests real scoped Tier-2 analysis.
+                // A missing or stale view is a gap, not an intentional skip.
+                if !snapshot.config.views.enabled {
+                    payload["not_computed"] = Value::Bool(true);
+                }
+                *outcome = JobOutcome::Fresh { payload };
             }
         }
     }
@@ -720,12 +750,21 @@ fn handle_inspect_payload(
                 } else {
                     format!("{} scanner", category.as_str())
                 };
-                *outcome = JobOutcome::Fresh {
-                    payload: serde_json::json!({
+                let payload = if category.is_tier2() {
+                    manager.tier2_incomplete_payload(
+                        &snapshot,
+                        *category,
+                        &scope,
+                        "analysis_incomplete",
+                        reason,
+                    )
+                } else {
+                    serde_json::json!({
                         "unavailable": true, "complete": false,
                         "gaps": [{"kind": "analysis_incomplete", "producer": producer, "reason": format!("{reason}; retry aft_inspect") }]
-                    }),
+                    })
                 };
+                *outcome = JobOutcome::Fresh { payload };
             }
         }
     }
@@ -746,27 +785,56 @@ fn handle_inspect_payload(
     } else {
         ctx.lsp().runtime_notes()
     };
+    append_inspect_runtime_notes(&mut payload, &runtime_notes);
+    Response::success(&req.id, payload)
+}
+
+fn append_inspect_runtime_notes(payload: &mut Value, runtime_notes: &[String]) {
     if !runtime_notes.is_empty() {
-        if let Some(text) = payload.get_mut("text") {
+        let rendered_notes = collapse_runtime_notes(runtime_notes);
+        if let Some(text) = payload
+            .get_mut("text")
+            .filter(|_| !rendered_notes.is_empty())
+        {
             if let Some(existing) = text.as_str() {
-                *text = serde_json::Value::String(format!(
-                    "{existing}\n{}",
-                    collapse_runtime_notes(&runtime_notes).join("\n")
-                ));
+                *text =
+                    serde_json::Value::String(format!("{existing}\n{}", rendered_notes.join("\n")));
             }
         }
         payload["lsp_runtime_notes"] = serde_json::json!(runtime_notes);
     }
-    Response::success(&req.id, payload)
 }
 
 /// Collapse runtime notes that differ only in their trailing parenthesized
 /// path, such as one "TypeScript 5.9.3: project installation (<tsserver>)"
 /// per TypeScript server, into one line with a count and the first path.
-/// Distinct notes keep their first-seen order.
+/// Distinct notes keep their first-seen order. A single known project SDK is
+/// routine; keep SDK notes when selection is uncertain, falls back, or names
+/// multiple installations (even when those installations have the same version).
 fn collapse_runtime_notes(notes: &[String]) -> Vec<String> {
+    let typescript_notes = notes
+        .iter()
+        .filter(|note| note.starts_with("TypeScript ") || note.starts_with("TypeScript:"))
+        .collect::<std::collections::HashSet<_>>();
+    let routine_sdk = if typescript_notes.len() == 1 {
+        typescript_notes.iter().next().copied().filter(|note| {
+            note.strip_prefix("TypeScript ")
+                .and_then(|note| note.split_once(": "))
+                .is_some_and(|(version, source)| {
+                    version != "unknown"
+                        && (source.starts_with("project installation (")
+                            || source
+                                .starts_with("native language server (project installation) ("))
+                })
+        })
+    } else {
+        None
+    };
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
     for note in notes {
+        if Some(note) == routine_sdk {
+            continue;
+        }
         let (head, detail) = match note
             .strip_suffix(')')
             .and_then(|rest| rest.rsplit_once(" ("))
@@ -829,6 +897,7 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     ctx: Arc<AppContext>,
     force_restrict: bool,
 ) -> DispatchOutcome {
+    let watcher_pending = crate::response_finalize::watcher_query_pending(&ctx, "inspect");
     let request_id = req.id.clone();
     let phase_log = InspectPhaseLog::for_request(request_id.clone());
     let deadline = InspectRequestDeadline::from_config(&ctx.config());
@@ -895,7 +964,7 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
         .unwrap_or_else(crate::executor::JobCancellation::new);
     let worker_cancellation = cancellation.clone();
     let root = snapshot.project_root.clone();
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = crate::response_finalize::pending_response_channel();
     // The request's admitted config, installed on the worker below.
     let admitted_config = ctx.config();
     std::thread::spawn(move || {
@@ -924,16 +993,27 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
             ),
         };
         crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
+        if response.success {
+            if let Some(payload) = response.data.as_object_mut() {
+                set_inspect_completion(payload);
+            }
+        }
+        // After the completion verdict, so a watcher backlog still marks the
+        // result incomplete.
+        crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
         let _ = tx.send(response);
     });
-    DispatchOutcome::Deferred(PendingResponse {
-        request_id: completion_request_id,
-        session_id: String::new(),
-        attach_command: String::new(),
-        poll: Box::new(move |_| rx.try_recv().ok()),
-        cancellation: Some(cancellation),
-        on_shutdown: Some(inspect_shutdown_terminal(request_id, shutdown_log)),
-    })
+    DispatchOutcome::Deferred(
+        PendingResponse::from_receiver(
+            completion_request_id,
+            String::new(),
+            String::new(),
+            rx,
+            |_, completion| completion.ok(),
+        )
+        .with_cancellation(cancellation)
+        .with_shutdown(inspect_shutdown_terminal(request_id, shutdown_log)),
+    )
 }
 
 fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapshot, Response> {
@@ -946,16 +1026,15 @@ fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapsh
 }
 
 fn deferred_response(request_id: String, response: Response) -> DispatchOutcome {
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = crate::response_finalize::pending_response_channel();
     let _ = tx.send(response);
-    DispatchOutcome::Deferred(PendingResponse {
+    DispatchOutcome::Deferred(PendingResponse::from_receiver(
         request_id,
-        session_id: String::new(),
-        attach_command: String::new(),
-        poll: Box::new(move |_| rx.try_recv().ok()),
-        cancellation: None,
-        on_shutdown: None,
-    })
+        String::new(),
+        String::new(),
+        rx,
+        |_, completion| completion.ok(),
+    ))
 }
 
 fn inspect_shutdown_terminal(
@@ -993,18 +1072,14 @@ fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCatego
         InspectCategory::Duplicates,
     ]
     .iter()
-    .any(|category| {
-        matches!(
-            outcomes.get(category),
-            Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. })
-        )
+    .any(|category| match outcomes.get(category) {
+        Some(JobOutcome::Fresh { payload }) => category_is_incomplete(payload),
+        Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. } | JobOutcome::Failed { .. }) => {
+            true
+        }
+        None => false,
     });
-    let todos = outcomes
-        .get(&InspectCategory::Todos)
-        .and_then(JobOutcome::payload)
-        .and_then(|payload| payload.get("count"))
-        .and_then(Value::as_u64)
-        .map(|count| count as usize);
+    let todos = count_of(InspectCategory::Todos);
 
     ctx.update_status_bar_tier2(
         count_of(InspectCategory::DeadCode),
@@ -1263,6 +1338,7 @@ fn run_blocking_inspect_body(
         &indexing_gaps,
         Some(&phase_log),
         Some(deadline),
+        Some(&initial_stats),
     );
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
@@ -1302,11 +1378,6 @@ fn run_blocking_inspect_body(
                 response.data["gaps"] = serde_json::json!([]);
             }
             response.data["gaps"].as_array_mut().unwrap().push(gap);
-            if let Some(text) = response.data["text"].as_str() {
-                response.data["text"] = Value::String(format!(
-                    "{text}\ncomplete: false — file freshness unverified; retry aft_inspect"
-                ));
-            }
             return build_inspect_terminal(
                 &req.id,
                 &phase_log,
@@ -1630,37 +1701,330 @@ enum InspectTerminal {
     },
 }
 
-/// Why a completed inspect is partial, or `None` when its diagnostics are
-/// authoritative (or were not part of the answer). The reason names every
-/// producer the diagnostics gaps attribute, in first-seen order, for example
-/// "diagnostics unknown for rust, typescript".
+/// Completion is about every reported category, not just language servers.
+/// Sections and topK select detail rows; neither changes which results count.
 pub(crate) fn partial_terminal_reason(payload: &Map<String, Value>) -> Option<String> {
-    let diagnostics = payload.get("summary")?.get("diagnostics")?;
-    if diagnostics.get("complete").and_then(Value::as_bool) != Some(false) {
-        return None;
-    }
-    let mut producers = Vec::<String>::new();
-    for gap in diagnostics
+    partial_reason_from_parts(&incomplete_result_parts(payload))
+}
+
+fn incomplete_result_parts(payload: &Map<String, Value>) -> Vec<(bool, String)> {
+    let mut parts = payload
+        .get("summary")
+        .and_then(Value::as_object)
+        .map(incomplete_summary_parts)
+        .unwrap_or_default();
+    for gap in payload
         .get("gaps")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
-        let producer = gap
-            .get("producer")
-            .or_else(|| gap.get("cause").and_then(|cause| cause.get("producer")))
-            .and_then(Value::as_str);
-        if let Some(producer) = producer {
-            if !producers.iter().any(|known| known == producer) {
-                producers.push(producer.to_string());
+        // Category gaps are already explained by their summary. Final checkout
+        // and stat-verification gaps have no category and must also count.
+        if gap.get("categories").is_some() {
+            continue;
+        }
+        let label = match gap["kind"].as_str() {
+            Some("view_pending") => "callgraph view pending",
+            Some("stat_verification_incomplete") => "file freshness unverified",
+            _ => "analysis incomplete",
+        };
+        let reason = gap["reason"].as_str().unwrap_or("analysis did not finish");
+        let reason = format!("{label}: {}", compact_inspect_reason(reason));
+        if !parts.iter().any(|(_, existing)| existing == &reason) {
+            parts.push((false, reason));
+        }
+    }
+    if parts.is_empty() && payload.get("complete").and_then(Value::as_bool) == Some(false) {
+        parts.push((false, "analysis incomplete: no complete report".to_string()));
+    }
+    parts.sort_by_key(|(diagnostic, reason)| {
+        (*diagnostic, if *diagnostic { 0 } else { reason.len() })
+    });
+    parts
+}
+
+/// Finalization can add freshness gaps after scanners have answered. Keep the
+/// structured state and the already rendered status line in sync at that point.
+fn set_inspect_completion(payload: &mut Map<String, Value>) {
+    let partial = partial_terminal_reason(payload);
+    payload.insert("complete".to_string(), Value::Bool(partial.is_none()));
+    payload.insert(
+        "inspect_terminal".to_string(),
+        serde_json::json!(if partial.is_some() {
+            "partial"
+        } else {
+            "fresh"
+        }),
+    );
+    if let Some(text) = payload.get("text").and_then(Value::as_str) {
+        let body = if text.starts_with("PARTIAL — ") || text.starts_with("FRESH\n") {
+            text.split_once('\n').map_or("", |(_, body)| body)
+        } else {
+            text
+        };
+        let header = partial.as_ref().map_or_else(
+            || "FRESH".to_string(),
+            |reason| format!("PARTIAL — {reason}"),
+        );
+        let mut text = if body.is_empty() {
+            header
+        } else {
+            format!("{header}\n{body}")
+        };
+        let summary_parts = payload
+            .get("summary")
+            .and_then(Value::as_object)
+            .map(incomplete_summary_parts)
+            .unwrap_or_default();
+        for (diagnostic, reason) in incomplete_result_parts(payload)
+            .into_iter()
+            .skip(MAX_INSPECT_HEADER_PARTS)
+        {
+            if diagnostic && !text.contains(&reason) {
+                text.push_str(&format!("\nIncomplete diagnostics: {reason}"));
+            }
+        }
+        for (_, reason) in incomplete_result_parts(payload) {
+            if !summary_parts.iter().any(|(_, part)| part == &reason) && !text.contains(&reason) {
+                text.push_str(&format!("\nIncomplete analysis: {reason}"));
+            }
+        }
+        payload.insert("text".to_string(), Value::String(text));
+    }
+    match partial {
+        Some(reason) => {
+            payload.insert("partial_reason".to_string(), Value::String(reason));
+        }
+        None => {
+            payload.remove("partial_reason");
+        }
+    }
+}
+
+fn category_is_incomplete(value: &Value) -> bool {
+    if value.get("not_computed").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    value.get("complete").and_then(Value::as_bool) == Some(false)
+        || value.get("unavailable").and_then(Value::as_bool) == Some(true)
+        || value.get("callgraph_available").and_then(Value::as_bool) == Some(false)
+}
+
+fn compact_inspect_reason(reason: &str) -> String {
+    reason
+        .trim_end_matches("; retry aft_inspect.")
+        .trim_end_matches("; retry aft_inspect")
+        .trim_end_matches("; retry")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn incomplete_analysis_reason(value: &Value) -> String {
+    let mut reasons = Vec::new();
+    for (key, cause) in [
+        ("parse_errors", "could not be parsed"),
+        ("skipped_files", "could not be analyzed"),
+    ] {
+        if let Some(files) = value
+            .get(key)
+            .and_then(Value::as_array)
+            .filter(|files| !files.is_empty())
+        {
+            let label = if files.len() == 1 { "file" } else { "files" };
+            reasons.push(format!("{} {label} {cause}", files.len()));
+        }
+    }
+    if !reasons.is_empty() {
+        return reasons.join("; ");
+    }
+    compact_inspect_reason(
+        value
+            .get("reason")
+            .or_else(|| value.get("callgraph_unavailable_reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("analysis did not finish"),
+    )
+}
+
+fn incomplete_category_gaps(category: InspectCategory, value: &Value) -> Vec<Value> {
+    if let Some(gaps) = value
+        .get("gaps")
+        .and_then(Value::as_array)
+        .filter(|gaps| !gaps.is_empty())
+    {
+        return gaps.clone();
+    }
+    let reason = if category == InspectCategory::Diagnostics {
+        "no authoritative report".to_string()
+    } else {
+        incomplete_analysis_reason(value)
+    };
+    vec![serde_json::json!({"kind": "analysis_incomplete", "reason": reason})]
+}
+
+/// Short scanner explanations precede verbose diagnostic producer explanations.
+/// Diagnostic causes retain first-seen order, including their scoped roots.
+fn incomplete_summary_parts(summary: &Map<String, Value>) -> Vec<(bool, String)> {
+    let mut groups = Vec::<(String, Vec<String>)>::new();
+    for (category, value) in summary {
+        if category == "diagnostics" || !category_is_incomplete(value) {
+            continue;
+        }
+        let label = category.replace('_', " ");
+        let reason = match value.pointer("/building/state").and_then(Value::as_str) {
+            Some("building") => "still building".to_string(),
+            Some("rebuilding") => "still rebuilding".to_string(),
+            Some(state) => format!("still building ({})", state.replace('_', " ")),
+            None => {
+                let reason = value
+                    .get("gaps")
+                    .and_then(Value::as_array)
+                    .and_then(|gaps| gaps.first())
+                    .and_then(|gap| gap["reason"].as_str())
+                    .map(compact_inspect_reason)
+                    .unwrap_or_else(|| incomplete_analysis_reason(value));
+                let status =
+                    if value["unavailable"] == true || value["callgraph_available"] == false {
+                        "unavailable"
+                    } else {
+                        "incomplete"
+                    };
+                format!("{status}: {reason}")
+            }
+        };
+        let reason = compact_inspect_reason(&reason);
+        if let Some((_, labels)) = groups.iter_mut().find(|(cause, _)| cause == &reason) {
+            labels.push(label);
+        } else {
+            groups.push((reason, vec![label]));
+        }
+    }
+    let mut parts = groups
+        .into_iter()
+        .map(|(reason, labels)| (false, format!("{} {reason}", labels.join(", "))))
+        .collect::<Vec<_>>();
+    parts.sort_by_key(|(_, reason)| reason.len());
+    if let Some(causes) = summary
+        .get("diagnostics")
+        .and_then(diagnostics_unknown_causes)
+    {
+        parts.extend(causes.into_iter().map(|cause| (true, cause)));
+    }
+    parts
+}
+
+fn partial_summary_reason(summary: &Map<String, Value>) -> Option<String> {
+    let parts = incomplete_summary_parts(summary);
+    partial_reason_from_parts(&parts)
+}
+
+fn partial_reason_from_parts(parts: &[(bool, String)]) -> Option<String> {
+    if parts.is_empty() {
+        return None;
+    }
+    let mut diagnostic_label_shown = false;
+    // Headline cap, registered as an exclusion in list_surfaces.rs.
+    let mut shown = parts
+        .iter()
+        .take(MAX_INSPECT_HEADER_PARTS)
+        .map(|(diagnostic, reason)| {
+            if *diagnostic && !diagnostic_label_shown {
+                diagnostic_label_shown = true;
+                format!("diagnostics unknown: {reason}")
+            } else {
+                reason.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    if parts.len() > shown.len() {
+        shown.push(format!("+{} more", parts.len() - shown.len()));
+    }
+    Some(format!("{}; retry aft_inspect.", shown.join("; ")))
+}
+
+fn diagnostics_unknown_causes(diagnostics: &Value) -> Option<Vec<String>> {
+    if diagnostics.get("complete").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let gaps = diagnostics
+        .get("gaps")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut causes = Vec::<(String, String, String, usize)>::new();
+    // Producer gaps are the primary explanation; uncovered files add counts
+    // to that explanation rather than restating it with slightly different words.
+    for uncovered in [false, true] {
+        for gap in gaps {
+            if (gap["kind"] == "uncovered_file") != uncovered {
+                continue;
+            }
+            let cause = if uncovered {
+                gap.get("cause").unwrap_or(gap)
+            } else {
+                gap
+            };
+            let producer = cause["producer"].as_str().unwrap_or("unknown producer");
+            let root = cause["root"].as_str().unwrap_or("");
+            let reason = cause["reason"]
+                .as_str()
+                .unwrap_or("no authoritative report");
+            let files = if uncovered {
+                1
+            } else {
+                gap.get("affected_files")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len)
+            };
+            if let Some(existing) = causes.iter_mut().find(|entry| {
+                entry.0 == producer && (entry.1 == root || entry.1.is_empty() || root.is_empty())
+            }) {
+                existing.3 += files;
+                if existing.1.is_empty() {
+                    existing.1 = root.to_string();
+                }
+            } else {
+                causes.push((
+                    producer.to_string(),
+                    root.to_string(),
+                    reason.to_string(),
+                    files,
+                ));
             }
         }
     }
-    Some(if producers.is_empty() {
-        "diagnostics unknown".to_string()
-    } else {
-        format!("diagnostics unknown for {}", producers.join(", "))
-    })
+    let mut explanations = causes
+        .into_iter()
+        .map(|(producer, root, reason, files)| {
+            let producer = if producer == "rust" {
+                "rust-analyzer"
+            } else {
+                &producer
+            };
+            let reason = reason.strip_prefix("still checking: ").unwrap_or(&reason);
+            let reason = reason
+                .strip_prefix(&format!("{producer}: "))
+                .unwrap_or(reason);
+            let reason = compact_inspect_reason(reason);
+            let root = if root.is_empty() {
+                String::new()
+            } else {
+                format!(" @ {root}")
+            };
+            let count = match files {
+                0 => String::new(),
+                1 => " (1 file)".to_string(),
+                n => format!(" ({n} files)"),
+            };
+            compact_inspect_reason(&format!("{producer}{root}: {reason}{count}"))
+        })
+        .collect::<Vec<_>>();
+    if explanations.is_empty() {
+        explanations.push("no authoritative report".to_string());
+    }
+    Some(explanations)
 }
 
 fn build_inspect_terminal(
@@ -1678,25 +2042,7 @@ fn build_inspect_terminal(
                     "inspect payload was not an object",
                 );
             };
-            // A completed request whose diagnostics are unknown for some
-            // producer is not fresh: it is partial, and its header says so
-            // and for which producers, so a reader never sees FRESH above
-            // "diagnostics: unknown".
-            let partial = partial_terminal_reason(payload);
-            payload.insert(
-                "inspect_terminal".to_string(),
-                Value::String(
-                    if partial.is_some() {
-                        "partial"
-                    } else {
-                        "fresh"
-                    }
-                    .to_string(),
-                ),
-            );
-            if let Some(reason) = partial {
-                payload.insert("partial_reason".to_string(), Value::String(reason));
-            }
+            set_inspect_completion(payload);
             payload.insert(
                 "wait_stamp".to_string(),
                 serde_json::json!({
@@ -2224,9 +2570,21 @@ fn build_inspect_payload(
 ) -> Value {
     let scope_files = scope_roots.map(|_| {
         payloads
-            .get(&InspectCategory::Metrics)
-            .and_then(|payload| payload.get("files"))
+            .get(&InspectCategory::Diagnostics)
+            .and_then(|payload| {
+                payload.get("scope_files").or_else(|| {
+                    payload
+                        .get("coverage")
+                        .and_then(|coverage| coverage.get("files"))
+                })
+            })
             .and_then(Value::as_u64)
+            .or_else(|| {
+                payloads
+                    .get(&InspectCategory::Metrics)
+                    .and_then(|payload| payload.get("files"))
+                    .and_then(Value::as_u64)
+            })
             .unwrap_or(0)
     });
     let no_files_matched_scope = scope_files == Some(0);
@@ -2241,8 +2599,29 @@ fn build_inspect_payload(
         let payload = payloads
             .get(category)
             .expect("all active categories have a fresh inspect payload");
+        if payload.get("not_computed").and_then(Value::as_bool) == Some(true) {
+            let mut category_summary = serde_json::json!({
+                "not_computed": true, "complete": true,
+                "reason": "not computed for scoped inspects; run aft_inspect without scope"
+            });
+            for key in ["building", "last_complete"] {
+                if let Some(value) = payload.get(key) {
+                    category_summary[key] = value.clone();
+                }
+            }
+            if category_summary.get("building").is_some()
+                || category_summary.get("last_complete").is_some()
+            {
+                category_summary["background_reason"] = payload["gaps"][0]["reason"].clone();
+            }
+            summary.insert(category.as_str().to_string(), category_summary);
+            if sections.includes(*category) {
+                details.insert(category.as_str().to_string(), Value::Null);
+            }
+            continue;
+        }
         if payload.get("unavailable").and_then(Value::as_bool) == Some(true) {
-            let category_gaps = payload["gaps"].as_array().expect("unavailable gaps");
+            let category_gaps = incomplete_category_gaps(*category, payload);
             gaps.extend(category_gaps.iter().cloned().map(|mut gap| {
                 gap["categories"] = serde_json::json!([category.as_str()]);
                 gap
@@ -2253,6 +2632,11 @@ fn build_inspect_payload(
                     "unavailable": true, "complete": false, "gaps": category_gaps,
                 }),
             );
+            for key in ["building", "last_complete"] {
+                if let Some(value) = payload.get(key) {
+                    summary.get_mut(category.as_str()).unwrap()[key] = value.clone();
+                }
+            }
             if sections.includes(*category) {
                 details.insert(category.as_str().to_string(), Value::Null);
             }
@@ -2275,14 +2659,18 @@ fn build_inspect_payload(
             category_summary["total_analyzed_lines"] = serde_json::json!(0);
             category_summary["duplicated_percent"] = serde_json::json!(0.0);
         }
-        if payload.get("complete").and_then(Value::as_bool) == Some(false) {
+        if category_is_incomplete(payload) {
             category_summary["complete"] = Value::Bool(false);
-            if let Some(category_gaps) = payload.get("gaps").and_then(Value::as_array) {
-                category_summary["gaps"] = Value::Array(category_gaps.clone());
-                gaps.extend(category_gaps.iter().cloned().map(|mut gap| {
-                    gap["categories"] = serde_json::json!([category.as_str()]);
-                    gap
-                }));
+            let category_gaps = incomplete_category_gaps(*category, payload);
+            category_summary["gaps"] = Value::Array(category_gaps.clone());
+            gaps.extend(category_gaps.into_iter().map(|mut gap| {
+                gap["categories"] = serde_json::json!([category.as_str()]);
+                gap
+            }));
+            for key in ["parse_errors", "skipped_files", "building"] {
+                if let Some(value) = payload.get(key) {
+                    category_summary[key] = value.clone();
+                }
             }
         }
         if *category == InspectCategory::Diagnostics {
@@ -2379,6 +2767,7 @@ fn build_inspect_payload(
         }
     }
 
+    let complete = partial_summary_reason(&summary).is_none();
     let text = render_inspect_text(
         &summary,
         &details,
@@ -2387,6 +2776,7 @@ fn build_inspect_payload(
     let mut payload = serde_json::json!({
         "summary": Value::Object(summary),
         "text": text,
+        "complete": complete,
         "scanner_state": {
             "tier2_last_run": tier2_last_run(snapshot),
             "tier2_trigger_reason": ctx.tier2_trigger_reason(),
@@ -2412,7 +2802,6 @@ fn build_inspect_payload(
         payload["details"] = Value::Object(details);
     }
     if !gaps.is_empty() {
-        payload["complete"] = Value::Bool(false);
         payload["gaps"] = Value::Array(gaps);
     }
     payload
@@ -2425,6 +2814,10 @@ fn render_inspect_text(
     scope: Option<(usize, u64)>,
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
+
+    if let Some(reason) = partial_summary_reason(summary) {
+        lines.push(format!("PARTIAL — {reason}"));
+    }
 
     if let Some((root_count, file_count)) = scope {
         let root_label = if root_count == 1 { "root" } else { "roots" };
@@ -2439,6 +2832,40 @@ fn render_inspect_text(
         ));
     }
 
+    let skipped = summary
+        .iter()
+        .filter(|(_, value)| value["not_computed"] == true)
+        .collect::<Vec<_>>();
+    if !skipped.is_empty() {
+        let labels = skipped
+            .iter()
+            .map(|(category, _)| category.replace('_', " "))
+            .collect::<Vec<_>>();
+        let mut line = format!(
+            "{}: not computed for scoped inspects; run aft_inspect without scope",
+            labels.join(", ")
+        );
+        let background = skipped
+            .iter()
+            .filter_map(|(category, value)| {
+                value["background_reason"].as_str().map(|reason| {
+                    format!(
+                        "{}: {}",
+                        category.replace('_', " "),
+                        compact_inspect_reason(reason)
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if !background.is_empty() {
+            line.push_str(&format!(
+                " (background analysis: {})",
+                background.join("; ")
+            ));
+        }
+        lines.push(line);
+    }
+
     // Counts are emitted only from verified producer results. A failed producer
     // is rendered separately so the remaining findings cannot read as all-clear.
     render_incomplete_categories(&mut lines, summary, details);
@@ -2446,7 +2873,10 @@ fn render_inspect_text(
     // is their only output.
     let available_summary = summary
         .iter()
-        .filter(|(_, value)| value.get("unavailable").and_then(Value::as_bool) != Some(true))
+        .filter(|(_, value)| {
+            value.get("unavailable").and_then(Value::as_bool) != Some(true)
+                && value["not_computed"] != true
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Map<String, Value>>();
     let summary = &available_summary;
@@ -2490,6 +2920,12 @@ fn render_inspect_text(
 /// failed to load, say) is a gap, and counting it here would read as success
 /// next to the gap line.
 fn render_scoped_diagnostics_coverage(lines: &mut Vec<String>, summary: &Map<String, Value>) {
+    if summary
+        .get("diagnostics")
+        .is_some_and(|section| section["complete"] == false)
+    {
+        return;
+    }
     let Some(coverage) = summary
         .get("diagnostics")
         .and_then(|section| section.get("coverage"))
@@ -2555,8 +2991,21 @@ fn render_incomplete_categories(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
 ) {
+    // Most diagnostic reasons live only in the header. Overflow must remain
+    // visible in the body, even for non-file producer failures.
+    for (_, reason) in incomplete_summary_parts(summary)
+        .into_iter()
+        .skip(MAX_INSPECT_HEADER_PARTS)
+        .filter(|(diagnostic, _)| *diagnostic)
+    {
+        lines.push(format!("Incomplete diagnostics: {reason}"));
+    }
     for (category, value) in summary {
         if value.get("complete").and_then(Value::as_bool) != Some(false) {
+            continue;
+        }
+        if category == "diagnostics" {
+            render_uncovered_file_groups(lines, category, value, details);
             continue;
         }
         for gap in value
@@ -2622,53 +3071,25 @@ fn render_incomplete_categories(
     }
 }
 
-/// Render scoped files that no producer analyzed as one line per
-/// (producer root, producer, reason) with a file count, then at most `topK`
-/// of the affected paths. A scope over a few hundred files whose producer is
-/// unavailable would otherwise print the same reason once per file and bury
-/// the one fact the agent needs: why nothing was analyzed.
+/// List at most `topK` affected paths, without repeating the header's causes
+/// and file counts. Full per-file authority gaps stay in structured data.
 fn render_uncovered_file_groups(
     lines: &mut Vec<String>,
     category: &str,
     section: &Value,
     details: &Map<String, Value>,
 ) {
-    let Some(groups) = section
+    if section
         .get("uncovered_file_groups")
         .and_then(Value::as_array)
         .filter(|groups| !groups.is_empty())
-    else {
+        .is_none()
+    {
         return;
-    };
-    for group in groups {
-        let count = group.get("files").and_then(Value::as_u64).unwrap_or(0);
-        let files = if count == 1 { "file" } else { "files" };
-        let reason = group
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("unavailable");
-        let producer = group.get("producer").and_then(Value::as_str);
-        let root = group.get("root").and_then(Value::as_str);
-        // A cause that is the failure of a producer already printed on its
-        // own "producer ... failed" line refers to that line by producer
-        // name: a multi-line cargo error printed twice buries everything else.
-        let reason = match producer {
-            Some(producer) if producer_failure_is_rendered(section, producer, reason) => {
-                format!("producer {producer} failed, reason above")
-            }
-            _ => reason.to_string(),
-        };
-        let cause = match (producer, root) {
-            (Some(producer), Some(root)) => format!("{producer} in {root}: {reason}"),
-            (Some(producer), None) => format!("{producer}: {reason}"),
-            (None, _) => reason,
-        };
-        lines.push(format!(
-            "Incomplete {category}: no authoritative diagnostics for {count} {files} ({cause})"
-        ));
     }
+    // Causes and file counts are already in the PARTIAL header.
     let list_key = format!("{category}_uncovered_files");
-    lines.push("Files without authoritative diagnostics:".to_string());
+    lines.push("Affected files:".to_string());
     for file in details
         .get(&list_key)
         .and_then(Value::as_array)
@@ -2681,22 +3102,6 @@ fn render_uncovered_file_groups(
     if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, &list_key) {
         lines.push(trailer);
     }
-}
-
-/// True when `section` carries a failed-producer gap for `producer` with
-/// exactly `reason`; `render_incomplete_categories` prints such a gap with
-/// its full reason on its own line.
-fn producer_failure_is_rendered(section: &Value, producer: &str, reason: &str) -> bool {
-    section
-        .get("gaps")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|gap| {
-            gap.get("kind").and_then(Value::as_str) == Some("failed_producer")
-                && gap.get("producer").and_then(Value::as_str) == Some(producer)
-                && gap.get("reason").and_then(Value::as_str) == Some(reason)
-        })
 }
 
 fn render_complexity_category(
@@ -2766,9 +3171,13 @@ fn render_cycles_category(
     let largest = section.get("largest").and_then(Value::as_u64).unwrap_or(0);
     let cycle_word = if count == 1 { "cycle" } else { "cycles" };
     let file_word = if largest == 1 { "file" } else { "files" };
-    lines.push(format!(
-        "Import cycles: {count} import {cycle_word} (largest: {largest} {file_word})"
-    ));
+    if section["scope_relation"] == "touches" {
+        lines.push(format!("Import cycles: {count} {cycle_word} touch the scope (largest: {largest} scoped {file_word})"));
+    } else {
+        lines.push(format!(
+            "Import cycles: {count} import {cycle_word} (largest: {largest} {file_word})"
+        ));
+    }
     let Some(items) = details.get("cycles").and_then(Value::as_array) else {
         return;
     };
@@ -3188,6 +3597,19 @@ fn render_duplicates_category(
         format!(" (generated: {generated_count})")
     };
     let excluded = excluded_test_clause(section);
+    if section["scope_relation"] == "touches" && !show_zero_denominator {
+        lines.push(format!(
+            "{label}: {count} groups touch the scope{generated_suffix}"
+        ));
+        if count > 0 {
+            render_duplicate_rows(lines, summary, details, key);
+        }
+        if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, key) {
+            lines.push(trailer);
+        }
+        render_generated_duplicate_usage(lines, summary, details, key);
+        return;
+    }
     let Some(duplicated_lines) = section.get("duplicated_lines").and_then(Value::as_u64) else {
         if count == 0 {
             lines.push(format!("{label}: 0{generated_suffix}{excluded}"));
@@ -3431,14 +3853,35 @@ fn render_diagnostics_category(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
 ) {
-    // Non-file gaps already have their reasons printed by
-    // `render_incomplete_categories`, so the diagnostics summary line names
-    // each such producer without repeating its reason.
-    if let Some(line) = crate::subc_format::format_diagnostics_summary_with(
-        Some(&Value::Object(summary.clone())),
-        true,
-    ) {
-        lines.push(line);
+    // Unknown totals belong only in the status header. Counts from producers
+    // that answered remain useful and must not imply an all-clear total.
+    if let Some(producers) = summary
+        .get("diagnostics")
+        .filter(|section| section["complete"] == false)
+        .and_then(|section| section["by_producer"].as_object())
+    {
+        for (producer, counts) in producers {
+            if let (Some(e), Some(w), Some(i), Some(h)) = (
+                counts["errors"].as_u64(),
+                counts["warnings"].as_u64(),
+                counts["info"].as_u64(),
+                counts["hints"].as_u64(),
+            ) {
+                lines.push(format!(
+                    "diagnostics: {e} errors, {w} warnings, {i} info, {h} hints from {producer}"
+                ));
+            }
+        }
+    } else if !summary
+        .get("diagnostics")
+        .is_some_and(|section| section["complete"] == false)
+    {
+        if let Some(line) = crate::subc_format::format_diagnostics_summary_with(
+            Some(&Value::Object(summary.clone())),
+            true,
+        ) {
+            lines.push(line);
+        }
     }
     let trailer = crate::list_surfaces::inspect::trailer_from_details(details, "diagnostics");
     if trailer.is_none()
@@ -3581,8 +4024,8 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
         InspectCategory::DeadCode
             if payload.get("callgraph_available").and_then(Value::as_bool) == Some(false) =>
         {
-            // This is a terminal capability result, not a partial scan: dead-code
-            // analysis cannot run without the callgraph, so it must not claim zero.
+            // No dead-code analysis ran without the graph. Report the capability
+            // failure without inventing a zero or claiming a complete result.
             serde_json::json!({
                 "callgraph_available": false,
                 "reason": payload.get("callgraph_unavailable_reason"),
@@ -3623,6 +4066,7 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
                     .unwrap_or_else(|| count_from_payload(Some(payload)))),
             );
             for key in [
+                "scope_relation",
                 "generated_count",
                 "total_count",
                 "duplicated_lines",
@@ -3659,6 +4103,11 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
         }),
         _ => serde_json::json!({ "count": count_from_payload(Some(payload)) }),
     };
+    if category == InspectCategory::Cycles {
+        if let Some(relation) = payload.get("scope_relation") {
+            summary["scope_relation"] = relation.clone();
+        }
+    }
     // Findings withheld from `count` because they live in test files or
     // fixtures; carried through so a reader can see what was left out.
     if matches!(
@@ -3717,6 +4166,18 @@ struct UncoveredFileGroup<'a> {
 fn uncovered_file_groups(gaps: &[Value]) -> Vec<UncoveredFileGroup<'_>> {
     let mut groups: BTreeMap<(Option<&str>, Option<&str>, &str), Vec<&str>> = BTreeMap::new();
     for gap in gaps {
+        // Unscoped failures carry the applicable paths as display metadata,
+        // without introducing scoped per-file authority claims.
+        if let Some(files) = gap.get("affected_files").and_then(Value::as_array) {
+            groups
+                .entry((
+                    gap["root"].as_str(),
+                    gap["producer"].as_str(),
+                    gap["reason"].as_str().unwrap_or("unavailable"),
+                ))
+                .or_default()
+                .extend(files.iter().filter_map(Value::as_str));
+        }
         if gap.get("kind").and_then(Value::as_str) != Some("uncovered_file") {
             continue;
         }
@@ -3841,10 +4302,8 @@ fn generated_details_for(payload: &Value, top_k: usize) -> Value {
     }
 }
 
-fn available_count_from_payload(category: InspectCategory, payload: &Value) -> Option<usize> {
-    if category == InspectCategory::DeadCode
-        && payload.get("callgraph_available").and_then(Value::as_bool) == Some(false)
-    {
+fn available_count_from_payload(_category: InspectCategory, payload: &Value) -> Option<usize> {
+    if category_is_incomplete(payload) {
         return None;
     }
     payload
@@ -4074,6 +4533,46 @@ mod status_bar_refresh_tests {
             "one real category must not surface a bar with fabricated U0 C0"
         );
     }
+
+    #[test]
+    fn incomplete_fresh_payload_keeps_status_bar_counts_stale_not_current() {
+        let ctx = ctx();
+        ctx.update_status_bar_tier2(Some(7), Some(3), Some(1), None, false);
+        refresh_status_bar_counts(
+            &ctx,
+            &outcomes(vec![
+                (
+                    InspectCategory::DeadCode,
+                    JobOutcome::Fresh {
+                        payload: serde_json::json!({
+                            "unavailable": true, "complete": false,
+                            "building": {"state": "building"},
+                            "gaps": [{"reason": "still building"}]
+                        }),
+                    },
+                ),
+                (
+                    InspectCategory::UnusedExports,
+                    JobOutcome::Fresh {
+                        payload: serde_json::json!({
+                            "count": 0, "complete": false, "parse_errors": [{"file": "a.ts"}]
+                        }),
+                    },
+                ),
+                (
+                    InspectCategory::Duplicates,
+                    JobOutcome::Fresh {
+                        payload: serde_json::json!({"count": 1}),
+                    },
+                ),
+            ]),
+        );
+        let counts = ctx.status_bar_count_values();
+        assert!(counts.tier2_stale);
+        assert_eq!(counts.dead_code, Some(7));
+        assert_eq!(counts.unused_exports, Some(3));
+        assert_eq!(counts.duplicates, Some(1));
+    }
 }
 
 #[cfg(test)]
@@ -4090,6 +4589,100 @@ mod render_text_tests {
 
     fn render_with_details(summary: Value, details: Value) -> String {
         render_inspect_text(&summary_map(summary), &summary_map(details), None)
+    }
+
+    #[test]
+    fn scoped_unfinished_producer_has_one_status_line_golden() {
+        let summary = summary_map(serde_json::json!({
+            "diagnostics": {"complete": false, "by_producer": {}, "gaps": [
+                {"kind": "checking_producer", "producer": "rust", "root": ".",
+                 "reason": "rust-analyzer: cargo check still running; retry"},
+                {"kind": "uncovered_file", "file": "src/lib.rs",
+                 "cause": {"producer": "rust", "root": ".",
+                           "reason": "still checking: rust-analyzer: cargo check still running; retry"}}
+            ], "coverage": {"files": 1, "authoritative": 0},
+            "uncovered_file_groups": [{"producer": "rust", "root": ".", "files": 1,
+                "reason": "still checking: rust-analyzer: cargo check still running; retry"}]},
+            "complexity": {"count": 0, "threshold": 10},
+            "todos": {"count": 0}
+        }));
+        let details =
+            summary_map(serde_json::json!({"diagnostics_uncovered_files": ["src/lib.rs"]}));
+        let text = render_inspect_text(&summary, &details, Some((1, 1)));
+        assert_eq!(text, "PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running (1 file); retry aft_inspect.\nscope: 1 root, 1 file\nAffected files:\n  src/lib.rs\nCyclomatic complexity: 0 functions >= 10");
+        let response = Response::success(
+            "scoped-inspect",
+            serde_json::json!({
+                "inspect_terminal": "partial", "partial_reason": partial_summary_reason(&summary),
+                "text": text, "summary": summary, "details": details,
+                "wait_stamp": {"text": "waited: yes; completed: lsp_start, lsp_quiescence",
+                    "phases": [{"id": "lsp_start", "producer": "rust"}]}
+            }),
+        );
+        assert_eq!(crate::subc_format::format_inspect_for_test(&response), text);
+    }
+
+    #[test]
+    fn unscoped_fresh_body_is_byte_identical_golden() {
+        assert_eq!(render(serde_json::json!({
+            "duplicates": {"count": 0, "duplicated_lines": 0, "total_analyzed_lines": 968281},
+            "complexity": {"count": 1, "threshold": 10,
+                "worst": {"file": "outside.ts", "function": "perform", "complexity": 215}},
+            "dead_code": {"count": 0, "test_only_count": 479},
+            "unused_exports": {"count": 0, "test_only_count": 35},
+            "todos": {"count": 0},
+            "diagnostics": {"errors": 0, "warnings": 0, "info": 0, "hints": 0}
+        })), "Duplicates: 0 duplicated lines (0.0% of 968281 analyzed lines) across 0 files, 0 groups\nCyclomatic complexity: 1 functions >= 10 (worst: outside.ts::perform 215)\nDead code: 0\n  test-only usage: 479:\nUnused exports: 0\n  test-only usage: 35:\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints");
+    }
+
+    #[test]
+    fn scoped_fixture_output_excludes_outside_duplicates_complexity_and_test_only_findings() {
+        let scope = JobScope::from_roots("/repo", vec![PathBuf::from("/repo/src/in.rs")]);
+        let payloads = [
+            (
+                InspectCategory::Duplicates,
+                serde_json::json!({
+                    "count": 1, "duplicated_lines": 40, "total_analyzed_lines": 968281,
+                    "items": [{"files": ["src/out.rs:1-20", "src/other.rs:1-20"]}]
+                }),
+            ),
+            (
+                InspectCategory::Complexity,
+                serde_json::json!({
+                    "count": 1, "threshold": 10,
+                    "worst": {"file": "src/out.rs", "function": "perform", "complexity": 215},
+                    "items": [{"file": "src/out.rs", "function": "perform", "complexity": 215}]
+                }),
+            ),
+            (
+                InspectCategory::DeadCode,
+                serde_json::json!({
+                    "count": 0, "test_only_count": 479, "items": [],
+                    "test_only_items": [{"file": "src/out.rs", "symbol": "outside"}],
+                    "test_only_top": [{"file": "src/out.rs", "symbol": "outside"}]
+                }),
+            ),
+            (
+                InspectCategory::UnusedExports,
+                serde_json::json!({
+                    "count": 0, "test_only_count": 35, "items": [],
+                    "test_only_items": [{"file": "src/out.rs", "symbol": "outside"}],
+                    "test_only_top": [{"file": "src/out.rs", "symbol": "outside"}]
+                }),
+            ),
+        ];
+        let summary = payloads
+            .into_iter()
+            .map(|(category, payload)| {
+                let filtered = crate::inspect::filter_payload_for_scope_for_test(payload, &scope);
+                (
+                    category.as_str().to_string(),
+                    summary_for(category, &filtered),
+                )
+            })
+            .collect();
+        assert_eq!(render_inspect_text(&summary, &Map::new(), Some((1, 1))),
+            "scope: 1 root, 1 file\nDuplicates: 0 groups touch the scope\nCyclomatic complexity: 0 functions >= 10\nDead code: 0\nUnused exports: 0");
     }
 
     #[test]
@@ -4114,7 +4707,7 @@ mod render_text_tests {
             "dead_code": { "callgraph_available": false }
         }));
 
-        assert_eq!(text, "Dead code analysis unavailable (no callgraph)");
+        assert_eq!(text, "PARTIAL — dead code unavailable: analysis did not finish; retry aft_inspect.\nDead code analysis unavailable (no callgraph)");
         assert!(!text.contains("Dead code: 0"));
     }
 
@@ -4569,9 +5162,282 @@ mod fresh_payload_tests {
             .collect()
     }
 
+    fn header_response(
+        payloads: &BTreeMap<InspectCategory, Value>,
+        sections: &Sections,
+    ) -> Response {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let payload = build_inspect_payload(&snapshot(), payloads, sections, 1, &ctx, None);
+        build_inspect_terminal(
+            "inspect-category-header",
+            &InspectPhaseLog::for_request("inspect-category-header"),
+            InspectTerminal::Fresh(payload),
+        )
+    }
+
+    fn assert_header(response: &Response, expected: &str, complete: bool) {
+        assert_eq!(response.data["complete"], complete, "{}", response.data);
+        assert_eq!(
+            response.data["inspect_terminal"],
+            if complete { "fresh" } else { "partial" }
+        );
+        let text = crate::subc_format::format_inspect_for_test(response);
+        assert_eq!(text.lines().next(), Some(expected), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("PARTIAL — ") || *line == "FRESH")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn header_dead_code_pending_with_complete_diagnostics_is_partial() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(InspectCategory::DeadCode, serde_json::json!({
+            "unavailable": true, "complete": false,
+            "building": {"state": "building", "progress": "projection"},
+            "gaps": [{"kind": "analysis_incomplete", "reason": "building projection; estimated remaining 10ms"}]
+        }));
+        for sections in [Sections::summary_only(), Sections::all()] {
+            let response = header_response(&payloads, &sections);
+            assert_header(
+                &response,
+                "PARTIAL — dead code still building; retry aft_inspect.",
+                false,
+            );
+            assert!(response.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("building projection"));
+        }
+    }
+
+    #[test]
+    fn header_every_category_complete_is_fresh() {
+        assert_header(
+            &header_response(
+                &fresh_payloads_for_all_categories(),
+                &Sections::summary_only(),
+            ),
+            "FRESH",
+            true,
+        );
+    }
+
+    #[test]
+    fn header_complete_but_truncated_stays_fresh() {
+        let response = header_response(&fresh_payloads_for_all_categories(), &Sections::all());
+        assert!(response.data["details"]["diagnostics_list_envelope"].is_object());
+        assert_eq!(
+            response.data["details"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(response.data["summary"]["diagnostics"]["errors"], 2);
+        assert_header(&response, "FRESH", true);
+    }
+
+    #[test]
+    fn header_not_analyzed_languages_stay_fresh() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.get_mut(&InspectCategory::DeadCode).unwrap()["languages_skipped"] =
+            serde_json::json!(["bash", "toml"]);
+        let response = header_response(&payloads, &Sections::all());
+        assert!(response.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("bash, toml not analyzed"));
+        assert_header(&response, "FRESH", true);
+    }
+
+    #[test]
+    fn header_scoped_policy_skips_are_complete_and_disclosed_once() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        for category in InspectCategory::active()
+            .iter()
+            .filter(|category| category.is_tier2())
+        {
+            payloads.insert(*category, serde_json::json!({
+                "not_computed": true, "unavailable": true, "complete": false,
+                "gaps": [{"kind": "tier2_unavailable", "reason": "analysis not ready; scoped inspection does not wait for Tier-2"}]
+            }));
+        }
+        let response = header_response(&payloads, &Sections::all());
+        assert_header(&response, "FRESH", true);
+        assert!(response.data.get("gaps").is_none(), "{}", response.data);
+        let text = response.data["text"].as_str().unwrap();
+        let notice = "dead code, unused exports, duplicates, cycles, complexity: not computed for scoped inspects; run aft_inspect without scope";
+        assert_eq!(text.matches(notice).count(), 1, "{text}");
+        assert!(
+            !text.contains("Dead code: 0") && !text.contains("Duplicates: 0"),
+            "{text}"
+        );
+        assert_eq!(response.data["summary"]["dead_code"]["complete"], true);
+    }
+
+    #[test]
+    fn header_scoped_cached_incomplete_analysis_is_still_partial() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(InspectCategory::DeadCode, serde_json::json!({
+            "callgraph_available": false, "callgraph_unavailable_reason": "cached callgraph unavailable"
+        }));
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::all(),
+            1,
+            &ctx,
+            Some(&[PathBuf::from("/repo/src")]),
+        );
+        let response = build_inspect_terminal(
+            "scoped-cached-gap",
+            &InspectPhaseLog::for_request("scoped-cached-gap"),
+            InspectTerminal::Fresh(payload),
+        );
+        assert_header(
+            &response,
+            "PARTIAL — dead code unavailable: cached callgraph unavailable; retry aft_inspect.",
+            false,
+        );
+        assert!(response.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("scope: 1 root, 2 files"));
+    }
+
+    #[test]
+    fn header_groups_categories_with_the_same_reason() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        for category in [InspectCategory::DeadCode, InspectCategory::Duplicates] {
+            payloads.insert(
+                category,
+                serde_json::json!({
+                    "unavailable": true, "complete": false, "building": {"state": "building"},
+                    "gaps": [{"kind": "analysis_incomplete", "reason": "cold build still running"}]
+                }),
+            );
+        }
+        let response = header_response(&payloads, &Sections::all());
+        assert_header(
+            &response,
+            "PARTIAL — dead code, duplicates still building; retry aft_inspect.",
+            false,
+        );
+        assert_eq!(response.data["gaps"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn header_several_gaps_are_one_line_shortest_first_with_overflow_in_body() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(InspectCategory::DeadCode, serde_json::json!({
+            "unavailable": true, "complete": false, "building": {"state": "building"},
+            "gaps": [{"kind": "analysis_incomplete", "reason": "dead code projection still building"}]
+        }));
+        payloads.get_mut(&InspectCategory::Diagnostics).unwrap()["complete"] =
+            serde_json::json!(false);
+        payloads.get_mut(&InspectCategory::Diagnostics).unwrap()["gaps"] = serde_json::json!([
+            {"producer": "dockerfile", "root": ".", "reason": "docker-langserver\nis unavailable"},
+            {"producer": "rust", "root": ".", "reason": "cargo check still running"},
+            {"producer": "typescript", "root": ".", "reason": "initialize crashed"},
+            {"producer": "python", "root": ".", "reason": "pyright is unavailable"}
+        ]);
+        let response = header_response(&payloads, &Sections::all());
+        assert_header(&response, "PARTIAL — dead code still building; diagnostics unknown: dockerfile @ .: docker-langserver is unavailable; rust-analyzer @ .: cargo check still running; +2 more; retry aft_inspect.", false);
+        let text = response.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("Incomplete diagnostics: typescript @ .: initialize crashed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Incomplete diagnostics: python @ .: pyright is unavailable"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn header_each_incomplete_category_sets_complete_false_without_gaps() {
+        for category in InspectCategory::active() {
+            let mut payloads = fresh_payloads_for_all_categories();
+            payloads.get_mut(category).unwrap()["complete"] = serde_json::json!(false);
+            let response = header_response(&payloads, &Sections::summary_only());
+            let text = crate::subc_format::format_inspect_for_test(&response);
+            assert_eq!(response.data["complete"], false, "{category:?}: {text}");
+            assert_eq!(
+                response.data["inspect_terminal"], "partial",
+                "{category:?}: {text}"
+            );
+            assert!(text.starts_with("PARTIAL — "), "{category:?}: {text}");
+            assert!(
+                text.lines()
+                    .next()
+                    .unwrap()
+                    .contains(&category.as_str().replace('_', " ")),
+                "{category:?}: {text}"
+            );
+            assert!(!response.data["gaps"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn header_unavailable_callgraph_and_parse_failures_are_partial() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::DeadCode,
+            serde_json::json!({
+                "callgraph_available": false, "callgraph_unavailable_reason": "store not ready"
+            }),
+        );
+        let response = header_response(&payloads, &Sections::summary_only());
+        assert_header(
+            &response,
+            "PARTIAL — dead code unavailable: store not ready; retry aft_inspect.",
+            false,
+        );
+        payloads = fresh_payloads_for_all_categories();
+        payloads.get_mut(&InspectCategory::UnusedExports).unwrap()["complete"] =
+            serde_json::json!(false);
+        payloads.get_mut(&InspectCategory::UnusedExports).unwrap()["parse_errors"] =
+            serde_json::json!([{"file": "a.ts", "reason": "parse failed"}]);
+        let response = header_response(&payloads, &Sections::summary_only());
+        assert_header(
+            &response,
+            "PARTIAL — unused exports incomplete: 1 file could not be parsed; retry aft_inspect.",
+            false,
+        );
+        assert!(response.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 file could not be parsed"));
+    }
+
+    #[test]
+    fn header_final_freshness_gap_is_partial_even_with_complete_categories() {
+        let response = header_response(&fresh_payloads_for_all_categories(), &Sections::all());
+        let mut payload = response.data;
+        payload["complete"] = serde_json::json!(false);
+        payload["gaps"] = serde_json::json!([{
+            "kind": "stat_verification_incomplete", "reason": "file freshness verification exceeded the request budget; retry aft_inspect"
+        }]);
+        let response = build_inspect_terminal(
+            "freshness-gap",
+            &InspectPhaseLog::for_request("freshness-gap"),
+            InspectTerminal::Fresh(payload),
+        );
+        assert_header(&response, "PARTIAL — file freshness unverified: file freshness verification exceeded the request budget; retry aft_inspect.", false);
+    }
+
     fn assert_no_banned_field(value: &Value) {
-        // `callgraph_available` is capability disclosure, not partiality, so fresh
-        // payloads may report terminal callgraph unavailability.
+        // These sentinels must never substitute for explicit completion and gaps.
         const BANNED_KEYS: &[&str] = &[
             "provisional",
             "provisional_counts",
@@ -4612,10 +5478,9 @@ mod fresh_payload_tests {
                         );
                     }
                     if key == "complete" {
-                        assert_eq!(
-                            value.as_bool(),
-                            Some(false),
-                            "inspect completion disclosure must name a real gap"
+                        assert!(
+                            value.is_boolean(),
+                            "completion must be an explicit boolean: {value}"
                         );
                     }
                     assert_no_banned_field(value);
@@ -4656,6 +5521,70 @@ mod fresh_payload_tests {
         );
         assert!(payload.get("topK").is_none());
         assert!(payload.get("top_k").is_none());
+    }
+
+    #[test]
+    fn scoped_inspect_file_accounting_survives_unfinished_metrics() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(InspectCategory::Metrics, serde_json::json!({
+            "unavailable": true, "complete": false, "gaps": [{"kind": "analysis_incomplete", "reason": "metrics still scanning"}]
+        }));
+        payloads.get_mut(&InspectCategory::Diagnostics).unwrap()["coverage"] = serde_json::json!({
+            "files": 606, "authoritative": 606, "examined": 606, "not_examined": 0
+        });
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::all(),
+            20,
+            &ctx,
+            Some(&[PathBuf::from("/repo/packages")]),
+        );
+        assert_eq!(payload["scope_files"], 606, "{payload:#}");
+        assert!(
+            payload.get("no_files_matched_scope").is_none(),
+            "{payload:#}"
+        );
+        let text = payload["text"].as_str().unwrap();
+        assert!(text.contains("\nscope: 1 root, 606 files\n"), "{text}");
+        assert!(text.contains("606 of 606 scoped files"), "{text}");
+    }
+
+    #[test]
+    fn scoped_inspect_file_accounting_survives_no_diagnostics_sweep() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(InspectCategory::Metrics, serde_json::json!({
+            "unavailable": true, "complete": false, "gaps": [{"kind": "analysis_incomplete", "reason": "metrics still scanning"}]
+        }));
+        // Warm scoped collection inventories files without opening them. It has
+        // no sweep coverage, and an unfinished metrics scan has no file count.
+        payloads.get_mut(&InspectCategory::Diagnostics).unwrap()["scope_files"] =
+            serde_json::json!(1);
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::all(),
+            20,
+            &ctx,
+            Some(&[PathBuf::from("/repo/src")]),
+        );
+        assert_eq!(payload["scope_files"], 1, "{payload:#}");
+        assert!(
+            payload.get("no_files_matched_scope").is_none(),
+            "{payload:#}"
+        );
+        assert!(payload["text"]
+            .as_str()
+            .unwrap()
+            .contains("scope: 1 root, 1 file"));
     }
 
     #[test]
@@ -4974,18 +5903,14 @@ mod fresh_payload_tests {
         );
         let text = payload["text"].as_str().expect("text");
 
-        // One line per (root, producer, reason), with the file count, instead
-        // of one line per file.
+        // Each cause and file count appears once, together in the status header.
         let group_lines = text
             .lines()
-            .filter(|line| line.starts_with("Incomplete diagnostics: no authoritative diagnostics"))
+            .filter(|line| line.starts_with("PARTIAL — diagnostics unknown:"))
             .collect::<Vec<_>>();
         assert_eq!(
             group_lines,
-            vec![
-                "Incomplete diagnostics: no authoritative diagnostics for 8 files (typescript in web: producer typescript failed, reason above)",
-                "Incomplete diagnostics: no authoritative diagnostics for 4 files (biome in tools: running, but has not reported on these files)",
-            ],
+            vec!["PARTIAL — diagnostics unknown: typescript @ web: typescript-language-server is unavailable; no node_modules in web: the project's dependencies are not installed; run your package manager's install (8 files); biome @ tools: running, but has not reported on these files (4 files); retry aft_inspect."],
             "{text}"
         );
         // At most topK (5 here) affected paths, largest group first, then the
@@ -5005,11 +5930,11 @@ mod fresh_payload_tests {
         // uncovered files instead of naming each one.
         let status = text
             .lines()
-            .find(|line| line.starts_with("diagnostics: unknown"))
+            .find(|line| line.starts_with("PARTIAL — diagnostics unknown:"))
             .expect("diagnostics status line");
         assert!(!status.contains("file_0"), "{status}");
         assert!(
-            status.contains("12 files without an authoritative report"),
+            status.contains("(8 files)") && status.contains("(4 files)"),
             "{status}"
         );
 
@@ -5136,13 +6061,89 @@ mod fresh_payload_tests {
         );
     }
 
+    #[test]
+    fn inspect_noise_single_project_typescript_note_is_omitted() {
+        let ordinary =
+            "TypeScript 5.9.3: project installation (/r/node_modules/typescript/lib/tsserver.js)"
+                .to_string();
+        let mut payload = serde_json::json!({"text": "FRESH\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints"});
+        append_inspect_runtime_notes(&mut payload, std::slice::from_ref(&ordinary));
+        assert_eq!(
+            payload["text"],
+            "FRESH\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints"
+        );
+        assert!(collapse_runtime_notes(&[ordinary.clone(), ordinary]).is_empty());
+        let native = "TypeScript 7.0.2: native language server (project installation) (/r/node_modules/@typescript/typescript-darwin-arm64/lib/tsc)".to_string();
+        assert!(collapse_runtime_notes(&[native]).is_empty());
+    }
+
+    #[test]
+    fn inspect_noise_actionable_typescript_notes_are_retained() {
+        let notes = [
+            "TypeScript 5.9.3: project installation (/r/a/lib/tsserver.js)",
+            "TypeScript 5.9.3: project installation (/r/b/lib/tsserver.js)",
+        ]
+        .map(String::from);
+        assert_eq!(
+            collapse_runtime_notes(&notes),
+            vec!["TypeScript 5.9.3: project installation ×2 (first: /r/a/lib/tsserver.js)"]
+        );
+        for note in [
+            "TypeScript 5.9.3: AFT cache fallback; not the project's pinned TypeScript (/cache/lib/tsserver.js)",
+            "TypeScript: server-managed SDK resolution (version not reported by AFT)",
+            "TypeScript: explicit tsserver.path override (version managed by configuration)",
+            "TypeScript unknown: project installation (/r/lib/tsserver.js)",
+            "TypeScript 5.9.3: version mismatch (expected 5.4.0)",
+            "rust-analyzer warning: proc macros unavailable",
+        ] {
+            assert_eq!(collapse_runtime_notes(&[note.to_string()]), vec![note]);
+        }
+    }
+
+    #[test]
+    fn daemon_noise_renderer_golden() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let clean =
+            serde_json::json!({"errors": 0, "warnings": 0, "info": 0, "hints": 0, "items": []});
+        let ordinary = "TypeScript 5.9.3: project installation (/repo/node_modules/typescript/lib/tsserver.js)";
+        let scenarios = [
+            ("single-project-sdk", clean.clone(), vec![ordinary]),
+            ("multiple-sdks", clean.clone(), vec![ordinary, "TypeScript 5.4.0: project installation (/repo/web/node_modules/typescript/lib/tsserver.js)"]),
+            ("fallback-sdk", clean, vec!["TypeScript 5.9.3: AFT cache fallback; not the project's pinned TypeScript (/cache/typescript/lib/tsserver.js)"]),
+            ("missing-docker-server", serde_json::json!({
+                "complete": false, "errors": null, "warnings": null, "info": null, "hints": null,
+                "items": [], "by_producer": {}, "gaps": [{"kind": "failed_producer", "producer": "dockerfile", "root": ".",
+                    "reason": "docker-langserver is unavailable; AFT plugins auto-install dockerfile-language-server-nodejs with lsp.auto_install enabled (user config) into <AFT cache>/lsp-packages/dockerfile-language-server-nodejs/node_modules/.bin; diagnose with `npx @cortexkit/aft doctor lsp <file>`",
+                    "affected_files": ["images/app.dockerfile", "images/base.dockerfile"]
+                }]
+            }), vec![]),
+        ];
+        let rendered = scenarios.into_iter().map(|(name, diagnostics, notes)| {
+            let mut payloads = fresh_payloads_for_all_categories();
+            payloads.insert(InspectCategory::Diagnostics, diagnostics);
+            let mut payload = build_inspect_payload(&snapshot(), &payloads, &Sections::summary_only(), 1, &ctx, None);
+            append_inspect_runtime_notes(&mut payload, &notes.into_iter().map(String::from).collect::<Vec<_>>());
+            let log = InspectPhaseLog::default();
+            let response = build_inspect_terminal(name, &log, InspectTerminal::Fresh(payload));
+            serde_json::json!({"name": name, "inspect_terminal": response.data["inspect_terminal"],
+                "text": crate::subc_format::format_inspect_for_test(&response)})
+        }).collect::<Vec<_>>();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/inspect/noise-renderer.json");
+        let actual = serde_json::to_string_pretty(&rendered).unwrap() + "\n";
+        if std::env::var_os("UPDATE_INSPECT_NOISE_GOLDEN").is_some() {
+            std::fs::write(&path, &actual).unwrap();
+        }
+        assert_eq!(actual, std::fs::read_to_string(path).unwrap());
+    }
+
     /// A producer whose workspace failed to load (rust-analyzer run with
     /// `--locked` over a stale Cargo.lock) leaves the one scoped file without
-    /// diagnostics. The multi-line cargo error is printed once, on the
-    /// producer line; the file-group line and the status line name the
-    /// producer instead of repeating it, and the coverage line counts files
-    /// with authoritative diagnostics (none), so it cannot read as success
-    /// beside the gap.
+    /// diagnostics. The cargo error is compacted into one status line, not
+    /// repeated in file groups and a footer; coverage cannot read as success.
     #[test]
     fn failed_producer_error_renders_once_and_coverage_counts_authoritative_files() {
         let ctx = AppContext::new(
@@ -5200,24 +6201,15 @@ mod fresh_payload_tests {
         );
         assert!(
             text.contains(&format!(
-                "Incomplete diagnostics: producer rust @ . failed ({cargo_error})"
+                "PARTIAL — diagnostics unknown: rust-analyzer @ .: {} (1 file); retry aft_inspect.",
+                cargo_error.split_whitespace().collect::<Vec<_>>().join(" ")
             )),
             "{text}"
         );
+        assert!(!text.contains("Incomplete diagnostics:"), "{text}");
+        assert!(!text.contains("\ndiagnostics: unknown"), "{text}");
         assert!(
-            text.contains(
-                "Incomplete diagnostics: no authoritative diagnostics for 1 file (rust in .: producer rust failed, reason above)"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "diagnostics: unknown (producer rust @ . failed, reason above; 1 file without an authoritative report)"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("diagnostics: authoritative results for 0 of 1 scoped file"),
+            !text.contains("diagnostics: authoritative results"),
             "{text}"
         );
         assert!(!text.contains("analyzed 1 of 1"), "{text}");
@@ -5552,13 +6544,13 @@ mod deferred_terminal_tests {
         assert_eq!(response.data["inspect_terminal"], "partial");
         assert_eq!(
             response.data["partial_reason"],
-            "diagnostics unknown for rust, typescript"
+            "diagnostics unknown: rust-analyzer @ spikes/x: Failed to load workspaces.; rust-analyzer @ .: still indexing; typescript @ .: x (1 file); retry aft_inspect."
         );
         assert!(response.data["wait_stamp"]["text"].is_string());
         let rendered = crate::subc_format::format_inspect_for_test(&response);
         assert_eq!(
             rendered.lines().next(),
-            Some("PARTIAL: diagnostics unknown for rust, typescript (see below)")
+            Some("PARTIAL — diagnostics unknown: rust-analyzer @ spikes/x: Failed to load workspaces.; rust-analyzer @ .: still indexing; typescript @ .: x (1 file); retry aft_inspect.")
         );
     }
 
@@ -5704,6 +6696,7 @@ mod deferred_terminal_tests {
             &[],
             Some(&phase_log),
             Some(InspectRequestDeadline::new(Duration::ZERO, Duration::ZERO)),
+            None,
         );
 
         assert!(response.success);
@@ -5909,6 +6902,9 @@ mod checkout_deferred_tests {
         let (response, calls) = run(true);
         assert_eq!(calls, 1, "one wait budget per worker request");
         assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["inspect_terminal"], "partial");
+        assert!(crate::subc_format::format_inspect_for_test(&response)
+            .starts_with("PARTIAL — callgraph view pending:"));
         let gaps = response.data["gaps"].as_array().unwrap();
         assert!(gaps.iter().any(|gap| gap["kind"] == "view_pending"
             && gap["path"]
@@ -5921,7 +6917,7 @@ mod checkout_deferred_tests {
         let (response, calls) = run(false);
         assert_eq!(calls, 0);
         assert_eq!(response.data["inspect_terminal"], "fresh");
-        assert!(response.data.get("complete").is_none());
+        assert_eq!(response.data["complete"], true);
         assert!(response.data.get("gaps").is_none());
     }
 }

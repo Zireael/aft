@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import { Effect, Exit } from "effect";
 
 /**
  * The `metadata.source` value on every prompt AFT admits into a session itself
@@ -69,10 +69,11 @@ export class V2SessionDelivery {
       if (keys.length === 0 || keys.every((key) => this.admittedCompletions.has(key))) {
         return Effect.succeed(false);
       }
-      for (const key of keys) this.admittedCompletions.add(key);
+      const reserved = keys.filter((key) => !this.admittedCompletions.has(key));
+      for (const key of reserved) this.admittedCompletions.add(key);
 
-      return this.session
-        .prompt({
+      return Effect.suspend(() =>
+        this.session.prompt({
           sessionID: input.sessionID,
           text: input.text,
           delivery: "steer",
@@ -83,8 +84,18 @@ export class V2SessionDelivery {
             source: AFT_PROMPT_SOURCE,
             task_ids: [...new Set(input.taskIDs)],
           },
-        })
-        .pipe(Effect.map(() => true));
+        }),
+      ).pipe(
+        Effect.onExit((exit) =>
+          Effect.sync(() => {
+            // Reserve while admission is in flight, but a failed or interrupted
+            // admission must not suppress the bridge's next delivery attempt.
+            if (Exit.isFailure(exit))
+              for (const key of reserved) this.admittedCompletions.delete(key);
+          }),
+        ),
+        Effect.map(() => true),
+      );
     });
   }
 

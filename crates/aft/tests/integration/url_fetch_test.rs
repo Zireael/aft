@@ -737,13 +737,15 @@ fn body_size_cap() {
     let project = TempDir::new().unwrap();
     let storage = TempDir::new().unwrap();
     let server = spawn_mock_server(1, |_path, stream| {
+        let body = format!("# Large\n{}", "x".repeat(11 * 1024 * 1024));
         write!(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            11 * 1024 * 1024
+            body.len()
         )
         .expect("write oversized headers");
         stream.flush().expect("flush oversized headers");
+        let _ = stream.write_all(body.as_bytes());
     });
     let mut aft = configure_with_storage(project.path(), storage.path());
 
@@ -757,11 +759,271 @@ fn body_size_cap() {
         .to_string(),
     );
 
-    assert_eq!(resp["success"], false, "oversized should fail: {resp:?}");
-    assert!(resp["message"]
+    assert_eq!(
+        resp["success"], true,
+        "bounded outline should succeed: {resp:?}"
+    );
+    assert_eq!(resp["complete"], false);
+    assert!(resp["text"]
         .as_str()
         .unwrap_or_default()
-        .contains("Response too large"));
+        .contains("Download truncated at 8388608 of"));
+    assert!(aft.shutdown().success());
+}
+
+// Oversized bodies must remain useful without either downloading or rendering
+// the whole document. Put small keys first so the bounded prefix can name them.
+fn oversized_json_server() -> MockServer {
+    let body = format!(
+        "{{\"truncated\":false,\"sha\":\"fixture\",\"tree\":\"{}\"}}",
+        "x".repeat(11 * 1024 * 1024)
+    );
+    spawn_mock_server(1, move |_path, stream| {
+        write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).unwrap();
+        // The client intentionally closes the connection at its download cap.
+        let _ = stream.write_all(body.as_bytes());
+    })
+}
+
+#[test]
+fn url_json_download_and_miss_are_bounded() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = oversized_json_server();
+    let url = server.url("/large.json");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    for command in ["outline", "zoom"] {
+        let resp = aft.send(
+            &json!({
+                "id": command, "command": command, "url": url,
+                "symbols": ["missing"], "allow_private": true,
+            })
+            .to_string(),
+        );
+        assert_eq!(resp["success"], true, "bounded document menu: {resp:?}");
+        let text = resp["text"]
+            .as_str()
+            .or_else(|| resp["content"].as_str())
+            .unwrap();
+        assert!(text.len() <= 50 * 1024, "URL output exceeded 50 KiB");
+        let response = aft::protocol::Response::success(command, resp.clone());
+        assert!(aft::subc_format::format_response(command, &response, false).len() <= 50 * 1024);
+        for key in ["truncated", "sha", "tree"] {
+            assert!(text.contains(key), "missing top-level key {key}: {text}");
+        }
+        assert!(
+            text.contains("truncated at 8388608 of"),
+            "missing download envelope: {text}"
+        );
+        assert!(
+            text.contains("bytes; narrow with"),
+            "missing narrowing advice: {text}"
+        );
+        if command == "zoom" {
+            assert!(text.contains("not found"), "missing symbol miss: {text}");
+        }
+    }
+    let cached = cache_content_path_for_url(storage.path(), &url, ".json");
+    assert_eq!(fs::metadata(cached).unwrap().len(), 8 * 1024 * 1024);
+    let small = aft.send(
+        &json!({"id":"small", "command":"zoom", "url":url,
+        "symbols":["truncated"], "allow_private":true})
+        .to_string(),
+    );
+    assert_eq!(small["success"], true);
+    assert!(
+        small["content"].as_str().unwrap().ends_with("false"),
+        "small key value: {small:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn url_json_top_level_value_is_capped() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = oversized_json_server();
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    let resp = aft.send(
+        &json!({
+            "id": "value", "command": "zoom", "url": server.url("/large.json"),
+            "symbols": ["tree"], "allow_private": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(resp["success"], true, "key selection failed: {resp:?}");
+    let text = resp["text"]
+        .as_str()
+        .or_else(|| resp["content"].as_str())
+        .unwrap();
+    assert!(text.len() <= 50 * 1024, "URL value output exceeded 50 KiB");
+    assert!(
+        text.contains(&"x".repeat(100)),
+        "selected value was not returned"
+    );
+    assert!(text.contains("truncated at"), "missing output envelope");
+    assert!(text.contains("narrow with"), "missing narrowing advice");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn reply_ceiling_cuts_fake_tool_and_warns() {
+    crate::test_helpers::init_test_logger();
+    let response = aft::protocol::Response::success(
+        "oversized",
+        json!({"text": "界".repeat(5 * 1024 * 1024 / 3)}),
+    );
+    let original = serde_json::to_string(&response).unwrap().len();
+    let text = aft::subc_format::format_response("fake_oversized_tool", &response, false);
+    assert!(
+        text.len() <= 2 * 1024 * 1024,
+        "reply ceiling failed to bound fake tool"
+    );
+    assert!(text.contains(&format!("of {original} bytes by AFT's reply ceiling")));
+    assert!(text.ends_with("the tool's own cap failed, please report"));
+    let logs = crate::test_helpers::take_logs();
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("fake_oversized_tool") && line.contains("reply ceiling")),
+        "missing WARN: {logs:?}"
+    );
+}
+
+#[test]
+fn reply_ceiling_finalization_bounds_late_text() {
+    crate::test_helpers::init_test_logger();
+    let storage = TempDir::new().unwrap();
+    let ctx = aft::context::AppContext::new(
+        Box::new(aft::parser::TreeSitterProvider::new()),
+        aft::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let mut response = aft::protocol::Response::success("late", json!({}));
+    let mut text = "界".repeat(5 * 1024 * 1024 / 3);
+    aft::response_finalize::finalize_tool_response(
+        &mut response,
+        &mut text,
+        &ctx,
+        "session",
+        "late_tool",
+        false,
+    );
+    assert!(text.len() <= 2 * 1024 * 1024);
+    assert!(text.contains("by AFT's reply ceiling"));
+    let mut response =
+        aft::protocol::Response::success("direct", json!({"text":"x".repeat(5 * 1024 * 1024)}));
+    aft::response_finalize::finalize_response_with_bg_completions(
+        &mut response,
+        &ctx,
+        "session",
+        "direct_tool",
+        false,
+    );
+    assert!(response.data["text"].as_str().unwrap().len() <= 2 * 1024 * 1024);
+    let logs = crate::test_helpers::take_logs();
+    for tool in ["late_tool", "direct_tool"] {
+        assert!(
+            logs.iter()
+                .any(|line| line.contains(tool) && line.contains("reply ceiling")),
+            "missing WARN for {tool}: {logs:?}"
+        );
+    }
+}
+
+#[test]
+fn url_markdown_rendering_and_heading_misses_are_bounded() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let mut body = format!("# Large\n{}\n", "界".repeat(100_000));
+    for i in 0..1000 {
+        body.push_str(&format!("## Heading {i} {}\nbody\n", "label".repeat(20)));
+    }
+    let server = spawn_mock_server(1, move |_path, stream| {
+        write_response(stream, "200 OK", "text/markdown", body.as_bytes())
+    });
+    let url = server.url("/large.md");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    for (command, symbol) in [("outline", "Large"), ("zoom", "Large"), ("zoom", "absent")] {
+        let resp = aft.send(
+            &json!({"id":symbol, "command":command, "url":url,
+            "symbols":[symbol], "allow_private":true})
+            .to_string(),
+        );
+        assert_eq!(resp["success"], symbol != "absent", "unexpected result");
+        let text = resp["text"]
+            .as_str()
+            .or_else(|| resp["content"].as_str())
+            .or_else(|| resp["message"].as_str())
+            .unwrap();
+        assert!(text.len() <= 50 * 1024);
+        assert!(
+            text.contains("truncated at"),
+            "missing rendered output envelope"
+        );
+        assert!(text.contains("narrow with"));
+        if symbol == "absent" {
+            assert!(text.contains("Available headings"));
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn url_plain_text_does_not_dump_body_on_heading_miss() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        write_response(
+            stream,
+            "200 OK",
+            "text/plain",
+            "body secret ".repeat(10000).as_bytes(),
+        )
+    });
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    let resp = aft.send(
+        &json!({"id":"plain", "command":"zoom", "url":server.url("/plain"),
+        "symbols":["missing"], "allow_private":true})
+        .to_string(),
+    );
+    assert_eq!(resp["success"], false);
+    let text = resp["message"].as_str().unwrap();
+    assert!(text.contains("No headings available"));
+    assert!(!text.contains("body secret"));
+    assert!(text.len() <= 50 * 1024);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn url_unknown_download_size_and_split_utf8_are_disclosed() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        let body = format!("{{\"tree\":\"{}\"}}", "界".repeat(4 * 1024 * 1024));
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let _ = stream.write_all(body.as_bytes());
+    });
+    let url = server.url("/unknown.json");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    let resp = aft.send(
+        &json!({"id":"unknown", "command":"outline", "url":url, "allow_private":true}).to_string(),
+    );
+    assert_eq!(
+        resp["success"], true,
+        "split UTF-8 must remain readable: {resp:?}"
+    );
+    let text = resp["text"].as_str().unwrap();
+    assert!(text.contains("truncated at 8388608 of ≥8388609 bytes"));
+    assert!(text.contains("tree"));
+    let cached = fs::read(cache_content_path_for_url(storage.path(), &url, ".json")).unwrap();
+    assert!(cached.len() <= 8 * 1024 * 1024);
+    assert!(std::str::from_utf8(&cached).is_ok());
     assert!(aft.shutdown().success());
 }
 

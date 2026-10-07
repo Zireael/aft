@@ -221,7 +221,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Budget,
                 kind: ReasonKind::Selecting,
-                predicate_name: "MAX_OUTPUT_BYTES, discover_outline_files, handle_outline_files_mode, budget_rollups_present",
+                predicate_name: "MAX_OUTPUT_BYTES, discover_outline_files, handle_outline_files_mode, format_multi_file_tree, budget_rollups_present",
             },
             ReasonEntry {
                 reason: Reason::Walk,
@@ -270,7 +270,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         reasons: &[ReasonEntry {
             reason: Reason::Cap,
             kind: ReasonKind::Selecting,
-            predicate_name: "cap_lines, compress_json, finish, middle_truncate, append_hunk, cap_git_lines, compress_add, compress_blame, compress_diff, flush_status_entries, looks_like_golangci_json, finish_folded, first_error_lines, truncate_line, parse_tree, compress_tsc, frozen_compress_tsc, compressor_line_dropping, render_cut, cap_lines_head_tail, cap_text_head_tail, apply_plain_cap_streaming",
+            predicate_name: "cap_lines, compress_json, finish, middle_truncate, append_hunk, cap_git_lines, compress_add, compress_blame, compress_diff, flush_status_entries, looks_like_golangci_json, finish_folded, first_error_lines, truncate_line, parse_tree, compress_tsc, frozen_compress_tsc, compressor_line_dropping, render_cut, cap_lines_head_tail, cap_text_head_tail, apply_plain_cap_streaming, test_verdict, cap_test_verdict",
         }],
     },
 ];
@@ -286,6 +286,78 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    ExclusionEntry {
+        file: "bash_background/remote.rs",
+        enclosing_item: "append_executor_environment_disclosure",
+        location_or_primitive: "executor environment name preview min(10)",
+        reason: "supplemental execution note names at most ten filtered environment variables and explicitly counts the rest with +N more; the complete executor report remains in persisted task metadata, not a paginated tool-result list",
+    },
+    ExclusionEntry {
+        file: "db/remote_exec.rs",
+        enclosing_item: "sweep",
+        location_or_primitive: "MAX_FROZEN_POLICIES / POLICY_SWEEP_BATCH SQL LIMIT",
+        reason: "internal policy-retention maintenance scans bounded pages and persists its rotation cursor; it does not produce an agent-visible list or change an active scope's policy identity",
+    },
+    ExclusionEntry {
+        file: "url_fetch.rs",
+        enclosing_item: "hash_url",
+        location_or_primitive: "URL cache hash prefix",
+        reason: "cache filename derivation takes a fixed digest prefix, not a truncation of agent-visible text or records",
+    },
+    ExclusionEntry {
+        file: "commands/url_output.rs",
+        enclosing_item: "cap_text",
+        location_or_primitive: "URL rendered text byte ceiling",
+        reason: "remote document previews use an explicit truncated-at-N-of-M-bytes footer with URL and symbol narrowing advice; this is a byte cut, not a paginated list of records",
+    },
+    ExclusionEntry {
+        file: "url_fetch.rs",
+        enclosing_item: "read_response_body, fetch_url_to_cache",
+        location_or_primitive: "URL download byte ceiling and UTF-8 prefix repair",
+        reason: "the producer stops after a bounded prefix and one lookahead byte; cached metadata discloses the cut with the known size or an explicit lower bound, separately from the rendered output ceiling",
+    },
+    ExclusionEntry {
+        file: "response_finalize.rs",
+        enclosing_item: "enforce_reply_ceiling",
+        location_or_primitive: "emergency rendered reply byte ceiling",
+        reason: "a last-resort byte cut on every tool's rendered text, not a list surface; emits a cut-at-N-of-M-bytes notice and a WARN naming the tool whose own cap failed",
+    },
+    ExclusionEntry {
+        file: "github_read/fetch.rs",
+        enclosing_item: "read_capped",
+        location_or_primitive: "bounded gh subprocess reader",
+        reason: "bounds stdout and stderr at the iterator; diff fetch ceilings are disclosed independently of line paging, and metadata ceilings refuse the fetch",
+    },
+    ExclusionEntry {
+        file: "github_read/diff.rs",
+        enclosing_item: "fetch_diff, page",
+        location_or_primitive: "PR diff diagnostic paths and line window",
+        reason: "diagnostic changed-path previews and sequential diff line pages integrate their list envelope trailers into content through the authorized NDJSON text builder",
+    },
+    ExclusionEntry {
+        file: "grep_executor.rs",
+        enclosing_item: "diagnose_scope_counts, bounded_fallback_walk_files_with_limits_target",
+        location_or_primitive: "MAX_FALLBACK_WALK_FILES / FALLBACK_WALK_BUDGET",
+        reason: "bounded filesystem fallback and empty-scope exclusion probe; ignored directories are pruned and counted once, and an exhausted probe reports unknown/incomplete rather than claiming an empty filesystem",
+    },
+    ExclusionEntry {
+        file: "logging.rs",
+        enclosing_item: "write_str",
+        location_or_primitive: "PANIC_MESSAGE_BYTES, PANIC_BACKTRACE_BYTES",
+        reason: "panic diagnostics bound formatted text, not a tool-result list; message and stack have separate byte budgets and an explicit truncation marker",
+    },
+    ExclusionEntry {
+        file: "bash_db_hints/mod.rs",
+        enclosing_item: "table_list, render, run_probe",
+        location_or_primitive: "BLOCK_CAP, PROBE_OUTPUT_CAP",
+        reason: "supplemental read-only schema trailer, not a paginated bash output list; omitted tables or schemas are explicitly counted, and an over-cap probe is discarded and counted as an error",
+    },
+    ExclusionEntry {
+        file: "agent_child_env.rs",
+        enclosing_item: "refresh_legacy_git_hooks",
+        location_or_primitive: "legacy hook directory and file byte take",
+        reason: "internal cache-maintenance enumeration and input-byte safety bounds, not an agent-visible list; the refresh logs examined and rewritten counts plus whether its scan was bounded",
+    },
     // The views-on semantic gap note names its first few missing files in the
     // response text; every missing file is listed in the JSON `semantic_gap`
     // field, and the text says how many more there are.
@@ -413,6 +485,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/outline.rs",
+        enclosing_item: "render_top_level_entries",
+        location_or_primitive: "type member preview take",
+        reason: "a type API preview with an exact '(N more)' count; single-file outlines list every product member, and the outer file budget carries the list trailer",
+    },
+    ExclusionEntry {
+        file: "commands/outline.rs",
         enclosing_item: "inspect_outline_file_content",
         location_or_primitive: "bounded line-count byte reader",
         reason: "caps bytes inspected for a file's line-count statistic; the file remains in the outline with an unknown line count, so no agent-visible list items are removed",
@@ -467,6 +545,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc_format.rs",
+        enclosing_item: "structure_outline_trailer_stays_last_after_skips",
+        location_or_primitive: "walk_truncated",
+        reason: "test-only response fixture proving that an integrated structure-map trailer remains last after skipped-file diagnostics; production outline walk and budget cuts are registered on the outline surface",
+    },
+    ExclusionEntry {
+        file: "subc_format.rs",
         enclosing_item: "directory_outline_preserves_walk_truncation_footer, files_outline_uses_the_counting_walk_limit_in_partial_footer",
         location_or_primitive: "subc_format walk truncation footer tests",
         reason: "test assertions verifying legacy walk truncation footer",
@@ -478,9 +562,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "trace_to_symbol reply is a single shortest path (path: Option<Vec<...>>) with no list semantics, so it carries no truncation envelope",
     },
     ExclusionEntry {
+        file: "response_finalize.rs",
+        enclosing_item: "drop",
+        location_or_primitive: "response_finalize::DeferredWakeGuard drop self.0.take()",
+        reason: "Option::take restoring the previous deferred-completion wake when a guard drops; no list is cut",
+    },
+    ExclusionEntry {
         file: "commands/configure.rs",
-        enclosing_item: "schedule_artifact_loads",
-        location_or_primitive: "commands::configure::schedule_artifact_loads warm_permit.take()",
+        enclosing_item: "schedule_artifact_loads_admitted",
+        location_or_primitive: "commands::configure::schedule_artifact_loads_admitted warm_permit.take()",
         reason: "Option::take releasing a warm-reload permit before a cold-build acquire; no list is cut",
     },
     ExclusionEntry {
@@ -535,6 +625,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "nearest_names",
         location_or_primitive: "commands::semantic_search::nearest_names NEAREST_NAME_FILE_LIMIT, NEAREST_NAME_LIMIT",
         reason: "a not-found answer suggests a few nearest names: the scan reads a bounded number of files and keeps the most similar names; these are suggestions for a name that occurs nowhere, not a cut of matching results",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/external_pattern.rs",
+        enclosing_item: "semantic_results, semantic_index",
+        location_or_primitive: "commands::semantic_search::external_pattern::Corpus semantic enumeration",
+        reason: "enumerates at most SEMANTIC_ENUMERATION_LIMIT prose candidates before ranking, like the external query-only route; more_available reports the remaining candidates and the engine envelopes the results page. Discovery currently attributes the restricted-visibility method to its preceding semantic_index helper",
+    },
+    ExclusionEntry {
+        file: "commands/inspect.rs",
+        enclosing_item: "partial_reason_from_parts",
+        location_or_primitive: "commands::inspect::MAX_INSPECT_HEADER_PARTS",
+        reason: "the PARTIAL status line previews at most MAX_INSPECT_HEADER_PARTS incomplete parts and says `+N more`; every scanner reason stays in the body and the structured gaps, diagnostic overflow reasons are rendered in the body, and the cap never changes `complete`",
     },
 ];
 

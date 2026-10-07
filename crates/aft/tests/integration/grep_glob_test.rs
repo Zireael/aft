@@ -1653,3 +1653,281 @@ fn filtered_scope_distinguishes_no_files_from_no_matches() {
         assert!(aft.shutdown().success());
     }
 }
+
+mod explicit_target_regressions {
+    use super::*;
+
+    fn ignored_reports_project() -> tempfile::TempDir {
+        setup_project(&[
+            (".git/info/exclude", ".cortexkit/alfonso/reports/\n"),
+            (".gitignore", "ignored-by-gitignore/\n"),
+            ("src/anchor.txt", "index anchor\n"),
+            (
+                ".cortexkit/alfonso/reports/common-auth-body-positive.log",
+                "17 pass; 0 fail\n",
+            ),
+            (
+                ".cortexkit/alfonso/reports/.gitignore",
+                "common-auth-body-hidden.log\nnested/\n",
+            ),
+            (
+                ".cortexkit/alfonso/reports/common-auth-body-hidden.log",
+                "18 pass; 0 fail\n",
+            ),
+            (
+                ".cortexkit/alfonso/reports/nested/common-auth-body-nested.log",
+                "19 pass; 0 fail\n",
+            ),
+            ("ignored-by-gitignore/report.log", "20 pass; 0 fail\n"),
+        ])
+    }
+
+    fn reports_request(command: &str, path: Option<&str>) -> Value {
+        let mut request = json!({"id": "reports", "command": command,
+        "pattern": if command == "grep" { r"\d+ pass; \d+ fail" } else { "common-auth-body-*.log" }});
+        if command == "grep" {
+            request["include"] = json!("common-auth-body-*.log");
+        }
+        if let Some(path) = path {
+            request["path"] = json!(path);
+        }
+        request
+    }
+
+    #[test]
+    fn explicit_ignored_reports_directory_with_include_is_searched() {
+        for indexed in [false, true] {
+            let project = ignored_reports_project();
+            let mut aft = AftProcess::spawn();
+            if indexed {
+                configure_with_index(&mut aft, project.path());
+                wait_for_index_ready(
+                    &mut aft,
+                    || json!({"id":"ready", "command":"grep", "pattern":"anchor"}),
+                );
+            } else {
+                configure(&mut aft, project.path());
+            }
+            for path in [".cortexkit/alfonso/reports", "ignored-by-gitignore"] {
+                let mut request = reports_request("grep", Some(path));
+                if path == "ignored-by-gitignore" {
+                    request["include"] = json!("*.log");
+                }
+                let response = send(&mut aft, request);
+                assert_eq!(
+                    response["total_matches"], 1,
+                    "indexed={indexed}: {response}"
+                );
+                assert_eq!(response["files_searched"], 1, "{response}");
+                assert_eq!(response["fallback"], "filesystem", "{response}");
+                let expected_name = if path == "ignored-by-gitignore" {
+                    "report.log"
+                } else {
+                    "common-auth-body-positive.log"
+                };
+                assert!(
+                    response["matches"][0]["file"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with(expected_name),
+                    "{response}"
+                );
+            }
+            let response = send(
+                &mut aft,
+                reports_request("glob", Some(".cortexkit/alfonso/reports")),
+            );
+            assert_eq!(response["total"], 1, "indexed={indexed}: {response}");
+            assert_eq!(response["fallback"], "filesystem", "{response}");
+            assert!(
+                response["files"][0]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("common-auth-body-positive.log"),
+                "{response}"
+            );
+            assert!(aft.shutdown().success());
+        }
+    }
+
+    #[test]
+    fn explicit_ignored_reports_directory_with_exact_name_include_list_is_searched() {
+        for indexed in [false, true] {
+            let project = setup_project(&[
+                (".git/info/exclude", ".cortexkit/alfonso/reports/\n"),
+                ("src/anchor.txt", "index anchor\n"),
+                (
+                    ".cortexkit/alfonso/reports/a.stderr.log",
+                    "command failed\nsecond error\n",
+                ),
+                (
+                    ".cortexkit/alfonso/reports/b.stderr.log",
+                    "command failed\n",
+                ),
+                (
+                    ".cortexkit/alfonso/reports/c.stderr.log",
+                    "error one\nerror two\nerror three\n",
+                ),
+                (
+                    ".cortexkit/alfonso/reports/not-listed.stderr.log",
+                    "command failed\nerror outside the include list\n",
+                ),
+            ]);
+            let mut aft = AftProcess::spawn();
+            if indexed {
+                configure_with_index(&mut aft, project.path());
+                wait_for_index_ready(
+                    &mut aft,
+                    || json!({"id":"ready", "command":"grep", "pattern":"anchor"}),
+                );
+            } else {
+                configure(&mut aft, project.path());
+            }
+
+            let response = send(
+                &mut aft,
+                json!({
+                    "id": format!("exact-include-indexed-{indexed}"),
+                    "command": "grep",
+                    "pattern": "(fail)|error",
+                    "path": ".cortexkit/alfonso/reports",
+                    // The agent-facing comma list arrives in this translated form.
+                    "include": ["**/a.stderr.log", "**/b.stderr.log", "**/c.stderr.log"],
+                }),
+            );
+            assert_eq!(response["success"], true, "indexed={indexed}: {response}");
+            assert_eq!(
+                response["total_matches"], 6,
+                "indexed={indexed}: {response}"
+            );
+            assert_eq!(
+                response["files_searched"], 3,
+                "indexed={indexed}: {response}"
+            );
+            assert_eq!(
+                response["files_with_matches"], 3,
+                "indexed={indexed}: {response}"
+            );
+            assert_eq!(
+                response["fallback"], "filesystem",
+                "indexed={indexed}: {response}"
+            );
+
+            let mut matched_names: Vec<String> = response["matches"]
+                .as_array()
+                .expect("matches array")
+                .iter()
+                .map(|matched| {
+                    matched["file"]
+                        .as_str()
+                        .expect("matched file")
+                        .replace('\\', "/")
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect();
+            matched_names.sort();
+            assert_eq!(
+                matched_names,
+                [
+                    "a.stderr.log",
+                    "a.stderr.log",
+                    "b.stderr.log",
+                    "c.stderr.log",
+                    "c.stderr.log",
+                    "c.stderr.log",
+                ],
+                "indexed={indexed}: {response}"
+            );
+            assert!(aft.shutdown().success());
+        }
+    }
+
+    #[test]
+    fn explicit_ignored_reports_single_file_is_searched() {
+        let project = ignored_reports_project();
+        let mut aft = AftProcess::spawn();
+        configure(&mut aft, project.path());
+        let response = send(
+            &mut aft,
+            reports_request(
+                "grep",
+                Some(".cortexkit/alfonso/reports/common-auth-body-hidden.log"),
+            ),
+        );
+        assert_eq!(response["total_matches"], 1, "{response}");
+        assert_eq!(response["files_searched"], 1, "{response}");
+        let response = send(
+            &mut aft,
+            reports_request(
+                "glob",
+                Some(".cortexkit/alfonso/reports/common-auth-body-hidden.log"),
+            ),
+        );
+        assert_eq!(response["total"], 1, "{response}");
+        assert!(aft.shutdown().success());
+    }
+
+    #[test]
+    fn non_explicit_reports_search_skips_ignored_files() {
+        let project = ignored_reports_project();
+        let mut aft = AftProcess::spawn();
+        configure(&mut aft, project.path());
+        let mut request = reports_request("grep", None);
+        // Use a project-relative glob that would admit these logs if the
+        // ignore filter were missing, rather than a root-only filename glob.
+        request["include"] = json!("**/*.log");
+        let response = send(&mut aft, request);
+        assert_eq!(response["total_matches"], 0, "{response}");
+        let mut request = reports_request("glob", None);
+        request["pattern"] = json!("**/common-auth-body-*.log");
+        let response = send(&mut aft, request);
+        assert_eq!(response["total"], 0, "{response}");
+        assert!(aft.shutdown().success());
+    }
+
+    #[test]
+    fn empty_reports_scope_names_ignore_and_include_exclusions() {
+        for indexed in [false, true] {
+            let project = ignored_reports_project();
+            let mut aft = AftProcess::spawn();
+            if indexed {
+                configure_with_index(&mut aft, project.path());
+                wait_for_index_ready(
+                    &mut aft,
+                    || json!({"id":"ready", "command":"grep", "pattern":"anchor"}),
+                );
+            } else {
+                configure(&mut aft, project.path());
+            }
+            for command in ["grep", "glob"] {
+                let response = send(
+                    &mut aft,
+                    reports_request(command, Some(".cortexkit/alfonso")),
+                );
+                let text = response["text"].as_str().unwrap();
+                assert!(
+                    text.contains("1 ignored items (directories counted once)"),
+                    "indexed={indexed}: {response}"
+                );
+                assert!(!text.contains("No searchable files exist"), "{response}");
+                let mut request = reports_request(command, Some("src"));
+                if command == "grep" {
+                    request["include"] = json!("*.missing");
+                } else {
+                    request["pattern"] = json!("*.missing");
+                }
+                let response = send(&mut aft, request);
+                let text = response["text"].as_str().unwrap();
+                assert!(
+                    text.contains("include pattern matched none of 1 files"),
+                    "indexed={indexed}: {response}"
+                );
+                assert!(!text.contains("No searchable files exist"), "{response}");
+            }
+            assert!(aft.shutdown().success());
+        }
+    }
+}

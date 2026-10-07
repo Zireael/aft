@@ -1,5 +1,6 @@
 //! Dispatch-path metrics and health-report helpers for the subc transport loop.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -532,6 +533,13 @@ pub(super) struct DispatchPathMetrics {
     bg_event_rates: BgEventRates,
     reap: ReapMetrics,
     bind_acks: StdMutex<BindAckLatencies>,
+    /// Tool calls that named no catalog preset on a route without a scope
+    /// stamp (so they ran under the unscoped default), by the route's
+    /// harness. Shows when the last caller starts naming one.
+    presetless_tool_calls: StdMutex<BTreeMap<String, u64>>,
+    /// Routes bound with a daemon scope stamp that made at least one tool
+    /// call, each counted once.
+    scoped_routes_with_tool_calls: AtomicU64,
 }
 
 impl DispatchPathMetrics {
@@ -563,7 +571,37 @@ impl DispatchPathMetrics {
             bg_event_rates: BgEventRates::new(),
             reap: ReapMetrics::new(),
             bind_acks: StdMutex::new(BindAckLatencies::default()),
+            presetless_tool_calls: StdMutex::new(BTreeMap::new()),
+            scoped_routes_with_tool_calls: AtomicU64::new(0),
         }
+    }
+
+    /// A tool call on an unscoped route named no catalog preset.
+    pub(super) fn record_presetless_tool_call(&self, harness: &str) {
+        if let Ok(mut counts) = self.presetless_tool_calls.lock() {
+            *counts.entry(harness.to_string()).or_default() += 1;
+        }
+    }
+
+    /// A route bound with a scope stamp made its first tool call.
+    pub(super) fn record_scoped_route_with_tool_calls(&self) {
+        self.scoped_routes_with_tool_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn tool_call_preset_snapshot(&self) -> Value {
+        let by_harness = self
+            .presetless_tool_calls
+            .lock()
+            .map(|counts| counts.clone())
+            .unwrap_or_default();
+        json!({
+            "tool_calls_without_preset": {
+                "total": by_harness.values().sum::<u64>(),
+                "by_harness": by_harness,
+            },
+            "scoped_routes_with_tool_calls": self.scoped_routes_with_tool_calls.load(Ordering::Relaxed),
+        })
     }
 
     /// Record how long a RouteBind took from arrival to its answer: a
@@ -903,6 +941,7 @@ impl DispatchPathMetrics {
                 "oldest_age_ms": oldest_pending_age_ms,
             },
             "bind_acks": self.bind_ack_snapshot(),
+            "tool_call_presets": self.tool_call_preset_snapshot(),
             "completion_channels": {
                 "control": self.control_completion_queued.load(Ordering::Relaxed),
                 "maintenance": self.maintenance_queued.load(Ordering::Relaxed),
@@ -1037,6 +1076,7 @@ pub(super) fn warn_slow_pending_binds(
                 blockers: vec!["scheduler_busy".to_string()],
                 oldest_queued_writer_age_ms: None,
                 in_flight_readers: Vec::new(),
+                in_flight_writer: None,
                 reader_admissions_while_promoted_writer_waited: 0,
             });
         crate::slog_warn!(
@@ -1052,7 +1092,7 @@ pub(super) fn warn_slow_pending_binds(
     }
 }
 
-fn pending_bind_breadcrumb(
+pub(super) fn pending_bind_breadcrumb(
     route: RouteChannel,
     root_id: &crate::path_identity::ProjectRootId,
     age: Duration,
@@ -1084,8 +1124,18 @@ fn pending_bind_breadcrumb(
         })
         .collect::<Vec<_>>()
         .join("; ");
+    let writer = snapshot
+        .in_flight_writer
+        .as_ref()
+        .map(|writer| {
+            format!(
+                "job={} command={} age_ms={}",
+                writer.request_id, writer.command, writer.started_age_ms,
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, configure_phase_timings=[{}], blockers=[{}], oldest_queued_writer_age_ms={:?}, in_flight_readers=[{}], reader_admissions_while_promoted_writer_waited={})",
+        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, configure_phase_timings=[{}], blockers=[{}], oldest_queued_writer_age_ms={:?}, in_flight_readers=[{}], in_flight_writer=[{}], reader_admissions_while_promoted_writer_waited={})",
         root_id.as_path().display(),
         duration_millis_u64(age),
         configure_request_id,
@@ -1094,6 +1144,7 @@ fn pending_bind_breadcrumb(
         blockers,
         snapshot.oldest_queued_writer_age_ms,
         readers,
+        writer,
         snapshot.reader_admissions_while_promoted_writer_waited,
     )
 }
@@ -1102,12 +1153,14 @@ fn pending_bind_breadcrumb(
 /// behind a reader on its root. Retryable like `actor_not_ready`: the reader
 /// ends eventually, and a later bind can then be admitted.
 pub(super) const BIND_BLOCKED_BY_READER: &str = "bind_blocked_by_reader";
+pub(super) const BIND_BLOCKED_BY_WRITER: &str = "bind_blocked_by_writer";
 
 /// The code and message an overdue route bind is refused with. A bind still
 /// queued while readers run on its root waited for them (a bind that needs
 /// exclusive use of the root cannot start beside readers), so the refusal
 /// names the oldest of them: its job, its tool and how long it has run.
-/// Every other cause keeps the generic `actor_not_ready`.
+/// A running writer can hold the same slot even when there are no readers;
+/// name it rather than suggesting that configure itself is necessarily stuck.
 pub(super) fn route_bind_deadline_refusal(
     age: Duration,
     deadline: Duration,
@@ -1116,6 +1169,17 @@ pub(super) fn route_bind_deadline_refusal(
 ) -> (&'static str, String) {
     let age_ms = duration_millis_u64(age);
     let deadline_ms = duration_millis_u64(deadline);
+    if let Some(writer) = snapshot.in_flight_writer.as_ref().filter(|_| {
+        matches!(
+            snapshot.configure_state,
+            "queued" | "running" | "blocked_by_other_mutating"
+        )
+    }) {
+        return (BIND_BLOCKED_BY_WRITER, format!(
+            "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): a mutating job held this root (job={} tool={} age_ms={}); retry once it finishes or is cancelled",
+            writer.request_id, writer.command, writer.started_age_ms,
+        ));
+    }
     let blocking_reader = (snapshot.configure_state == "queued")
         .then(|| {
             snapshot
@@ -1658,6 +1722,17 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     }
 }
 
+fn bash_db_hint_metrics() -> Value {
+    #[cfg(unix)]
+    {
+        crate::bash_db_hints::metrics()
+    }
+    #[cfg(not(unix))]
+    {
+        Value::Null
+    }
+}
+
 fn bash_task_retention_metrics(shared_app: &App) -> Value {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1982,6 +2057,7 @@ fn build_health_diagnostic_rollup(
         },
         "memory": memory,
         "bash_task_retention": bash_task_retention_metrics(shared_app),
+        "bash_db_schema_hints": bash_db_hint_metrics(),
         "mutating_lanes": mutating_lanes_metrics(executor),
         "process_io": crate::process_io::ProcessIoSnapshot::capture().to_value(),
         "roots": roots,
@@ -2044,6 +2120,10 @@ pub(super) fn build_health_report(
         None => cached_mutating_lanes.unwrap_or_else(|| json!({ "scheduler_busy": true })),
     };
     metrics.insert("snapshot_age_ms".to_string(), json!(snapshot_age_ms));
+    metrics.insert(
+        "durable_log".to_string(),
+        crate::logging::durable_log_health(),
+    );
     metrics.insert(
         "runtime".to_string(),
         json!({
@@ -2929,6 +3009,7 @@ mod tests {
                 reader("subc-1-790", "read", 900),
                 reader("subc-1-789", "grep", 840_000),
             ],
+            in_flight_writer: None,
             reader_admissions_while_promoted_writer_waited: 0,
         };
         let age = Duration::from_millis(10_600);
@@ -2977,6 +3058,7 @@ mod tests {
                     blockers: vec![blocker.to_string()],
                     oldest_queued_writer_age_ms: Some(6_000),
                     in_flight_readers: Vec::new(),
+                    in_flight_writer: None,
                     reader_admissions_while_promoted_writer_waited: 0,
                 },
             );
@@ -3062,6 +3144,24 @@ mod tests {
         assert!(stall["last_stall_duration_ms"].is_null(), "{stall}");
         assert_eq!(stall["active_stalls"].as_u64(), Some(0), "{stall}");
         assert_eq!(stall["captures"].as_u64(), Some(0), "{stall}");
+    }
+
+    #[test]
+    fn health_report_exposes_live_durable_log_counters() {
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let app = App::default_shared();
+        let report = build_health_report(
+            &HealthRollupCache::new(),
+            &executor,
+            &HashMap::new(),
+            &metrics,
+            &app,
+        );
+        let health = &report.metrics.expect("health metrics")["durable_log"];
+        assert!(health["dropped_lines_total"].is_u64(), "{health}");
+        assert!(health.get("last_write_error").is_some(), "{health}");
+        assert!(health.get("failing_since").is_some(), "{health}");
     }
 
     #[test]
@@ -3710,6 +3810,7 @@ mod tests {
         let (_dir, root) = test_root("health-snapshot-age-coverage");
         let ctx = test_ctx();
         let watcher = ctx.watcher_counters();
+        watcher.note_fsevents_stream_creation();
         watcher.note_raw_event();
         watcher.note_raw_event();
         watcher.note_invalidating_event();
@@ -3749,6 +3850,7 @@ mod tests {
         assert_eq!(watcher["invalidating_events_total"].as_u64(), Some(1));
         assert_eq!(watcher["paths_after_gitignore_total"].as_u64(), Some(7));
         assert_eq!(watcher["paths_dispatched_total"].as_u64(), Some(6));
+        assert_eq!(watcher["fsevents_stream_creations_total"].as_u64(), Some(1));
         assert_eq!(watcher["overflows_total"].as_u64(), Some(1));
         assert_eq!(watcher["overflows_during_rescan"].as_u64(), Some(0));
         assert_eq!(

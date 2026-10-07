@@ -108,6 +108,11 @@ pub(crate) fn resolve_derived_path(view_dir: &Path, generation: &str) -> Result<
 #[derive(Debug)]
 pub enum ViewError {
     Io(std::io::Error),
+    IoAt {
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Sqlite(rusqlite::Error),
     Json(serde_json::Error),
     InvalidManifest(String),
@@ -130,6 +135,15 @@ impl fmt::Display for ViewError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "view I/O failed: {error}"),
+            Self::IoAt {
+                operation,
+                path,
+                source,
+            } => write!(
+                formatter,
+                "view I/O failed {operation} {}: {source}",
+                path.display()
+            ),
             Self::Sqlite(error) => write!(formatter, "view SQLite operation failed: {error}"),
             Self::Json(error) => write!(formatter, "view manifest JSON failed: {error}"),
             Self::InvalidManifest(message) => write!(formatter, "invalid view manifest: {message}"),
@@ -166,10 +180,20 @@ impl fmt::Display for ViewError {
 impl std::error::Error for ViewError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Io(error) | Self::IoAt { source: error, .. } => Some(error),
             Self::Sqlite(error) => Some(error),
             Self::Json(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+impl ViewError {
+    pub(crate) fn io_at(operation: &'static str, path: &Path, source: std::io::Error) -> Self {
+        Self::IoAt {
+            operation,
+            path: path.to_path_buf(),
+            source,
         }
     }
 }
@@ -713,7 +737,8 @@ impl ViewStore {
     pub fn open(storage: impl AsRef<Path>, project_scope_key: &str) -> Result<Self> {
         validate_scope_key(project_scope_key)?;
         let view_dir = storage.as_ref().join("views").join(project_scope_key);
-        fs::create_dir_all(&view_dir)?;
+        fs::create_dir_all(&view_dir)
+            .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
         let store = Self { view_dir };
         store.initialize_pointer()?;
         Ok(store)
@@ -723,7 +748,8 @@ impl ViewStore {
     /// per-checkout (v2) layout keeps views under `views/v2/<scope>` and
     /// reaches this only through a registered view.
     pub(crate) fn open_dir(view_dir: PathBuf) -> Result<Self> {
-        fs::create_dir_all(&view_dir)?;
+        fs::create_dir_all(&view_dir)
+            .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
         let store = Self { view_dir };
         store.initialize_pointer()?;
         Ok(store)
@@ -791,8 +817,9 @@ impl ViewStore {
     }
 
     pub fn load_manifest(&self, generation: &str) -> Result<Manifest> {
-        Ok(Manifest::from_json_bytes(&fs::read(
-            self.manifest_path(generation)?,
+        let path = self.manifest_path(generation)?;
+        Ok(Manifest::from_json_bytes(&fs::read(&path).map_err(
+            |error| ViewError::io_at("reading", &path, error),
         )?)?)
     }
 
@@ -1174,10 +1201,14 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&temporary)?;
-        file.write_all(&manifest.to_json_bytes()?)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
+            .open(&temporary)
+            .map_err(|error| ViewError::io_at("creating", &temporary, error))?;
+        file.write_all(&manifest.to_json_bytes()?)
+            .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
+        file.write_all(b"\n")
+            .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
+        file.sync_all()
+            .map_err(|error| ViewError::io_at("syncing", &temporary, error))?;
         drop(file);
         fs::hard_link(&temporary, path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -1188,7 +1219,7 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
                         .to_string(),
                 )
             } else {
-                ViewError::Io(error)
+                ViewError::io_at("linking manifest to", path, error)
             }
         })?;
         // The hard link gives the generation its permanent name without an
@@ -1206,7 +1237,10 @@ fn sync_file_and_parent(path: &Path) -> Result<()> {
 }
 
 fn sync_file(path: &Path) -> Result<()> {
-    open_file_for_sync(path)?.sync_all()?;
+    open_file_for_sync(path)
+        .map_err(|error| ViewError::io_at("opening for sync", path, error))?
+        .sync_all()
+        .map_err(|error| ViewError::io_at("syncing", path, error))?;
     Ok(())
 }
 
@@ -1272,7 +1306,10 @@ fn sync_parent(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    File::open(path)
+        .map_err(|error| ViewError::io_at("opening directory for sync", path, error))?
+        .sync_all()
+        .map_err(|error| ViewError::io_at("syncing directory", path, error))?;
     Ok(())
 }
 

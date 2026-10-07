@@ -21,6 +21,10 @@ type AskCall = {
   metadata?: Record<string, unknown>;
 };
 
+function resultText(result: unknown): string {
+  return typeof result === "string" ? result : ((result as { output?: string })?.output ?? "");
+}
+
 maybeDescribe("glob/conflicts tool_call e2e", () => {
   const harnesses: E2EHarness[] = [];
 
@@ -43,21 +47,21 @@ maybeDescribe("glob/conflicts tool_call e2e", () => {
     const glob = searchTools(pluginContext(h)).glob;
 
     const normal = await glob.execute({ pattern: "**/*.ts" }, runtime(h));
-    expect(normal).toContain("2 files matching **/*.ts");
-    expect(normal).toContain("src/main.ts");
-    expect(normal).toContain("scripts/helper.ts");
+    expect(resultText(normal)).toContain("2 files matching **/*.ts");
+    expect(resultText(normal)).toContain("src/main.ts");
+    expect(resultText(normal)).toContain("scripts/helper.ts");
 
     const noMatch = await glob.execute({ pattern: "**/*.zzz" }, runtime(h));
-    expect(noMatch).toContain("0 files matching **/*.zzz");
+    expect(resultText(noMatch)).toContain("0 files matching **/*.zzz");
 
     const missing = h.path("missing-dir");
     const scoped = await glob.execute(
       { pattern: "**/*.ts", path: `${h.path("src")} ${missing}` },
       runtime(h),
     );
-    expect(scoped).toContain("1 file matching **/*.ts");
-    expect(scoped).toContain("src/main.ts");
-    expect(scoped).toContain(`Skipped 1 path not found: ${missing}`);
+    expect(resultText(scoped)).toContain("1 file matching **/*.ts");
+    expect(resultText(scoped)).toContain("src/main.ts");
+    expect(resultText(scoped)).toContain(`Skipped 1 path not found: ${missing}`);
   });
 
   test("glob asks before searching an external directory", async () => {
@@ -72,7 +76,7 @@ maybeDescribe("glob/conflicts tool_call e2e", () => {
         runtime(h, recordingAsk(askCalls)),
       );
 
-      expect(output).toContain("2 files matching **/*.ts");
+      expect(resultText(output)).toContain("2 files matching **/*.ts");
       expect(askCalls.some((call) => call.permission === "external_directory")).toBe(true);
     } finally {
       rmSync(external, { recursive: true, force: true });

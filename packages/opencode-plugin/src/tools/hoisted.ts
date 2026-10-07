@@ -66,7 +66,7 @@ function readAttachments(data: Record<string, unknown>): ReadAttachment[] {
 }
 
 const ISSUE_AND_PR_READ_DESCRIPTION =
-  "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).";
+  "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`). Use `pr://NUMBER/diff` for the whole diff or `pr://NUMBER/diff/<path>` for an exact changed path (also with OWNER/REPO). Diff pages name the head SHA; use read, not outline or zoom.";
 
 /** Reuse the user-tier github.read description gate across every GitHub-capable tool. */
 export function whenGhReadEnabled(enabled: boolean, description: string): string {
@@ -666,6 +666,15 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
                   additions: diff.additions ?? 0,
                   deletions: diff.deletions ?? 0,
                 },
+                files: [
+                  {
+                    file: filePath,
+                    patch,
+                    additions: diff.additions ?? 0,
+                    deletions: diff.deletions ?? 0,
+                    status: data.created === true ? "added" : "modified",
+                  },
+                ],
               }
             : {}),
           diagnostics: {},
@@ -982,6 +991,15 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
                 additions: diff.additions ?? 0,
                 deletions: diff.deletions ?? 0,
               },
+              files: [
+                {
+                  file: filePath,
+                  patch,
+                  additions: diff.additions ?? 0,
+                  deletions: diff.deletions ?? 0,
+                  status: data.created === true ? "added" : "modified",
+                },
+              ],
             }
           : {}),
         diagnostics: {},
@@ -1058,6 +1076,27 @@ function stringArray(value: unknown): string[] {
     : [];
 }
 
+function applyPatchFileDiffs(files: unknown): unknown[] {
+  if (!Array.isArray(files)) return [];
+  return files.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
+    const fileDiff = entry as Record<string, unknown>;
+    const file =
+      typeof fileDiff.file === "string"
+        ? fileDiff.file
+        : typeof fileDiff.filePath === "string"
+          ? fileDiff.filePath
+          : fileDiff.relativePath;
+    const status =
+      fileDiff.type === "add" || fileDiff.type === "added"
+        ? "added"
+        : fileDiff.type === "delete" || fileDiff.type === "deleted"
+          ? "deleted"
+          : "modified";
+    return { ...fileDiff, ...(typeof file === "string" ? { file } : {}), status };
+  });
+}
+
 function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
   return {
     description: applyPatchDescription(ctx),
@@ -1121,7 +1160,7 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
           typeof response.text === "string" ? response.text : applyPatchErrorMessage(response, ""),
         metadata: {
           diff: typeof metadata.diff === "string" ? metadata.diff : "",
-          files: Array.isArray(metadata.files) ? metadata.files : [],
+          files: applyPatchFileDiffs(metadata.files),
         },
       };
       if (typeof response.title === "string" && response.title.length > 0) {

@@ -10,6 +10,7 @@ import {
   runningTaskStatusHint,
   sleep,
   type WatchCallerRole,
+  WORKER_WAIT_LIMIT_PHRASE,
   workerBackgroundTaskNote,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
@@ -54,14 +55,18 @@ function orchestratedTransportTimeoutMs(
   wait: boolean,
   effectiveTimeout: number | undefined,
   foregroundWaitMs: number,
-  noHardKill = false,
+  workerWaitMaxMs?: number,
 ): number {
-  // A command without a hard-kill timeout can hold the call open until it
-  // finishes, so the transport timeout must not expire first.
-  if (noHardKill) return LONGEST_TIMER_DELAY_MS;
-  const waitBudget =
-    blockToCompletion || wait ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
-  return waitBudget + BASH_TRANSPORT_MARGIN_MS;
+  const blocking = blockToCompletion || wait;
+  let waitBudget = blocking ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
+  // The engine hands a delegated worker's blocking call back at the worker
+  // wait limit (the command moves to the background), even when the worker's
+  // waits keep its hard kill further away than the default.
+  if (blocking && workerWaitMaxMs !== undefined) {
+    waitBudget = Math.min(effectiveTimeout ?? workerWaitMaxMs, workerWaitMaxMs);
+  }
+  // A configured limit can exceed what a JavaScript timer accepts.
+  return Math.min(waitBudget + BASH_TRANSPORT_MARGIN_MS, LONGEST_TIMER_DELAY_MS);
 }
 
 type ForegroundAbortOutcome = "killed" | "call_settled" | "timed_out";
@@ -200,10 +205,17 @@ export function bashCompanionRegistered(
 function backgroundWaitDescription(
   watchToolRegistered: boolean,
   statusRegistered: boolean,
+  role: WatchCallerRole = "primary",
 ): string {
+  if (watchToolRegistered && role === "worker") {
+    // A delegated worker is never woken by a completion reminder, so it is
+    // told only how to wait; the primary wording below offers ending the turn.
+    const noPolling = statusRegistered ? "; never loop bash_status to wait" : "";
+    return `then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to ${WORKER_WAIT_LIMIT_PHRASE}, then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one)${noPolling}.`;
+  }
   if (watchToolRegistered) {
     const noPolling = statusRegistered ? ", and never loop bash_status to wait" : "";
-    return `then bash_watch handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits until the command finishes); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one)${noPolling}.`;
+    return `then bash_watch handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports it is still running; watch again to keep waiting); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one)${noPolling}.`;
   }
   return statusRegistered
     ? "the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else."
@@ -230,6 +242,13 @@ export interface BashDescriptionSurface {
   outline?: boolean;
   status?: boolean;
   write?: boolean;
+  /**
+   * Whose surface this describes. Defaults to `primary`, the wording every
+   * plugin registration uses (it covers both roles). The subc module
+   * catalog's `worker` preset asks for `worker`, which never offers a
+   * completion reminder or ending the turn.
+   */
+  role?: WatchCallerRole;
 }
 
 export function bashToolDescription(
@@ -244,6 +263,11 @@ export function bashToolDescription(
   const outline = surface.outline !== false;
   const status = surface.status !== false;
   const write = surface.write !== false;
+  const role = surface.role ?? "primary";
+  const autoPromote =
+    role === "worker"
+      ? "keep it off otherwise so a long command moves to the background while you work"
+      : "keep it off otherwise so auto-promote can remind you while you work";
   const steerTools = [
     aftSearchRegistered ? "aft_search (concepts, identifiers, regex, literals)" : "the grep tool",
     "read",
@@ -254,7 +278,7 @@ export function bashToolDescription(
     ? " Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks."
     : "";
   const tasks = backgroundOn
-    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitDescription(watchToolRegistered, status)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(status, write)}.`
+    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; ${autoPromote}. Use background: true yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitDescription(watchToolRegistered, status, role)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(status, write)}.`
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
   return `Execute shell commands.${compression}${tasks}
 
@@ -384,6 +408,26 @@ export function nativeSandboxEnabled(config: PluginContext["config"]): boolean {
   return config.sandbox?.enabled === true;
 }
 
+/**
+ * The `timeout` argument's description. The primary wording is what every
+ * plugin registration shows; the subc module catalog's `worker` preset uses
+ * the worker wording, because a worker's promoted command never sends it a
+ * completion reminder.
+ */
+export function bashTimeoutDescription(
+  backgroundOn: boolean,
+  role: WatchCallerRole = "primary",
+): string {
+  if (!backgroundOn) {
+    return "Hard kill cap in milliseconds (positive integer). When omitted, the foreground command can run up to 30 minutes and returns inline when it finishes.";
+  }
+  const promoted =
+    role === "worker"
+      ? "moves to the background as a task that won't wake you, so wait on it with bash_watch; wait:true disables promotion and remains inline until completion, the timeout, or the worker wait limit"
+      : "is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout";
+  return `Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window ${promoted}. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.`;
+}
+
 export function createBashTool(
   ctx: PluginContext,
   aftSearchRegisteredOverride?: boolean,
@@ -408,7 +452,7 @@ export function createBashTool(
           .boolean()
           .optional()
           .describe(
-            `When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; ${userMessageDetachDescription(initialBashCfg.detach_on_user_message)} Use only when you know the result is required before doing anything else.`,
+            `When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (in a delegated session at most the worker wait limit, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); ${userMessageDetachDescription(initialBashCfg.detach_on_user_message)} Use only when you know the result is required before doing anything else.`,
           ),
       }
     : {};
@@ -438,7 +482,7 @@ export function createBashTool(
           .boolean()
           .optional()
           .describe(
-            `When true, spawn the command in the background and return a taskId${taskControls.length > 0 ? ` for ${taskControls.join("/")}` : ""} instead of waiting for completion. Defaults to false.`,
+            `When true, spawn the command in the background and return a taskId${taskControls.length > 0 ? ` for ${taskControls.join("/")}` : ""} instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.`,
           ),
       }
     : {};
@@ -463,9 +507,7 @@ export function createBashTool(
       .string()
       .describe("Shell command to execute. Supports pipes, redirection, and normal shell syntax."),
     timeout: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-      initialBashCfg.background
-        ? "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout."
-        : "Hard kill cap in milliseconds (positive integer). When omitted, the foreground command can run up to 30 minutes and returns inline when it finishes.",
+      bashTimeoutDescription(initialBashCfg.background),
     ),
     workdir: z
       .string()
@@ -570,13 +612,12 @@ export function createBashTool(
       // and the call answers with the timed-out result. Omitting it lets the
       // engine apply its 30-minute default.
       const rawTimeout = coerceOptionalInt(args.timeout, "timeout", 1, Number.MAX_SAFE_INTEGER);
-      // A subagent that asks to wait for its command without a timeout has
-      // nothing else to do until the command finishes and can't be woken
-      // after its turn ends, so the engine skips its 30-minute default kill
-      // (it knows the role from the `worker_session` field callBridge adds to
-      // every request). A new message still detaches the wait and an abort
-      // still kills the command. The transport timeout must not undercut it.
-      const workerUnboundedWait = isSubagent && requestedWait && rawTimeout === undefined;
+      // A subagent's blocking call (wait:true, or every foreground call when
+      // subagent background is off) is handed back by the engine at the
+      // worker wait limit, with the command moved to the background (the
+      // engine knows the role from the `worker_session` field callBridge adds
+      // to every request). The transport timeout must not undercut it.
+      const workerWaitMaxMs = isSubagent ? bashCfg.worker_wait_max_ms : undefined;
       const ptyRows = coerceOptionalInt(args.ptyRows, "ptyRows", 1, 60);
       const ptyCols = coerceOptionalInt(args.ptyCols, "ptyCols", 1, 140);
       const compressed = coerceBoolean(args.compressed, true);
@@ -632,7 +673,7 @@ export function createBashTool(
               requestedWait,
               rawTimeout,
               foregroundWaitMs,
-              workerUnboundedWait,
+              workerWaitMaxMs,
             ),
             onProgress: ({ text }) => {
               accumulatedOutput = preview(accumulatedOutput + text);
@@ -685,7 +726,10 @@ export function createBashTool(
         const taskId = data.task_id;
         trackBgTask(context.sessionID, taskId);
         let rendered = (data.output as string | undefined) ?? "";
-        if (isSubagent && allowSubagentBg) {
+        // Also when subagent background is off: a blocking call that reached
+        // the worker wait limit hands back a still-running task the worker
+        // must know how to wait on.
+        if (isSubagent) {
           rendered += workerBackgroundTaskNote(taskId);
         }
         const metadataPayload = { description, output: rendered, status: "running", taskId };
@@ -807,6 +851,13 @@ async function formatBashStatusText(
   let text = `Task ${taskId}: ${status}${exit}${dur}`;
   if (typeof data.live_descendants_summary === "string") {
     text += ` · ${data.live_descendants_summary}`;
+  }
+  if (data.output_incomplete === true) {
+    const reason =
+      typeof data.status_reason === "string" && data.status_reason
+        ? data.status_reason
+        : "PTY output may be incomplete";
+    text += `\n[${reason}]`;
   }
   if (data.mode === "pty") {
     // PTY output is rendered from the raw terminal spill file; never feed it

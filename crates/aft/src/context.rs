@@ -289,12 +289,61 @@ fn pending_path_in_roots(path: &Path, roots: &[PathBuf]) -> bool {
 /// and stop loading the embedding backend.
 pub(crate) const UNBOUND_BUILD_ABANDON_GRACE: Duration = Duration::from_secs(120);
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static HELD_LIFECYCLE_LOCKS: std::cell::RefCell<Vec<usize>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Detect recursive admission before parking on a non-reentrant mutex. Track
+/// the mutex identity, not the context, because cloned admissions share it.
+struct LifecycleLockMarker {
+    #[cfg(debug_assertions)]
+    identity: usize,
+}
+
+impl LifecycleLockMarker {
+    fn enter(_mutex: &Arc<parking_lot::Mutex<bool>>) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            let identity = Arc::as_ptr(_mutex) as usize;
+            HELD_LIFECYCLE_LOCKS.with(|held| {
+                let mut held = held.borrow_mut();
+                assert!(
+                    !held.contains(&identity),
+                    "recursive root lifecycle lock acquisition"
+                );
+                held.push(identity);
+            });
+            Self { identity }
+        }
+        #[cfg(not(debug_assertions))]
+        Self {}
+    }
+}
+
+impl Drop for LifecycleLockMarker {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        HELD_LIFECYCLE_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            let position = held.iter().rposition(|id| *id == self.identity).unwrap();
+            held.remove(position);
+        });
+    }
+}
+
 /// Serializes the daemon's bound/unbound transition with admission of deferred
 /// root work. The lock covers only the bounded decision and worker-start commit;
 /// call sites must not wait for worker completion or run a scan while holding it.
 #[derive(Clone, Debug)]
 pub(crate) struct SubcLifecycleAdmission {
     unbound: Arc<parking_lot::Mutex<bool>>,
+    /// Mirrors `unbound` for cancellation checkpoints. A bound root takes the
+    /// atomic fast path; an unbound root still confirms grace and rebind under
+    /// the admission lock before signalling cancellation.
+    unbound_hint: Arc<AtomicBool>,
     /// When the current unbound period started; `None` while bound. Written
     /// only while holding `unbound`.
     unbound_since: Arc<parking_lot::Mutex<Option<Instant>>>,
@@ -307,6 +356,7 @@ impl Default for SubcLifecycleAdmission {
     fn default() -> Self {
         Self {
             unbound: Arc::default(),
+            unbound_hint: Arc::default(),
             unbound_since: Arc::default(),
             abandon_grace_ms: Arc::new(AtomicU64::new(
                 UNBOUND_BUILD_ABANDON_GRACE.as_millis() as u64
@@ -317,17 +367,21 @@ impl Default for SubcLifecycleAdmission {
 
 impl SubcLifecycleAdmission {
     fn mark_bound(&self) {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let mut unbound = self.unbound.lock();
         *unbound = false;
         *self.unbound_since.lock() = None;
+        self.unbound_hint.store(false, Ordering::Release);
     }
 
     fn mark_unbound(&self, configure_generation: &AtomicU64) {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let mut unbound = self.unbound.lock();
         if !*unbound {
             *unbound = true;
             *self.unbound_since.lock() = Some(Instant::now());
             configure_generation.fetch_add(1, Ordering::SeqCst);
+            self.unbound_hint.store(true, Ordering::Release);
         }
     }
 
@@ -336,6 +390,7 @@ impl SubcLifecycleAdmission {
     /// unbind (rebind within the window) never trips it, so those builds keep
     /// running exactly as they do while bound.
     pub(crate) fn unbound_past_grace(&self) -> bool {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let unbound = self.unbound.lock();
         if !*unbound {
             return false;
@@ -349,12 +404,19 @@ impl SubcLifecycleAdmission {
     /// Serialize cancellation with rebind: a root rebound before this decision
     /// cannot have its still-running work cancelled by a stale grace check.
     pub(crate) fn cancel_if_abandoned(&self, cancel: impl FnOnce()) {
+        // Lifecycle transitions are in memory and must be observed at every
+        // parser checkpoint, independently of the throttled disk-liveness
+        // probe. Avoid a mutex on the usual bound-root path.
+        if !self.unbound_hint.load(Ordering::Acquire) {
+            return;
+        }
         // A checkpoint may be inside a lifecycle admission closure that already
         // owns this lock. Defer that checkpoint instead of recursively locking;
         // the next batch/parser poll makes the synchronized decision.
         let Some(unbound) = self.unbound.try_lock() else {
             return;
         };
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let grace = Duration::from_millis(self.abandon_grace_ms.load(Ordering::SeqCst));
         if *unbound
             && self
@@ -373,11 +435,13 @@ impl SubcLifecycleAdmission {
     }
 
     pub(crate) fn is_current(&self, generation: &AtomicU64, expected: u64) -> bool {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let unbound = self.unbound.lock();
         !*unbound && generation.load(Ordering::SeqCst) == expected
     }
 
     fn advance_generation(&self, generation: &AtomicU64) -> u64 {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let _unbound = self.unbound.lock();
         generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
     }
@@ -388,6 +452,7 @@ impl SubcLifecycleAdmission {
         expected: u64,
         action: impl FnOnce() -> R,
     ) -> Option<R> {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let unbound = self.unbound.lock();
         if *unbound || generation.load(Ordering::SeqCst) != expected {
             return None;
@@ -396,6 +461,7 @@ impl SubcLifecycleAdmission {
     }
 
     pub(crate) fn is_bound(&self) -> bool {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         !*self.unbound.lock()
     }
 
@@ -408,6 +474,7 @@ impl SubcLifecycleAdmission {
     }
 
     fn run_if_unbound<R>(&self, action: impl FnOnce() -> R) -> Option<R> {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let unbound = self.unbound.lock();
         if !*unbound {
             return None;
@@ -826,8 +893,16 @@ impl RootHealthSnapshot {
 }
 
 pub struct StatusEmitter {
-    latest: Arc<Mutex<Option<StatusPayload>>>,
+    latest: Arc<Mutex<Option<PendingStatusSnapshot>>>,
     notify: mpsc::Sender<()>,
+    context: Mutex<Weak<AppContext>>,
+    #[cfg(test)]
+    pub(crate) snapshot_builds: AtomicUsize,
+}
+
+enum PendingStatusSnapshot {
+    Ready(StatusPayload),
+    Context(Weak<AppContext>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -908,6 +983,9 @@ impl Default for WatcherBackendExclusions {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct WatcherCountersSnapshot {
+    /// Successful native stream allocations over this root's process lifetime,
+    /// including its auxiliary paths and config-file fallback watch.
+    pub(crate) fsevents_stream_creations_total: u64,
     pub(crate) raw_events_total: u64,
     pub(crate) raw_events_since_last_rescan: u64,
     pub(crate) invalidating_events_total: u64,
@@ -938,6 +1016,7 @@ const WATCHER_RESCAN_RERUN: u8 = 2;
 
 #[derive(Debug, Default)]
 pub(crate) struct WatcherCounters {
+    fsevents_stream_creations_total: AtomicU64,
     raw_events_total: AtomicU64,
     raw_events_since_last_rescan: AtomicU64,
     invalidating_events_total: AtomicU64,
@@ -970,6 +1049,12 @@ pub(crate) struct WatcherRescanInterval {
 }
 
 impl WatcherCounters {
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn note_fsevents_stream_creation(&self) {
+        self.fsevents_stream_creations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn note_raw_event(&self) {
         self.raw_events_total.fetch_add(1, Ordering::Relaxed);
         self.raw_events_since_last_rescan
@@ -1187,6 +1272,9 @@ impl WatcherCounters {
     pub(crate) fn snapshot(&self) -> WatcherCountersSnapshot {
         let last_rescan_at_ms = self.last_rescan_at_ms.load(Ordering::Acquire);
         WatcherCountersSnapshot {
+            fsevents_stream_creations_total: self
+                .fsevents_stream_creations_total
+                .load(Ordering::Relaxed),
             raw_events_total: self.raw_events_total.load(Ordering::Relaxed),
             raw_events_since_last_rescan: self.raw_events_since_last_rescan.load(Ordering::Relaxed),
             invalidating_events_total: self.invalidating_events_total.load(Ordering::Relaxed),
@@ -1266,6 +1354,14 @@ pub(crate) struct WatcherDrainSliceState {
     pub(crate) view_publication_paths: BTreeSet<PathBuf>,
     pub(crate) view_publication_due: Option<Instant>,
     pub(crate) path_slice_count: usize,
+}
+
+pub(crate) struct WatcherDrainGuard<'a>(&'a AtomicUsize);
+
+impl Drop for WatcherDrainGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Pending watcher-derived reconciliation state taken out of the context for
@@ -1584,12 +1680,25 @@ impl StatusEmitter {
         std::thread::spawn(move || {
             status_debounce_loop(rx, latest_for_thread, progress_sender);
         });
-        Self { latest, notify }
+        Self {
+            latest,
+            notify,
+            context: Mutex::new(Weak::new()),
+            #[cfg(test)]
+            snapshot_builds: AtomicUsize::new(0),
+        }
     }
 
     pub fn signal(&self, snapshot: StatusPayload) {
         if let Ok(mut latest) = self.latest.lock() {
-            *latest = Some(snapshot);
+            *latest = Some(PendingStatusSnapshot::Ready(snapshot));
+        }
+        let _ = self.notify.send(());
+    }
+
+    fn signal_context(&self, context: Weak<AppContext>) {
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = Some(PendingStatusSnapshot::Context(context));
         }
         let _ = self.notify.send(());
     }
@@ -1597,7 +1706,7 @@ impl StatusEmitter {
 
 fn status_debounce_loop(
     rx: mpsc::Receiver<()>,
-    latest: Arc<Mutex<Option<StatusPayload>>>,
+    latest: Arc<Mutex<Option<PendingStatusSnapshot>>>,
     progress_sender: SharedProgressSender,
 ) {
     while rx.recv().is_ok() {
@@ -1617,6 +1726,22 @@ fn status_debounce_loop(
             .ok()
             .and_then(|sender| sender.clone());
         if let Some(sender) = sender {
+            // Census work happens only for the surviving signal, outside the
+            // emitter lock. Upgrade at emission so queued signals cannot keep a
+            // retired actor (and its watchers/servers) alive.
+            let snapshot = match snapshot {
+                PendingStatusSnapshot::Ready(snapshot) => snapshot,
+                PendingStatusSnapshot::Context(context) => {
+                    let Some(context) = context.upgrade() else {
+                        continue;
+                    };
+                    let Some(snapshot) = context.try_build_status_snapshot() else {
+                        // Keep the previous bar; the next producer signal retries.
+                        continue;
+                    };
+                    snapshot
+                }
+            };
             sender(PushFrame::StatusChanged(StatusChangedFrame::new(
                 None, snapshot,
             )));
@@ -2292,6 +2417,36 @@ fn database_path_key(path: &Path) -> PathBuf {
         .unwrap_or_else(|| canonical_parent.join(path))
 }
 
+fn database_connection_busy() -> crate::db::OpenError {
+    crate::db::OpenError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some("process-shared database connection is in use".into()),
+    ))
+}
+
+#[derive(Default)]
+struct DatabaseRuntimeFailure {
+    error: Option<String>,
+    retry_at: Option<Instant>,
+    backoff: Duration,
+}
+
+impl DatabaseRuntimeFailure {
+    fn record(&mut self, error: String, busy: bool) {
+        self.error = Some(error);
+        if !busy {
+            self.backoff = if self.backoff.is_zero() {
+                Duration::from_secs(2)
+            } else {
+                (self.backoff * 2).min(Duration::from_secs(60))
+            };
+            // Measure from completion: even a slow failed open gets a full
+            // pause before another call can attempt it.
+            self.retry_at = Some(Instant::now() + self.backoff);
+        }
+    }
+}
+
 /// Process-global services shared by all project actors in this AFT process.
 ///
 /// `App` owns only true process services. Per-root caches and the live
@@ -2301,6 +2456,9 @@ pub struct App {
     /// actor points at this handle so roots do not open duplicate SQLite/WAL
     /// descriptors for the same database.
     db: parking_lot::Mutex<Option<(PathBuf, Arc<Mutex<TrackedConnection>>)>>,
+    /// The authenticated module connection's endpoint, independent of model
+    /// backend configuration. Consumer routes must use this same daemon.
+    subc_connection_file: parking_lot::RwLock<Option<PathBuf>>,
     lifecycle_census: crate::lifecycle_census::LifecycleCensusCache,
     active_watchers: AtomicUsize,
     active_actor_roots: AtomicUsize,
@@ -2311,12 +2469,21 @@ pub struct App {
     /// Weak actor references let status attribute process RSS across roots
     /// without making the process-global App own per-root caches.
     memory_contexts: parking_lot::Mutex<BTreeMap<PathBuf, Weak<AppContext>>>,
+    #[cfg(test)]
+    test_storage: tempfile::TempDir,
 }
 
 impl App {
+    pub(crate) fn set_subc_connection_file(&self, path: PathBuf) {
+        *self.subc_connection_file.write() = Some(path);
+    }
+    pub(crate) fn subc_connection_file(&self) -> Option<PathBuf> {
+        self.subc_connection_file.read().clone()
+    }
     pub fn new(provider_factory: LanguageProviderFactory) -> Self {
         Self {
             db: parking_lot::Mutex::new(None),
+            subc_connection_file: parking_lot::RwLock::new(None),
             lifecycle_census: crate::lifecycle_census::LifecycleCensusCache::default(),
             active_watchers: AtomicUsize::new(0),
             active_actor_roots: AtomicUsize::new(0),
@@ -2325,6 +2492,11 @@ impl App {
             stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
             provider_factory,
             memory_contexts: parking_lot::Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            test_storage: tempfile::Builder::new()
+                .prefix("aft-test-context-")
+                .tempdir()
+                .expect("private test storage"),
         }
     }
 
@@ -2339,6 +2511,21 @@ impl App {
 
     pub fn create_provider(&self) -> Box<dyn LanguageProvider> {
         (self.provider_factory)()
+    }
+
+    /// All context constructors and publications share this default, including
+    /// helpers in other modules. The owning App keeps the directory alive.
+    #[cfg(test)]
+    pub(crate) fn isolate_test_config(&self, mut config: Config) -> Config {
+        if config
+            .storage_dir
+            .as_ref()
+            .is_none_or(|p| p.as_os_str().is_empty())
+        {
+            config.storage_dir = Some(self.test_storage.path().to_path_buf());
+        }
+        crate::test_storage::assert_context(&config);
+        config
     }
 
     pub fn lsp_child_registry(&self) -> crate::lsp::child_registry::LspChildRegistry {
@@ -2472,7 +2659,11 @@ impl App {
         mode: crate::db::OpenMode,
     ) -> Result<Arc<Mutex<TrackedConnection>>, crate::db::OpenError> {
         let key = database_path_key(path);
-        let mut slot = self.db.lock();
+        let mut slot = if mode == crate::db::OpenMode::SingleAttempt {
+            self.db.try_lock().ok_or_else(database_connection_busy)?
+        } else {
+            self.db.lock()
+        };
         if let Some((existing_path, conn)) = slot.as_ref() {
             if existing_path == &key {
                 return Ok(Arc::clone(conn));
@@ -2482,6 +2673,40 @@ impl App {
         let conn = Arc::new(Mutex::new(crate::db::open_with_mode(path, mode)?));
         *slot = Some((key, Arc::clone(&conn)));
         Ok(conn)
+    }
+
+    /// Peek through the resident handle if this process already owns the file.
+    /// Opening and closing another descriptor can release SQLite's process-wide
+    /// locks. Hold the App slot through the peek so another root cannot open
+    /// the file between checking for a handle and opening a read-only one.
+    pub(crate) fn database_schema_version(
+        &self,
+        path: &Path,
+        mode: crate::db::OpenMode,
+    ) -> Result<(Option<u32>, bool), crate::db::OpenError> {
+        let key = database_path_key(path);
+        let slot = if mode == crate::db::OpenMode::SingleAttempt {
+            self.db.try_lock().ok_or_else(database_connection_busy)?
+        } else {
+            self.db.lock()
+        };
+        if let Some((existing_path, shared)) = slot.as_ref() {
+            if existing_path == &key {
+                let shared = Arc::clone(shared);
+                drop(slot);
+                let mut conn = if mode == crate::db::OpenMode::SingleAttempt {
+                    shared.try_lock().map_err(|_| database_connection_busy())?
+                } else {
+                    shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                };
+                return crate::db::schema_version_without_wait(&mut conn)
+                    .map(|version| (Some(version), true))
+                    .map_err(Into::into);
+            }
+        }
+        Ok((crate::db::peek_schema_version(path), false))
     }
 
     pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
@@ -2844,6 +3069,7 @@ pub struct AppContext {
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     view_runtime: RwLock<Option<ViewRuntimeState>>,
+    view_publication_retry: parking_lot::Mutex<crate::executor::view_publication::PublicationRetry>,
     deleted_view_root_retired: AtomicBool,
     #[cfg(test)]
     view_publication_attempts: AtomicUsize,
@@ -2868,6 +3094,12 @@ pub struct AppContext {
         parking_lot::Mutex<Option<(PathBuf, BTreeMap<PathBuf, Option<String>>)>>,
     callgraph_store_rx:
         parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>>,
+    // Unit tests must observe only this context's admissions and wait policy:
+    // another root can start a worker or request an inline wait concurrently.
+    #[cfg(test)]
+    callgraph_cold_build_spawn_count: AtomicUsize,
+    #[cfg(test)]
+    callgraph_build_wait_override: parking_lot::Mutex<Option<Duration>>,
     callgraph_store_rx_generation: AtomicU64,
     callgraph_store_rx_epoch: AtomicU64,
     callgraph_store_build_denied: parking_lot::Mutex<Option<(u64, String)>>,
@@ -2947,10 +3179,15 @@ pub struct AppContext {
     watcher: parking_lot::Mutex<Option<RecommendedWatcher>>,
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
     watcher_drain_slice: parking_lot::Mutex<Option<WatcherDrainSliceState>>,
+    watcher_drains_in_flight: AtomicUsize,
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
     watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
     lsp_manager: Arc<parking_lot::Mutex<LspManager>>,
+    /// At most one diagnostics collector may outlive its caller's budget.
+    /// Later edits queue their latest disk contents instead of growing a pool
+    /// of threads waiting on a slow handshake or the same manager mutex.
+    lsp_post_edit_worker_running: Arc<AtomicBool>,
     /// Watcher changes waiting for the LSP manager lock. `Some` while the one
     /// helper thread that forwards them exists; drains that find the lock
     /// busy merge into it instead of starting threads of their own (see
@@ -2958,6 +3195,10 @@ pub struct AppContext {
     lsp_watcher_forward_slot: crate::lsp::manager::WatcherForwardSlot,
     /// How many of those helper threads were started, for tests.
     lsp_watcher_forward_helpers_spawned: AtomicUsize,
+    /// Document and configuration-file changes waiting for the LSP manager
+    /// lock (see [`crate::lsp::pending_changes`]); a busy lock queues them
+    /// instead of dropping them.
+    lsp_pending_change_slot: crate::lsp::pending_changes::PendingLspChangeSlot,
     configure_generation: Arc<AtomicU64>,
     /// Advances only when the warm configuration changes, not on route
     /// teardown. Already-admitted workers use it to decide whether their disk
@@ -2983,7 +3224,9 @@ pub struct AppContext {
     // run persistence-dependent tools while the root's database is opening.
     database_runtime_state: AtomicU8,
     database_runtime_changed: tokio::sync::Notify,
-    database_runtime_error: parking_lot::Mutex<Option<String>>,
+    database_runtime_failure: parking_lot::Mutex<DatabaseRuntimeFailure>,
+    #[cfg(test)]
+    database_open_attempts: AtomicU64,
     /// The pending aft.db open request, the configure epoch it belongs to, and
     /// whether an open is running. See `crate::database_open`.
     database_open: parking_lot::Mutex<crate::database_open::DatabaseOpenSlot>,
@@ -3141,14 +3384,13 @@ enum CallgraphBackgroundWork {
 
 #[cfg(test)]
 struct CallgraphBuildStartGate {
-    root: PathBuf,
     reached: crossbeam_channel::Sender<()>,
     release: crossbeam_channel::Receiver<()>,
 }
 
 #[cfg(test)]
 static CALLGRAPH_BUILD_START_GATE: std::sync::OnceLock<
-    parking_lot::Mutex<Option<CallgraphBuildStartGate>>,
+    parking_lot::Mutex<BTreeMap<PathBuf, CallgraphBuildStartGate>>,
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
@@ -3160,13 +3402,20 @@ fn install_callgraph_build_start_gate(
 ) {
     let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    *CALLGRAPH_BUILD_START_GATE
-        .get_or_init(|| parking_lot::Mutex::new(None))
-        .lock() = Some(CallgraphBuildStartGate {
-        root,
-        reached: reached_tx,
-        release: release_rx,
-    });
+    let previous = CALLGRAPH_BUILD_START_GATE
+        .get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+        .lock()
+        .insert(
+            root,
+            CallgraphBuildStartGate {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+    assert!(
+        previous.is_none(),
+        "callgraph build-start gate already installed for root"
+    );
     (reached_rx, release_tx)
 }
 
@@ -3181,26 +3430,15 @@ pub(crate) fn install_callgraph_build_start_gate_for_test(
 }
 
 #[cfg(test)]
-static CALLGRAPH_BUILD_WAIT_MS_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-    std::sync::OnceLock::new();
-
-#[cfg(test)]
-pub(crate) struct CallgraphBuildWaitMsGuard {
-    _guard: std::sync::MutexGuard<'static, ()>,
-    previous: Option<std::ffi::OsString>,
+pub(crate) struct CallgraphBuildWaitMsGuard<'a> {
+    context: &'a AppContext,
+    previous: Option<Duration>,
 }
 
 #[cfg(test)]
-impl Drop for CallgraphBuildWaitMsGuard {
+impl Drop for CallgraphBuildWaitMsGuard<'_> {
     fn drop(&mut self) {
-        // SAFETY: serialized by CALLGRAPH_BUILD_WAIT_MS_LOCK for this guard's
-        // lifetime, and restored before the lock is released.
-        unsafe {
-            match &self.previous {
-                Some(value) => std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", value),
-                None => std::env::remove_var("AFT_CALLGRAPH_BUILD_WAIT_MS"),
-            }
-        }
+        *self.context.callgraph_build_wait_override.lock() = self.previous;
     }
 }
 
@@ -3303,34 +3541,28 @@ impl MaintenanceProbeLock {
     ];
 }
 
-/// Serialize test overrides of the query-op inline wait. Configure-tail tests
-/// share this with query-op tests so they cannot clobber each other's env.
+/// Override only this context's inline wait, including queries on helper threads.
+/// Mutating the environment would also change unrelated roots' query outcomes.
 #[cfg(test)]
-pub(crate) fn override_callgraph_build_wait_ms_for_test(ms: u64) -> CallgraphBuildWaitMsGuard {
-    let guard = crate::test_env::lock_test_mutex(
-        CALLGRAPH_BUILD_WAIT_MS_LOCK.get_or_init(|| std::sync::Mutex::new(())),
-    );
-    let previous = std::env::var_os("AFT_CALLGRAPH_BUILD_WAIT_MS");
-    // SAFETY: serialized by CALLGRAPH_BUILD_WAIT_MS_LOCK and restored on drop.
-    unsafe {
-        std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", ms.to_string());
-    }
-    CallgraphBuildWaitMsGuard {
-        _guard: guard,
-        previous,
-    }
+pub(crate) fn override_callgraph_build_wait_ms_for_test(
+    context: &AppContext,
+    ms: u64,
+) -> CallgraphBuildWaitMsGuard<'_> {
+    let previous = context
+        .callgraph_build_wait_override
+        .lock()
+        .replace(Duration::from_millis(ms));
+    CallgraphBuildWaitMsGuard { context, previous }
 }
 
 #[cfg(test)]
 fn wait_on_callgraph_build_start_gate(root: &Path) {
-    let mut slot = CALLGRAPH_BUILD_START_GATE
-        .get_or_init(|| parking_lot::Mutex::new(None))
-        .lock();
-    if !slot.as_ref().is_some_and(|gate| gate.root == root) {
-        return;
-    }
-    let gate = slot.take();
-    drop(slot);
+    // Remove only the worker's root, and release the registry lock before waiting
+    // so a held worker cannot prevent another root from reaching its own gate.
+    let gate = CALLGRAPH_BUILD_START_GATE
+        .get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+        .lock()
+        .remove(root);
     if let Some(gate) = gate {
         let _ = gate.reached.send(());
         let _ = gate.release.recv();
@@ -3410,6 +3642,9 @@ fn callgraph_build_wait_window() -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+// Retain the aggregate for integration harnesses compiled without cfg(test).
+// In-process unit tests use the context-local counter instead: resetting an
+// aggregate can erase another test's admission, and its workers can inflate it.
 static CALLGRAPH_COLD_BUILD_SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[doc(hidden)]
@@ -3423,6 +3658,24 @@ pub fn callgraph_cold_build_spawn_count_for_test() -> usize {
 }
 
 impl AppContext {
+    /// Register the owning handle without making the status worker retain a root.
+    pub(crate) fn bind_status_context(self: &Arc<Self>) {
+        *self.status_emitter.context.lock().unwrap() = Arc::downgrade(self);
+    }
+
+    pub fn signal_status_changed(&self) {
+        let context = self.status_emitter.context.lock().unwrap().clone();
+        if context.strong_count() > 0 {
+            self.status_emitter.signal_context(context);
+        } else {
+            // Stack-owned contexts are supported by the library API. Transport
+            // roots register their owning Arc before serving any requests.
+            if let Some(snapshot) = self.try_build_status_snapshot() {
+                self.status_emitter().signal(snapshot);
+            }
+        }
+    }
+
     pub fn new(provider: Box<dyn LanguageProvider>, config: Config) -> Self {
         Self::with_app_and_provider(App::default_shared(), provider, config)
     }
@@ -3437,6 +3690,8 @@ impl AppContext {
         provider: Box<dyn LanguageProvider>,
         config: Config,
     ) -> Self {
+        #[cfg(test)]
+        let config = app.isolate_test_config(config);
         let bash_compress_enabled = config.experimental_bash_compress;
         let watcher_counters = config
             .project_root
@@ -3503,6 +3758,7 @@ impl AppContext {
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             view_runtime: RwLock::new(None),
+            view_publication_retry: parking_lot::Mutex::new(Default::default()),
             deleted_view_root_retired: AtomicBool::new(false),
             #[cfg(test)]
             view_publication_attempts: AtomicUsize::new(0),
@@ -3516,6 +3772,10 @@ impl AppContext {
             callgraph_catch_up: Arc::default(),
             workspace_resolution_manifests: parking_lot::Mutex::new(None),
             callgraph_store_rx: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            callgraph_cold_build_spawn_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            callgraph_build_wait_override: parking_lot::Mutex::new(None),
             callgraph_store_rx_generation: AtomicU64::new(0),
             callgraph_store_rx_epoch: AtomicU64::new(0),
             callgraph_store_build_denied: parking_lot::Mutex::new(None),
@@ -3571,12 +3831,15 @@ impl AppContext {
             watcher: parking_lot::Mutex::new(None),
             watcher_rx: parking_lot::Mutex::new(None),
             watcher_drain_slice: parking_lot::Mutex::new(None),
+            watcher_drains_in_flight: AtomicUsize::new(0),
             watcher_thread: parking_lot::Mutex::new(None),
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
+            lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
+            lsp_pending_change_slot: Default::default(),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
             subc_lifecycle,
@@ -3589,7 +3852,9 @@ impl AppContext {
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
             database_runtime_state: AtomicU8::new(0),
             database_runtime_changed: tokio::sync::Notify::new(),
-            database_runtime_error: parking_lot::Mutex::new(None),
+            database_runtime_failure: parking_lot::Mutex::new(DatabaseRuntimeFailure::default()),
+            #[cfg(test)]
+            database_open_attempts: AtomicU64::new(0),
             database_open: parking_lot::Mutex::new(Default::default()),
             database_open_idle: parking_lot::Condvar::new(),
             parked_configure_tail: parking_lot::Mutex::new(None),
@@ -3640,13 +3905,35 @@ impl AppContext {
     /// checked before project scoping or tsconfig-membership work, so a cache hit
     /// faithfully reuses each category's presence or absence.
     pub fn status_bar_count_values(&self) -> StatusBarCountValues {
+        self.try_status_bar_count_values().unwrap_or_else(|| {
+            // Explicit status reads may still report independent Tier-2
+            // categories. Publishers use the try accessor and skip contention.
+            let tier2 = self
+                .status_bar_tier2
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            StatusBarCountValues {
+                errors: None,
+                warnings: None,
+                dead_code: tier2.dead_code,
+                unused_exports: tier2.unused_exports,
+                duplicates: tier2.duplicates,
+                todos: tier2.todos,
+                tier2_stale: tier2.stale,
+            }
+        })
+    }
+
+    /// A busy manager is not a missing diagnostic producer. Publishers must
+    /// leave their previous bar untouched and retry on a later signal.
+    pub(crate) fn try_status_bar_count_values(&self) -> Option<StatusBarCountValues> {
         let tier2 = self
             .status_bar_tier2
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let tsconfig_generation = self.tsconfig_membership.lock().generation();
-        let lsp = self.lsp_manager.lock();
+        let lsp = self.lsp_manager.try_lock()?;
         let diagnostics_generation = lsp.diagnostics_generation();
         let root = self
             .canonical_cache_root_opt()
@@ -3670,12 +3957,12 @@ impl AppContext {
                 && cached.tier2_generation == tier2.generation
                 && cached.tsconfig_generation == tsconfig_generation
             {
-                return mask_failed(
+                return Some(mask_failed(
                     cached
                         .counts
                         .clone()
                         .expect("a valid status-count cache carries truthful values"),
-                );
+                ));
             }
         }
 
@@ -3729,7 +4016,7 @@ impl AppContext {
             tsconfig_generation,
             counts: Some(counts.clone()),
         };
-        mask_failed(counts)
+        Some(mask_failed(counts))
     }
 
     /// Provides legacy numeric status-bar fields to callers that still require
@@ -4488,6 +4775,10 @@ impl AppContext {
         self.subc_lifecycle.is_unbound()
     }
 
+    pub(crate) fn try_subc_unbound_quiesced(&self) -> Option<bool> {
+        self.subc_lifecycle.try_is_bound().map(|bound| !bound)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_unbound_build_abandon_grace_for_test(&self, grace: Duration) {
         self.subc_lifecycle.set_abandon_grace_for_test(grace);
@@ -4626,6 +4917,17 @@ impl AppContext {
             // Contended: the manager is busy, so events may be queuing.
             None => true,
         }
+    }
+
+    /// A drain takes its continuation out of the slot while applying it, so
+    /// an empty slot alone does not prove that indexed answers are current.
+    pub fn watcher_query_has_pending_changes(&self) -> bool {
+        self.watcher_drains_in_flight.load(Ordering::Acquire) > 0 || self.watcher_drain_has_work()
+    }
+
+    pub(crate) fn watcher_drain_guard(&self) -> WatcherDrainGuard<'_> {
+        self.watcher_drains_in_flight.fetch_add(1, Ordering::AcqRel);
+        WatcherDrainGuard(&self.watcher_drains_in_flight)
     }
 
     pub fn completion_drains_have_work(&self) -> bool {
@@ -5484,6 +5786,11 @@ impl AppContext {
         self.database_open.lock().epoch
     }
 
+    #[cfg(test)]
+    pub(crate) fn note_database_open_attempt_for_test(&self) {
+        self.database_open_attempts.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn database_open_slot(
         &self,
     ) -> (
@@ -5514,26 +5821,46 @@ impl AppContext {
     }
 
     pub(crate) fn finish_database_runtime(&self, result: Result<(), String>) {
-        let success = result.is_ok();
-        *self.database_runtime_error.lock() = result.err();
-        self.database_runtime_state
-            .store(if success { 2 } else { 3 }, Ordering::Release);
-        self.database_runtime_changed.notify_waiters();
+        match result {
+            Ok(()) => {
+                *self.database_runtime_failure.lock() = DatabaseRuntimeFailure::default();
+                self.database_runtime_state.store(2, Ordering::Release);
+                self.database_runtime_changed.notify_waiters();
+            }
+            Err(error) => self.finish_database_runtime_error(error, false),
+        }
     }
 
     pub(crate) fn finish_database_runtime_error(&self, error: String, busy: bool) {
-        *self.database_runtime_error.lock() = Some(error);
+        let mut failure = self.database_runtime_failure.lock();
+        failure.record(error, busy);
         self.database_runtime_state
             .store(if busy { 4 } else { 3 }, Ordering::Release);
+        drop(failure);
         self.database_runtime_changed.notify_waiters();
     }
 
     pub fn claim_database_runtime_retry(&self, command: &str) -> bool {
-        crate::persistence_gate::requires_database(command)
-            && self
+        if !crate::persistence_gate::requires_database(command) {
+            return false;
+        }
+        if self.database_runtime_state.load(Ordering::Acquire) == 3 {
+            // Concurrent calls must neither queue on a retry nor start their
+            // own open. Only the claimant changes failed to initializing.
+            let Some(failure) = self.database_runtime_failure.try_lock() else {
+                return false;
+            };
+            if failure.retry_at.is_none_or(|at| Instant::now() < at) {
+                return false;
+            }
+            return self
                 .database_runtime_state
-                .compare_exchange(5, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+                .compare_exchange(3, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        }
+        self.database_runtime_state
+            .compare_exchange(5, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     pub fn retry_database_runtime(&self) {
@@ -5593,6 +5920,14 @@ impl AppContext {
         if !crate::persistence_gate::requires_database(command) {
             return None;
         }
+        // Some library callers enter this gate without transport admission.
+        // They get the same bounded reopen as standalone and daemon calls,
+        // never the bind's longer deferred initialization retry loop.
+        if self.database_runtime_state.load(Ordering::Acquire) == 3
+            && self.claim_database_runtime_retry(command)
+        {
+            self.retry_database_runtime();
+        }
         let failure;
         let (code, message, retryable) = match self.database_runtime_state.load(Ordering::Acquire) {
             1 => (
@@ -5606,16 +5941,21 @@ impl AppContext {
                 let _ = self.database_runtime_state.compare_exchange(4, 5, Ordering::AcqRel, Ordering::Acquire);
                 failure = format!(
                     "Project persistence is busy after bounded initialization retries: {}. Retry the tool shortly; no rebind is needed. No tool operation was performed.",
-                    self.database_runtime_error.lock().as_deref().unwrap_or("database busy")
+                    self.database_runtime_failure.lock().error.as_deref().unwrap_or("database busy")
                 );
                 ("database_unavailable", failure.as_str(), true)
             },
             3 => {
+                let state = self.database_runtime_failure.lock();
+                let remaining = state.retry_at.map_or(Duration::ZERO, |at| {
+                    at.saturating_duration_since(Instant::now())
+                });
                 failure = format!(
-                    "Project persistence could not be opened: {}. Read-only tools still work. Resolve the database error and rebind to retry. No tool operation was performed.",
-                    self.database_runtime_error.lock().as_deref().unwrap_or("unknown database error")
+                    "Project persistence could not be opened: {}. Read-only tools still work. AFT retries on the next persistence-requiring call after {} seconds; no rebind is needed. No tool operation was performed.",
+                    state.error.as_deref().unwrap_or("unknown database error"),
+                    remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0),
                 );
-                ("database_unavailable", failure.as_str(), false)
+                ("database_unavailable", failure.as_str(), true)
             },
             _ => return None,
         };
@@ -5713,6 +6053,8 @@ impl AppContext {
             let Some(next) = built else {
                 return false;
             };
+            #[cfg(test)]
+            let next = self.app.isolate_test_config(next);
             let next = Arc::new(next);
             // Compare the configured spelling, not a normalized equivalent:
             // that spelling is the memo key for containment-root resolution.
@@ -6204,6 +6546,7 @@ impl AppContext {
     }
 
     pub(crate) fn clear_view_runtime(&self) {
+        self.reset_view_publication_retry();
         self.checkout_driver.clear();
         self.checkout_semantic.clear();
         *self
@@ -6403,6 +6746,11 @@ impl AppContext {
             phase,
         )
         .map_err(|error| error.to_string())?;
+        // Missing members are valid deletions, but an absent checkout is not
+        // a valid empty view. It may have disappeared during the source walk.
+        if self.retire_deleted_view_root() {
+            return Err("view publication root was deleted".to_owned());
+        }
         let report = assembly.report();
         let view = crate::views::ViewStore::open(&snapshot.storage, &snapshot.scope)
             .map_err(|error| error.to_string())?;
@@ -6938,12 +7286,24 @@ impl AppContext {
     }
 
     pub(crate) fn record_checkout_watcher_change(&self, path: &Path) {
+        self.reset_view_publication_retry();
         if let Some(driver) = self.checkout_driver.get() {
             driver.record_absolute_change(path);
         }
         // The driver only records the change; the semantic view resolves it
         // on its worker after the quiet window.
         self.checkout_semantic.wake();
+    }
+
+    pub(crate) fn view_publication_retry(
+        &self,
+    ) -> &parking_lot::Mutex<crate::executor::view_publication::PublicationRetry> {
+        &self.view_publication_retry
+    }
+
+    pub(crate) fn reset_view_publication_retry(&self) {
+        let root = self.canonical_cache_root_opt().unwrap_or_default();
+        self.view_publication_retry.lock().reset(&root);
     }
 
     /// Activates a supplied, already loaded checkout runtime for this root.
@@ -6998,6 +7358,19 @@ impl AppContext {
         outcome
     }
 
+    #[cfg(test)]
+    pub(crate) fn callgraph_cold_build_spawn_count_for_test(&self) -> usize {
+        self.callgraph_cold_build_spawn_count.load(Ordering::SeqCst)
+    }
+
+    fn callgraph_build_wait_window(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(wait) = *self.callgraph_build_wait_override.lock() {
+            return wait;
+        }
+        callgraph_build_wait_window()
+    }
+
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
         let active = self
             .checkout_query_runtime
@@ -7007,7 +7380,7 @@ impl AppContext {
         self.callgraph_store_for_ops_with_wait(if active {
             crate::views::contracts::CALLGRAPH_QUERY_WAIT
         } else {
-            callgraph_build_wait_window()
+            self.callgraph_build_wait_window()
         })
     }
 
@@ -7046,6 +7419,9 @@ impl AppContext {
             };
             return match runtime.callgraph.reader(&runtime.access, snapshot) {
                 Ok(reader) => CallgraphStoreAccess::Ready(Arc::clone(&reader.store)),
+                Err(error) if error.reason == crate::views::read::CALLGRAPH_DISABLED => {
+                    CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
+                }
                 Err(_) => CallgraphStoreAccess::Building,
             };
         }
@@ -7075,6 +7451,14 @@ impl AppContext {
                         Err(error) => CallgraphStoreAccess::Error(error),
                     };
                 }
+            }
+            // The detached standalone view publication owns this graph. A query
+            // before installation must disclose loading, not start a legacy
+            // graph on stdin. Daemon and in-process warmers keep their fallback.
+            if self.daemonless_query_mode()
+                && (self.git_common_dir().is_some() || self.view_runtime_snapshot().is_some())
+            {
+                return CallgraphStoreAccess::Building;
             }
         }
         let operation_generation = self.configure_generation();
@@ -7516,6 +7900,9 @@ impl AppContext {
         let persist_epoch_flag = self.callgraph_persist_epoch_flag();
 
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        self.callgraph_cold_build_spawn_count
+            .fetch_add(1, Ordering::SeqCst);
         let lifecycle = self.subc_lifecycle.clone();
 
         std::thread::spawn(move || {
@@ -8851,6 +9238,10 @@ impl AppContext {
     }
 
     pub fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
+        // Queries sample status before deciding whether semantic search can
+        // run. Wake a failed views-on lane here, even when no runtime exists
+        // yet; status polling shares the same rate limit as interactive queries.
+        self.checkout_semantic.request_retry();
         self.semantic_index_status.as_ref()
     }
 
@@ -9952,13 +10343,27 @@ impl AppContext {
 
     /// Notify LSP servers that a file was written.
     /// Call this after write_format_validate in command handlers.
+    /// A busy manager queues the change rather than dropping it.
     pub fn lsp_notify_file_changed(&self, file_path: &Path, content: &str) {
         let config = self.config();
-        if let Some(mut lsp) = self.lsp_manager.try_lock() {
-            if let Err(e) = lsp.notify_file_changed_if_running(file_path, content, &config) {
-                crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
-            }
-        }
+        crate::lsp::pending_changes::send_or_queue_lsp_change(
+            &self.lsp_manager,
+            &self.lsp_pending_change_slot,
+            Arc::clone(&config),
+            |lsp| {
+                if let Err(e) = lsp.notify_file_changed_if_running(file_path, content, &config) {
+                    crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
+                }
+            },
+            |pending| pending.queue_document(file_path, false),
+        );
+    }
+
+    /// Whether document or configuration-file changes are still queued for
+    /// the LSP manager.
+    #[doc(hidden)]
+    pub fn lsp_pending_changes_for_test(&self) -> bool {
+        self.lsp_pending_change_slot.lock().is_some()
     }
 
     /// Forward paths the project file watcher saw change to the language
@@ -10108,19 +10513,26 @@ impl AppContext {
         };
 
         let config = self.config();
-        if let Some(mut lsp) = self.lsp_manager.try_lock() {
-            if let Err(err) = lsp.notify_file_changed(file_path, &content, &config) {
-                crate::slog_warn!(
-                    "LSP resync failed for {} after external edit: {}",
-                    file_path.display(),
-                    err
-                );
-                return false;
-            }
-            true
-        } else {
-            false
-        }
+        let mut sent = true;
+        // A busy manager queues the resync (delivered with the file's
+        // contents at that time) instead of dropping it.
+        crate::lsp::pending_changes::send_or_queue_lsp_change(
+            &self.lsp_manager,
+            &self.lsp_pending_change_slot,
+            Arc::clone(&config),
+            |lsp| {
+                if let Err(err) = lsp.notify_file_changed(file_path, &content, &config) {
+                    crate::slog_warn!(
+                        "LSP resync failed for {} after external edit: {}",
+                        file_path.display(),
+                        err
+                    );
+                    sent = false;
+                }
+            },
+            |pending| pending.queue_document(file_path, true),
+        );
+        sent
     }
 
     /// Notify LSP and optionally wait for diagnostics.
@@ -10139,9 +10551,92 @@ impl AppContext {
         timeout: std::time::Duration,
     ) -> crate::lsp::manager::PostEditWaitOutcome {
         let config = self.config();
-        let Some(mut lsp) = self.lsp_manager.try_lock() else {
-            return crate::lsp::manager::PostEditWaitOutcome::default();
+        let timeout = timeout.min(Duration::from_secs(10));
+        let pending = crate::lsp::manager::PostEditWaitOutcome {
+            pending_servers: crate::lsp::manager::expected_server_keys_for_file(file_path, &config),
+            ..Default::default()
         };
+        if pending.pending_servers.is_empty() {
+            return pending;
+        }
+        if timeout.is_zero()
+            || self
+                .lsp_post_edit_worker_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            crate::lsp::pending_changes::queue_lsp_change(
+                &self.lsp_manager,
+                &self.lsp_pending_change_slot,
+                config,
+                |pending| pending.queue_document(file_path, !timeout.is_zero()),
+            );
+            return pending;
+        }
+
+        // The executor's writer slot waits only for this fixed budget. Cold
+        // initialization and manager reacquisition can otherwise extend a
+        // diagnostics wait even when the channel wait itself is lock-free.
+        struct RunningCollector(Arc<AtomicBool>);
+        impl Drop for RunningCollector {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let running = RunningCollector(Arc::clone(&self.lsp_post_edit_worker_running));
+        let manager = Arc::clone(&self.lsp_manager);
+        let slot = Arc::clone(&self.lsp_pending_change_slot);
+        let file_path = file_path.to_path_buf();
+        let content = content.to_string();
+        let deadline = Instant::now() + timeout;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        if let Err(err) = std::thread::Builder::new()
+            .name("aft-lsp-post-edit".into())
+            .spawn(move || {
+                let outcome = Self::lsp_collect_post_edit_diagnostics(
+                    &manager, &slot, config, &file_path, &content, deadline,
+                );
+                // Release before sending: a sequential caller must not mistake
+                // the completed collector for an overlapping edit.
+                drop(running);
+                let _ = tx.send(outcome);
+            })
+        {
+            crate::slog_warn!("could not start post-edit diagnostics collector: {err}");
+            return pending;
+        }
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(pending)
+    }
+
+    fn lsp_collect_post_edit_diagnostics(
+        manager: &Arc<parking_lot::Mutex<LspManager>>,
+        slot: &crate::lsp::pending_changes::PendingLspChangeSlot,
+        config: Arc<Config>,
+        file_path: &Path,
+        content: &str,
+        deadline: Instant,
+    ) -> crate::lsp::manager::PostEditWaitOutcome {
+        crate::lsp::manager::start_servers_for_file_unlocked(|| manager.lock(), file_path, &config);
+        let locked = manager.try_lock_for(deadline.saturating_duration_since(Instant::now()));
+        if locked.is_none() || Instant::now() >= deadline {
+            drop(locked);
+            // Do not send captured contents after the caller timed out: a
+            // newer edit may already be on disk. The backlog reads it afresh.
+            crate::lsp::pending_changes::queue_lsp_change(
+                manager,
+                slot,
+                Arc::clone(&config),
+                |pending| pending.queue_document(file_path, true),
+            );
+            return crate::lsp::manager::PostEditWaitOutcome {
+                pending_servers: crate::lsp::manager::expected_server_keys_for_file(
+                    file_path, &config,
+                ),
+                ..Default::default()
+            };
+        }
+        let mut lsp = locked.expect("manager lock acquired before deadline");
 
         // Clear any queued notifications before this write so the wait loop only
         // observes diagnostics triggered by the current change.
@@ -10160,7 +10655,18 @@ impl AppContext {
             Ok(v) => v,
             Err(e) => {
                 crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
-                return crate::lsp::manager::PostEditWaitOutcome::default();
+                let pending_servers =
+                    crate::lsp::manager::expected_server_keys_for_file(file_path, &config);
+                let unresponsive_servers = pending_servers
+                    .iter()
+                    .filter(|key| lsp.producer_failure(key) == Some("server not responding"))
+                    .cloned()
+                    .collect();
+                return crate::lsp::manager::PostEditWaitOutcome {
+                    pending_servers,
+                    unresponsive_servers,
+                    ..Default::default()
+                };
             }
         };
 
@@ -10176,13 +10682,12 @@ impl AppContext {
         // The manager lock is released while servers work on the pull; the
         // wait registered below re-checks the store, so a publish another
         // drain consumed in the meantime is not missed.
-        let diagnostics_deadline = Instant::now() + timeout;
         drop(lsp);
         if let Err(err) = crate::lsp::manager::pull_file_diagnostics_unlocked(
-            || self.lsp_manager.lock(),
+            || manager.lock(),
             file_path,
             &config,
-            Some(timeout),
+            Some(deadline.saturating_duration_since(Instant::now())),
         ) {
             crate::slog_warn!(
                 "post-edit LSP diagnostic pull failed for {}: {}",
@@ -10190,8 +10695,8 @@ impl AppContext {
                 err
             );
         }
-        let mut lsp = self.lsp_manager.lock();
-        let remaining = diagnostics_deadline.saturating_duration_since(Instant::now());
+        let mut lsp = manager.lock();
+        let remaining = deadline.saturating_duration_since(Instant::now());
 
         // Register the wake receiver while the manager is still locked. Events
         // that raced with registration remain on the raw receiver; events won by
@@ -10209,13 +10714,11 @@ impl AppContext {
             // Waiting on channel activity does not require access to manager
             // state, so other LSP operations can continue their bookkeeping.
             let event = wait.next_event();
-            let mut lsp = self.lsp_manager.lock();
+            let mut lsp = manager.lock();
             complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, event);
         }
 
-        self.lsp_manager
-            .lock()
-            .finish_post_edit_diagnostics_wait(wait)
+        manager.lock().finish_post_edit_diagnostics_wait(wait)
     }
 
     /// Collect custom server root_markers from user config for use in
@@ -10325,11 +10828,17 @@ impl AppContext {
         }
 
         let config = self.config();
-        if let Some(mut lsp) = self.lsp_manager.try_lock() {
-            if let Err(e) = lsp.notify_files_watched_changed(config_paths, &config) {
-                crate::slog_warn!("watched-file sync error: {}", e);
-            }
-        }
+        crate::lsp::pending_changes::send_or_queue_lsp_change(
+            &self.lsp_manager,
+            &self.lsp_pending_change_slot,
+            Arc::clone(&config),
+            |lsp| {
+                if let Err(e) = lsp.notify_files_watched_changed(config_paths, &config) {
+                    crate::slog_warn!("watched-file sync error: {}", e);
+                }
+            },
+            |pending| pending.queue_watched(config_paths),
+        );
     }
 
     pub fn lsp_notify_watched_config_file(&self, file_path: &Path, change_type: FileChangeType) {
@@ -10983,6 +11492,60 @@ mod subc_lifecycle_admission_tests {
     use super::*;
 
     #[test]
+    fn cancellation_hint_preserves_grace_and_rebind_decisions() {
+        let admission = SubcLifecycleAdmission::default();
+        let worker = admission.clone();
+        let generation = AtomicU64::new(0);
+        let cancelled = std::cell::Cell::new(false);
+        worker.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(!cancelled.get(), "bound roots must keep running");
+
+        admission.set_abandon_grace_for_test(Duration::from_secs(600));
+        admission.mark_unbound(&generation);
+        worker.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(
+            !cancelled.get(),
+            "a short unbind must preserve the grace window"
+        );
+
+        // Expire the grace window without sleeping or advancing the unrelated
+        // filesystem probe. A shared lifecycle sees expiry at its next check.
+        *admission.unbound_since.lock() = Some(Instant::now() - Duration::from_secs(601));
+        worker.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(
+            cancelled.replace(false),
+            "expired unbound roots must cancel"
+        );
+
+        admission.mark_bound();
+        worker.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(!cancelled.get(), "rebind must clear the cancellation hint");
+
+        admission.set_abandon_grace_for_test(Duration::ZERO);
+        admission.mark_unbound(&generation);
+        worker.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(cancelled.get(), "a second unbind must publish a fresh hint");
+    }
+
+    #[test]
+    fn cancellation_hint_never_overrides_synchronized_rebind() {
+        let admission = SubcLifecycleAdmission::default();
+        let generation = AtomicU64::new(0);
+        admission.set_abandon_grace_for_test(Duration::ZERO);
+        admission.mark_unbound(&generation);
+        admission.mark_bound();
+        // A worker may have loaded the previous true hint just before rebind.
+        // The admission lock's bound state remains the authoritative decision.
+        admission.unbound_hint.store(true, Ordering::Release);
+        let cancelled = std::cell::Cell::new(false);
+        admission.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(
+            !cancelled.get(),
+            "a stale hint must not cancel a rebound root"
+        );
+    }
+
+    #[test]
     fn route_teardown_does_not_supersede_disk_artifact_compatibility() {
         let ctx = AppContext::new(default_language_provider_factory(), Config::default());
         ctx.note_configure_warm_key("config-a".to_string(), false);
@@ -11060,6 +11623,49 @@ mod subc_lifecycle_admission_tests {
                 .is_none(),
             "worker starts after unbind must be denied"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn lifecycle_gate_recursive_acquisition_panics_instead_of_parking() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let admission = SubcLifecycleAdmission::default();
+            let generation = AtomicU64::new(11);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                admission.run_if_current(&generation, 11, || {
+                    // A clone must not bypass the same-thread ownership marker.
+                    admission.clone().is_bound();
+                });
+            }));
+            tx.send(result).unwrap();
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recursive acquisition must panic before parking on the lifecycle mutex");
+        worker.join().unwrap();
+        let panic = result.expect_err("recursive acquisition was accepted");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied());
+        assert_eq!(message, Some("recursive root lifecycle lock acquisition"));
+    }
+
+    #[test]
+    fn lifecycle_gate_marker_allows_other_roots_and_cleans_up_after_unwind() {
+        let admission = SubcLifecycleAdmission::default();
+        let other = SubcLifecycleAdmission::default();
+        let generation = AtomicU64::new(11);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            admission.run_if_current(&generation, 11, || {
+                assert!(other.is_bound());
+                assert_eq!(admission.try_is_bound(), None);
+                panic!("unwind admission");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(admission.is_bound());
     }
 
     #[test]
@@ -11594,12 +12200,12 @@ mod callgraph_store_for_ops_tests {
     use std::sync::Barrier;
     use tempfile::TempDir;
 
-    fn callgraph_build_wait_ms(ms: u64) -> super::CallgraphBuildWaitMsGuard {
-        super::override_callgraph_build_wait_ms_for_test(ms)
+    fn callgraph_build_wait_ms(ctx: &AppContext, ms: u64) -> super::CallgraphBuildWaitMsGuard<'_> {
+        super::override_callgraph_build_wait_ms_for_test(ctx, ms)
     }
 
-    fn force_async_callgraph_builds() -> super::CallgraphBuildWaitMsGuard {
-        callgraph_build_wait_ms(0)
+    fn force_async_callgraph_builds(ctx: &AppContext) -> super::CallgraphBuildWaitMsGuard<'_> {
+        callgraph_build_wait_ms(ctx, 0)
     }
 
     /// Returns the project and storage directories with the context that uses
@@ -11626,6 +12232,95 @@ mod callgraph_store_for_ops_tests {
             },
         ));
         ([project, storage], ctx)
+    }
+
+    #[test]
+    fn callgraph_build_wait_override_is_per_context_and_reaches_query_threads() {
+        let (_first_dirs, first) = cold_build_context();
+        let (_second_dirs, second) = cold_build_context();
+        let original = first.callgraph_build_wait_window();
+        let first_wait = callgraph_build_wait_ms(&first, 30_000);
+        let _second_wait = force_async_callgraph_builds(&second);
+
+        let query_ctx = Arc::clone(&first);
+        assert_eq!(
+            std::thread::spawn(move || query_ctx.callgraph_build_wait_window())
+                .join()
+                .expect("query thread"),
+            Duration::from_secs(30),
+            "another root's async policy must not change this root's query wait"
+        );
+        assert_eq!(second.callgraph_build_wait_window(), Duration::ZERO);
+        {
+            let _nested_wait = callgraph_build_wait_ms(&first, 50);
+            assert_eq!(
+                first.callgraph_build_wait_window(),
+                Duration::from_millis(50)
+            );
+        }
+        assert_eq!(first.callgraph_build_wait_window(), Duration::from_secs(30));
+        drop(first_wait);
+        assert_eq!(first.callgraph_build_wait_window(), original);
+        assert_eq!(second.callgraph_build_wait_window(), Duration::ZERO);
+    }
+
+    #[test]
+    fn callgraph_cold_build_spawn_count_is_per_context() {
+        let (_first_dirs, first) = cold_build_context();
+        let (_second_dirs, second) = cold_build_context();
+        let _first_wait = force_async_callgraph_builds(&first);
+        let _second_wait = force_async_callgraph_builds(&second);
+        first.isolate_cold_build_limiter_for_test(1);
+        second.isolate_cold_build_limiter_for_test(1);
+
+        assert!(matches!(
+            first.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        assert_eq!(second.callgraph_cold_build_spawn_count_for_test(), 0);
+        assert!(matches!(
+            second.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        assert_eq!(first.callgraph_cold_build_spawn_count_for_test(), 1);
+        assert_eq!(second.callgraph_cold_build_spawn_count_for_test(), 1);
+
+        for ctx in [&first, &second] {
+            let events = ctx
+                .callgraph_store_rx()
+                .lock()
+                .take()
+                .expect("build receiver");
+            events
+                .recv_timeout(Duration::from_secs(30))
+                .expect("worker settles");
+        }
+    }
+
+    #[test]
+    fn callgraph_build_start_gates_are_per_root() {
+        let first = TempDir::new().expect("first root");
+        let second = TempDir::new().expect("second root");
+        let (first_reached, first_release) =
+            install_callgraph_build_start_gate(first.path().into());
+        let (second_reached, second_release) =
+            install_callgraph_build_start_gate(second.path().into());
+        let workers = [first.path(), second.path()].map(|root| {
+            let root = root.to_path_buf();
+            std::thread::spawn(move || wait_on_callgraph_build_start_gate(&root))
+        });
+
+        first_reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("installing a second root's gate must not discard the first root's gate");
+        second_reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a held first root must not prevent the second root reaching its gate");
+        first_release.send(()).expect("release first root");
+        second_release.send(()).expect("release second root");
+        for worker in workers {
+            worker.join().expect("gated worker");
+        }
     }
 
     fn with_fake_home_env<R>(home: &Path, f: impl FnOnce() -> R) -> R {
@@ -11713,7 +12408,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn home_root_gate_blocks_callgraph_store_entry_points() {
-        let _wait_guard = force_async_callgraph_builds();
         let home = TempDir::new().expect("home tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         let source_dir = home.path().join("src");
@@ -11726,6 +12420,7 @@ mod callgraph_store_for_ops_tests {
 
         with_fake_home_env(home.path(), || {
             let ctx = configure_context(home.path(), storage.path());
+            let _wait_guard = force_async_callgraph_builds(&ctx);
             assert!(
                 !ctx.heavy_root_work_allowed(),
                 "HOME root configure must close the heavy-root-work gate"
@@ -11762,7 +12457,6 @@ mod callgraph_store_for_ops_tests {
                 "HOME root health must not advertise callgraph building"
             );
 
-            reset_callgraph_cold_build_spawn_count_for_test();
             assert!(matches!(
                 ctx.callgraph_store_for_ops(),
                 CallgraphStoreAccess::Unavailable
@@ -11774,7 +12468,7 @@ mod callgraph_store_for_ops_tests {
                 "shared gate must also block synchronous standalone callgraph builds"
             );
             assert_eq!(
-                callgraph_cold_build_spawn_count_for_test(),
+                ctx.callgraph_cold_build_spawn_count_for_test(),
                 0,
                 "HOME root gate must not spawn a cold callgraph build"
             );
@@ -11841,9 +12535,8 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn non_home_root_still_allows_callgraph_cold_builds() {
-        let _env_guard = force_async_callgraph_builds();
-        reset_callgraph_cold_build_spawn_count_for_test();
         let (_ctx_dirs, ctx) = cold_build_context();
+        let _wait_guard = force_async_callgraph_builds(&ctx);
 
         assert!(ctx.heavy_root_work_allowed());
         assert!(matches!(
@@ -11851,7 +12544,7 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Building | CallgraphStoreAccess::Ready(_)
         ));
         assert_eq!(
-            callgraph_cold_build_spawn_count_for_test(),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "non-home roots must still be able to cold-build the callgraph store"
         );
@@ -11869,9 +12562,8 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn semantic_ready_event_resumes_tier2_without_rescheduling_callgraph() {
-        let _env_guard = force_async_callgraph_builds();
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let (_ctx_dirs, ctx) = cold_build_context();
+        let _wait_guard = force_async_callgraph_builds(&ctx);
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.semantic_index_rx().lock() = Some(rx);
         ctx.schedule_semantic_cold_seed_gate_for_configure();
@@ -11881,7 +12573,7 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Building
         ));
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "the semantic cold seed must not block callgraph admission"
         );
@@ -11901,7 +12593,7 @@ mod callgraph_store_for_ops_tests {
             "semantic Ready must resume deferred Tier-2 work"
         );
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "semantic Ready must not schedule a duplicate callgraph warm"
         );
@@ -11918,9 +12610,8 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn semantic_gate_cleared_event_resumes_tier2_without_rescheduling_callgraph() {
-        let _env_guard = force_async_callgraph_builds();
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let (_ctx_dirs, ctx) = cold_build_context();
+        let _wait_guard = force_async_callgraph_builds(&ctx);
         ctx.schedule_semantic_cold_seed_gate_for_configure();
 
         assert!(matches!(
@@ -11928,7 +12619,7 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Building
         ));
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "the semantic cold seed must not block callgraph admission"
         );
@@ -11943,7 +12634,7 @@ mod callgraph_store_for_ops_tests {
             "cached-load or retry-wait clear must resume deferred Tier-2 work"
         );
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "clearing the semantic gate must not schedule a duplicate callgraph warm"
         );
@@ -11960,9 +12651,8 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn semantic_cold_seed_gate_allows_callgraph_cold_spawn_immediately() {
-        let _env_guard = force_async_callgraph_builds();
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let (_ctx_dirs, ctx) = cold_build_context();
+        let _wait_guard = force_async_callgraph_builds(&ctx);
 
         ctx.set_semantic_cold_seed_active_for_test(true);
         assert!(matches!(
@@ -11970,14 +12660,14 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Building
         ));
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "callgraph navigation must start while the semantic cold seed is active"
         );
 
         ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "clearing the semantic cold gate must not schedule a second callgraph warm"
         );
@@ -12155,7 +12845,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn query_wait_joins_callgraph_build_scheduled_without_wait() {
-        let _env_guard = callgraph_build_wait_ms(10_000);
         let project = TempDir::new().expect("project tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
@@ -12171,6 +12860,7 @@ mod callgraph_store_for_ops_tests {
                 ..Config::default()
             },
         ));
+        let _wait_guard = callgraph_build_wait_ms(&ctx, 10_000);
         let (reached, release) = install_callgraph_build_start_gate(project_root);
 
         assert!(matches!(
@@ -12272,7 +12962,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn callgraph_cold_build_stops_at_next_fence_when_root_is_abandoned_past_grace() {
-        let _env_guard = callgraph_build_wait_ms(10_000);
         let (ctx, _project, _storage, project_root, release, events) =
             gated_callgraph_cold_build(Duration::ZERO);
         let census = ctx.cold_build_limiter().census();
@@ -12297,7 +12986,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn callgraph_cold_build_continues_through_unbind_inside_grace() {
-        let _env_guard = callgraph_build_wait_ms(10_000);
         let (ctx, _project, _storage, _project_root, release, events) =
             gated_callgraph_cold_build(Duration::from_secs(600));
 
@@ -12316,7 +13004,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn inline_wait_settled_event_clears_superseded_receiver() {
-        let _env_guard = callgraph_build_wait_ms(2_000);
         let project = TempDir::new().expect("project tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
@@ -12330,6 +13017,7 @@ mod callgraph_store_for_ops_tests {
                 ..Config::default()
             },
         ));
+        let _wait_guard = callgraph_build_wait_ms(&ctx, 2_000);
         let (reached, release) = install_callgraph_build_start_gate(project_root);
         let request_ctx = Arc::clone(&ctx);
         let request = std::thread::spawn(move || request_ctx.callgraph_store_for_ops());
@@ -12797,8 +13485,53 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
+    fn views_legacy_refresh_ignores_busy_process_worker() {
+        // Only the process-worker control needs this lock: refresh-worker tests
+        // shut that worker down or hold its queue while exercising exit paths.
+        let _guard = crate::callgraph_store::REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            crate::callgraph_store::flush_callgraph_store_refreshes_with_budget(
+                Duration::from_secs(12)
+            )
+        );
+        let (_busy_dirs, busy_ctx) = cold_build_context();
+        let busy_root = std::fs::canonicalize(busy_ctx.config().project_root.as_ref().unwrap())
+            .expect("canonical busy root");
+        let family = crate::search_index::artifact_cache_key(&busy_root);
+        crate::root_cache::configure_artifact_access(&busy_root, &family, false);
+        busy_ctx.set_canonical_cache_root(busy_root.clone());
+        busy_ctx
+            .ensure_callgraph_store()
+            .expect("busy root callgraph build")
+            .expect("busy root callgraph reader");
+        let (held, release) =
+            crate::callgraph_store::install_callgraph_refresh_worker_test_gate(busy_root.clone());
+        assert!(busy_ctx.enqueue_callgraph_store_refresh([busy_root.join("src/lib.rs")]));
+        held.recv_timeout(Duration::from_secs(12))
+            .expect("process worker must be held on the unrelated root");
+
+        // Exercise the entire migration window while another root cannot finish
+        // its refresh. A views fixture must not inherit that queue's backlog.
+        views_first_publication_retires_legacy_after_migration_window();
+
+        release.send(()).expect("release busy process worker");
+        assert!(
+            crate::callgraph_store::flush_callgraph_store_refreshes_with_budget(
+                Duration::from_secs(12)
+            )
+        );
+    }
+
+    #[test]
     fn views_first_publication_retires_legacy_after_migration_window() {
         let fixture = ViewsCallgraphFixture::new();
+        // Process-worker tests hold unrelated roots and shut down the shared
+        // queue. Keep this root's migration refreshes on a fixture-owned worker.
+        let worker = crate::callgraph_store::isolated_callgraph_refresh_worker_for_test(
+            fixture.root.clone(),
+        );
         crate::runtime_drain::reset_legacy_watcher_refreshes_for_test();
         crate::runtime_drain::refresh_callgraph_store_for_watcher(
             &fixture.ctx,
@@ -12808,6 +13541,10 @@ mod callgraph_store_for_ops_tests {
             crate::runtime_drain::legacy_watcher_refreshes_for_test(),
             1,
             "legacy refresh must remain active before the first publication"
+        );
+        assert!(
+            worker.wait(Duration::from_secs(12)),
+            "legacy refresh worker hung"
         );
         let legacy_response = fixture.callers();
         assert!(legacy_response.success, "{legacy_response:?}");
@@ -12846,18 +13583,16 @@ mod callgraph_store_for_ops_tests {
             1,
             "disabling views must enqueue legacy refresh again"
         );
-        let deadline = Instant::now() + Duration::from_secs(12);
-        loop {
-            let response = fixture.callers();
-            if response.success && response.data["total_callers"] == 2 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "views-off legacy refresh did not converge: {response:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            worker.wait(Duration::from_secs(12)),
+            "views-off legacy refresh worker hung"
+        );
+        let response = fixture.callers();
+        assert!(response.success, "{response:?}");
+        assert_eq!(
+            response.data["total_callers"], 2,
+            "views-off legacy refresh did not converge: {response:?}"
+        );
     }
 
     #[test]
@@ -13265,10 +14000,8 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn writer_denied_callgraph_build_is_terminal_not_building() {
-        let _env_guard = callgraph_build_wait_ms(30_000);
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
-
         let (_denied_ctx_dirs, denied_ctx) = cold_build_context();
+        let _denied_wait_guard = callgraph_build_wait_ms(&denied_ctx, 30_000);
         let denied_reason = match denied_ctx.callgraph_store_for_ops() {
             CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason)) => reason,
             CallgraphStoreAccess::Building => {
@@ -13286,7 +14019,7 @@ mod callgraph_store_for_ops_tests {
                 if reason.contains("could not acquire writer capability")
         ));
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            denied_ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "polling a denied root must not spawn another doomed build"
         );
@@ -13294,6 +14027,7 @@ mod callgraph_store_for_ops_tests {
         // Control case: granting the artifact-access capability installed by
         // `configure_artifact_access` should change this cold build from denied to ready.
         let (_writable_ctx_dirs, writable_ctx) = cold_build_context();
+        let _writable_wait_guard = callgraph_build_wait_ms(&writable_ctx, 30_000);
         let writable_root = writable_ctx
             .config()
             .project_root
@@ -13312,9 +14046,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn concurrent_cold_callgraph_store_for_ops_spawns_one_build() {
-        let _env_guard = force_async_callgraph_builds();
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
-
         let project = TempDir::new().expect("project tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         let source_dir = project.path().join("src");
@@ -13335,6 +14066,7 @@ mod callgraph_store_for_ops_tests {
             },
         ));
 
+        let _wait_guard = force_async_callgraph_builds(&ctx);
         let barrier = Arc::new(Barrier::new(3));
         let handles = (0..2)
             .map(|_| {
@@ -13359,7 +14091,7 @@ mod callgraph_store_for_ops_tests {
         }
 
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "concurrent cold callers must share one background build"
         );
@@ -13633,6 +14365,107 @@ mod callgraph_store_for_ops_tests {
 mod status_emitter_tests {
     use super::*;
     use crate::parser::TreeSitterProvider;
+
+    #[test]
+    fn status_signal_burst_builds_one_snapshot() {
+        let (ctx, rx) = ctx_with_frame_rx();
+        let ctx = Arc::new(ctx);
+        ctx.bind_status_context();
+        for _ in 0..12 {
+            ctx.signal_status_changed();
+        }
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("status changed");
+        assert_eq!(
+            ctx.status_emitter.snapshot_builds.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn status_counts_do_not_acquire_a_held_lsp_manager() {
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(PathBuf::from("/proj")),
+                ..Config::default()
+            },
+        ));
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        ctx.lsp().diagnostics_store_mut_for_test().publish(
+            crate::lsp::roots::ServerKey {
+                kind: crate::lsp::registry::ServerKind::Rust,
+                root: PathBuf::from("/proj"),
+            },
+            PathBuf::from("/proj/main.rs"),
+            vec![],
+        );
+        let (client, mut fleet_rx) = crate::fleet_status::FleetStatusClient::dial_channel(2);
+        ctx.install_fleet_status_client(Some(client));
+        let mut first = String::from("first");
+        let mut response = crate::protocol::Response::success("status", serde_json::json!({}));
+        crate::response_finalize::finalize_tool_response(
+            &mut response,
+            &mut first,
+            &ctx,
+            "s",
+            "read",
+            false,
+        );
+        assert!(first.contains("D1 U2 C3"));
+        assert!(first.contains("E0 W0"));
+        fleet_rx
+            .try_recv()
+            .expect("initial fleet publish")
+            .complete_unavailable();
+        ctx.update_status_bar_tier2(Some(9), Some(2), Some(3), Some(4), false);
+        let held = ctx.lsp();
+        let worker_ctx = Arc::clone(&ctx);
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let counts_unavailable = worker_ctx.try_status_bar_count_values().is_none();
+            let push_unavailable = worker_ctx.try_build_status_snapshot().is_none();
+            let mut text = String::from("file contents");
+            crate::response_finalize::finalize_tool_response(
+                &mut response,
+                &mut text,
+                &worker_ctx,
+                "s",
+                "read",
+                false,
+            );
+            tx.send((text, counts_unavailable, push_unavailable))
+                .unwrap();
+        });
+        let values = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        worker.join().unwrap();
+        let (text, counts_unavailable, push_unavailable) =
+            values.expect("status counts must not acquire a contended manager");
+        assert!(counts_unavailable && push_unavailable);
+        assert!(
+            fleet_rx.try_recv().is_err(),
+            "a contended publish must not clear the fleet segment"
+        );
+        assert_eq!(
+            text, "file contents",
+            "contention must leave the previous bar alone"
+        );
+        let mut retry = String::from("next signal");
+        let mut response = crate::protocol::Response::success("retry", serde_json::json!({}));
+        crate::response_finalize::finalize_tool_response(
+            &mut response,
+            &mut retry,
+            &ctx,
+            "s",
+            "read",
+            false,
+        );
+        assert!(
+            retry.contains("D9 U2 C3"),
+            "a skipped emission must not consume the change"
+        );
+    }
 
     fn ctx_with_frame_rx() -> (AppContext, mpsc::Receiver<PushFrame>) {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
@@ -14314,6 +15147,7 @@ mod harness_path_tests {
 
     #[test]
     fn bash_tasks_dir_uses_hash_session() {
+        let _storage_env = crate::test_env::without_storage_override();
         let storage = PathBuf::from("/tmp/cortexkit/aft");
         let ctx = ctx_with_storage_and_harness(storage.clone(), Harness::Opencode);
 
@@ -14389,7 +15223,7 @@ mod harness_path_tests {
         );
         assert_eq!(
             ctx.inspect_dir(),
-            storage
+            ctx.storage_dir()
                 .join("inspect")
                 .join(crate::path_identity::project_scope_key(&root))
         );
@@ -14416,6 +15250,283 @@ mod shared_db_tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn failed_database_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+        // Each context owns its storage fixture. A process-wide override would
+        // redirect unrelated contexts while libtest runs them in parallel.
+        let storage = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let path = storage.path().join("aft.db");
+        let conn = crate::db::open(&path).unwrap();
+        conn.execute(
+            "UPDATE schema_version SET version = ?1",
+            [crate::db::CURRENT_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+        drop(conn);
+        let ctx = AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "database-recovery".into(),
+        );
+        crate::database_open::run_staged_open(
+            &ctx,
+            crate::database_open::DatabaseOpenRunner::ConfigureTail,
+            true,
+        );
+        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 3);
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+        let response = ctx.database_runtime_refusal("failed", "bash").unwrap();
+        assert!(serde_json::to_value(response).unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("storage_requires_newer_reader"));
+        assert!(ctx.db().is_none());
+        (storage, root, ctx)
+    }
+
+    #[test]
+    fn database_fixtures_keep_storage_local_to_each_context() {
+        let (first_storage, _first_root, first) = failed_database_context();
+        let (second_storage, _second_root, second) = failed_database_context();
+        assert_eq!(second.storage_dir(), second_storage.path());
+        assert_eq!(first.storage_dir(), first_storage.path());
+    }
+
+    fn persistence_call(ctx: &AppContext) -> Option<crate::protocol::Response> {
+        ctx.database_runtime_refusal("retry", "db_set_host_state")
+    }
+
+    #[test]
+    fn failed_database_open_recovers_after_backoff_without_rebind() {
+        let (storage, _root, ctx) = failed_database_context();
+        // The failed open held no connection. Repair only this test's database,
+        // closing the repair connection before AFT attempts to reopen it.
+        let conn = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+        conn.execute(
+            "UPDATE schema_version SET version = ?1",
+            [crate::db::CURRENT_SCHEMA_VERSION],
+        )
+        .unwrap();
+        drop(conn);
+        std::thread::sleep(Duration::from_millis(2_100));
+
+        let refusal = persistence_call(&ctx);
+        assert!(
+            refusal.is_none(),
+            "repaired database stayed latched: {refusal:?}"
+        );
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 2);
+        assert!(ctx.db().is_some());
+        let failure = ctx.database_runtime_failure.lock();
+        assert!(failure.error.is_none());
+        assert!(failure.retry_at.is_none());
+        assert_eq!(failure.backoff, Duration::ZERO);
+        drop(failure);
+        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "persist", "command": "db_set_host_state",
+            "params": {"key": "recovered", "value": "without-rebind"}
+        }))
+        .unwrap();
+        assert!(crate::commands::state::handle_db_set_host_state(&request, &ctx).success);
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            crate::db::state::get_host_state(&conn, "recovered").unwrap(),
+            Some("without-rebind".into())
+        );
+    }
+
+    #[test]
+    fn failed_database_open_does_not_reopen_inside_backoff() {
+        let (_storage, _root, ctx) = failed_database_context();
+        for _ in 0..10 {
+            assert!(persistence_call(&ctx).is_some());
+        }
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+        assert!(ctx.database_runtime_refusal("read", "read").is_none());
+    }
+
+    fn make_database_retry_due(ctx: &AppContext) {
+        ctx.database_runtime_failure.lock().retry_at =
+            Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    #[test]
+    fn permanent_database_error_is_rechecked_with_doubling_capped_backoff() {
+        let (storage, _root, ctx) = failed_database_context();
+        assert_eq!(
+            ctx.database_runtime_failure.lock().backoff,
+            Duration::from_secs(2)
+        );
+        // A different unsupported version must appear in the next refusal,
+        // proving that retries re-check the file rather than replaying an error.
+        let conn = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+        conn.execute(
+            "UPDATE schema_version SET version = ?1",
+            [crate::db::CURRENT_SCHEMA_VERSION + 2],
+        )
+        .unwrap();
+        drop(conn);
+        for (index, seconds) in [4, 8, 16, 32, 60, 60].into_iter().enumerate() {
+            make_database_retry_due(&ctx);
+            assert!(ctx.database_runtime_refusal("read", "read").is_none());
+            assert!(!ctx.claim_database_runtime_retry("read"));
+            let response = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+            let message = response["message"].as_str().unwrap();
+            assert!(message.contains("storage_requires_newer_reader"));
+            assert!(message.contains(&format!(
+                "format version {}",
+                crate::db::CURRENT_SCHEMA_VERSION + 2
+            )));
+            assert!(message.contains("next persistence-requiring call after"));
+            assert!(message.contains("AFT retries"));
+            assert!(!message.contains("rebind to retry"));
+            assert_eq!(response["retryable"], true);
+            assert_eq!(
+                ctx.database_runtime_failure.lock().backoff,
+                Duration::from_secs(seconds)
+            );
+            assert_eq!(
+                ctx.database_open_attempts.load(Ordering::Acquire),
+                index as u64 + 2
+            );
+            assert!(persistence_call(&ctx).is_some());
+            assert_eq!(
+                ctx.database_open_attempts.load(Ordering::Acquire),
+                index as u64 + 2
+            );
+            assert!(ctx.db().is_none());
+        }
+    }
+
+    #[test]
+    fn only_one_concurrent_call_claims_a_failed_database_retry() {
+        let (_storage, _root, ctx) = failed_database_context();
+        let ctx = Arc::new(ctx);
+        make_database_retry_due(&ctx);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let calls = (0..8)
+            .map(|_| {
+                let ctx = Arc::clone(&ctx);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ctx.claim_database_runtime_retry("bash")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls
+                .into_iter()
+                .map(|call| call.join().unwrap())
+                .filter(|claimed| *claimed)
+                .count(),
+            1
+        );
+        ctx.retry_database_runtime();
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn failed_database_retry_reuses_and_preserves_a_resident_connection() {
+        let storage = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let ctx = AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let path = storage.path().join("aft.db");
+        let resident = ctx.app().open_db(&path).unwrap();
+        let peeks = crate::db::schema_peek_count_for_test();
+        resident
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE schema_version SET version = ?1",
+                [crate::db::CURRENT_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "resident".into(),
+        );
+        crate::database_open::run_staged_open(
+            &ctx,
+            crate::database_open::DatabaseOpenRunner::ConfigureTail,
+            true,
+        );
+        assert_eq!(
+            crate::db::schema_peek_count_for_test(),
+            peeks,
+            "resident schema checks must not open another descriptor"
+        );
+        let response = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+        assert!(response["message"]
+            .as_str()
+            .unwrap()
+            .contains("storage_requires_newer_reader"));
+        assert!(Arc::ptr_eq(
+            &resident,
+            &ctx.db().expect("refusal must preserve the shared handle")
+        ));
+        resident
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE schema_version SET version = ?1",
+                [crate::db::CURRENT_SCHEMA_VERSION],
+            )
+            .unwrap();
+        make_database_retry_due(&ctx);
+        assert!(persistence_call(&ctx).is_none());
+        assert_eq!(
+            crate::db::schema_peek_count_for_test(),
+            peeks,
+            "retries must not open another descriptor on a resident database"
+        );
+        assert!(Arc::ptr_eq(&resident, &ctx.db().unwrap()));
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn database_single_attempt_does_not_wait_for_a_held_connection_or_open_slot() {
+        let storage = tempdir().unwrap();
+        let path = storage.path().join("aft.db");
+        let app = App::default_shared();
+        let resident = app.open_db(&path).unwrap();
+        let held = resident.lock().unwrap();
+        assert!(app
+            .database_schema_version(&path, crate::db::OpenMode::SingleAttempt)
+            .unwrap_err()
+            .is_busy());
+        drop(held);
+        let held = app.db.lock();
+        assert!(app
+            .database_schema_version(&path, crate::db::OpenMode::SingleAttempt)
+            .unwrap_err()
+            .is_busy());
+        assert!(app
+            .open_db_with_mode(&path, crate::db::OpenMode::SingleAttempt)
+            .unwrap_err()
+            .is_busy());
+        drop(held);
+    }
+
     #[test]
     fn database_retry_without_configured_root_refuses_without_panicking() {
         let ctx = AppContext::from_app(App::default_shared(), Config::default());
@@ -14432,7 +15543,7 @@ mod shared_db_tests {
         )
         .unwrap();
         assert_eq!(response["code"], "database_unavailable");
-        assert_eq!(response["retryable"], false);
+        assert_eq!(response["retryable"], true);
         assert!(response["message"]
             .as_str()
             .unwrap()

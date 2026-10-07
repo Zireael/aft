@@ -95,8 +95,9 @@ fn dry_run_reports_counts_and_removes_nothing() {
     assert!(report.dry_run);
     assert_eq!(report.matched.stacks, 1);
     assert_eq!(report.matched.entries, 2);
-    // Two content files plus the stack's meta.json.
-    assert_eq!(report.matched.files, 3);
+    // Two content files, the stack's meta.json, and its post-state.json
+    // sidecar (unsynced post-edit fingerprints, purged with the stack).
+    assert_eq!(report.matched.files, 4);
     assert!(report.matched.bytes > 0);
     assert_eq!(report.matched.db_rows, 2);
     assert_eq!(report.matched.sessions, vec![S1.to_string()]);

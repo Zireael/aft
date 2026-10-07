@@ -91,6 +91,89 @@ impl CompiledPattern {
     }
 }
 
+/// Search the whole input normally, repairing only matches that consumed an
+/// LF. Re-searching the match's starting line recovers the line-local match
+/// that the cross-line match would otherwise hide, then scanning resumes at
+/// the next line start so that lines the cross-line match consumed are checked.
+pub(crate) fn for_each_line_match(
+    regex: &regex::bytes::Regex,
+    content: &[u8],
+    mut visit: impl FnMut(usize, usize) -> bool,
+) {
+    let replacement_for = |start: usize, search_from: usize| {
+        let line_start = content[search_from..start]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(search_from, |newline| search_from + newline + 1);
+        let line_end = content[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(content.len(), |newline| line_start + newline);
+        let replacement = regex
+            .find(&content[line_start..line_end])
+            .map(|matched| (line_start + matched.start(), line_start + matched.end()));
+        (replacement, line_end + 1)
+    };
+
+    // Keep the common path on the regex crate's streaming iterator. It is
+    // faster than restarting a search for every ordinary match.
+    let mut resume_from = 0;
+    let mut line_search_from = 0;
+    let mut first_pass = true;
+    loop {
+        if first_pass {
+            first_pass = false;
+            let mut resume = None;
+            for matched in regex.find_iter(content) {
+                let start = matched.start();
+                let end = matched.end();
+                if content[start..end].contains(&b'\n') {
+                    let (replacement, next_line_start) = replacement_for(start, line_search_from);
+                    if let Some((replacement_start, replacement_end)) = replacement {
+                        if !visit(replacement_start, replacement_end) {
+                            return;
+                        }
+                    }
+                    resume = Some(next_line_start);
+                    break;
+                }
+                if !visit(start, end) {
+                    return;
+                }
+            }
+            let Some(next_line_start) = resume else {
+                return;
+            };
+            resume_from = next_line_start;
+            line_search_from = next_line_start;
+        } else {
+            if resume_from > content.len() {
+                return;
+            }
+            let Some(matched) = regex.find_at(content, resume_from) else {
+                return;
+            };
+            let start = matched.start();
+            let end = matched.end();
+            if content[start..end].contains(&b'\n') {
+                let (replacement, next_line_start) = replacement_for(start, line_search_from);
+                if let Some((replacement_start, replacement_end)) = replacement {
+                    if !visit(replacement_start, replacement_end) {
+                        return;
+                    }
+                }
+                resume_from = next_line_start;
+                line_search_from = next_line_start;
+            } else {
+                if !visit(start, end) {
+                    return;
+                }
+                resume_from = if start == end { start + 1 } else { end };
+            }
+        }
+    }
+}
+
 pub fn compile(pattern: &str, opts: CompileOpts) -> CompileResult {
     if pattern.len() > opts.size_limit_bytes {
         return CompileResult::InvalidPattern {

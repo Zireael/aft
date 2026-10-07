@@ -5,6 +5,7 @@ import type { TSchema } from "typebox";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig, resolvedDisabledTools } from "./config.js";
 import { detectPiHarness, type PiHarness } from "./harness.js";
+import { withOmpInternalUrls } from "./omp-internal-urls.js";
 import { prepareToolDefinitionForRegistration } from "./tools/_shared.js";
 import { registerAstTools } from "./tools/ast.js";
 import { registerBashCompanionTools, registerBashTool } from "./tools/bash.js";
@@ -228,7 +229,12 @@ export function bindToolRegistrationFunnel(
   >(
     tool: ToolDefinition<TParams, TDetails, TState>,
   ): void => {
-    const prepared = prepareToolDefinitionForRegistration(tool, effectiveHarness, presentation);
+    const hostAware = effectiveHarness === "omp" ? withOmpInternalUrls(tool, ctx.ompRouter) : tool;
+    const prepared = prepareToolDefinitionForRegistration(
+      hostAware,
+      effectiveHarness,
+      presentation,
+    );
     originalRegisterTool(prepared as ToolDefinition<TParams, TDetails, TState>);
   };
 

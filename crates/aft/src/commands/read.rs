@@ -25,7 +25,7 @@ use crate::github_read::{
     SystemGithubReadClock,
 };
 use crate::protocol::{RawRequest, Response};
-use crate::response_finalize::{DispatchOutcome, PendingResponse, PendingResponsePoll};
+use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
 const DEFAULT_LIMIT: u32 = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
@@ -875,9 +875,24 @@ fn github_read_response(
     completion: GithubReadCompletion,
     start_line: usize,
 ) -> Response {
-    let lines_read = completion.content.lines().count();
-    let actual_end = start_line.saturating_add(lines_read.saturating_sub(1));
-    let truncated = lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines);
+    let (start_line, lines_read, actual_end, truncated) = if let Some(page) = &completion.diff_page
+    {
+        (
+            page.start_line,
+            page.lines_read,
+            page.end_line,
+            page.truncated,
+        )
+    } else {
+        let lines_read = completion.content.lines().count();
+        let actual_end = start_line.saturating_add(lines_read.saturating_sub(1));
+        (
+            start_line,
+            lines_read,
+            actual_end,
+            lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines),
+        )
+    };
     let attachments = completion
         .attachments
         .into_iter()
@@ -952,6 +967,13 @@ pub(crate) fn handle_github_zoom(
     selector: &str,
 ) -> Response {
     let resource = match parse_resource(target) {
+        Ok(resource) if resource.diff_path.is_some() => {
+            return Response::error(
+                &req.id,
+                "invalid_resource",
+                "Use read for diffs; aft_zoom does not support diff links",
+            )
+        }
         Ok(resource) if resource.comment_selector.is_none() => resource,
         Ok(_) => return Response::error(
             &req.id,
@@ -1014,24 +1036,34 @@ pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome 
 
     let request_id = req.id.clone();
     let session_id = req.session().to_string();
-    let mut poll: PendingResponsePoll = Box::new(move |_| {
-        pending.try_complete().map(|completion| match completion {
+    if let Some(completion) = pending.try_complete() {
+        return DispatchOutcome::Immediate(match completion {
             Ok(completion) => github_read_response(&req, completion, start_line),
             Err(error) => Response::error(&req.id, error.code(), error.to_string()),
-        })
-    });
-    if let Some(response) = poll(ctx) {
-        return DispatchOutcome::Immediate(response);
+        });
     }
 
-    DispatchOutcome::Deferred(PendingResponse {
+    DispatchOutcome::Deferred(PendingResponse::from_receiver(
         request_id,
         session_id,
-        attach_command: "read".to_string(),
-        poll,
-        cancellation: None,
-        on_shutdown: None,
-    })
+        "read".to_string(),
+        pending.into_receiver(),
+        move |_, result| {
+            let completion = match result {
+                Ok(completion) => completion,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err(crate::github_read::GithubReadError::FetchFailed(
+                        "GitHub read worker stopped before completing".to_string(),
+                    ))
+                }
+            };
+            Some(match completion {
+                Ok(completion) => github_read_response(&req, completion, start_line),
+                Err(error) => Response::error(&req.id, error.code(), error.to_string()),
+            })
+        },
+    ))
 }
 
 /// Handle a `read` request.
@@ -1061,7 +1093,18 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let mut response = handle_read_legacy(req, ctx);
+    let binding_root = ctx
+        .canonical_cache_root_opt()
+        .or_else(|| ctx.config().project_root.clone());
+    let guard = binding_root.and_then(|root| {
+        ctx.hashline_bindings()
+            .capture(root, req.session().to_string())
+    });
+    let capture_source = guard.as_ref().is_some_and(|guard| guard.effective())
+        && (req.params.get("_hashline_bash_read_kind").is_none()
+            || ctx.config().experimental_bash_rewrite);
+    let mut captured_source = None;
+    let mut response = handle_read_local(req, ctx, capture_source, &mut captured_source);
     if !response.success
         || response
             .data
@@ -1072,16 +1115,7 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
         return response;
     }
 
-    let binding_root = ctx
-        .canonical_cache_root_opt()
-        .or_else(|| ctx.config().project_root.clone());
-    let Some(binding_root) = binding_root else {
-        return response;
-    };
-    let Some(guard) = ctx
-        .hashline_bindings()
-        .capture(binding_root, req.session().to_string())
-    else {
+    let Some(guard) = guard else {
         return response;
     };
     if !guard.effective() {
@@ -1091,9 +1125,13 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
     let Some(file) = req.params.get("file").and_then(Value::as_str) else {
         return response;
     };
-    let path = match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
-        Ok(path) => path,
-        Err(_) => return response,
+    let path = if let Some(captured) = &captured_source {
+        captured.path.clone()
+    } else {
+        match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
+            Ok(path) => path.as_path().to_path_buf(),
+            Err(_) => return response,
+        }
     };
     let requested_path = req
         .params
@@ -1125,6 +1163,22 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
         });
     let selection = read_selection(req, &response);
     let publication = guard.with_binding_mut(|binding| {
+        if let Some(captured) = &captured_source {
+            #[cfg(test)]
+            let reuse = !LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
+            #[cfg(not(test))]
+            let reuse = true;
+            if reuse {
+                return crate::hashline::snapshot::capture_taggable_source_with_options(
+                    binding.snapshots_mut(),
+                    &path,
+                    requested_path.clone(),
+                    selection,
+                    crate::hashline::snapshot::RenderOptions::default(),
+                    &captured.source,
+                );
+            }
+        }
         if let Some(kind) = bash_kind {
             crate::hashline::snapshot::capture_bash_rewrite_read(
                 binding.snapshots_mut(),
@@ -1145,7 +1199,11 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     });
     let Ok(publication) = publication else {
-        return response;
+        return if captured_source.is_some() {
+            handle_read_legacy(req, ctx)
+        } else {
+            response
+        };
     };
 
     if let Some(data) = response.data.as_object_mut() {
@@ -1264,6 +1322,26 @@ fn read_selection(
 }
 
 fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
+    handle_read_local(req, ctx, false, &mut None)
+}
+
+struct CapturedRead {
+    path: std::path::PathBuf,
+    source: crate::hashline::snapshot::ReadSource,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_HASHLINE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LEGACY_READ_RENDER_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn handle_read_local(
+    req: &RawRequest,
+    ctx: &AppContext,
+    capture_source: bool,
+    captured_source: &mut Option<CapturedRead>,
+) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -1390,21 +1468,31 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Read raw bytes for binary detection
-    let raw_bytes = match fs::read(path.as_path()) {
-        Ok(b) => b,
-        Err(e) => {
-            return Response::error(
-                &req.id,
-                "io_error",
-                format!("read: failed to read file: {}", e),
-            );
-        }
+    let read_source = capture_source
+        .then(|| crate::hashline::snapshot::read_source(path.as_path()).ok())
+        .flatten()
+        .filter(|source| source.has_complete_bytes());
+    let fallback_bytes;
+    let raw_bytes = if let Some(source) = &read_source {
+        source.bytes()
+    } else {
+        fallback_bytes = match fs::read(path.as_path()) {
+            Ok(b) => b,
+            Err(e) => {
+                return Response::error(
+                    &req.id,
+                    "io_error",
+                    format!("read: failed to read file: {}", e),
+                );
+            }
+        };
+        &fallback_bytes
     };
 
     let byte_size = raw_bytes.len();
 
     // Binary detection
-    if is_binary(&raw_bytes) {
+    if is_binary(raw_bytes) {
         return Response::success(
             &req.id,
             serde_json::json!({
@@ -1417,7 +1505,7 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Convert to string
-    let content = match String::from_utf8(raw_bytes) {
+    let content = match std::str::from_utf8(raw_bytes) {
         Ok(s) => s,
         Err(_) => {
             return Response::success(
@@ -1432,6 +1520,37 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    #[cfg(test)]
+    let skip_render = read_source.is_some() && !LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
+    #[cfg(not(test))]
+    let skip_render = read_source.is_some();
+    let response = render_text_read(
+        req,
+        content,
+        byte_size,
+        start_line,
+        explicit_end_line,
+        limit,
+        skip_render,
+    );
+    if let Some(source) = read_source {
+        *captured_source = Some(CapturedRead {
+            path: path.as_path().to_path_buf(),
+            source,
+        });
+    }
+    response
+}
+
+fn render_text_read(
+    req: &RawRequest,
+    content: &str,
+    byte_size: usize,
+    start_line: u32,
+    explicit_end_line: Option<u64>,
+    limit: u32,
+    skip_render: bool,
+) -> Response {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len() as u32;
 
@@ -1474,32 +1593,57 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
 
     for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
         let line_num = start_idx + i + 1; // 1-based
-        let display_line = if line.len() > MAX_LINE_LENGTH {
+        let (display_text, truncated_line) = if line.len() > MAX_LINE_LENGTH {
             // Find a safe UTF-8 boundary at or before MAX_LINE_LENGTH to avoid
             // panicking on multi-byte characters (e.g. emoji, CJK).
             let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
+            (&line[..safe_end], true)
+        } else {
+            (*line, false)
+        };
+        let display_size = line_num_width
+            + 2
+            + display_text.len()
+            + 1
+            + if truncated_line {
+                "... (truncated)".len()
+            } else {
+                0
+            };
+        let display_line = if skip_render {
+            String::new()
+        } else if truncated_line {
             format!(
                 "{:>width$}: {}... (truncated)\n",
                 line_num,
-                &line[..safe_end],
+                display_text,
                 width = line_num_width
             )
         } else {
-            format!("{:>width$}: {}\n", line_num, line, width = line_num_width)
+            format!(
+                "{:>width$}: {}\n",
+                line_num,
+                display_text,
+                width = line_num_width
+            )
         };
 
-        output_bytes += display_line.len();
+        output_bytes += display_size;
         if output_bytes > MAX_BYTES {
             truncated_by_size = true;
             // Add truncation notice
-            output.push_str(&format!(
-                "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
-                MAX_BYTES / 1024
-            ));
+            if !skip_render {
+                output.push_str(&format!(
+                    "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
+                    MAX_BYTES / 1024
+                ));
+            }
             break;
         }
 
         output.push_str(&display_line);
+        #[cfg(test)]
+        LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.set(bytes.get() + display_line.len()));
         lines_read += 1;
     }
 
@@ -1958,6 +2102,7 @@ mod tests {
                     bytes: vec![137, 80, 78, 71, 13, 10, 26, 10],
                 }],
                 document: None,
+                diff_page: None,
             },
             1,
         );
@@ -2378,6 +2523,125 @@ mod hashline_wiring_tests {
             session_id: None,
             params: json!({ "file": path.to_string_lossy() }),
         }
+    }
+
+    fn registered_context(root: &Path) -> AppContext {
+        let ctx = context(root);
+        assert!(
+            ctx.hashline_bindings()
+                .register(
+                    root,
+                    DEFAULT_SESSION_ID.to_string(),
+                    RegistrationRequest {
+                        configured_enabled: true,
+                        edit_slot_survives: true,
+                        read_slot_survives: true,
+                    }
+                )
+                .effective
+        );
+        ctx
+    }
+
+    fn snapshots(
+        ctx: &AppContext,
+        root: &Path,
+    ) -> Vec<(std::path::PathBuf, crate::hashline::snapshot::Snapshot)> {
+        ctx.hashline_bindings()
+            .capture(root.to_path_buf(), DEFAULT_SESSION_ID.to_string())
+            .unwrap()
+            .with_binding(|binding| {
+                let mut snapshots: Vec<_> = binding
+                    .snapshots()
+                    .iter()
+                    .map(|(path, snapshot)| (path.to_path_buf(), snapshot.clone()))
+                    .collect();
+                snapshots.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.tag.cmp(&b.1.tag)));
+                snapshots
+            })
+    }
+
+    #[test]
+    fn hashline_whole_read_uses_one_source_and_matches_legacy_responses_and_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let fixtures = [
+            ("normal", b"alpha\nbeta\n".to_vec(), false),
+            ("crlf", b"alpha\r\nbeta\r\nlast".to_vec(), false),
+            ("empty", Vec::new(), false),
+            ("readonly", b"readonly\r\n".to_vec(), true),
+            ("binary", b"a\0b".to_vec(), false),
+            ("invalid_utf8", vec![0xff, 0xfe], false),
+            (
+                "large",
+                "line with realistic log output\n"
+                    .repeat(20000)
+                    .into_bytes(),
+                false,
+            ),
+            (
+                "wide",
+                format!("{}\r\nlast\n", "🦀".repeat(1000)).into_bytes(),
+                false,
+            ),
+        ];
+        for (name, bytes, readonly) in fixtures {
+            let path = root.join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            if readonly {
+                let mut changed = permissions.clone();
+                changed.set_readonly(true);
+                std::fs::set_permissions(&path, changed).unwrap();
+            }
+            let legacy_ctx = registered_context(&root);
+            let actual_ctx = registered_context(&root);
+            let req = request_for(&path);
+            LEGACY_HASHLINE_READ.with(|legacy| legacy.set(true));
+            crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.set(0));
+            LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.set(0));
+            let reference = handle_read(&req, &legacy_ctx);
+            let before = crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.get());
+            let rendered_before = LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.get());
+            LEGACY_HASHLINE_READ.with(|legacy| legacy.set(false));
+            crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.set(0));
+            LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.set(0));
+            let actual = handle_read(&req, &actual_ctx);
+            let after = crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.get());
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&reference).unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                snapshots(&actual_ctx, &root),
+                snapshots(&legacy_ctx, &root),
+                "{name}"
+            );
+            assert_eq!(after, 1, "{name}: reuse the legacy read's source");
+            assert_eq!(
+                LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.get()),
+                0,
+                "{name}: no discarded legacy rendering"
+            );
+            eprintln!("hashline {name}: source reads {before} -> {after}, discarded render bytes {rendered_before} -> 0");
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        // Refused paths must remain store-neutral and keep their error response.
+        let path = root.join("missing");
+        let legacy_ctx = registered_context(&root);
+        let actual_ctx = registered_context(&root);
+        let req = request_for(&path);
+        LEGACY_HASHLINE_READ.with(|legacy| legacy.set(true));
+        let reference = handle_read(&req, &legacy_ctx);
+        LEGACY_HASHLINE_READ.with(|legacy| legacy.set(false));
+        let actual = handle_read(&req, &actual_ctx);
+        assert!(!actual.success);
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&reference).unwrap()
+        );
+        assert!(snapshots(&actual_ctx, &root).is_empty());
     }
 
     #[test]

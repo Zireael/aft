@@ -1628,13 +1628,13 @@ fn publish_inspect_pointer(
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(generation.as_bytes())?;
         file.write_all(b"\n")?;
-        file.sync_all()?;
+        // The pointer names rebuildable analysis. Keep the atomic rename for
+        // concurrent readers, without asking the drive to persist this cache.
     }
     if let Err(error) = crate::fs_lock::rename_over(&tmp, &pointer) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error.into());
     }
-    crate::fs_lock::sync_parent(&pointer);
     gc_old_inspect_generations(inspect_dir, project_key, generation);
     Ok(())
 }
@@ -1781,9 +1781,7 @@ fn sweep_inspect_scope_dirs_with_limits(
         }
     }
 
-    if summary.removed > 0 {
-        crate::fs_lock::sync_parent(inspect_root);
-    }
+    if summary.removed > 0 {}
     crate::slog_info!(
         "inspect cache sweep: removed {} scope dirs, {:.1} MiB",
         summary.removed,
@@ -2477,6 +2475,18 @@ fn now_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn durability_inspect_pointer_count() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::durability::take();
+        publish_inspect_pointer(dir.path(), "durability", "generation.sqlite").unwrap();
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        assert_eq!(
+            fs::read(inspect_pointer_path(dir.path(), "durability")).unwrap(),
+            b"generation.sqlite\n"
+        );
+    }
     use std::cell::Cell;
     use std::collections::HashSet;
     use std::fs;

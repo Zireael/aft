@@ -24,6 +24,7 @@ pub fn render_document(document: &GithubDocument) -> String {
         number: document.number,
         repository: Some(document.repository.clone()),
         comment_selector: None,
+        diff_path: None,
     };
     render_document_for_resource(document, &resource)
         .expect("a whole-document render has no fallible selector")
@@ -844,6 +845,7 @@ mod tests {
             number: 999,
             repository: Some("cortexkit/aft".to_string()),
             comment_selector: None,
+            diff_path: None,
         };
 
         let outline = render_outline_for_resource(&document, &resource);
@@ -899,6 +901,7 @@ mod tests {
             number: 999,
             repository: Some("cortexkit/aft".to_string()),
             comment_selector: None,
+            diff_path: None,
         };
 
         let outline = render_outline_for_resource(&document, &resource);
@@ -950,6 +953,7 @@ mod tests {
             number: 7,
             repository: Some("owner/repo".to_string()),
             comment_selector: None,
+            diff_path: None,
         };
 
         let outline = render_outline_for_resource(&document, &resource);

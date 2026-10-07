@@ -49,6 +49,10 @@ function createToolContext(harness: E2EHarness): ToolContext {
   } as ToolContext;
 }
 
+function resultText(result: unknown): string {
+  return typeof result === "string" ? result : ((result as { output?: string })?.output ?? "");
+}
+
 async function createFixtureProject(harness: E2EHarness): Promise<void> {
   await mkdir(harness.path("src"), { recursive: true });
   await Promise.all([
@@ -116,8 +120,8 @@ export function runReadOnlySpineToolcallSuite(
         createToolContext(h),
       );
 
-      expect(output).toContain("tool_call_grep_marker");
-      expect(output).toContain("Found 1 match across 1 file");
+      expect(resultText(output)).toContain("tool_call_grep_marker");
+      expect(resultText(output)).toContain("Found 1 match across 1 file");
     });
 
     test("grep appends the plugin-side skipped path footer after tool_call", async () => {
@@ -129,9 +133,9 @@ export function runReadOnlySpineToolcallSuite(
         createToolContext(h),
       );
 
-      expect(output).toContain("tool_call_grep_marker");
-      expect(output).toContain("Found 1 match across 1 file");
-      expect(output).toContain("Skipped 1 path not found: missing-dir");
+      expect(resultText(output)).toContain("tool_call_grep_marker");
+      expect(resultText(output)).toContain("Found 1 match across 1 file");
+      expect(resultText(output)).toContain("Skipped 1 path not found: missing-dir");
     });
 
     test("aft_search returns server-rendered literal search text through tool_call", async () => {
@@ -157,8 +161,8 @@ export function runReadOnlySpineToolcallSuite(
       );
 
       expect(output).toContain("FRESH");
-      expect(output).toContain("wait-stamp:");
-      expect(output).toContain("completed phases:");
+      expect(output).not.toContain("wait-stamp:");
+      expect(output).not.toContain("completed phases:");
       expect(output).toContain("TODOs: 1");
       expect(output).toContain("src/hit.ts:9 TODO cutover inspect marker");
     }, 90_000);

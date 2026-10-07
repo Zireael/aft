@@ -9,11 +9,14 @@ import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "./config.js";
 import { astTools } from "./tools/ast.js";
 import {
+  bashCompanionRegistered,
+  bashTimeoutDescription,
   bashToolDescription,
   createBashKillTool,
   createBashStatusTool,
   createBashTool,
 } from "./tools/bash.js";
+import { bashWatchDescription, createBashWatchTool } from "./tools/bash_watch.js";
 import { createBashWriteTool } from "./tools/bash_write.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { createReadTool, hoistedTools } from "./tools/hoisted.js";
@@ -268,3 +271,89 @@ export function buildSubcToolSchemasJson(): string {
 }
 
 export const SUBC_BARE_TOOL_NAMES: readonly SubcBareToolName[] = BARE_TOOL_ORDER;
+
+/**
+ * Tool schemas the module catalog's `worker` preset serves in place of the
+ * base ones, plus the tools only that preset serves. The `head` preset is the
+ * base artifact unchanged, and the `reader` preset only narrows the tool list,
+ * so neither needs entries here.
+ *
+ * A worker is a delegated session: once its turn ends it has delivered its
+ * result, and nothing (no completion reminder, no async notification) wakes
+ * it. Every text here is therefore the worker wording of the same builders
+ * the OpenCode tools use, so the strings are never forked: `bash` and
+ * `powershell` keep their arguments but describe promotion and waiting for a
+ * worker, `bash_status` is the OpenCode tool's own (which points at
+ * `bash_watch`), and `bash_watch` is the OpenCode tool's schema with its
+ * worker description.
+ */
+export function buildSubcToolPresets(): Record<string, Record<string, Record<string, unknown>>> {
+  const ctx = makeSubcSchemaStubCtx();
+  const base = buildSubcToolSchemas();
+  const bashConfig = resolveBashConfig(ctx.config);
+  const statusRegistered = bashCompanionRegistered(ctx.config, "bash_status");
+  const workerTimeout = bashTimeoutDescription(bashConfig.background, "worker");
+  const withWorkerTimeout = (schema: Record<string, unknown>): Record<string, unknown> => {
+    const clone = structuredClone(schema);
+    const properties = clone.properties as Record<string, Record<string, unknown>>;
+    properties.timeout = { ...properties.timeout, description: workerTimeout };
+    return clone;
+  };
+  const bash = withWorkerTimeout(base.bash);
+  bash.description = bashToolDescription(
+    false,
+    bashConfig.compress,
+    bashConfig.background,
+    true,
+    true,
+    true,
+    { role: "worker" },
+  );
+  return {
+    worker: {
+      bash,
+      powershell: withWorkerTimeout(base.powershell),
+      bash_status: argsToJsonSchema(createBashStatusTool(ctx)),
+      bash_watch: workerBashWatchSchema(
+        argsToJsonSchema(createBashWatchTool(ctx)),
+        bashWatchDescription("worker", statusRegistered),
+      ),
+    },
+  };
+}
+
+/**
+ * The worker preset's `bash_watch`: the OpenCode tool's arguments with the
+ * worker description. The module serves this tool itself and always waits
+ * synchronously, because a catalog consumer has no channel that would deliver
+ * an async watch's notification; the two async-only arguments say so.
+ */
+function workerBashWatchSchema(
+  schema: Record<string, unknown>,
+  description: string,
+): Record<string, unknown> {
+  const clone = structuredClone(schema);
+  const properties = clone.properties as Record<string, Record<string, unknown>>;
+  properties.background = {
+    ...properties.background,
+    description:
+      "Accepted for compatibility. This watch always waits: a delegated session gets no async notification, so background: true waits up to the worker wait limit like a watch without a timeout.",
+  };
+  properties.once = {
+    ...properties.once,
+    description: "Accepted for compatibility; only an async watch reads it.",
+  };
+  return { ...clone, description };
+}
+
+/** Deterministic JSON bytes for the preset artifact, keys sorted at every preset level. */
+export function buildSubcToolPresetsJson(): string {
+  const presets = buildSubcToolPresets();
+  const sorted: Record<string, Record<string, Record<string, unknown>>> = {};
+  for (const preset of Object.keys(presets).sort()) {
+    const tools: Record<string, Record<string, unknown>> = {};
+    for (const name of Object.keys(presets[preset]).sort()) tools[name] = presets[preset][name];
+    sorted[preset] = tools;
+  }
+  return `${JSON.stringify(sorted, null, 2)}\n`;
+}

@@ -26,7 +26,7 @@ use crate::db::bash_tasks::BashTaskRow;
 use super::process::LiveDescendant;
 use super::BgTaskStatus;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 const CONTROL_DIR: &str = "control";
 const IO_DIR: &str = "io";
 const METADATA_FILE: &str = "metadata.json";
@@ -189,6 +189,8 @@ pub struct PinnedDir {
 
 impl PinnedDir {
     pub fn open(path: &Path) -> io::Result<Self> {
+        #[cfg(test)]
+        work_counts::record_open();
         #[cfg(unix)]
         let file = OpenOptions::new()
             .read(true)
@@ -233,6 +235,8 @@ impl PinnedDir {
 
     #[cfg(unix)]
     fn open_dir_at(&self, name: &OsStr) -> io::Result<Self> {
+        #[cfg(test)]
+        work_counts::record_open();
         let file = openat_file(
             self.file.as_raw_fd(),
             name,
@@ -297,6 +301,8 @@ impl PinnedDir {
     }
 
     pub fn open_file(&self, name: &OsStr, write: bool) -> io::Result<File> {
+        #[cfg(test)]
+        work_counts::record_open();
         #[cfg(unix)]
         let file = openat_file(
             self.file.as_raw_fd(),
@@ -506,6 +512,13 @@ pub struct PersistedTask {
     pub finished_at: Option<u64>,
     pub duration_ms: Option<u64>,
     pub timeout_ms: Option<u64>,
+    /// Whether `timeout_ms` is AFT's default background limit rather than a
+    /// caller's `timeout`. Only the default may be extended while a delegated
+    /// worker waits on the task, and that must still hold after a restart
+    /// reloads the task from this record. Absent (false) on records written
+    /// before AFT recorded it; such a task is never extended.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub default_hard_kill: bool,
     pub exit_code: Option<i32>,
     pub child_pid: Option<u32>,
     pub pgid: Option<i32>,
@@ -531,10 +544,25 @@ pub struct PersistedTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_temp_dir: Option<PathBuf>,
     pub status_reason: Option<String>,
+    /// Capture did not finish cleanly; independent of the command's exit status.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub output_incomplete: bool,
     /// Who started the task and the key they gave the call. Absent on records
     /// written before AFT recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_key: Option<super::TaskCallKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote: Option<super::registry::remote::RemoteTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_note: Option<String>,
+    /// Missing job-wide output ranges, independent of execution outcome.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_output: Vec<(u64, u64)>,
+    /// Caller-side removals, names only; never environment values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stripped_env_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub local_fallback_started: bool,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -543,6 +571,10 @@ fn default_notify_on_completion() -> bool {
 
 fn default_compressed() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -584,6 +616,7 @@ impl PersistedTask {
             finished_at: None,
             duration_ms: None,
             timeout_ms,
+            default_hard_kill: false,
             exit_code: None,
             child_pid: None,
             pgid: None,
@@ -598,7 +631,13 @@ impl PersistedTask {
             sandbox_native: false,
             sandbox_temp_dir: None,
             status_reason: None,
+            output_incomplete: false,
             call_key,
+            remote: None,
+            execution_note: None,
+            incomplete_output: Vec::new(),
+            stripped_env_names: Vec::new(),
+            local_fallback_started: false,
         }
     }
 
@@ -704,6 +743,7 @@ impl From<BashTaskRow> for PersistedTask {
             finished_at,
             duration_ms: finished_at.map(|finished_at| finished_at.saturating_sub(started_at)),
             timeout_ms: row.timeout_ms.and_then(|value| u64::try_from(value).ok()),
+            default_hard_kill: false,
             exit_code: row.exit_code,
             child_pid: row.pid.and_then(|value| u32::try_from(value).ok()),
             pgid: row.pgid.and_then(|value| i32::try_from(value).ok()),
@@ -718,7 +758,13 @@ impl From<BashTaskRow> for PersistedTask {
             sandbox_native: false,
             sandbox_temp_dir: None,
             status_reason: None,
+            output_incomplete: false,
             call_key: None,
+            remote: None,
+            execution_note: None,
+            incomplete_output: Vec::new(),
+            stripped_env_names: Vec::new(),
+            local_fallback_started: false,
         }
     }
 }
@@ -1003,6 +1049,17 @@ pub fn uninitialized_layout_is_recent(
             return Ok(age < grace);
         }
     };
+    // Exit files are reserved empty at spawn. A nonempty marker means the
+    // wrapper finished, so missing metadata cannot be the initial-write window.
+    if task
+        .dirs
+        .io
+        .open_file(&task.paths.artifact_name(TaskArtifact::Exit), false)
+        .and_then(|file| file.metadata())
+        .is_ok_and(|meta| meta.len() > 0)
+    {
+        return Ok(false);
+    }
     let modified = match task.paths.layout {
         TaskLayout::Directory => task.dirs.control.modified()?,
         TaskLayout::Flat => task
@@ -1228,12 +1285,16 @@ pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
 }
 
 fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
+    #[cfg(test)]
+    work_counts::record_read();
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     // The version is read before the full shape, so metadata written by a
     // newer build is refused by name (and kept out of quarantine) instead of
     // failing as an unparseable task.
+    #[cfg(test)]
+    work_counts::record_parse();
     let version = serde_json::from_str::<serde_json::Value>(&content)
         .ok()
         .and_then(|value| value.get("schema_version")?.as_u64());
@@ -1244,12 +1305,15 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
         version,
     )
     .map_err(crate::persisted_format::UnsupportedPersistedFormat::into_io_error)?;
-    let task: PersistedTask = serde_json::from_str(&content).map_err(io::Error::other)?;
-    if !matches!(task.schema_version, 2 | 3 | 4 | 5 | SCHEMA_VERSION) {
+    #[cfg(test)]
+    work_counts::record_parse();
+    let task: PersistedTask = serde_json::from_str(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if !matches!(task.schema_version, 2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "unsupported background task schema_version {} (expected 2, 3, 4, 5, or {SCHEMA_VERSION})",
+                "unsupported background task schema_version {} (expected 2, 3, 4, 5, 6, or {SCHEMA_VERSION})",
                 task.schema_version
             ),
         ));
@@ -1296,7 +1360,12 @@ fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io:
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
-    randomized_atomic_replace(dir, name, &content)
+    atomic_replace(
+        dir,
+        name,
+        &content,
+        task.remote.is_some() || task.local_fallback_started,
+    )
 }
 
 pub fn update_task_at<F>(task: &ResolvedTask, update: F) -> io::Result<PersistedTask>
@@ -1541,6 +1610,10 @@ pub fn read_exit_marker(paths: &TaskPaths) -> io::Result<Option<ExitMarker>> {
 }
 
 pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) -> io::Result<()> {
+    atomic_replace(dir, name, content, false)
+}
+
+fn atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8], durable: bool) -> io::Result<()> {
     for _ in 0..32 {
         let temporary = random_temp_name()?;
         let mut file = match dir.open_new_file(&temporary) {
@@ -1550,9 +1623,17 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
         };
         let result = (|| {
             file.write_all(content)?;
-            file.sync_all()?;
+            if durable {
+                file.sync_all()?;
+            }
+            // Atomic replacement protects readers after a daemon kill. Task
+            // history is mirrored in a weaker database and is not a durable log.
             validate_regular_handle(&file)?;
-            dir.rename(&temporary, name)
+            dir.rename(&temporary, name)?;
+            if durable {
+                dir.file.sync_all()?;
+            }
+            Ok(())
         })();
         if result.is_err() {
             let _ = dir.remove_file(&temporary);
@@ -1568,7 +1649,9 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
 pub fn create_control_file(dirs: &TaskDirs, name: &str, content: &[u8]) -> io::Result<File> {
     let mut file = dirs.control.open_new_file(OsStr::new(name))?;
     file.write_all(content)?;
-    file.sync_all()?;
+    // These immutable payloads are verified and read through held handles
+    // before spawning. They need cross-process visibility, not power-loss
+    // durability: recovery never re-executes a task from its payload files.
     file.seek(SeekFrom::Start(0))?;
     validate_regular_handle(&file)?;
     Ok(file)
@@ -1582,6 +1665,46 @@ pub fn open_control_file(task: &ResolvedTask, name: &str) -> io::Result<File> {
         ));
     }
     task.dirs.control.open_file(OsStr::new(name), false)
+}
+
+#[cfg(test)]
+pub(crate) mod work_counts {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Counts {
+        pub opens: usize,
+        pub metadata_reads: usize,
+        pub parses: usize,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Counts> = Cell::new(Counts::default());
+    }
+
+    fn record(update: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            update(&mut counts);
+            cell.set(counts);
+        });
+    }
+
+    pub(crate) fn record_open() {
+        record(|counts| counts.opens += 1);
+    }
+    pub(crate) fn record_read() {
+        record(|counts| counts.metadata_reads += 1);
+    }
+    pub(crate) fn record_parse() {
+        record(|counts| counts.parses += 1);
+    }
+    pub(crate) fn reset() {
+        COUNTS.with(|cell| cell.set(Counts::default()));
+    }
+    pub(crate) fn get() -> Counts {
+        COUNTS.with(Cell::get)
+    }
 }
 
 #[derive(Debug)]
@@ -1639,7 +1762,7 @@ impl ValidatedArtifact {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(content)?;
-        self.file.sync_all()
+        Ok(())
     }
 
     pub fn try_clone_file(&self) -> io::Result<File> {
@@ -1688,13 +1811,9 @@ fn open_task_artifact_with_access(
             "background task layout identity changed",
         ));
     }
-    let metadata = read_task_at(&resolved)?;
-    if metadata.task_id != paths.task_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "background task metadata identity mismatch",
-        ));
-    }
+    // The resolver has already read the current metadata and checked its task
+    // identity. Re-reading that same file adds no artifact-path validation;
+    // the open below remains relative to the freshly pinned I/O directory.
     let file = resolved
         .dirs
         .io
@@ -1736,6 +1855,29 @@ pub struct TaskIoHandles {
 }
 
 impl TaskIoHandles {
+    /// Replay fallback retains the same validated task artifacts rather than
+    /// creating a new task or replacing its output with another set of files.
+    #[cfg(unix)]
+    pub(crate) fn reopen(task: &ResolvedTask) -> io::Result<Self> {
+        let open = |a: TaskArtifact| task.dirs.io.open_file(OsStr::new(a.file_name()), true);
+        let mut stdout = open(TaskArtifact::Stdout)?;
+        stdout.seek(SeekFrom::End(0))?;
+        let mut stderr = open(TaskArtifact::Stderr)?;
+        stderr.seek(SeekFrom::End(0))?;
+        Ok(Self {
+            dirs: task.dirs.clone(),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            exit: open(TaskArtifact::Exit)?,
+            pipeline_status: Some(open(TaskArtifact::PipelineStatus)?),
+            pty: None,
+            sandbox_unavailable: open(TaskArtifact::SandboxUnavailable)?,
+            write_counter: crate::write_ledger::register(
+                crate::write_ledger::Domain::BashTaskIo,
+                task.paths.dir.display().to_string(),
+            ),
+        })
+    }
     pub fn create(
         task: &ResolvedTask,
         mode: BgMode,
@@ -1817,7 +1959,10 @@ impl TaskIoHandles {
     #[cfg(unix)]
     pub fn inheritable_file(&self, artifact: TaskArtifact) -> io::Result<File> {
         let file = self.clone_file(artifact)?;
-        set_close_on_exec(file.as_raw_fd(), false)?;
+        // Only the child's pre-exec allowlist may make a marker inheritable.
+        // Clearing CLOEXEC here would expose it to unrelated concurrent spawns
+        // in the daemon before the owning wrapper has even been launched.
+        set_close_on_exec(file.as_raw_fd(), true)?;
         Ok(file)
     }
 
@@ -1837,7 +1982,6 @@ impl TaskIoHandles {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(content)?;
-        file.sync_all()?;
         self.write_counter.credit_logical(content.len() as u64);
         Ok(())
     }
@@ -2140,10 +2284,116 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durability_bash_record_payload_count() {
+        let storage = tempfile::tempdir().unwrap();
+        let task =
+            create_task_layout(storage.path(), "durability", "bash-0000000000000601").unwrap();
+        crate::durability::take();
+        for name in [
+            "command.sh",
+            "wrapper.sh",
+            "environment.bin",
+            "manifest.blake3",
+        ] {
+            create_control_file(&task.dirs, name, b"payload").unwrap();
+        }
+        for state in ["starting", "running", "exited", "completed"] {
+            randomized_atomic_replace(
+                &task.dirs.control,
+                OsStr::new("metadata.json"),
+                state.as_bytes(),
+            )
+            .unwrap();
+        }
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        assert_eq!(
+            fs::read(task.dirs.control.path.join("metadata.json")).unwrap(),
+            b"completed"
+        );
+    }
     use super::*;
 
     fn valid_id(suffix: u64) -> String {
         format!("bash-{suffix:016x}")
+    }
+
+    fn counted_task(storage: &Path) -> (ResolvedTask, PersistedTask) {
+        let task = create_task_layout(storage, "counted", &valid_id(42)).unwrap();
+        let metadata = PersistedTask::starting(
+            task.paths.task_id.clone(),
+            "counted".into(),
+            "printf 'a realistic long build command'; ".repeat(128),
+            storage.into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        write_task_at(&task, &metadata).unwrap();
+        (task, metadata)
+    }
+
+    #[test]
+    fn artifact_open_reads_metadata_once() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        let mut handles = TaskIoHandles::create(&task, BgMode::Pipes, false).unwrap();
+        let output = b"build output\n".repeat(10_000);
+        handles.write(TaskArtifact::Stdout, &output).unwrap();
+        work_counts::reset();
+        let mut file = open_task_artifact(&task.paths, TaskArtifact::Stdout).unwrap();
+        assert_eq!(file.read_all().unwrap(), output);
+        let counts = work_counts::get();
+        eprintln!("artifact open work: {counts:?}");
+        assert_eq!(counts.metadata_reads, 1);
+        assert_eq!(counts.parses, 2);
+        #[cfg(unix)]
+        assert_eq!(counts.opens, 7);
+    }
+
+    #[test]
+    fn missing_exit_marker_reads_metadata_once() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        work_counts::reset();
+        assert_eq!(read_exit_marker(&task.paths).unwrap(), None);
+        let counts = work_counts::get();
+        eprintln!("missing marker work: {counts:?}");
+        assert_eq!(counts.metadata_reads, 1);
+        assert_eq!(counts.parses, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_lifecycle_round_trips_payloads_and_metadata() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, mut metadata) = counted_task(storage.path());
+        work_counts::reset();
+        // Task metadata uses atomic replacement without a disk flush (the
+        // durability design treats bash task history as rebuildable; no
+        // flush helper remains in this module), and payload files are only
+        // consumed through verified handles.
+        write_task_at(&task, &metadata).unwrap();
+        for (name, bytes) in [
+            (COMMAND_FILE, metadata.command.as_bytes()),
+            (WRAPPER_FILE, super::super::process::PAYLOAD_WRAPPER),
+            (ENVIRONMENT_FILE, b"PATH=/usr/bin".as_slice()),
+            (MANIFEST_FILE, b"verified digest".as_slice()),
+        ] {
+            let mut held = create_control_file(&task.dirs, name, bytes).unwrap();
+            let mut actual = Vec::new();
+            held.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, bytes);
+        }
+        metadata.status = super::super::BgTaskStatus::Running;
+        write_task_at(&task, &metadata).unwrap();
+        metadata.status = super::super::BgTaskStatus::Completed;
+        write_task_at(&task, &metadata).unwrap();
+        let counts = work_counts::get();
+        eprintln!("task lifecycle work: {counts:?}");
+        assert!(read_task_at(&task).unwrap().is_terminal());
     }
 
     #[test]
@@ -2158,6 +2408,36 @@ mod tests {
         ] {
             assert!(validate_task_id(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_clones_stay_close_on_exec_until_the_child_allowlist_remaps_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let task = create_task_layout(temp.path(), "marker-clones", &valid_id(1)).unwrap();
+        let handles = TaskIoHandles::create(&task, BgMode::Pipes, true).unwrap();
+        let markers = [
+            TaskArtifact::Exit,
+            TaskArtifact::SandboxUnavailable,
+            TaskArtifact::PipelineStatus,
+        ]
+        .map(|artifact| handles.inheritable_file(artifact).unwrap());
+        for marker in &markers {
+            let flags = unsafe { libc::fcntl(marker.as_raw_fd(), libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+                "marker clone is inheritable in the parent"
+            );
+        }
+        let output = std::process::Command::new("/bin/bash")
+            .args(["-c", "if [ ! -e /dev/fd/1 ] || [ ! -e /dev/fd/2 ]; then echo 'descriptor lookup cannot see open stdio' >&2; exit 1; fi; for fd in \"$@\"; do if [ -e \"/dev/fd/$fd\" ]; then echo \"leaked marker $fd\" >&2; exit 1; fi; done", "marker-probe"])
+            .args(markers.iter().map(|marker| marker.as_raw_fd().to_string()))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

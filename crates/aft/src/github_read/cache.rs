@@ -196,16 +196,27 @@ pub struct GithubReadCompletion {
     pub attachments: Vec<GithubImageAttachment>,
     /// Live structured data retained for mutation flows that must reuse read ordinals.
     pub document: Option<super::model::GithubDocument>,
+    pub diff_page: Option<super::diff::GithubDiffPage>,
 }
 
 /// Handle for a fetch or attachment task that is running away from the request
 /// loop. Poll it from `PendingResponse`; never wait on it in standalone input
 /// handling.
 pub struct GithubReadDeferred {
-    receiver: mpsc::Receiver<Result<GithubReadCompletion, GithubReadError>>,
+    receiver: crate::response_finalize::PendingResponseReceiver<
+        Result<GithubReadCompletion, GithubReadError>,
+    >,
 }
 
 impl GithubReadDeferred {
+    pub(crate) fn into_receiver(
+        self,
+    ) -> crate::response_finalize::PendingResponseReceiver<
+        Result<GithubReadCompletion, GithubReadError>,
+    > {
+        self.receiver
+    }
+
     pub fn try_complete(&self) -> Option<Result<GithubReadCompletion, GithubReadError>> {
         match self.receiver.try_recv() {
             Ok(result) => Some(result),
@@ -259,7 +270,9 @@ struct GithubReadFlightWaiter {
     selector: GithubReadSelector,
     view: GithubReadView,
     fallback: Option<GithubReadCacheEntry>,
-    sender: mpsc::SyncSender<Result<GithubReadCompletion, GithubReadError>>,
+    sender: crate::response_finalize::PendingResponseSender<
+        Result<GithubReadCompletion, GithubReadError>,
+    >,
 }
 
 /// Coordinates live GitHub fetches, durable fallback copies, single-flight work,
@@ -350,6 +363,29 @@ impl GithubReadEngine {
         view: GithubReadView,
     ) -> Result<GithubReadStart, GithubReadError> {
         self.require_enabled(github)?;
+        if request.resource.diff_path.is_some() {
+            if view != GithubReadView::Document {
+                return Err(GithubReadError::invalid_resource(
+                    "Use read for diffs; aft_outline and aft_zoom do not support diff links",
+                ));
+            }
+            // Diff requests bypass cache lookup and shared document flights.
+            // Every page must reflect a fresh PR head, even after a failed fetch.
+            // The completion wake is captured here, so a quiet connection is
+            // still told when the diff arrives.
+            let (sender, receiver) = crate::response_finalize::pending_response_channel();
+            let fetcher = Arc::clone(&self.fetcher);
+            std::thread::spawn(move || {
+                let result = fetcher
+                    .fetch_diff(&GithubFetchRequest {
+                        resource: request.resource,
+                        working_directory: request.working_directory,
+                    })
+                    .map(|diff| diff.page(selector));
+                let _ = sender.send(result);
+            });
+            return Ok(GithubReadStart::Deferred(GithubReadDeferred { receiver }));
+        }
         let fallback = self.cache_fallback_for_request(&request);
         Ok(self.defer_fetch(request, selector, view, fallback))
     }
@@ -437,7 +473,9 @@ impl GithubReadEngine {
     ) -> GithubReadStart {
         let slot = self.flight_slot_for_request(&request);
         let fetch_request = request.clone();
-        let (sender, receiver) = mpsc::sync_channel(1);
+        // Every coalesced caller owns its own wake-bound sender. Capturing only
+        // the leader's connection would leave followers waiting on idle routes.
+        let (sender, receiver) = crate::response_finalize::pending_response_channel();
         let leader = {
             let mut state = self.state.lock();
             let waiters = state.flights.entry(slot.clone()).or_default();
@@ -520,6 +558,7 @@ fn fetch_store(
         number: request.resource.number,
         repository: Some(repository.clone()),
         comment_selector: None,
+        diff_path: None,
     };
     let canonical_text = render_document_for_resource(&document, &cache_resource)
         .expect("cache rendering has no discussion selector");
@@ -593,6 +632,7 @@ fn complete(
         freshness,
         attachments,
         document,
+        diff_page: None,
     }
 }
 
@@ -910,6 +950,95 @@ mod tests {
     }
 
     #[test]
+    fn diff_reads_fetch_live_without_cache_or_attachments() {
+        struct DiffFetcher(AtomicUsize);
+        impl GithubFetcher for DiffFetcher {
+            fn fetch(&self, _: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
+                panic!("diff must not fetch a document");
+            }
+            fn fetch_diff(
+                &self,
+                _: &GithubFetchRequest,
+            ) -> Result<super::super::diff::GithubDiff, GithubReadError> {
+                let revision = self.0.fetch_add(1, Ordering::SeqCst);
+                if revision >= 2 {
+                    return Err(GithubReadError::FetchFailed(
+                        "live diff unavailable".to_string(),
+                    ));
+                }
+                Ok(super::super::diff::GithubDiff {
+                    header: format!("PR owner/repo#42 head {revision}"),
+                    body: "+change\n".to_string(),
+                    cap_hit: false,
+                })
+            }
+        }
+        let cache = Arc::new(MemoryCache::with_entry("ordinary document", 1));
+        let downloader = Arc::new(CountingDownloader::default());
+        let engine = GithubReadEngine::new(
+            cache.clone(),
+            Arc::new(DiffFetcher(AtomicUsize::new(0))),
+            downloader.clone(),
+            Arc::new(FixtureClock::new(1)),
+        );
+        for revision in 0..3 {
+            let started = engine
+                .start_resource(
+                    &enabled_gh_read(),
+                    "pr://owner/repo/42/diff",
+                    "fixture",
+                    "identity",
+                    Some(true),
+                    GithubReadSelector::WholeDocument,
+                )
+                .unwrap();
+            let GithubReadStart::Deferred(deferred) = started else {
+                panic!("live diff must defer");
+            };
+            let result = wait_for(deferred);
+            if revision < 2 {
+                assert!(result
+                    .unwrap()
+                    .content
+                    .contains(&format!("head {revision}")));
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), "live diff unavailable");
+            }
+        }
+        assert_eq!(
+            cache.0.lock().as_ref().unwrap().canonical_text,
+            "ordinary document"
+        );
+        assert_eq!(downloader.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn diff_outline_refuses_before_fetching() {
+        let fetcher = Arc::new(FixtureFetcher::default());
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            fetcher.clone(),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(1)),
+        );
+        let result = engine.start_resource_with_view(
+            &enabled_gh_read(),
+            "pr://42/diff",
+            "fixture",
+            "identity",
+            None,
+            GithubReadSelector::WholeDocument,
+            GithubReadView::Outline,
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Use read for diffs"));
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn disabled_read_refuses_before_the_fetch_seam_runs() {
         let fetcher = Arc::new(FixtureFetcher::default());
         let engine = GithubReadEngine::new(
@@ -1078,6 +1207,92 @@ mod tests {
             error,
             GithubReadError::FetchFailed("fixture GitHub fetch failed".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_github_read_failure_notifies_completion() {
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            Arc::new(FailingFetcher),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(1_000)),
+        );
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let pending = {
+            let _scope = wake.install();
+            let GithubReadStart::Deferred(pending) = engine
+                .start(
+                    &enabled_gh_read(),
+                    request(None),
+                    GithubReadSelector::WholeDocument,
+                )
+                .expect("start failing read")
+            else {
+                panic!("live fetch must defer")
+            };
+            pending
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
+            .await
+            .expect("GitHub read failure wake");
+        assert_eq!(wake.generation(), 1);
+        assert!(matches!(
+            pending.try_complete(),
+            Some(Err(GithubReadError::FetchFailed(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn deferred_github_read_notifies_each_waiter_after_completion() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let fetcher = Arc::new(GatedFetcher {
+            calls: AtomicUsize::new(0),
+            started: started_tx,
+            release: Mutex::new(Some(release_rx)),
+        });
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            fetcher.clone(),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(1_000)),
+        );
+        let first_wake = crate::response_finalize::DeferredResponseWake::default();
+        let second_wake = crate::response_finalize::DeferredResponseWake::default();
+        let start = |wake: &crate::response_finalize::DeferredResponseWake| {
+            let _scope = wake.install();
+            let GithubReadStart::Deferred(pending) = engine
+                .start(
+                    &enabled_gh_read(),
+                    request(None),
+                    GithubReadSelector::WholeDocument,
+                )
+                .expect("start deferred read")
+            else {
+                panic!("live fetch must defer")
+            };
+            pending
+        };
+        let first = start(&first_wake);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("fetch starts");
+        let second = start(&second_wake);
+        release_tx.send(()).expect("release shared fetch");
+        // No polling fallback: both connections must be notified even though
+        // only the first caller started the shared producer thread.
+        for (wake, pending) in [(&first_wake, first), (&second_wake, second)] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
+                .await
+                .expect("GitHub read completion wake");
+            assert_eq!(wake.generation(), 1);
+            let completion = pending
+                .try_complete()
+                .expect("result queued before wake")
+                .unwrap();
+            assert!(completion.content.contains("fixture"));
+        }
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

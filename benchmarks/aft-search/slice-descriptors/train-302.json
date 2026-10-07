@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["synapse-runtime-teardown-crash"],
+  "note": "Synapse embedding and rerank clients shut their nested runtime down with shutdown_background so a deleted-root reap on the async frame loop cannot panic; panic hook persists a bounded backtrace to AFT's log. No ranking-fence file."
+}

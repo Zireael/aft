@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::blob_store::v2::{ContentHash, FamilyKey, FamilyPlane, FamilyStoreReader, PutOrTouch};
+use crate::blob_store::v2::{
+    ContentHash, FamilyKey, FamilyPlane, FamilyStore, FamilyStoreReader, PutOrTouch,
+};
 use crate::blob_store::{FullKey, SemanticKey, SEMANTIC_PRODUCER_VERSION};
 use crate::refresh::{FailureClass, FailureTracker, PreparedWork};
 use crate::semantic_index::{
@@ -114,7 +116,9 @@ impl SemanticProducer {
         .full_key()
     }
 
-    /// The family key of `bytes` at `rel_path` under this producer.
+    /// The input-addressed family key of `bytes` at `rel_path` under this
+    /// producer. Model output can vary across invocations; the store keeps the
+    /// first valid payload for these inputs, never replaces it with new floats.
     pub fn key(&self, bytes: &[u8], rel_path: &RelPath) -> FamilyKey {
         FamilyKey::from(&self.full_key(bytes, rel_path))
     }
@@ -267,6 +271,10 @@ pub struct SemanticPlane {
     separator: char,
     /// Unique in the process and never reused, unlike the plane's address.
     id: u64,
+    /// Counts actual fill reads separately from the driver's reconciliation
+    /// reads, so source-reuse tests cannot miss a read on the embedding path.
+    #[cfg(test)]
+    source_reads: Mutex<BTreeMap<PathBuf, usize>>,
 }
 
 static NEXT_PLANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -314,7 +322,14 @@ impl SemanticPlane {
             overlay_builds: std::sync::atomic::AtomicU64::new(0),
             id: NEXT_PLANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             separator: std::path::MAIN_SEPARATOR,
+            #[cfg(test)]
+            source_reads: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_source_reads(&self) -> BTreeMap<PathBuf, usize> {
+        std::mem::take(&mut *lock(&self.source_reads))
     }
 
     /// Lets a test on any platform run the overlay with Windows' separator.
@@ -556,7 +571,12 @@ impl SemanticPlane {
             ) else {
                 continue;
             };
-            match std::fs::read(root.join(&source)) {
+            let source = root.join(&source);
+            #[cfg(test)]
+            {
+                *lock(&self.source_reads).entry(source.clone()).or_default() += 1;
+            }
+            match std::fs::read(&source) {
                 Ok(bytes) if ContentHash::of(&bytes) == item.content => {
                     prepared.push(PreparedWork {
                         rel_path: item.rel_path.as_bytes().to_vec(),
@@ -601,8 +621,27 @@ impl SemanticPlane {
             {
                 report.stored_hits += 1;
                 ready.push((item.clone(), key));
-            } else if let Some(claim) = arena.claim(key) {
-                claimed.push((item.clone(), relative.clone(), group, claim));
+            } else if let Some(claim) = {
+                #[cfg(test)]
+                run_before_claim_for_test();
+                arena.claim(key)
+            } {
+                // A previous owner can finish and release its claim between
+                // our store miss and acquiring this claim. Recheck under the
+                // claim or a completed key would be embedded a second time.
+                if arena.get(&key).is_some() {
+                    report.resident_hits += 1;
+                    ready.push((item.clone(), key));
+                } else if arena
+                    .load(&store.reader(), &key, relative, &payload_producer)
+                    .map_err(plane_error)?
+                    .is_some()
+                {
+                    report.stored_hits += 1;
+                    ready.push((item.clone(), key));
+                } else {
+                    claimed.push((item.clone(), relative.clone(), group, claim));
+                }
             } else {
                 waiting.push((item.clone(), relative.clone(), key));
             }
@@ -628,7 +667,34 @@ impl SemanticPlane {
         }
         let mut transient = Vec::new();
         let mut succeeded = Vec::new();
-        if !to_embed.is_empty() {
+        // Protect all planned keys once, even though complete file runs are
+        // stored in smaller batches. Per-batch growing-pin writes would undo
+        // the linear pin-write bound. Unattempted keys are harmless protection.
+        let keys = ready
+            .iter()
+            .map(|(_, key)| *key)
+            .chain(to_embed.iter().map(|(_, _, _, claim)| *claim.key()))
+            .collect::<Vec<_>>();
+        protect(&view, &keys)?;
+        let mut pending = to_embed.into_iter().zip(chunks).peekable();
+        while pending.peek().is_some() {
+            // Keep whole files together so every successful request can be
+            // stored before the next one. A single larger file still spans
+            // requests and cannot be persisted until its run is complete.
+            let mut to_embed = Vec::new();
+            let mut chunks = Vec::new();
+            let mut batch_texts = 0usize;
+            while let Some((_, file_chunks)) = pending.peek() {
+                if !to_embed.is_empty()
+                    && batch_texts.saturating_add(file_chunks.len()) > budget.max_batch.max(1)
+                {
+                    break;
+                }
+                let (item, file_chunks) = pending.next().expect("peeked file");
+                batch_texts += file_chunks.len();
+                to_embed.push(item);
+                chunks.push(file_chunks);
+            }
             let (mut calls, mut texts) = (0usize, 0usize);
             let embedded = {
                 let mut counted = |batch: Vec<String>| {
@@ -647,7 +713,6 @@ impl SemanticPlane {
                     {
                         let key = *claim.key();
                         let payload = run.encode_view_payload(&payload_producer);
-                        protect(&view, &[key])?;
                         match store.put_or_touch(&key, &payload) {
                             Ok(PutOrTouch::Inserted { .. } | PutOrTouch::Reused { .. }) => {
                                 succeeded.push(full_key);
@@ -679,10 +744,24 @@ impl SemanticPlane {
                         // Releasing the claim wakes views waiting on the key.
                         drop(claim);
                     }
+                    admit_ready(
+                        &view,
+                        &store,
+                        std::mem::take(&mut ready),
+                        &self.producer.id(),
+                        current,
+                        &mut report,
+                    )?;
+                    if !report.errors.is_empty() || !report.store_errors.is_empty() {
+                        report.deferred += pending.count();
+                        break;
+                    }
                 }
                 Err(error) => {
                     transient.extend(to_embed.into_iter().map(|(_, _, full_key, _)| full_key));
                     report.errors.push(error);
+                    report.deferred += pending.count();
+                    break;
                 }
             }
         }
@@ -700,20 +779,14 @@ impl SemanticPlane {
             }
         }
 
-        let keys = ready.iter().map(|(_, key)| *key).collect::<Vec<_>>();
-        protect(&view, &keys)?;
-        // A family GC sweep can delete a blob row between the lookup above and
-        // the live-pin write. Such a key is not admitted: its path stays
-        // pending and the next fill stores the blob again.
-        let swept = store
-            .touch(&keys)
-            .map_err(|error| plane_error(error.to_string()))?
-            .missing
-            .into_iter()
-            .collect::<HashSet<_>>();
-        ready.retain(|(_, key)| !swept.contains(key));
-        let now = current();
-        let producer = self.producer.id();
+        admit_ready(
+            &view,
+            &store,
+            ready,
+            &self.producer.id(),
+            current,
+            &mut report,
+        )?;
         let mut state = lock(&view);
         for full_key in &succeeded {
             state.tracker.record_success(full_key);
@@ -732,24 +805,55 @@ impl SemanticPlane {
                 .insert((item.rel_path.clone(), item.content), reason);
             report.failed += 1;
         }
-        for (item, key) in ready {
-            let live = now.live_state(&item.rel_path).copied();
-            let admission = state.fill.admit(
-                &Completion { item, key },
-                &producer,
-                live.as_ref(),
-                Some(now.generation().manifest()),
-            );
-            match admission {
-                Admission::Installed => report.installed += 1,
-                Admission::DroppedContent | Admission::DroppedProducer => report.dropped += 1,
-            }
-        }
-        if report.installed > 0 || report.failed > 0 {
+        if report.failed > 0 {
             state.fill_version += 1;
         }
         Ok(report)
     }
+}
+
+fn admit_ready(
+    view: &Mutex<ViewState>,
+    store: &FamilyStore,
+    ready: Vec<(WorkItem, FamilyKey)>,
+    producer: &str,
+    current: &dyn Fn() -> Snapshot,
+    report: &mut FillReport,
+) -> Result<(), PlaneError> {
+    if ready.is_empty() {
+        return Ok(());
+    }
+    let keys = ready.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+    protect(view, &keys)?;
+    // GC may have won before the live-pin write. Do not admit a missing row.
+    let swept = store
+        .touch(&keys)
+        .map_err(|error| plane_error(error.to_string()))?
+        .missing
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let now = current();
+    let mut state = lock(view);
+    let installed_before = report.installed;
+    for (item, key) in ready {
+        if swept.contains(&key) {
+            continue;
+        }
+        let live = now.live_state(&item.rel_path).copied();
+        match state.fill.admit(
+            &Completion { item, key },
+            producer,
+            live.as_ref(),
+            Some(now.generation().manifest()),
+        ) {
+            Admission::Installed => report.installed += 1,
+            Admission::DroppedContent | Admission::DroppedProducer => report.dropped += 1,
+        }
+    }
+    if report.installed != installed_before {
+        state.fill_version += 1;
+    }
+    Ok(())
 }
 
 fn protect(view: &Mutex<ViewState>, keys: &[FamilyKey]) -> Result<(), PlaneError> {
@@ -758,6 +862,24 @@ fn protect(view: &Mutex<ViewState>, keys: &[FamilyKey]) -> Result<(), PlaneError
             .protect(keys)
             .map_err(|error| plane_error(error.to_string())),
         None => Err(plane_error("semantic fill has no live pin")),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn before_claim_for_test(callback: impl FnOnce() + 'static) {
+    BEFORE_CLAIM.with(|hook| *hook.borrow_mut() = Some(Box::new(callback)));
+}
+
+#[cfg(test)]
+fn run_before_claim_for_test() {
+    let callback = BEFORE_CLAIM.with(|hook| hook.borrow_mut().take());
+    if let Some(callback) = callback {
+        callback();
     }
 }
 
@@ -1187,6 +1309,7 @@ impl super::first_load::CompositePlane for SemanticPlane {
             .map_err(|error| plane_error(error.to_string()))?;
         let view = self.view(&ViewAccess::Owner(owner.clone()));
         let state = lock(&view);
+        let mut candidates = Vec::new();
         for (path, entry) in manifest.entries_mut() {
             let EntryV2::Regular {
                 content, planes, ..
@@ -1218,15 +1341,7 @@ impl super::first_load::CompositePlane for SemanticPlane {
                 },
             };
             if let Some(key) = key {
-                live.protect(&[key])
-                    .map_err(|error| plane_error(error.to_string()))?;
-                let touched = store
-                    .touch(&[key])
-                    .map_err(|error| plane_error(error.to_string()))?;
-                if touched.missing.is_empty() {
-                    planes.semantic = Some(PlaneState::ready(&key));
-                    continue;
-                }
+                candidates.push((path.clone(), key));
             }
             if let Some(reason) = state.failed.get(&(path.clone(), *content)) {
                 planes.semantic = Some(PlaneState::Failed {
@@ -1238,6 +1353,26 @@ impl super::first_load::CompositePlane for SemanticPlane {
             if !matches!(&planes.semantic, Some(PlaneState::Failed { producer, .. }) if *producer == id)
             {
                 planes.semantic = Some(PlaneState::pending("awaiting semantic fill"));
+            }
+        }
+        if !candidates.is_empty() {
+            // Pin all candidates before the touch transaction. Missing rows
+            // remain pending/failed: GC may have won before protection landed.
+            let keys = candidates.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+            live.protect(&keys)
+                .map_err(|error| plane_error(error.to_string()))?;
+            let missing = store
+                .touch(&keys)
+                .map_err(|error| plane_error(error.to_string()))?
+                .missing
+                .into_iter()
+                .collect::<HashSet<_>>();
+            for (path, key) in candidates {
+                if !missing.contains(&key) {
+                    if let Some(EntryV2::Regular { planes, .. }) = manifest.get_mut(&path) {
+                        planes.semantic = Some(PlaneState::ready(&key));
+                    }
+                }
             }
         }
         Ok(())

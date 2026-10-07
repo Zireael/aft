@@ -17,6 +17,11 @@ export function formatForegroundResult(data: Record<string, unknown>): string {
   }
   if (status === "timed_out") {
     rendered += `\n[command timed out]`;
+    // Name the limit that killed it, so AFT's own default limit is not
+    // mistaken for the command failing.
+    if (typeof data.status_reason === "string" && data.status_reason !== "") {
+      rendered += ` ${data.status_reason}`;
+    }
   }
   if (typeof exit === "number" && exit !== 0) {
     rendered += `\n[exit code: ${exit}]`;

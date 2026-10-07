@@ -89,6 +89,7 @@ log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+apollo-parser = "0.8.6"
 lsp-types = "0.97"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
@@ -158,6 +159,7 @@ aft-tokenizer = { path = "../aft-tokenizer", version = "0.58.2" }
 # Lives in github.com/cortexkit/commons (product-neutral, used without subc);
 # its CI runs the cfg(windows) verbatim/UNC/drive-case vectors continuously.
 cortexkit-paths = "0.1"
+cortexkit-exec-remote-types = "0.2.1"
 
 glob = "0.3"
 which = "7"
@@ -196,11 +198,11 @@ markup5ever_rcdom = "0.38"
 # Keep protocol and transport pinned in lockstep: the transport Frame codec and
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
-cortexkit-role-tool-provider = "=0.4.5"
+cortexkit-role-tool-provider = "=0.5.0"
 jsonschema = { version = "0.33", default-features = false }
-subc-protocol = "=0.28.0"
-subc-transport = "=0.9.0"
-subc-client-rs = "=0.25.0"
+subc-protocol = "=0.29.0"
+subc-transport = "=0.10.0"
+subc-client-rs = "=0.26.1"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.
@@ -224,10 +226,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_UI_Shell",
 ] }
 
 [dev-dependencies]
-cortexkit-role-tool-provider-conformance = "=0.4.5"
+graphql-parser = "0.4.1"
+cortexkit-role-tool-provider-conformance = "=0.5.0"
 cortexkit-role-harness = "=0.1.0"
 async-trait = "0.1"
 tokio = { version = "1", features = ["test-util"] }

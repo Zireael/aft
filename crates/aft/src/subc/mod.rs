@@ -174,9 +174,8 @@ const _: () = assert!(
 /// long-running reminders that arrive after their reliable completion event.
 const COMPLETED_TASK_SUPPRESSION_MAX: usize = 4096;
 
-/// Bash foreground orchestration polls detached tasks with short read-lane jobs.
-/// The sleep between polls is outside the executor so no read or write worker is
-/// pinned while a foreground command is still running.
+/// The separate subc foreground-bash orchestrator checks task state and wait
+/// deadlines off executor slots at this interval.
 const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Host elicitation asks fail closed if the MCP facade does not answer promptly.
@@ -199,12 +198,15 @@ type PushEnvelope = (ProjectRootId, PushFrame);
 type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
 mod bash;
+#[cfg(test)]
+mod bash_selector_tests;
 mod drain;
 mod health;
 mod manifest;
 mod persistence;
 mod push;
 mod readiness;
+mod remote_policy;
 mod stall_watchdog;
 mod standing;
 mod tool_provider;
@@ -428,10 +430,33 @@ struct ResolvedSubcResponse {
 #[derive(Default)]
 struct PendingSubcResponses {
     entries: Vec<PendingSubcResponse>,
+    dirty: bool,
+    wake_generation: u64,
+    next_deadline_poll: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct DeferredResponseSender {
+    entries: mpsc::UnboundedSender<PendingSubcResponse>,
+    wake: crate::response_finalize::DeferredResponseWake,
+}
+
+impl DeferredResponseSender {
+    fn send(
+        &self,
+        pending: PendingSubcResponse,
+    ) -> Result<(), mpsc::error::SendError<PendingSubcResponse>> {
+        self.entries.send(pending)
+    }
 }
 
 impl PendingSubcResponses {
     fn register(&mut self, pending: PendingSubcResponse) {
+        self.dirty = true;
+        if let Some(interval) = pending.pending.poll_interval() {
+            let due = Instant::now() + interval;
+            self.next_deadline_poll = Some(self.next_deadline_poll.map_or(due, |old| old.min(due)));
+        }
         self.entries.retain(|entry| {
             let keep = entry.route != pending.route || entry.corr != pending.corr;
             if !keep {
@@ -442,6 +467,45 @@ impl PendingSubcResponses {
             keep
         });
         self.entries.push(pending);
+    }
+
+    fn poll_if_woken(
+        &mut self,
+        executor: &Executor,
+        wake: &crate::response_finalize::DeferredResponseWake,
+    ) -> Vec<ResolvedSubcResponse> {
+        if self.needs_deadline_poll()
+            && self
+                .next_deadline_poll
+                .is_some_and(|due| Instant::now() >= due)
+        {
+            // Check at the top of each turn so sustained control traffic cannot
+            // starve state-based waits or independent deadlines in biased select.
+            self.dirty = true;
+            self.next_deadline_poll = self
+                .timer_poll_interval()
+                .map(|interval| Instant::now() + interval);
+        }
+        let generation = wake.generation();
+        if !self.dirty && self.wake_generation == generation {
+            return Vec::new();
+        }
+        // Capture before polling: a producer that completes during this pass
+        // increments the generation and is therefore observed on the next turn.
+        self.wake_generation = generation;
+        self.dirty = false;
+        self.poll_ready(executor)
+    }
+
+    fn needs_deadline_poll(&self) -> bool {
+        self.timer_poll_interval().is_some()
+    }
+
+    fn timer_poll_interval(&self) -> Option<Duration> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.pending.poll_interval())
+            .min()
     }
 
     fn poll_ready(&mut self, executor: &Executor) -> Vec<ResolvedSubcResponse> {
@@ -540,6 +604,7 @@ impl PendingSubcResponses {
         resolved
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1022,6 +1087,9 @@ struct RouteIdentityData {
     /// kept so that when the daemon ends that scope, the bash tasks started on
     /// this route can be ended with it; that cleanup is not built yet.
     scope: Option<subc_protocol::scope::ScopeStamp>,
+    /// Set by the route's first tool call, so the health counter of scoped
+    /// routes that make tool calls counts each route once.
+    made_tool_call: AtomicBool,
 }
 
 impl Deref for RouteIdentity {
@@ -1569,6 +1637,9 @@ struct ReclaimedRoutes {
     highest_epoch_by_channel: HashMap<u16, u32>,
 }
 
+const ROUTE_RECLAIMED_MESSAGE: &str =
+    "project root was removed; the route must be reopened with a fresh bind before retrying";
+
 impl ReclaimedRoutes {
     fn insert(&mut self, route: RouteChannel) {
         self.highest_epoch_by_channel
@@ -2028,6 +2099,10 @@ fn reap_idle_roots_with_presence(
         if deleted {
             match executor.try_retire_idle_actor_in_background(&root_id) {
                 Some(true) => {
+                    crate::db::remote_exec::forget_root_in_background(
+                        ctx.db(),
+                        root_id.as_path().display().to_string(),
+                    );
                     live_roots.remove(&root_id);
                     forgotten_deleted_roots.push(root_id.clone());
                 }
@@ -2168,15 +2243,16 @@ fn reap_idle_lsp_servers(
 }
 
 /// Forgets a project root whose directory is gone, together with every route
-/// bound to it. The daemon still has those routes bound (nothing here tells it
-/// otherwise) and still counts every request open on them until it sees a
-/// terminal frame for the request's corr. The returned frames are those
-/// terminals, one per request this call stops tracking: a StreamEnd for each
-/// held bg_events stream and a `route_not_bound` error for each tool call or
-/// permission ask. The caller must queue them; dropping them leaves requests
-/// the daemon waits on forever, which pins its restart drain at the ceiling.
+/// bound to it. The daemon counts each request open until it sees a terminal
+/// frame for that request's corr. Return those terminals before any route
+/// Goodbye so drain accounting settles before the daemon closes the routes and
+/// tells carriers to reopen them. Held tool calls may already have run, so their
+/// errors must not invite automatic retries; pending permission asks have not
+/// dispatched a command and can safely be retried after a fresh bind.
+/// The caller must queue every frame in order; dropping terminals can pin the
+/// daemon's drain, and dropping Goodbyes leaves carriers holding dead routes.
 #[allow(clippy::too_many_arguments)]
-#[must_use = "the returned terminal frames must be queued, or the daemon keeps those requests open"]
+#[must_use = "queue the returned terminals and route Goodbyes in order to settle and close the routes"]
 fn purge_deleted_root_residents(
     root_id: &ProjectRootId,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
@@ -2196,7 +2272,6 @@ fn purge_deleted_root_residents(
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     metrics: &DispatchPathMetrics,
 ) -> Vec<Frame> {
-    const RECLAIMED_MESSAGE: &str = "project root was removed; the route is no longer bound";
     let mut terminals = Vec::new();
     let mut push_terminal = |built: Result<Frame, SubcError>| match built {
         Ok(frame) => terminals.push(frame),
@@ -2220,7 +2295,7 @@ fn purge_deleted_root_residents(
             .filter_map(|ask| (&ask.root == root_id).then_some(ask.route)),
     );
 
-    for route in stale_routes {
+    for route in stale_routes.iter().copied() {
         reclaimed_routes.insert(route);
         remove_installed_route(installed_route_epochs, route);
         remove_route_channel(routes, root_channels, route);
@@ -2236,8 +2311,8 @@ fn purge_deleted_root_residents(
                 route.epoch,
                 corr,
                 request.flags,
-                "route_not_bound",
-                RECLAIMED_MESSAGE,
+                "outcome_unknown_root_reclaimed",
+                "project root was removed while the tool call was in flight; it may have run partly and must not be re-sent automatically",
             ));
         }
         retry_buffer.remove(&route);
@@ -2261,8 +2336,10 @@ fn purge_deleted_root_residents(
             ask.route.epoch,
             ask.tool_corr,
             ask.tool_flags,
-            "route_not_bound",
-            RECLAIMED_MESSAGE,
+            // The ask is stored before submit_deferred_bash, which runs only
+            // after an allow reply. No command has started on this path.
+            "route_reclaimed",
+            ROUTE_RECLAIMED_MESSAGE,
         ));
         false
     });
@@ -2274,6 +2351,17 @@ fn purge_deleted_root_residents(
         root_id.as_path().display(),
         terminals.len()
     );
+    // Close only after every held corr has its terminal, including permission
+    // asks above. The daemon releases each binding and relays Goodbye to its
+    // carrier, whose next call opens a fresh route instead of reusing this one.
+    for route in stale_routes {
+        match build_goodbye_frame(PROTOCOL_VERSION, route.channel, route.epoch, 0) {
+            Ok(frame) => terminals.push(frame),
+            Err(error) => {
+                log::warn!("subc attach: failed to build root-reclaim route Goodbye: {error}")
+            }
+        }
+    }
     terminals
 }
 
@@ -2386,7 +2474,7 @@ fn ingress_route_should_be_processed(
     }
 
     // A late request for a reclaimed root reaches the normal unknown-route
-    // handler, which returns the typed `route_not_bound` error. Other stale or
+    // handler, which returns the typed `route_reclaimed` error. Other stale or
     // never-installed generations remain silent so they cannot affect a newer
     // route or change the protocol's rejected-bind behavior.
     frame.header.ty == FrameType::Request
@@ -2807,6 +2895,7 @@ async fn handle_bash_elicitation_reply(
                 pending.repeat,
                 pending.worker_session,
                 false,
+                None,
             );
             return Ok(());
         }
@@ -3374,6 +3463,8 @@ fn run_subc_mode_inner(
             tool_response_body_limit,
             lifecycle_probe,
             &storage_dir,
+            #[cfg(test)]
+            None,
         )
         .await
     });
@@ -3389,9 +3480,11 @@ fn run_subc_mode_inner(
         Ok(ModuleLoopExit::Graceful | ModuleLoopExit::ConnectionLost)
     );
     let index_flush = std::thread::spawn(move || {
+        record_exit_phase_event("index_flush", "start");
         if flush_indexes {
             flush_actor_indexes_on_graceful_shutdown(&flush_contexts, exit_started);
         }
+        record_exit_phase_event("index_flush", "end");
         log::info!(
             "subc exit phase=index_flush_done elapsed_ms={}",
             exit_started.elapsed().as_millis()
@@ -3411,9 +3504,11 @@ fn run_subc_mode_inner(
         crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET.as_millis(),
         exit_started.elapsed().as_millis()
     );
+    record_exit_phase_event("lsp_shutdown", "start");
     if let Some(registry) = registry {
         crate::lsp::manager::LspManager::shutdown_taken_clients(clients, registry);
     }
+    record_exit_phase_event("lsp_shutdown", "end");
     log::info!(
         "subc exit phase=lsp_done elapsed_ms={}",
         exit_started.elapsed().as_millis()
@@ -3641,6 +3736,34 @@ fn flush_actor_indexes_on_graceful_shutdown_with(
     }
     line
 }
+
+/// Record phase boundaries for process-level shutdown tests without relying on
+/// log timestamps, which are rounded and intended for diagnostics.
+#[cfg(debug_assertions)]
+static EXIT_PHASE_EVENT_LOCK: StdMutex<()> = StdMutex::new(());
+
+#[cfg(debug_assertions)]
+fn record_exit_phase_event(phase: &str, boundary: &str) {
+    use std::io::Write;
+
+    let Some(path) = std::env::var_os("AFT_TEST_EXIT_PHASE_EVENTS") else {
+        return;
+    };
+    let Ok(_guard) = EXIT_PHASE_EVENT_LOCK.lock() else {
+        return;
+    };
+    if let Ok(mut events) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(events, "{phase}:{boundary}");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+fn record_exit_phase_event(_phase: &str, _boundary: &str) {}
 
 /// Test-only entry that enables the non-manifest native-command passthrough on
 /// route channels. Integration tests drive synthetic native commands (`glob`,
@@ -3938,7 +4061,6 @@ async fn process_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
-    standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -3955,7 +4077,6 @@ async fn process_route_bind_completion(
         pending_binds,
         installed_route_epochs,
         executor,
-        standing_actor,
         shutdown,
         metrics,
         lifecycle_probe,
@@ -3975,7 +4096,6 @@ async fn drain_pending_route_bind_completions(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
-    standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -3993,7 +4113,6 @@ async fn drain_pending_route_bind_completions(
             pending_binds,
             installed_route_epochs,
             executor,
-            standing_actor,
             shutdown,
             metrics,
             lifecycle_probe,
@@ -4019,6 +4138,7 @@ async fn run_module_loop<R, W>(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
+    #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
 ) -> Result<ModuleLoopExit, SubcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -4079,6 +4199,7 @@ where
     };
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
     // Lives until this function returns, i.e. for the whole attached session,
     // including teardown. Dropping it stops the thread.
     let _stall_watchdog = spawn_stall_watchdog(&dispatch_path_metrics, &executor, storage_dir);
@@ -4114,17 +4235,34 @@ where
     let mut next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
     let mut next_maintenance_at = next_drain_at;
     let mut root_presence = RootPresenceProbe::new();
-    let standing_actor =
-        standing::StandingActor::new(Arc::clone(&shared_app), Arc::clone(&executor));
-    // Startup reconciliation is intentionally direct; subsequent passes use
-    // this existing maintenance timer arm and never create a standing timer.
-    standing_actor.reconcile_at_startup();
+    let standing_actor = Arc::new(
+        standing::StandingActor::new(Arc::clone(&shared_app), Arc::clone(&executor))
+            .with_startup_storage_dir(storage_dir),
+    );
+    #[cfg(test)]
+    let standing_actor = standing_actor_override.unwrap_or(standing_actor);
+    let standing_for_worker = Arc::clone(&standing_actor);
+    let mut standing_startup_pending = true;
+    let standing_worker = standing::StandingWorker::start(move || {
+        // Startup also opens the standing database. It must not hold up the
+        // transport any more than a periodic reconciliation can.
+        if standing_startup_pending {
+            standing_for_worker.reconcile_at_startup();
+            standing_startup_pending = false;
+        }
+        standing_for_worker.tick();
+    });
     let mut next_standing_pass_at = tokio::time::Instant::now();
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) =
         mpsc::channel::<bash::BashDeferredCompletion>(256);
     let (deferred_response_tx, mut deferred_response_rx) =
         mpsc::unbounded_channel::<PendingSubcResponse>();
+    let deferred_wake = crate::response_finalize::DeferredResponseWake::default();
+    let deferred_response_tx = DeferredResponseSender {
+        entries: deferred_response_tx,
+        wake: deferred_wake.clone(),
+    };
     let (bash_poll_touch_tx, mut bash_poll_touch_rx) = mpsc::channel::<ProjectRootId>(256);
     let (control_completion_tx, mut control_completion_rx) =
         mpsc::channel::<RouteBindCompletion>(256);
@@ -4185,7 +4323,7 @@ where
         shared_app.set_open_route_count(routes.len() + management_routes.len());
         crate::logging::perf_tick(Some(&executor));
         dispatch_path_metrics.mark_frame_loop_tick();
-        let ready_inspects = pending_responses.poll_ready(executor.as_ref());
+        let ready_inspects = pending_responses.poll_if_woken(executor.as_ref(), &deferred_wake);
         for resolved in ready_inspects {
             if let Err(error) = deliver_resolved_subc_response(
                 &writer_tx,
@@ -4231,7 +4369,6 @@ where
             &mut pending_binds,
             &mut installed_route_epochs,
             &executor,
-            &standing_actor,
             &shutdown,
             &dispatch_path_metrics,
             lifecycle_probe.as_ref(),
@@ -4393,7 +4530,6 @@ where
                     &mut pending_binds,
                     &mut installed_route_epochs,
                     &executor,
-                    &standing_actor,
                     &shutdown,
                     &dispatch_path_metrics,
                     lifecycle_probe.as_ref(),
@@ -4533,6 +4669,7 @@ where
                             &frame,
                             &shared_app,
                             &executor,
+                            &standing_actor,
                             &mut live_roots,
                             &mut pending_binds,
                             &mut installed_route_epochs,
@@ -4610,6 +4747,7 @@ where
                                 phase_trace,
                                 &routes,
                                 &pending_binds,
+                                &reclaimed_routes,
                                 &mut live_roots,
                                 &executor,
                                 &active_tool_calls,
@@ -5014,9 +5152,12 @@ where
                     );
                 }
             }
-            _ = tokio::time::sleep(PENDING_POLL_INTERVAL), if !pending_responses.is_empty() => {
-                // The next loop turn polls detached inspect completions. Keeping
-                // the timer here lets already-ready control frames run first.
+            _ = deferred_wake.notified() => {}
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                pending_responses.next_deadline_poll.unwrap_or_else(Instant::now)
+            )), if pending_responses.needs_deadline_poll() => {
+                // State-based waits and overall deadlines explicitly retain a
+                // timer. Channel-only producers never need idle registry polls.
             }
             _ = tokio::time::sleep_until(next_drain_at) => {
                 // Wakes an otherwise-idle loop so the pre-turn drain check
@@ -5038,6 +5179,7 @@ where
                 // only spawn their work, and only when it is due.
                 if let Some(db) = shared_app.try_db() {
                     crate::db::write_ledger::maybe_spawn_fold(db.clone());
+                    crate::db::remote_exec::maybe_spawn_sweep(db.clone());
                     crate::db::compression_events::maybe_spawn_retention(
                         db,
                         retention_registries,
@@ -5059,7 +5201,7 @@ where
                 root_presence.request(live_roots.keys().cloned().collect());
                 for root_id in &reap.forgotten_deleted_roots {
                     bg_unacked_keys_by_root.remove(root_id);
-                    let terminals = purge_deleted_root_residents(
+                    let reclaim_frames = purge_deleted_root_residents(
                         root_id,
                         &mut routes,
                         &mut root_channels,
@@ -5078,12 +5220,12 @@ where
                         &mut pending_bash_asks,
                         &dispatch_path_metrics,
                     );
-                    for terminal in terminals {
+                    for frame in reclaim_frames {
                         if let Err(error) = send_reliable_writer_frame(
                             &writer_tx,
                             &dispatch_path_metrics,
-                            terminal,
-                            "root-reclaim terminal",
+                            frame,
+                            "root-reclaim terminal or route Goodbye",
                         )
                         .await
                         {
@@ -5111,7 +5253,7 @@ where
                     &dispatch_path_metrics,
                 );
                 if tokio::time::Instant::now() >= next_standing_pass_at {
-                    standing_actor.tick();
+                    standing_worker.request();
                     next_standing_pass_at = tokio::time::Instant::now()
                         + standing::STANDING_MAINTENANCE_INTERVAL;
                 }
@@ -5622,7 +5764,6 @@ async fn handle_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
-    standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -5772,9 +5913,6 @@ async fn handle_route_bind_completion(
         meta.maintenance_poisoned = false;
     }
     if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
-        // The bind transition revokes any matching unbound standing admission
-        // before this session can select the shared artifact family.
-        standing_actor.begin_session_bind(&ctx);
         ctx.mark_subc_bound();
         if restore_watcher {
             crate::commands::configure::ensure_project_watcher(&ctx);
@@ -5940,6 +6078,7 @@ async fn handle_control_request(
     frame: &Frame,
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
+    standing_actor: &Arc<standing::StandingActor>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
@@ -5965,8 +6104,10 @@ async fn handle_control_request(
     user_config_path: Option<&Path>,
     tool_response_body_limit: usize,
 ) -> Result<(), SubcError> {
-    let request =
-        serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(SubcError::Json)?;
+    let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
+        Ok(request) => request,
+        Err(error) => return refuse_undecodable_control_request(tx, frame, &error, metrics).await,
+    };
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
@@ -5980,6 +6121,19 @@ async fn handle_control_request(
             role_versions,
         } => {
             let route_id = route_key(route_channel, epoch);
+            // Whether the daemon stamped this bind with a scope decides what a
+            // tool call without a preset gets (refused when scoped, the
+            // unscoped default otherwise), so every bind says which it was.
+            log::info!(
+                "subc route bind: channel={route_channel} epoch={epoch} harness={} session={} scope={} role_versions={}",
+                identity.harness,
+                identity.session,
+                scope.as_ref().map_or_else(
+                    || "none".to_string(),
+                    |stamp| format!("{:?}", stamp.kind).to_lowercase()
+                ),
+                if role_versions.is_some() { "declared" } else { "none" }
+            );
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,
@@ -6263,6 +6417,7 @@ async fn handle_control_request(
                 consumer_elicitation_capable,
                 disabled_tools: bind_disabled_tools,
                 scope,
+                made_tool_call: AtomicBool::new(false),
             }));
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
@@ -6288,11 +6443,22 @@ async fn handle_control_request(
             let (configure_rx, configure_cancellation) = executor.submit_bind_cancellable_async(
                 bind_root_id.clone(),
                 configure_request_id.clone(),
-                Arc::new(move |ctx| {
-                    log_ctx::with_session(Some(configure_session.clone()), || {
-                        dispatch(configure_req.clone(), ctx)
+                {
+                    let standing_actor = Arc::clone(standing_actor);
+                    Arc::new(move |ctx| {
+                        log_ctx::with_session(Some(configure_session.clone()), || {
+                            let response = dispatch(configure_req.clone(), ctx);
+                            if response.success {
+                                // Revoke matching standing publication before the
+                                // session is installed, but never on the frame loop.
+                                // Contention is covered by the normal bind deadline;
+                                // health and other routes remain serviceable.
+                                standing_actor.begin_session_bind(ctx);
+                            }
+                            response
+                        })
                     })
-                }),
+                },
             );
             pending_binds.insert(
                 route_id,
@@ -6508,8 +6674,28 @@ async fn handle_management_request(
                 "command".to_string(),
                 json!(crate::commands::health_digest::HEALTH_DIGEST_OPERATION),
             );
-            let request = serde_json::from_value::<RawRequest>(Value::Object(request))
-                .map_err(SubcError::Json)?;
+            let request = match serde_json::from_value::<RawRequest>(Value::Object(request)) {
+                Ok(request) => request,
+                // A malformed parameter (a non-string `session_id`, say) is
+                // this request's error, never a reason to end the frame loop.
+                Err(error) => {
+                    return send_management_response(
+                        tx,
+                        frame,
+                        operation,
+                        Response::error(
+                            "management-health-digest",
+                            "invalid_request",
+                            format!(
+                                "health.digest params do not decode: {}",
+                                brief_decode_error(&error)
+                            ),
+                        ),
+                        metrics,
+                    )
+                    .await;
+                }
+            };
             match ProjectRootId::from_path(Path::new(root))
                 .ok()
                 .and_then(|root_id| executor.actor_context(&root_id))
@@ -6814,6 +7000,54 @@ async fn send_route_bind_ack(
     send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await
 }
 
+/// Longest decode-error text a refusal carries back to the sender; serde can
+/// quote a whole body in its message.
+const DECODE_ERROR_TEXT_MAX: usize = 240;
+
+/// A serde decode error, shortened for a refusal message and a log line.
+fn brief_decode_error(error: &serde_json::Error) -> String {
+    let text = error.to_string();
+    match text.char_indices().nth(DECODE_ERROR_TEXT_MAX) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text,
+    }
+}
+
+/// Answers a channel-0 request whose body does not decode, and keeps the
+/// module running.
+///
+/// One request AFT cannot read (for example a route bind whose scope stamp
+/// carries a field a deny-unknown-fields type does not know yet) must cost
+/// only that request. Ending the frame loop instead would drop every route on
+/// the connection, fleet-wide, until the daemon respawned the module. Only
+/// transport failures may end the loop.
+async fn refuse_undecodable_control_request(
+    tx: &WriterSender,
+    frame: &Frame,
+    error: &serde_json::Error,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let reason = brief_decode_error(error);
+    log::warn!(
+        "subc attach: refusing channel-0 request corr={} whose body does not decode ({} bytes): {reason}",
+        frame.header.corr,
+        frame.body.len()
+    );
+    let response = build_error_frame(
+        frame.header.ver,
+        0,
+        0,
+        frame.header.corr,
+        frame.header.flags,
+        UNDECODABLE_CONTROL_REQUEST,
+        &format!("control request does not decode: {reason}"),
+    )?;
+    send_reliable_writer_frame(tx, metrics, response, "undecodable control request error").await
+}
+
+/// Error code for a channel-0 request AFT could not decode.
+pub(crate) const UNDECODABLE_CONTROL_REQUEST: &str = "undecodable_control_request";
+
 async fn send_route_bind_error(
     tx: &WriterSender,
     frame: &Frame,
@@ -6960,27 +7194,41 @@ async fn submit_provider_read(
     let job_operation = operation.clone();
     let request_id = format!("subc-{}-{}", route.channel, corr);
     let job_id = request_id.clone();
-    // No database, index, build, or configuration lookup occurs on this lane.
+    // Parameterless catalogs stay on the read lane. Scoped worker routing
+    // params are committed durably before the catalog reply is published.
+    let freeze_policy = remote_policy::key(&identity, body.get("preset").and_then(Value::as_str))
+        .is_some()
+        && body
+            .get("params")
+            .and_then(Value::as_object)
+            .is_some_and(|p| p.contains_key("remote_exec") || p.contains_key("siblings"));
     let rx = submit_active_tool_call(
         executor,
         active,
         route,
         corr,
         identity.root.clone(),
-        Lane::PureRead,
+        if freeze_policy {
+            Lane::Mutating
+        } else {
+            Lane::PureRead
+        },
         request_id.clone(),
         RouteDetachPolicy::CancelOnDetach,
         &operation,
         RequestFrameMeta { ver, flags },
-        Box::new(move |_| {
+        Box::new(move |ctx| {
             let result = if job_operation == "role.describe" {
                 Ok(tool_provider::describe())
             } else {
-                tool_provider::catalog(
-                    body,
-                    &identity.disabled_tools,
-                    crate::bash_background::powershell_available(),
-                )
+                if freeze_policy {
+                    crate::database_open::run_staged_open(
+                        ctx,
+                        crate::database_open::DatabaseOpenRunner::ConfigureTail,
+                        true,
+                    );
+                }
+                remote_policy::catalog(body, &identity, ctx)
             };
             Response::success(
                 job_id,
@@ -7031,6 +7279,7 @@ async fn handle_tool_call(
     mut phase_trace: PhaseTrace,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
+    reclaimed_routes: &ReclaimedRoutes,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Arc<Executor>,
     active_tool_calls: &ActiveToolCalls,
@@ -7048,7 +7297,7 @@ async fn handle_tool_call(
     bg_wake_pending: &mut BgWakePending,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     dispatch: DispatchFn,
-    deferred_response_tx: &mpsc::UnboundedSender<PendingSubcResponse>,
+    deferred_response_tx: &DeferredResponseSender,
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
     module_drain: &drain::ModuleDrainWindow,
@@ -7069,16 +7318,25 @@ async fn handle_tool_call(
     }
 
     let Some(identity) = routes.get(&route_id).cloned() else {
+        // Both refusals happen before decoding or dispatching the call. Keep
+        // them distinct from reclaiming an already-running call: carriers may
+        // reopen and resend these requests without duplicating tool effects.
+        let (code, message) = if reclaimed_routes.contains(route_id) {
+            ("route_reclaimed", ROUTE_RECLAIMED_MESSAGE)
+        } else {
+            ("route_not_bound", "route is not bound before tool call")
+        };
         let error = build_error_frame(
             frame.header.ver,
             frame.header.channel,
             frame.header.epoch,
             frame.header.corr,
             frame.header.flags,
-            "route_not_bound",
-            "route is not bound before tool call",
+            code,
+            message,
         )?;
-        return send_reliable_writer_frame(tx, metrics, error, "route_not_bound error").await;
+        return send_reliable_writer_frame(tx, metrics, error, "unbound or reclaimed route error")
+            .await;
     };
     let restore_watcher = live_roots
         .get(&identity.root)
@@ -7095,7 +7353,10 @@ async fn handle_tool_call(
         }
     }
 
-    let envelope = serde_json::from_slice::<Value>(&frame.body).map_err(SubcError::Json)?;
+    let envelope = match serde_json::from_slice::<Value>(&frame.body) {
+        Ok(envelope) => envelope,
+        Err(error) => return refuse_undecodable_route_request(tx, frame, &error, metrics).await,
+    };
     let operation = envelope.get("op").and_then(Value::as_str).or_else(|| {
         envelope
             .get("name")
@@ -7139,6 +7400,7 @@ async fn handle_tool_call(
         }
     }
     let route_request = if identity.role == tool_provider::RouteRole::ToolProviderV1 {
+        note_route_tool_call(&identity, metrics);
         let call = match serde_json::from_value::<cortexkit_role_tool_provider::call::ToolCallRequest>(
             envelope,
         ) {
@@ -7156,15 +7418,17 @@ async fn handle_tool_call(
                 .await
             }
         };
-        if let Err(error) = tool_provider::admit(
+        let role = match tool_provider::admit(
             &call,
+            identity.scope.is_some(),
             &identity.disabled_tools,
             crate::bash_background::powershell_available(),
             &identity.session,
             !matches!(identity.trust, BindTrust::Untrusted),
         ) {
-            return send_provider_error(tx, metrics, frame, error).await;
-        }
+            Ok(role) => role,
+            Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+        };
         let mut arguments = call.arguments;
         if matches!(call.name.as_str(), "bash" | "powershell") {
             let args = arguments
@@ -7172,14 +7436,7 @@ async fn handle_tool_call(
                 .expect("admission validated arguments");
             args.insert("foreground_orchestrate".into(), json!(true));
             args.insert("block_to_completion".into(), json!(true));
-            args.insert(
-                "shell".into(),
-                json!(if call.name == "powershell" {
-                    "powershell"
-                } else {
-                    "bash"
-                }),
-            );
+            provider_shell_selector(&call.name, args);
         }
         RouteRequest::ToolCall(ToolCallRequest {
             name: call.name,
@@ -7187,11 +7444,19 @@ async fn handle_tool_call(
             edit_slot_survives: None,
             preview: false,
             worker_session: false,
+            preset: call.preset,
+            v1_role: Some(role),
             call_key: call.call_key,
             schema_pin: call.schema_pin,
         })
     } else {
-        decode_legacy_route_request(envelope)?
+        match decode_legacy_route_request(envelope) {
+            Ok(request) => request,
+            Err(SubcError::Json(error)) => {
+                return refuse_undecodable_route_request(tx, frame, &error, metrics).await
+            }
+            Err(error) => return Err(error),
+        }
     };
     if matches!(
         route_request,
@@ -7275,6 +7540,35 @@ async fn handle_tool_call(
         let refusal = opaque_field_refusal_frame(&frame, &error)?;
         return send_reliable_writer_frame(tx, metrics, refusal, "invalid_request refusal").await;
     }
+    note_route_tool_call(&identity, metrics);
+    let scoped_route = identity.scope.is_some();
+    // The preset rule covers the model's tool calls, the names the catalog
+    // serves. A legacy route's management op (`op` + `params`) and the
+    // plugins' own plumbing commands are not model calls and name no preset.
+    let agent_tool = is_subc_agent_core_tool(&call.name);
+    // The call's preset decides its role. A v1 call was refused at admission
+    // already; a legacy call is refused here, before anything runs, with the
+    // same error frame a v1 refusal gets.
+    let role = match call.caller_role(scoped_route && agent_tool) {
+        Ok(role) => role,
+        Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+    };
+    if agent_tool && call.preset.is_none() && !scoped_route {
+        metrics.record_presetless_tool_call(&identity.harness);
+    }
+    if role == tool_provider::CallerRole::Reader
+        && !tool_provider::READER_TOOLS.contains(&call.name.as_str())
+    {
+        let error = subc_protocol::ErrorBody::new(
+            "unknown_tool",
+            format!(
+                "tool {:?} is not served by the \"reader\" preset",
+                call.name
+            ),
+        )
+        .with_detail(json!({"tool": call.name, "preset": "reader"}));
+        return send_provider_error(tx, metrics, frame, error).await;
+    }
     if let Some(pin) = call.schema_pin.as_deref() {
         // The pin is only logged: refusing a call built against a catalog
         // version that no longer matches is not implemented yet.
@@ -7290,10 +7584,15 @@ async fn handle_tool_call(
     } else {
         crate::logging::ToolCallCaller::Agent
     };
-    let format_context = crate::subc_format::FormatContext::from_tool_call(
+    let mut format_context = crate::subc_format::FormatContext::from_tool_call(
         &bare_name,
         &arguments,
         identity.project_root.as_path(),
+    );
+    format_context.worker_session = role.is_worker();
+    format_context.bash_watch_available = Some(
+        role.has_bash_watch()
+            && crate::tool_gate::catalog_keeps("bash_watch", &identity.disabled_tools),
     );
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
@@ -7441,7 +7740,10 @@ async fn handle_tool_call(
             &bare_name,
             &arguments,
             call.preview,
-            call.worker_session,
+            role.is_worker(),
+            format_context
+                .bash_watch_available
+                .unwrap_or(role.is_worker()),
         );
         if matches!(bind_trust, BindTrust::Untrusted) && module_draining {
             // A permission ask sent now would hold this call open across the
@@ -7550,7 +7852,7 @@ async fn handle_tool_call(
                     cancel,
                     grants: plan.grants,
                     repeat,
-                    worker_session: call.worker_session,
+                    worker_session: role.is_worker(),
                     asked_at: Instant::now(),
                     expires_at: Instant::now() + bash_elicitation_timeout(),
                 },
@@ -7602,8 +7904,9 @@ async fn handle_tool_call(
             call_key,
             None,
             repeat,
-            call.worker_session,
+            role.is_worker(),
             identity.role == tool_provider::RouteRole::ToolProviderV1,
+            remote_policy::key(&identity, call.preset.as_deref()),
         );
         return Ok(());
     }
@@ -7619,10 +7922,11 @@ async fn handle_tool_call(
         report_registration_downgrade: identity.role == tool_provider::RouteRole::Legacy,
         standard_edit_grammar: identity.role == tool_provider::RouteRole::ToolProviderV1,
         disabled_tools: Some(Arc::clone(&identity.disabled_tools)),
-        worker_session: call.worker_session,
+        worker_session: role.is_worker(),
     };
 
     let uses_deferred_response_seam = bare_name == "inspect"
+        || bare_name == "bash_watch"
         || crate::commands::lsp_navigation::is_lsp_navigation_command(&bare_name);
     if uses_deferred_response_seam {
         let Some(deferred_ctx) = executor.actor_context(&identity.root) else {
@@ -7653,8 +7957,10 @@ async fn handle_tool_call(
         let format_context_for_run = format_context.clone();
         let bare_name_for_run = bare_name.clone();
         let (setup_tx, setup_rx) = oneshot::channel::<DeferredSetupOutcome>();
+        let completion_wake = deferred_response_tx.wake.clone();
         phase_trace.mark_executor_submitted();
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
+            let _deferred_wake_scope = completion_wake.install();
             phase_trace.mark_job_admitted();
             // Admission for this deferred tool call: pin the config so the
             // preflight and the deferred worker share one snapshot.
@@ -7682,6 +7988,11 @@ async fn handle_tool_call(
                                 &prepared.request,
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
+                            )
+                        } else if bare_name_for_run == "bash_watch" {
+                            crate::commands::bash_watch::handle_deferred(
+                                &prepared.request,
+                                Arc::clone(&deferred_ctx),
                             )
                         } else {
                             crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_restriction(
@@ -8097,7 +8408,10 @@ fn submit_maintenance_job(
                 MaintenanceJobOutcome {
                     empty_bg_sessions: Vec::new(),
                     unacked_bg_keys: None,
-                    requeue_kind: drained.has_more.then_some(kind),
+                    // Contention has more possible work but no progress. The
+                    // next maintenance tick probes again; only a successful
+                    // partial batch needs an immediate continuation.
+                    requeue_kind: (drained.has_more && drained.processed > 0).then_some(kind),
                     diagnostics_on_edit: None,
                 }
             }
@@ -8341,6 +8655,8 @@ fn decode_legacy_route_request(envelope: Value) -> Result<RouteRequest, SubcErro
                 edit_slot_survives: None,
                 preview: false,
                 worker_session: false,
+                preset: None,
+                v1_role: None,
                 call_key: None,
                 schema_pin: None,
             }))
@@ -8366,6 +8682,16 @@ enum BgEventsOp {
     BgEvents,
 }
 
+fn provider_shell_selector(name: &str, args: &mut serde_json::Map<String, Value>) {
+    // The public selector distinguishes PowerShell from the default bash;
+    // `shell: "bash"` is not part of the bash tool's argument grammar.
+    if name == "powershell" {
+        args.insert("shell".into(), json!("powershell"));
+    } else {
+        args.remove("shell");
+    }
+}
+
 /// A tool call as AFT decodes it from a route `REQUEST` body.
 ///
 /// This is AFT's own type rather than `subc_protocol::tool_call::ToolCallRequest`
@@ -8389,9 +8715,20 @@ struct ToolCallRequest {
     preview: bool,
     /// The caller is a delegated worker session. The AFT plugins set it next
     /// to the call, like `preview`, and never inside the agent's `arguments`;
-    /// see `RawRequest::worker_session`.
+    /// see `RawRequest::worker_session`. Read it through
+    /// [`ToolCallRequest::caller_role`].
     #[serde(default)]
     worker_session: bool,
+    /// The catalog preset the call names (subc-protocol 0.29's
+    /// `ToolCallRequest.preset`, set by the consumer beside `call_key`). It
+    /// decides the call's role; see `tool_provider::resolve_caller_role`.
+    #[serde(default)]
+    preset: Option<String>,
+    /// The role a v1 call resolved at admission, from the catalog preset it
+    /// names (`tool_provider::caller_role`). Never decoded from the wire: a v1
+    /// body has no `worker_session`, and a legacy body leaves this `None`.
+    #[serde(skip)]
+    v1_role: Option<tool_provider::CallerRole>,
     /// The consumer's own key for this call, which lets it recognise the
     /// same call arriving twice. Checked with subc-protocol's validator
     /// before anything runs; a bash call records it on its background task.
@@ -8404,6 +8741,63 @@ struct ToolCallRequest {
     /// refusing a call whose pin no longer matches the catalog comes later.
     #[serde(default)]
     schema_pin: Option<String>,
+}
+
+impl ToolCallRequest {
+    /// The role this call runs under: the v1 role resolved at admission, or
+    /// on a legacy route the role its preset (or, without one, the plugins'
+    /// `worker_session` flag) resolves to. Every worker-specific behaviour
+    /// downstream reads the resolved role's `is_worker()`.
+    fn caller_role(
+        &self,
+        scoped_route: bool,
+    ) -> Result<tool_provider::CallerRole, subc_protocol::ErrorBody> {
+        match self.v1_role {
+            Some(role) => Ok(role),
+            None => tool_provider::resolve_caller_role(
+                self.preset.as_deref(),
+                scoped_route,
+                self.worker_session,
+            ),
+        }
+    }
+}
+
+/// Counts a scoped route's first tool call in the health metrics. A call on
+/// any route, refused or not, marks the route; only the first one counts.
+fn note_route_tool_call(identity: &RouteIdentity, metrics: &DispatchPathMetrics) {
+    if identity.scope.is_some() && !identity.made_tool_call.swap(true, Ordering::Relaxed) {
+        metrics.record_scoped_route_with_tool_calls();
+    }
+}
+
+/// Answers a route request whose body does not decode with `invalid_request`
+/// for that one request. Like [`refuse_undecodable_control_request`], a body
+/// AFT cannot read must never end the frame loop and every route with it.
+async fn refuse_undecodable_route_request(
+    tx: &WriterSender,
+    frame: &Frame,
+    error: &serde_json::Error,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let reason = brief_decode_error(error);
+    log::warn!(
+        "subc attach: refusing route request channel={} corr={} whose body does not decode ({} bytes): {reason}",
+        frame.header.channel,
+        frame.header.corr,
+        frame.body.len()
+    );
+    let refusal = build_error_frame_with_detail(
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+        frame.header.flags,
+        "invalid_request",
+        &format!("request body does not decode: {reason}"),
+        json!({ "field": "body" }),
+    )?;
+    send_reliable_writer_frame(tx, metrics, refusal, "undecodable route request error").await
 }
 
 /// Check the consumer-chosen opaque tokens on a call (`call_key`,
@@ -8862,6 +9256,371 @@ pub(crate) mod test_support {
             registry.poll_ready(executor.as_ref()).is_empty(),
             "a cancelled navigation must not leak a reply"
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_navigation_producer_notifies_completion() {
+        let _serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let (dir, _) = test_root("navigation-producer-wake");
+        let (ctx, source) = cold_navigation_context(dir.path());
+        let (started_rx, release_tx) =
+            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let _scope = wake.install();
+        let DispatchOutcome::Deferred(mut pending) =
+            crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_restriction(
+                &navigation_request("nav-wake", &source),
+                Arc::clone(&ctx),
+                true,
+            )
+        else {
+            panic!("cold navigation must defer")
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("producer starts");
+        pending.cancellation.as_ref().unwrap().request_cancel();
+        release_tx.send(()).expect("release producer");
+        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+            .await
+            .expect("navigation completion wake");
+        assert_eq!(wake.generation(), 1);
+        assert!(
+            !(pending.poll)(&ctx)
+                .expect("terminal ready before wake")
+                .success
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_inspect_producer_notifies_completion() {
+        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let (dir, _) = test_root("inspect-producer-wake");
+        std::fs::write(dir.path().join("README.md"), "# Fixture\n").unwrap();
+        let ctx = inspect_context(dir.path());
+        let (started_rx, release_tx) =
+            crate::commands::inspect::install_deferred_inspect_stat_gate_for_test();
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let _scope = wake.install();
+        let DispatchOutcome::Deferred(mut pending) =
+            crate::commands::inspect::handle_inspect_deferred_with_restriction(
+                &inspect_request("inspect-wake"),
+                Arc::clone(&ctx),
+                true,
+            )
+        else {
+            panic!("inspect must defer")
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("producer starts");
+        release_tx.send(()).expect("release producer");
+        tokio::time::timeout(Duration::from_secs(10), wake.notified())
+            .await
+            .expect("inspect completion wake");
+        assert_eq!(wake.generation(), 1);
+        assert!((pending.poll)(&ctx)
+            .expect("terminal ready before wake")
+            .data
+            .get("inspect_terminal")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn deferred_bash_watch_producer_notifies_completion() {
+        use crate::bash_background::persistence::{
+            create_task_layout, write_task_at, PersistedTask,
+        };
+        use crate::bash_background::BgTaskStatus;
+
+        let (dir, _) = test_root("bash-watch-producer-wake");
+        let session = "watch-session";
+        let task_id = "bash-0123456789abcdef";
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            storage_dir: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let ctx = Arc::new(AppContext::from_app(App::default_shared(), config));
+        let storage = crate::bash_background::task_storage_dir(&ctx);
+        let task = create_task_layout(&storage, session, task_id).expect("task layout");
+        let mut metadata = PersistedTask::starting(
+            task_id.into(),
+            session.into(),
+            "echo watched-done".into(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            None,
+            false,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task_at(&task, &metadata).expect("terminal task");
+        std::fs::write(&task.paths.stdout, "watched-done\n").expect("task stdout");
+        std::fs::write(&task.paths.stderr, "").expect("task stderr");
+        ctx.bash_background()
+            .replay_session(&storage, session)
+            .expect("restore terminal task");
+
+        let request = serde_json::from_value(json!({
+            "id": "watch-wake",
+            "command": "bash_watch",
+            "session_id": session,
+            "task_id": task_id,
+            "worker_session": true,
+        }))
+        .expect("watch request");
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let mut pending = {
+            let _scope = wake.install();
+            let DispatchOutcome::Deferred(pending) =
+                crate::commands::bash_watch::handle_deferred(&request, Arc::clone(&ctx))
+            else {
+                panic!("bash watch must defer")
+            };
+            pending
+        };
+        // Await only the producer's wake, not a timer or registry poll: periodic
+        // polling would hide a missing completion signal on an idle connection.
+        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+            .await
+            .expect("bash watch completion wake");
+        assert_eq!(wake.generation(), 1);
+        let response = (pending.poll)(&ctx).expect("terminal queued before wake");
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["status"], "completed");
+        assert_eq!(response.data["waited"]["reason"], "exited");
+        assert!((pending.poll)(&ctx).is_none(), "terminal is delivered once");
+    }
+
+    #[tokio::test]
+    async fn deferred_registry_idle_turns_do_not_repoll_and_completion_wakes() {
+        let executor = Executor::new();
+        let (dir, root) = test_root("deferred-wake-counter");
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config::default(),
+        ));
+        executor.register_actor(root.clone(), ctx);
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let (tx, rx) = {
+            let _scope = wake.install();
+            crate::response_finalize::pending_response_channel()
+        };
+        let polls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&polls);
+        let mut pending = PendingSubcResponses::default();
+        pending.register(PendingSubcResponse {
+            route: RouteChannel {
+                channel: 17,
+                epoch: 1,
+            },
+            corr: 71,
+            flags: control_flags(),
+            ver: PROTOCOL_VERSION,
+            root,
+            session_id: "session".into(),
+            bare_name: "inspect".into(),
+            format_context: crate::subc_format::FormatContext::from_tool_call(
+                "inspect",
+                &json!({}),
+                dir.path(),
+            ),
+            bind_trust: BindTrust::FirstParty,
+            pending: PendingResponse::from_receiver(
+                "wake".into(),
+                "session".into(),
+                "inspect".into(),
+                rx,
+                move |_, completion| {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    completion.ok()
+                },
+            ),
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
+        });
+        assert!(pending.poll_if_woken(&executor, &wake).is_empty());
+        let initial = polls.load(Ordering::Relaxed);
+        for _ in 0..12 {
+            assert!(pending.poll_if_woken(&executor, &wake).is_empty());
+        }
+        assert_eq!(
+            polls.load(Ordering::Relaxed) - initial,
+            0,
+            "idle completion polls"
+        );
+        assert!(!pending.needs_deadline_poll());
+        std::thread::spawn(move || {
+            tx.send(Response::success("wake", json!({"done": true})))
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+            .await
+            .expect("completion wake");
+        let ready = pending.poll_if_woken(&executor, &wake);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].response.data, json!({"done": true}));
+        assert!(pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    async fn assert_state_based_bash_terminal_uses_timer(case: &str, expected_status: &str) {
+        let executor = Executor::new();
+        let (dir, root) = test_root("polled-bash-terminal");
+        let mut config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            storage_dir: Some(dir.path().to_path_buf()),
+            foreground_wait_window_ms: 200,
+            ..Config::default()
+        };
+        config.bash.worker_wait_max_ms = 200;
+        let ctx = Arc::new(AppContext::from_app(App::default_shared(), config));
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        struct ShutdownOnDrop(crate::bash_background::BgTaskRegistry);
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                self.0.shutdown();
+            }
+        }
+        let _cleanup = ShutdownOnDrop(ctx.bash_background().clone());
+        let task_id = ctx
+            .bash_background()
+            .spawn(
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                if case == "completion" {
+                    "while [ ! -f exit-ready ]; do sleep 0.05; done; echo terminal"
+                } else {
+                    "sleep 30"
+                },
+                "polled-bash-session".into(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(
+                    if case == "hard-timeout" { 2 } else { 60 },
+                )),
+                crate::bash_background::task_storage_dir(&ctx),
+                1,
+                false,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .expect("spawn controlled bash task");
+        let request = serde_json::from_value(json!({
+            "id": "polled-bash",
+            "command": "bash",
+            "session_id": "polled-bash-session",
+            "worker_session": case == "worker-cap",
+            "params": { "wait": case != "promotion", "timeout": 60_000 },
+        }))
+        .unwrap();
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let DispatchOutcome::Deferred(pending) =
+            crate::commands::bash_orchestrate::build_bash_outcome(
+                &request,
+                &ctx,
+                Response::success(
+                    "polled-bash",
+                    json!({"task_id": task_id, "status": "running"}),
+                ),
+            )
+        else {
+            panic!("running foreground task must defer")
+        };
+        let mut registry = PendingSubcResponses::default();
+        registry.register(PendingSubcResponse {
+            route: RouteChannel {
+                channel: 17,
+                epoch: 1,
+            },
+            corr: 71,
+            flags: control_flags(),
+            ver: PROTOCOL_VERSION,
+            root,
+            session_id: "polled-bash-session".into(),
+            bare_name: "bash".into(),
+            format_context: crate::subc_format::FormatContext::from_tool_call(
+                "bash",
+                &json!({}),
+                dir.path(),
+            ),
+            bind_trust: BindTrust::FirstParty,
+            pending,
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
+        });
+        assert!(registry.poll_if_woken(&executor, &wake).is_empty());
+        assert!(
+            registry.needs_deadline_poll(),
+            "state-based bash must retain an idle timer"
+        );
+        if case == "completion" {
+            std::fs::write(dir.path().join("exit-ready"), "").unwrap();
+        } else if case == "kill" {
+            ctx.bash_background()
+                .kill(&task_id, "polled-bash-session")
+                .unwrap();
+        }
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    registry.next_deadline_poll.unwrap(),
+                ))
+                .await;
+                let ready = registry.poll_if_woken(&executor, &wake);
+                if !ready.is_empty() {
+                    break ready;
+                }
+            }
+        })
+        .await
+        .expect("state-based bash terminal without a producer wake");
+        assert_eq!(
+            wake.generation(),
+            0,
+            "the timer, not a completion wake, resolved bash"
+        );
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].response.data["status"], expected_status);
+        if expected_status == "running" {
+            assert_eq!(
+                ctx.bash_background()
+                    .observed_status(&task_id, "polled-bash-session", 0)
+                    .unwrap()
+                    .info
+                    .status,
+                crate::bash_background::BgTaskStatus::Running,
+                "hand-back must not kill the task"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_state_based_bash_completion_uses_idle_timer() {
+        assert_state_based_bash_terminal_uses_timer("completion", "completed").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_state_based_bash_kill_uses_idle_timer() {
+        assert_state_based_bash_terminal_uses_timer("kill", "killed").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_state_based_bash_hard_timeout_uses_idle_timer() {
+        assert_state_based_bash_terminal_uses_timer("hard-timeout", "timed_out").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_state_based_bash_promotion_uses_idle_timer() {
+        assert_state_based_bash_terminal_uses_timer("promotion", "running").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_state_based_bash_worker_cap_uses_idle_timer() {
+        assert_state_based_bash_terminal_uses_timer("worker-cap", "running").await;
     }
 
     #[test]
@@ -9481,6 +10240,7 @@ pub(crate) mod test_support {
             compressed_tokens: None,
             tokens_skipped: false,
             status_reason: None,
+            output_incomplete: false,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,
             live_descendants_summary: None,
@@ -9559,6 +10319,7 @@ pub(crate) mod test_support {
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
             scope: None,
+            made_tool_call: AtomicBool::new(false),
         }))
     }
 
@@ -9589,6 +10350,10 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
+#[path = "../../tests/helpers/fake_lsp.rs"]
+mod fake_lsp;
+
+#[cfg(test)]
 mod tests {
     use super::test_support::{
         completion_frame, inspect_context, reap_until_forgotten, route_identity, test_ctx,
@@ -9596,6 +10361,396 @@ mod tests {
     };
     use super::*;
     use crate::bash_background::BgTaskStatus;
+
+    #[tokio::test]
+    async fn standing_tick_skips_busy_lifecycle_and_acks_another_root_bind() {
+        let (dir, busy_root) = test_root("standing-busy-lifecycle");
+        let healthy_path = dir.path().join("healthy-root");
+        std::fs::create_dir_all(&healthy_path).unwrap();
+        let healthy_root = ProjectRootId::from_path(&healthy_path).unwrap();
+        let app = App::default_shared();
+        let executor = Arc::new(Executor::new());
+        let index = crate::config::IndexConfig {
+            roots: vec![
+                crate::config::IndexRootConfig {
+                    path: busy_root.as_path().to_string_lossy().into_owned(),
+                    indexes: vec![crate::config::IndexKind::Search],
+                },
+                crate::config::IndexRootConfig {
+                    path: healthy_root.as_path().to_string_lossy().into_owned(),
+                    indexes: vec![crate::config::IndexKind::Search],
+                },
+            ],
+        };
+        let busy_ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(busy_root.as_path().to_path_buf()),
+                storage_dir: Some(dir.path().join("storage")),
+                index,
+                ..Config::default()
+            },
+        ));
+        busy_ctx.set_canonical_cache_root(busy_root.as_path().to_path_buf());
+        busy_ctx.set_harness(crate::harness::Harness::Opencode);
+        executor.register_actor(busy_root.clone(), Arc::clone(&busy_ctx));
+        let actor = Arc::new(standing::StandingActor::new(
+            Arc::clone(&app),
+            Arc::clone(&executor),
+        ));
+        actor.begin_session_bind(&busy_ctx);
+        let held_ctx = Arc::clone(&busy_ctx);
+        let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let holder = std::thread::spawn(move || {
+            held_ctx.run_if_subc_bound_generation(held_ctx.configure_generation(), || {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(20));
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let tick_actor = Arc::clone(&actor);
+        let (tick_tx, tick_rx) = crossbeam_channel::bounded(1);
+        let tick = std::thread::spawn(move || {
+            tick_actor.tick();
+            tick_tx.send(()).unwrap();
+        });
+        let tick_result = tick_rx.recv_timeout(Duration::from_secs(2));
+        let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+        let fixture_path = dir.path().to_path_buf();
+        let loop_executor = Arc::clone(&executor);
+        let module_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (read, write) = tokio::io::split(module);
+            runtime.block_on(run_module_loop(
+                read,
+                write,
+                &fixture_path.join("absent-connection.json"),
+                app,
+                loop_executor,
+                |request, _| Response::success(request.id, json!({})),
+                Some(fixture_path.join("absent-user-config.json")),
+                false,
+                usize::MAX,
+                None,
+                &fixture_path.join("storage"),
+                Some(actor),
+            ))
+        });
+        let bind_result: Result<(), String> = async {
+            let hello = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut daemon))
+                .await
+                .map_err(|_| "ModuleHello blocked".to_string())?
+                .map_err(|e| e.to_string())?
+                .unwrap();
+            assert_eq!(hello.header.ty, FrameType::Hello);
+            let ack = Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                HELLO_CORR,
+                b"{}".to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &ack)
+                .await
+                .map_err(|e| e.to_string())?;
+            let bind = ModuleControlRequest::RouteBind {
+                route_channel: 75,
+                epoch: 1,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    healthy_root.as_path(),
+                    "opencode",
+                    "standing-busy-root-isolation",
+                ),
+                principal: Some(subc_protocol::Principal::Direct),
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+            };
+            let bind = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                75,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &bind)
+                .await
+                .map_err(|e| e.to_string())?;
+            let reply = tokio::time::timeout(ROUTE_BIND_DEADLINE, read_frame(&mut daemon))
+                .await
+                .map_err(|_| {
+                    "healthy bind exceeded deadline while another lifecycle was held".to_string()
+                })?
+                .map_err(|e| e.to_string())?
+                .unwrap();
+            if reply.header.ty != FrameType::Response || reply.header.corr != 75 {
+                return Err(format!("bind must be acknowledged, not refused: {reply:?}"));
+            }
+            if !matches!(
+                serde_json::from_slice::<ModuleControlResponse>(&reply.body).unwrap(),
+                ModuleControlResponse::RouteBindAck {}
+            ) {
+                return Err("expected RouteBindAck".into());
+            }
+            Ok(())
+        }
+        .await;
+        // Release before teardown even on the baseline: this is a finite model
+        // of the permanent recursive hold seen in production, not a hung suite.
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        tick.join().unwrap();
+        drop(daemon);
+        module_thread.join().unwrap().unwrap();
+        let settled = executor.submit_async(
+            healthy_root,
+            Lane::Mutating,
+            "standing-busy-root-settled".into(),
+            Box::new(|_| Response::success("standing-busy-root-settled", json!({}))),
+        );
+        tokio::time::timeout(Duration::from_secs(2), settled)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(executor);
+        tick_result.expect(
+            "standing tick must skip a busy lifecycle, not hold reconciliation waiting for it",
+        );
+        bind_result
+            .expect("an unrelated busy lifecycle must not prevent successful bind acknowledgement");
+    }
+
+    #[tokio::test]
+    async fn standing_actor_lock_contention_does_not_block_route_binds_or_health() {
+        let (dir, root) = test_root("standing-frame-isolation");
+        let app = App::default_shared();
+        let executor = Arc::new(Executor::new());
+        let ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(root.as_path().to_path_buf()),
+                storage_dir: Some(dir.path().join("storage")),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        executor.register_actor(root.clone(), ctx);
+        let actor = Arc::new(standing::StandingActor::new(
+            Arc::clone(&app),
+            Arc::clone(&executor),
+        ));
+        let held_actor = Arc::clone(&actor);
+        let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let holder = std::thread::spawn(move || {
+            held_actor.hold_locks_for_test(|| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(20));
+            })
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+        let fixture_path = dir.path().to_path_buf();
+        // Production keeps the executor outside the module loop through its
+        // teardown. Retain that owner here too, rather than dropping the final
+        // executor handle from a finishing bind worker.
+        let loop_executor = Arc::clone(&executor);
+        // A separate current-thread runtime reproduces the production transport.
+        // The test's deadline must still run if that frame thread takes a lock.
+        let module_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (read, write) = tokio::io::split(module);
+            runtime.block_on(run_module_loop(
+                read,
+                write,
+                &fixture_path.join("absent-connection.json"),
+                app,
+                loop_executor,
+                |request, _| Response::success(request.id, json!({})),
+                Some(fixture_path.join("absent-user-config.json")),
+                false,
+                usize::MAX,
+                None,
+                &fixture_path.join("storage"),
+                Some(actor),
+            ))
+        });
+        let while_held: Result<(), String> = async {
+            let hello = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut daemon))
+                .await
+                .map_err(|_| "ModuleHello blocked".to_string())?
+                .map_err(|e| e.to_string())?
+                .unwrap();
+            assert_eq!(hello.header.ty, FrameType::Hello);
+            let ack = Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                HELLO_CORR,
+                b"{}".to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &ack)
+                .await
+                .map_err(|e| e.to_string())?;
+            let bind = ModuleControlRequest::RouteBind {
+                route_channel: 71,
+                epoch: 1,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    root.as_path(),
+                    "opencode",
+                    "standing-isolation",
+                ),
+                principal: Some(subc_protocol::Principal::Direct),
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+            };
+            let bind = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                71,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &bind)
+                .await
+                .map_err(|e| e.to_string())?;
+            let health = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                72,
+                serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &health)
+                .await
+                .map_err(|e| e.to_string())?;
+            let health_reply =
+                tokio::time::timeout(Duration::from_secs(2), read_frame(&mut daemon))
+                    .await
+                    .map_err(|_| "health reply blocked on standing actor locks".to_string())?
+                    .map_err(|e| e.to_string())?
+                    .unwrap();
+            assert_eq!(
+                (health_reply.header.ty, health_reply.header.corr),
+                (FrameType::Response, 72)
+            );
+            // A bind needing the standing handoff cannot succeed while it is
+            // locked, but it must be refused before the daemon's relay expires.
+            let bind_reply =
+                tokio::time::timeout(DAEMON_BIND_RELAY_TIMEOUT, read_frame(&mut daemon))
+                    .await
+                    .map_err(|_| {
+                        "route bind was not answered before the daemon relay deadline".to_string()
+                    })?
+                    .map_err(|e| e.to_string())?
+                    .unwrap();
+            assert_eq!(
+                (bind_reply.header.ty, bind_reply.header.corr),
+                (FrameType::Error, 71)
+            );
+            Ok(())
+        }
+        .await;
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        let recovery: Result<(), String> = if while_held.is_ok() {
+            async {
+                let bind = ModuleControlRequest::RouteBind {
+                    route_channel: 73,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new(
+                        root.as_path(),
+                        "opencode",
+                        "standing-recovery",
+                    ),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: None,
+                    role_versions: None,
+                };
+                let frame = Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    0,
+                    0,
+                    73,
+                    serde_json::to_vec(&bind).unwrap(),
+                )
+                .unwrap();
+                write_frame(&mut daemon, &frame)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let response =
+                    tokio::time::timeout(Duration::from_secs(2), read_frame(&mut daemon))
+                        .await
+                        .map_err(|_| {
+                            "route bind did not recover after releasing standing locks".to_string()
+                        })?
+                        .map_err(|e| e.to_string())?
+                        .unwrap();
+                assert_eq!(
+                    (response.header.ty, response.header.corr),
+                    (FrameType::Response, 73)
+                );
+                assert!(matches!(
+                    serde_json::from_slice::<ModuleControlResponse>(&response.body).unwrap(),
+                    ModuleControlResponse::RouteBindAck {}
+                ));
+                Ok(())
+            }
+            .await
+        } else {
+            Ok(())
+        };
+        // Closing the transport also makes the baseline failure safe: release
+        // locks and let the real loop tear down before asserting the deadline.
+        drop(daemon);
+        let _ = module_thread.join().unwrap();
+        let settled = executor.submit_async(
+            root,
+            Lane::Mutating,
+            "standing-test-settled".into(),
+            Box::new(|_| Response::success("standing-test-settled", json!({}))),
+        );
+        tokio::time::timeout(Duration::from_secs(2), settled)
+            .await
+            .expect("released bind work must settle before executor teardown")
+            .unwrap();
+        drop(executor);
+        while_held.expect("standing maintenance must never park the frame loop");
+        recovery.expect("releasing standing locks must restore successful route binds");
+    }
 
     /// `call_key` and `schema_pin` decode from the request body and are held
     /// to subc-protocol's shape; a refusal names the field that failed.
@@ -9875,6 +11030,10 @@ mod tests {
                 &frame,
                 &app,
                 &executor,
+                &Arc::new(standing::StandingActor::new(
+                    Arc::clone(&app),
+                    Arc::clone(&executor),
+                )),
                 &mut HashMap::new(),
                 &mut pending_binds,
                 &mut HashMap::new(),
@@ -11029,10 +12188,11 @@ mod tests {
         assert!(route_bash_cancels.is_empty());
         assert!(reclaimed_routes.contains(route));
         assert!(cancel_signal.is_cancelled());
-        // The daemon still has the route bound, so every request the purge
-        // stops tracking is answered on its own corr and route.
+        // Answer held requests before telling the daemon to close the route.
+        assert_eq!(terminals.last().unwrap().header.ty, FrameType::Goodbye);
         let mut ended = terminals
             .iter()
+            .filter(|frame| frame.header.ty != FrameType::Goodbye)
             .map(|frame| {
                 assert_eq!(
                     (frame.header.channel, frame.header.epoch),
@@ -11051,7 +12211,7 @@ mod tests {
             .find(|frame| frame.header.ty == FrameType::Error)
             .expect("error terminal");
         let error: Value = serde_json::from_slice(&error_frame.body).expect("error body");
-        assert_eq!(error["code"], "route_not_bound");
+        assert_eq!(error["code"], "outcome_unknown_root_reclaimed");
         assert!(active_tool_calls.lock().expect("active calls").is_empty());
         assert_eq!(
             health::take_bg_observability_logs_for_test(),
@@ -11059,6 +12219,132 @@ mod tests {
                 "subc bg subscription: ended root={} session=deleted-route channel=19@3 cause=root-reclaim suppressed=0",
                 root.as_path().display()
             )]
+        );
+    }
+
+    /// Invoke the purge with a held call or a permission ask, independently of
+    /// the reaper's idle gates, so each terminal's retry contract is observable.
+    fn reclaim_test_request(pending_permission: bool) -> Vec<Frame> {
+        let (_dir, root) = test_root("reclaim-request-code");
+        let route = route_key(19, 3);
+        let executor = Executor::new();
+        let identity = route_identity(&root, "reclaim-session");
+        let active: ActiveToolCalls = Arc::default();
+        let mut asks = HashMap::new();
+        if pending_permission {
+            asks.insert(
+                ReverseCorrKey { route, corr: 100 },
+                PendingBashAsk {
+                    route,
+                    tool_corr: 78,
+                    tool_flags: control_flags(),
+                    tool_ver: PROTOCOL_VERSION,
+                    root: root.clone(),
+                    project_root: root.as_path().to_path_buf(),
+                    session_id: identity.session.clone(),
+                    spawn_principal: identity.spawn_principal.clone(),
+                    edit_slot_survives: None,
+                    call_key: None,
+                    request_id: "pending-permission".to_string(),
+                    arguments: json!({"command": "printf must-not-run"}),
+                    format_context: crate::subc_format::FormatContext::default(),
+                    cancel: bash::BashWaitCancel {
+                        connection: PersistentCancelSignal::new(),
+                        route: PersistentCancelSignal::new(),
+                        drain: drain::ModuleDrainWindow::default(),
+                    },
+                    grants: Vec::new(),
+                    repeat: None,
+                    worker_session: false,
+                    asked_at: Instant::now(),
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            );
+        } else {
+            active.lock().unwrap().insert(
+                (route, 78),
+                ActiveToolCall {
+                    root_id: root.clone(),
+                    cancellation: JobCancellation::new(),
+                    detach_policy: RouteDetachPolicy::RetainForReplay,
+                    tool: "edit".to_string(),
+                    started_at: Instant::now(),
+                    request: RequestFrameMeta {
+                        ver: PROTOCOL_VERSION,
+                        flags: control_flags(),
+                    },
+                    answering: false,
+                },
+            );
+        }
+        let frames = purge_deleted_root_residents(
+            &root,
+            &mut HashMap::from([(route, identity)]),
+            &mut HashMap::from([(root.clone(), HashSet::from([route]))]),
+            &mut HashMap::from([(route.channel, route.epoch)]),
+            &mut HashMap::new(),
+            &active,
+            &executor,
+            &mut HashMap::new(),
+            &mut ReclaimedRoutes::default(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut asks,
+            &DispatchPathMetrics::new(),
+        );
+        assert!(asks.is_empty());
+        assert!(active.lock().unwrap().is_empty());
+        frames
+    }
+
+    #[test]
+    fn deleted_root_reclaim_in_flight_call_is_outcome_unknown() {
+        let frames = reclaim_test_request(false);
+        let terminal = frames
+            .iter()
+            .find(|frame| frame.header.ty == FrameType::Error)
+            .unwrap();
+        assert_eq!(
+            (
+                terminal.header.channel,
+                terminal.header.epoch,
+                terminal.header.corr
+            ),
+            (19, 3, 78)
+        );
+        let error: ErrorBody = serde_json::from_slice(&terminal.body).unwrap();
+        assert_eq!(error.code, "outcome_unknown_root_reclaimed");
+        assert!(error.message.contains("may have run partly"));
+        assert!(error.message.contains("must not be re-sent automatically"));
+    }
+
+    #[test]
+    fn deleted_root_reclaim_pending_permission_is_route_reclaimed() {
+        let frames = reclaim_test_request(true);
+        let terminal = frames
+            .iter()
+            .find(|frame| frame.header.ty == FrameType::Error)
+            .unwrap();
+        assert_eq!(
+            (
+                terminal.header.channel,
+                terminal.header.epoch,
+                terminal.header.corr
+            ),
+            (19, 3, 78)
+        );
+        let error: ErrorBody = serde_json::from_slice(&terminal.body).unwrap();
+        assert_eq!(error.code, "route_reclaimed");
+        assert!(error.message.contains("project root was removed"));
+        assert!(error.message.contains("reopened"));
+        assert_eq!(
+            frames.last().unwrap().header.ty,
+            FrameType::Goodbye,
+            "permission terminal must precede Goodbye"
         );
     }
 
@@ -11503,6 +12789,110 @@ mod tests {
         let status = status_ctx.build_status_snapshot();
         assert_eq!(status["runtime"]["live_actor_roots"], 0);
         assert_eq!(status["runtime"]["open_routes"], 0);
+    }
+
+    #[test]
+    fn deleted_root_reap_drops_synapse_runtime_on_async_frame_loop() {
+        use crate::commands::semantic_search::rerank::{slot, synapse, SelectedBackend};
+
+        let (root_dir, root) = test_root("deleted-root-synapse-runtime");
+        let connection = tempfile::NamedTempFile::new().expect("connection file");
+        let app = App::default_shared();
+        let ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(root.as_path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
+        ctx.mark_subc_bound();
+        let mut inputs = slot::BuildInputs::from_config(&Config::default(), true);
+        inputs.search.rerank = Some(crate::config::RerankConfig {
+            backend: Some(crate::config::RerankBackendKind::Synapse),
+            ..Default::default()
+        });
+        inputs.semantic.subc_connection_file = Some(connection.path().to_path_buf());
+        inputs.semantic.route_project_root = Some(root.as_path().to_path_buf());
+        // An explicit pin needs no discovery server, but constructs the real
+        // Synapse transport and its nested Tokio runtime on the build thread.
+        ctx.rerank_slot().set_constructor_for_test(
+            Arc::new(|inputs| {
+                let backend = synapse::SynapseReranker::connect(
+                    &inputs.semantic,
+                    "test-reranker".into(),
+                    Some("test-pin".into()),
+                    100,
+                    true,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .map_err(|error| format!("{error:?}"))?;
+                Ok(Some(SelectedBackend {
+                    backend: Arc::new(backend),
+                    fail_closed: false,
+                }))
+            }),
+            Duration::ZERO,
+        );
+        ctx.rerank_slot().reconcile(inputs.clone());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if matches!(
+                ctx.rerank_slot().read(inputs.clone()),
+                slot::Installed::Ready(_)
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Synapse backend never installed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let root_channels = HashMap::from([(
+            root.clone(),
+            HashSet::from([RouteChannel {
+                channel: 17,
+                epoch: 1,
+            }]),
+        )]);
+        root_dir.close().expect("delete bound project root");
+
+        // Match run_subc_mode_inner: a current-thread runtime driving the
+        // frame loop. A frame-loop context reference can outlive the detached
+        // actor teardown, so its final drop must not rely on that thread.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("frame-loop runtime");
+        runtime.block_on(async move {
+            let metrics = DispatchPathMetrics::new();
+            loop {
+                let outcome = reap_idle_roots(
+                    Instant::now(),
+                    &mut live_roots,
+                    &HashMap::new(),
+                    &root_channels,
+                    &executor,
+                    &metrics,
+                );
+                if outcome.forgotten_deleted_roots.contains(&root) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "deleted root was never reaped");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(!executor.actor_registered(&root));
+            assert!(!live_roots.contains_key(&root));
+            // Wait for LSP shutdown and the actor's detached drop. This pins
+            // the last reference to the async caller instead of racing it.
+            while Arc::strong_count(&ctx) != 1 {
+                assert!(Instant::now() < deadline, "actor teardown never finished");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(app.actor_root_count(), 0);
+            drop(ctx);
+        });
     }
 
     #[test]
@@ -12788,6 +14178,102 @@ mod tests {
         assert_eq!(meta.maintenance_jobs_in_flight, 0);
     }
 
+    #[tokio::test]
+    async fn contended_lsp_maintenance_does_not_requeue_without_progress() {
+        let (_dir, root) = test_root("lsp-contention-requeue");
+        let ctx = Arc::new(AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config::default(),
+        ));
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (tx, mut rx) = mpsc::channel(4);
+        let held = ctx.lsp();
+        let total = runtime_drain::LSP_EVENT_DRAIN_BATCH_CAP + 1;
+        for _ in 0..total {
+            held.enqueue_event_for_test(crate::lsp::client::LspEvent::Notification {
+                server_kind: crate::lsp::registry::ServerKind::Rust,
+                root: root.as_path().to_path_buf(),
+                method: "custom/pending".into(),
+                params: None,
+            });
+        }
+        submit_maintenance_job(
+            &executor,
+            root.clone(),
+            MaintenanceDrainKind::Lsp,
+            Vec::new(),
+            &tx,
+            &metrics,
+        );
+        let completion = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        drop(held);
+        let completion = completion.expect("a contended drain must finish").unwrap();
+        assert!(completion.response.success);
+        assert_eq!(
+            completion.requeue_kind, None,
+            "zero progress must not immediately spin the maintenance lane"
+        );
+        assert_eq!(
+            ctx.lsp().pending_event_count_for_test(),
+            total,
+            "contention consumes no events"
+        );
+
+        // A fresh scheduling turn, rather than a completion-driven loop, is
+        // still allowed to retry the source. No events have been lost or taken.
+        let held = ctx.lsp();
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let (due, _) = due_maintenance_jobs(
+            &mut live_roots,
+            Some(&executor),
+            &BgSubsBySession::new(),
+            &BgWakePending::new(),
+            usize::MAX,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            due.iter()
+                .filter(|(_, kind)| *kind == MaintenanceDrainKind::Lsp)
+                .count(),
+            1
+        );
+        drop(held);
+        submit_maintenance_job(
+            &executor,
+            root.clone(),
+            MaintenanceDrainKind::Lsp,
+            Vec::new(),
+            &tx,
+            &metrics,
+        );
+        let partial = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            partial.requeue_kind,
+            Some(MaintenanceDrainKind::Lsp),
+            "a progressing partial batch requeues"
+        );
+        assert_eq!(ctx.lsp().pending_event_count_for_test(), 1);
+        submit_maintenance_job(
+            &executor,
+            root,
+            MaintenanceDrainKind::Lsp,
+            Vec::new(),
+            &tx,
+            &metrics,
+        );
+        let final_batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_batch.requeue_kind, None);
+        assert_eq!(ctx.lsp().pending_event_count_for_test(), 0);
+    }
+
     #[test]
     fn maintenance_requeue_drops_while_bind_is_pending() {
         let (_dir, root) = test_root("maintenance-bind-requeue");
@@ -13069,6 +14555,7 @@ mod tests {
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
             scope: None,
+            made_tool_call: AtomicBool::new(false),
         }));
         let replay_key = push::ReplayKey::from_identity(&identity);
         let completion = RouteBindCompletion {
@@ -13104,8 +14591,6 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel(8);
         let metrics = Arc::new(DispatchPathMetrics::new());
         let executor = Arc::new(Executor::new());
-        let standing_actor =
-            standing::StandingActor::new(App::default_shared(), Arc::clone(&executor));
 
         handle_route_bind_completion(
             &writer_tx,
@@ -13118,7 +14603,6 @@ mod tests {
             &mut pending_binds,
             &mut installed_route_epochs,
             &executor,
-            &standing_actor,
             &Arc::new(Notify::new()),
             &metrics,
             None,
@@ -13153,6 +14637,7 @@ mod tests {
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
             scope: None,
+            made_tool_call: AtomicBool::new(false),
         }));
         let completion = RouteBindCompletion {
             route,
@@ -13188,8 +14673,6 @@ mod tests {
         let (writer_tx, _writer_rx) = mpsc::channel(8);
         let metrics = Arc::new(DispatchPathMetrics::new());
         let executor = Arc::new(Executor::new());
-        let standing_actor =
-            standing::StandingActor::new(App::default_shared(), Arc::clone(&executor));
 
         handle_route_bind_completion(
             &writer_tx,
@@ -13202,7 +14685,6 @@ mod tests {
             &mut pending_binds,
             &mut installed_route_epochs,
             &executor,
-            &standing_actor,
             &Arc::new(Notify::new()),
             &metrics,
             None,
@@ -13372,6 +14854,493 @@ mod tests {
         );
         // Refusing the bind also cancelled its queued configure job.
         assert_eq!(bind_response.data["code"], "request_cancelled");
+    }
+
+    #[tokio::test]
+    async fn frozen_lsp_edit_releases_writer_before_route_bind_deadline() {
+        use crate::lsp::client::LspEvent;
+        use crate::lsp::registry::ServerKind;
+
+        let (_dir, root) = test_root("frozen-lsp-edit-bind");
+        let file = root.as_path().join("main.ts");
+        let release = root.as_path().join("resume-lsp");
+        std::fs::write(root.as_path().join("package.json"), "{}").unwrap();
+        std::fs::write(&file, "// original\n").unwrap();
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().to_path_buf()),
+                storage_dir: Some(root.as_path().join("storage")),
+                ..Default::default()
+            },
+        ));
+        ctx.lsp()
+            .override_binary(ServerKind::TypeScript, fake_lsp::fake_server_binary());
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_FREEZE_AFTER_OPEN", release.to_str().unwrap());
+        ctx.lsp()
+            .notify_file_changed(&file, "// original\n", &ctx.config())
+            .unwrap();
+        let startup_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if ctx.lsp().drain_events().into_iter().any(|event| {
+                matches!(event,
+                LspEvent::Notification { method, .. } if method == "custom/frozen")
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < startup_deadline,
+                "fake server did not freeze"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        // More than any platform's anonymous pipe capacity: didChange must
+        // actually write into a full stdin pipe, not merely wait for diagnostics.
+        let replacement = format!("// edited {}\n", "x".repeat(2 * 1024 * 1024));
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": "frozen-edit", "command": "edit_match", "file": file,
+            "match": "// original\n", "replacement": replacement,
+            "diagnostics": true, "wait_ms": 500,
+        }))
+        .unwrap();
+        let started = Instant::now();
+        let (mut edit, _) = executor.submit_tool_call_cancellable_async(
+            root.clone(),
+            Lane::Mutating,
+            "frozen-edit".into(),
+            "edit",
+            Box::new(move |ctx| crate::commands::edit_match::handle_edit_match(&request, ctx)),
+        );
+        let write_deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::metadata(&file).unwrap().len() < 1024 * 1024 {
+            assert!(Instant::now() < write_deadline, "edit never wrote the file");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let configure: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-frozen", "command": "configure",
+            "project_root": root.as_path(), "storage_dir": root.as_path().join("storage"),
+            "harness": "opencode", "session_id": "frozen-bind",
+            "config": [{"tier": "user", "source": "/user/aft.jsonc", "doc": json!({
+                "search_index": false, "semantic_search": false, "callgraph_store": false,
+            }).to_string()}],
+        }))
+        .unwrap();
+        let (mut bind, cancellation) = executor.submit_cancellable_async(
+            root.clone(),
+            Lane::Mutating,
+            "subc-bind-frozen".into(),
+            Box::new(move |ctx| crate::commands::configure::handle_configure(&configure, ctx)),
+        );
+        let route = route_key(71, 1);
+        let mut pending_binds = HashMap::from([(
+            route,
+            PendingBind {
+                bind_root_id: root.clone(),
+                inserted_new_actor: false,
+                cancelled: false,
+                configure_request_id: "subc-bind-frozen".into(),
+                started_at: Instant::now(),
+                warned_half_deadline: false,
+                deadline_reported: false,
+                corr: 71,
+                ver: PROTOCOL_VERSION,
+                flags: control_flags(),
+                cancellation,
+            },
+        )]);
+        let mut installed = HashMap::from([(route.channel, route.epoch)]);
+        let (writer_tx, mut writer_rx) = mpsc::channel(8);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let mut edit_response = None;
+        let mut bind_response = None;
+        let mut edit_elapsed = None;
+        let mut printed_blocker = false;
+        while started.elapsed() < Duration::from_secs(12) {
+            if edit_response.is_none() {
+                if let Ok(response) = edit.try_recv() {
+                    edit_elapsed = Some(started.elapsed());
+                    edit_response = Some(response);
+                }
+            }
+            if let Ok(response) = bind.try_recv() {
+                bind_response = Some(response);
+                break;
+            }
+            if !printed_blocker && started.elapsed() >= ROUTE_BIND_DEADLINE {
+                let snapshot = executor.bind_blocker_snapshot(&root, "subc-bind-frozen");
+                eprintln!(
+                    "{}",
+                    health::pending_bind_breadcrumb(
+                        route,
+                        &root,
+                        started.elapsed(),
+                        "subc-bind-frozen",
+                        &snapshot
+                    )
+                );
+                printed_blocker = true;
+            }
+            expire_overdue_route_binds(
+                &writer_tx,
+                &executor,
+                &mut pending_binds,
+                &mut installed,
+                &metrics,
+            )
+            .await
+            .unwrap();
+            if pending_binds[&route].deadline_reported {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let refusal = writer_rx
+            .try_recv()
+            .ok()
+            .map(|frame| serde_json::from_slice::<Value>(&frame.body).unwrap());
+        eprintln!("frozen LSP reproduction: elapsed_ms={} edit_finished={} bind_finished={} refusal={refusal:?}", started.elapsed().as_millis(), edit_response.is_some(), bind_response.is_some());
+        // Always resume before asserting, including on the broken implementation.
+        std::fs::write(&release, "resume").unwrap();
+        let response = match edit_response {
+            Some(response) => response,
+            None => tokio::time::timeout(Duration::from_secs(15), edit)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        if bind_response.is_none() {
+            let _ = tokio::time::timeout(Duration::from_secs(15), bind)
+                .await
+                .unwrap();
+        }
+        assert!(edit_elapsed.is_some_and(|elapsed| elapsed < Duration::from_secs(2)),
+            "edit with frozen stdin exceeded its bound: elapsed={edit_elapsed:?}; refusal={refusal:?}");
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["lsp_complete"], false, "{response:?}");
+        assert_eq!(
+            response.data["lsp_pending_servers"],
+            json!(["typescript"]),
+            "{response:?}"
+        );
+        assert_eq!(
+            response.data["lsp_status"], "diagnostics unknown (server not responding)",
+            "{response:?}"
+        );
+        assert!(
+            bind_response.is_some_and(|response| response.success),
+            "bind missed its deadline: {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn frozen_lsp_stdin_write_is_bounded_and_recovers_without_restart() {
+        use crate::lsp::client::{LspClient, LspEvent};
+        use crate::lsp::registry::ServerKind;
+        use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument};
+
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("resume");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut client = LspClient::spawn(
+            ServerKind::TypeScript,
+            dir.path().to_path_buf(),
+            &fake_lsp::fake_server_binary(),
+            &[],
+            &HashMap::from([(
+                "AFT_FAKE_LSP_FREEZE_AFTER_OPEN".into(),
+                release.to_str().unwrap().into(),
+            )]),
+            tx,
+            crate::lsp::child_registry::LspChildRegistry::new(),
+        )
+        .unwrap();
+        client.initialize(dir.path(), None).unwrap();
+        let uri = crate::lsp::position::path_to_uri(&dir.path().join("main.ts"))
+            .unwrap()
+            .as_str()
+            .parse::<lsp_types::Uri>()
+            .unwrap();
+        client
+            .send_notification::<DidOpenTextDocument>(lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem::new(
+                    uri.clone(),
+                    "typescript".into(),
+                    0,
+                    "// original\n".into(),
+                ),
+            })
+            .unwrap();
+        loop {
+            let event = rx.recv_timeout(Duration::from_secs(15)).unwrap();
+            if matches!(event, LspEvent::Notification { method, .. } if method == "custom/frozen") {
+                break;
+            }
+        }
+        let pid = client.child_pid();
+        let change = |version, text: String| lsp_types::DidChangeTextDocumentParams {
+            text_document: lsp_types::VersionedTextDocumentIdentifier::new(uri.clone(), version),
+            content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text,
+            }],
+        };
+        // The watchdog releases the pipe even if the bound is removed. A red
+        // test should fail an assertion, not strand the test runner in write(2).
+        let watchdog_release = release.clone();
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            std::fs::write(watchdog_release, "resume").unwrap();
+        });
+        let started = Instant::now();
+        let blocked = client
+            .send_notification::<DidChangeTextDocument>(change(1, "x".repeat(2 * 1024 * 1024)));
+        let elapsed = started.elapsed();
+        let skipped =
+            client.send_notification::<DidChangeTextDocument>(change(2, "// later\n".into()));
+        let skipped_elapsed = started.elapsed().saturating_sub(elapsed);
+        let still_alive = !client.child_exited();
+        std::fs::write(&release, "resume").unwrap();
+        let mut resumed = false;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Ok(LspEvent::Notification { method, .. }) =
+                rx.recv_timeout(Duration::from_millis(100))
+            {
+                if method == "textDocument/publishDiagnostics" {
+                    resumed = true;
+                    break;
+                }
+            }
+        }
+        let recovered =
+            client.send_notification::<DidChangeTextDocument>(change(3, "// recovered\n".into()));
+        watchdog.join().unwrap();
+        assert!(
+            blocked.is_err() && elapsed < Duration::from_secs(1),
+            "stdin write bound failed: result={blocked:?} elapsed={elapsed:?}"
+        );
+        assert!(
+            skipped.is_err() && skipped_elapsed < Duration::from_millis(100),
+            "unresponsive server was consulted again: {skipped:?} {skipped_elapsed:?}"
+        );
+        assert!(still_alive, "timeout killed the suspended server");
+        assert!(
+            resumed && recovered.is_ok(),
+            "same server did not recover: {recovered:?}"
+        );
+        assert_eq!(client.child_pid(), pid, "recovery restarted the server");
+    }
+
+    #[tokio::test]
+    async fn bind_overdue_behind_a_mutating_job_names_job_tool_and_age() {
+        let (_dir, root) = test_root("bind-blocked-by-mutation");
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (writer, _) = executor.submit_tool_call_cancellable_async(
+            root.clone(),
+            Lane::Mutating,
+            "subc-5001-1416".into(),
+            "edit",
+            Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                Response::success("subc-5001-1416", json!({}))
+            }),
+        );
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (bind, cancellation) = executor.submit_cancellable_async(
+            root.clone(),
+            Lane::Mutating,
+            "subc-bind-writer".into(),
+            Box::new(|_| Response::success("subc-bind-writer", json!({}))),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !executor
+            .try_bind_blocker_snapshot(&root, "subc-bind-writer")
+            .is_some_and(|snapshot| snapshot.configure_state == "queued")
+        {
+            assert!(Instant::now() < deadline, "bind never queued");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let route = route_key(72, 1);
+        let mut pending_binds = HashMap::from([(
+            route,
+            PendingBind {
+                bind_root_id: root.clone(),
+                inserted_new_actor: false,
+                cancelled: false,
+                configure_request_id: "subc-bind-writer".into(),
+                started_at: Instant::now().checked_sub(Duration::from_secs(11)).unwrap(),
+                warned_half_deadline: false,
+                deadline_reported: false,
+                corr: 72,
+                ver: PROTOCOL_VERSION,
+                flags: control_flags(),
+                cancellation,
+            },
+        )]);
+        let mut installed = HashMap::from([(route.channel, route.epoch)]);
+        let (writer_tx, mut writer_rx) = mpsc::channel(8);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        expire_overdue_route_binds(
+            &writer_tx,
+            &executor,
+            &mut pending_binds,
+            &mut installed,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        release_tx.send(()).unwrap();
+        assert!(writer.await.unwrap().success);
+        assert_eq!(bind.await.unwrap().data["code"], "request_cancelled");
+        let frame = writer_rx.try_recv().expect("refusal before daemon relay");
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["code"], "bind_blocked_by_writer", "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains("job=subc-5001-1416 tool=edit age_ms="),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn post_edit_diagnostics_budget_includes_manager_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.ts");
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(&file, "// original\n").unwrap();
+        let ctx = test_ctx();
+        ctx.lsp().override_binary(
+            crate::lsp::registry::ServerKind::TypeScript,
+            fake_lsp::fake_server_binary(),
+        );
+        let guard = ctx.lsp();
+        let held_ctx = Arc::clone(&ctx);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = held_ctx.lsp_notify_and_collect_diagnostics(
+                &file,
+                "// changed\n",
+                Duration::from_millis(100),
+            );
+            tx.send((started.elapsed(), result)).unwrap();
+        });
+        let bounded = rx.recv_timeout(Duration::from_secs(1));
+        drop(guard);
+        worker.join().unwrap();
+        let (elapsed, outcome) =
+            bounded.expect("LSP manager contention escaped the diagnostics budget");
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(
+            !outcome.complete() && !outcome.pending_servers.is_empty(),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn frozen_lsp_diagnostics_timeout_stops_consulting_silent_server() {
+        use crate::lsp::client::LspEvent;
+        use crate::lsp::registry::ServerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.ts");
+        let release = dir.path().join("resume");
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(&file, "// original\n").unwrap();
+        let ctx = test_ctx();
+        ctx.lsp()
+            .override_binary(ServerKind::TypeScript, fake_lsp::fake_server_binary());
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_FREEZE_AFTER_OPEN", release.to_str().unwrap());
+        ctx.lsp()
+            .notify_file_changed(&file, "// original\n", &ctx.config())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if ctx.lsp().drain_events().into_iter().any(|event| {
+                matches!(event,
+                LspEvent::Notification { method, .. } if method == "custom/frozen")
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "server did not freeze");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(&file, "// small edit\n").unwrap();
+        let outcome = ctx.lsp_notify_and_collect_diagnostics(
+            &file,
+            "// small edit\n",
+            Duration::from_millis(100),
+        );
+        let key = ctx.lsp().active_server_keys().pop().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut marked = false;
+        while Instant::now() < deadline {
+            if ctx.lsp().producer_failure(&key) == Some("server not responding") {
+                marked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        let skipped = ctx.lsp_notify_and_collect_diagnostics(
+            &file,
+            "// another edit\n",
+            Duration::from_secs(2),
+        );
+        let skipped_elapsed = started.elapsed();
+        let count = ctx.lsp().server_count();
+        std::fs::write(&release, "resume").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut resumed = false;
+        while Instant::now() < deadline {
+            if ctx.lsp().drain_events().into_iter().any(|event| {
+                matches!(event,
+                LspEvent::Notification { method, .. } if method == "custom/resumed")
+            }) {
+                resumed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(&file, "// current after resume\n").unwrap();
+        let recovered = ctx.lsp_notify_and_collect_diagnostics(
+            &file,
+            "// current after resume\n",
+            Duration::from_secs(2),
+        );
+        assert!(
+            !outcome.complete() && outcome.diagnostics.is_empty(),
+            "{outcome:?}"
+        );
+        assert!(
+            marked,
+            "diagnostics timeout did not mark the silent server unresponsive"
+        );
+        assert_eq!(count, 1, "timeout removed the suspended server");
+        assert!(
+            resumed && recovered.complete(),
+            "resumed server could not resync the current document: {recovered:?}"
+        );
+        // Consulting the silent server again would wait out the whole 2 s
+        // budget, so the discriminating bound is half of it. The time spent
+        // is otherwise the notify path's own cost, which a loaded Windows
+        // runner measured at about 200 ms.
+        assert!(
+            !skipped.complete()
+                && skipped.unresponsive_servers.contains(&key)
+                && skipped_elapsed < Duration::from_millis(1000),
+            "unresponsive diagnostics were consulted again: {skipped:?} {skipped_elapsed:?}"
+        );
     }
 
     /// Restart-shaped burst: 40 git roots configured together, then their
@@ -13862,6 +15831,10 @@ mod tests {
             let (bash_tx, mut bash_rx) = mpsc::channel(8);
             let (touch_tx, _touch_rx) = mpsc::channel(8);
             let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+            let deferred_tx = DeferredResponseSender {
+                entries: deferred_tx,
+                wake: crate::response_finalize::DeferredResponseWake::default(),
+            };
             tokio::time::timeout(
                 Duration::from_millis(500),
                 handle_tool_call(
@@ -13870,6 +15843,7 @@ mod tests {
                     decoded.phase_trace,
                     &routes,
                     &HashMap::new(),
+                    &ReclaimedRoutes::default(),
                     &mut HashMap::new(),
                     executor,
                     &Arc::default(),

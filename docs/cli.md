@@ -31,6 +31,31 @@ run `doctor --reconfigure`, to change them. For scripts, three modes skip the pr
 
 All three accept `--harness opencode|pi|omp`.
 
+### OpenCode 2 host tools
+
+After the feature choices, `setup` offers to disable OpenCode 2's own `shell`
+and `patch` tool plugins so agents use AFT's `bash` and `apply_patch`. It adds
+`-opencode.tool.shell` and `-opencode.tool.patch` under `plugins` in
+`opencode.json(c)`. Removing the plugins removes their tool-name-specific hooks
+as well as their tools; AFT keeps its own tool names.
+
+Each default follows its AFT replacement: when `bash` or `apply_patch` is in
+`disabled_tools`, setup defaults to keeping the corresponding host tool. The
+shell default also respects `bash: false`, `bash.enabled: false`, and AFT being
+disabled as a whole. `--yes` and non-terminal runs apply these defaults without
+asking. Answering no restores a previously removed host plugin.
+
+`doctor` reports each host tool separately. `doctor --fix` adds a missing removal
+entry only while AFT's replacement is enabled; it never restores a host plugin
+automatically. Rerun setup to restore one. OpenCode 1 is not changed.
+
+With the host patch plugin disabled, AFT supplies the same model-specific
+editing surface: model IDs containing `gpt-`, but not `gpt-4` or `oss`, get
+`apply_patch` rather than AFT's `edit` and `write`. Other models get AFT's `edit`
+and `write` rather than `apply_patch`. The gate only removes tools AFT registered,
+so disabling AFT's `edit` leaves the host's edit tool alone. AFT's `apply_patch`
+uses the OpenCode 2 `edit` permission action, so existing edit rules cover it.
+
 **`doctor`** — Read-only health check. Reports host install state, plugin registration,
 plugin cache version, binary cache, config parse errors, ONNX Runtime availability (for
 semantic search), storage directory sizes, and log file status. Exits non-zero when

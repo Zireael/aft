@@ -608,6 +608,7 @@ fn github_call(arguments: Value) -> Value {
         call_key: None,
         schema_pin: None,
         origin: None,
+        preset: None,
     })
     .expect("a tool call serializes to JSON")
 }

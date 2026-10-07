@@ -55,6 +55,8 @@ pub mod ast_grep_hints;
 pub mod ast_grep_lang;
 pub mod backup;
 pub mod bash_background;
+#[cfg(unix)]
+pub(crate) mod bash_db_hints;
 pub mod bash_permissions;
 pub mod bash_rewrite;
 pub mod blob_store;
@@ -76,11 +78,13 @@ pub mod context;
 pub(crate) mod database_open;
 pub mod db;
 pub mod developer_tools;
+pub(crate) mod durability;
 pub mod edit;
 pub mod effective_path;
 #[doc(hidden)]
 pub mod environment;
 pub mod error;
+pub mod exec_remote;
 pub mod executor;
 pub mod extract;
 pub mod feature_config;
@@ -157,6 +161,8 @@ pub mod symbol_cache_disk;
 pub mod symbol_diff;
 pub mod symbols;
 pub mod synapse_embed;
+#[cfg(test)]
+pub(crate) mod test_storage;
 pub mod tool_gate;
 pub mod tool_path;
 pub mod url_fetch;

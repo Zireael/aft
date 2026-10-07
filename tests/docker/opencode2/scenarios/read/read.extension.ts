@@ -1,12 +1,15 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertRequestToolSurface } from "../../harness/mock-server.js";
 
 import type { HarnessExtension, HarnessValidationContext, ScenarioLifecycleContext } from "../../harness/types.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const EXPECTED_IDS = new Set([
   "read/T1/happy",
+  "read/T1/edit-family/non-gpt",
+  "read/T1/edit-family/gpt",
   "read/T2/invalid_arguments",
   "read/T2/missing_target",
   "read/T3/read_ask_allow",
@@ -15,6 +18,8 @@ const EXPECTED_IDS = new Set([
   "read/T6/read-directory-payload-entries/complete",
   "read/T6/read-directory-payload-entries/incomplete",
   "read/T7/happy",
+  "read/T7/edit-family/non-gpt",
+  "read/T7/edit-family/gpt",
 ]);
 
 async function validateReadScenarios(context: HarnessValidationContext): Promise<void> {
@@ -81,6 +86,17 @@ const extension: HarnessExtension = {
   name: "read-scenarios-v1",
   validate: validateReadScenarios,
   beforeScenario,
+  observe: async (context, event) => {
+    if (context.host_generation !== "v2" || event.kind !== "mock_exchange") return;
+    const expected = context.scenario.metadata?.tool_surface as
+      { model: string; present: string[]; absent: string[] } | undefined;
+    if (!expected) return;
+    const names = assertRequestToolSurface(event.exchange, expected);
+    await writeFile(
+      join(context.forensic_dir, `tool-surface-${event.exchange.label}.json`),
+      `${JSON.stringify({ model: expected.model, tools: names }, null, 2)}\n`,
+    );
+  },
 };
 
 export default extension;

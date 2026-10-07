@@ -53,6 +53,30 @@ thread_local! {
     /// only sees the tool's own arguments, which the agent controls.
     static CURRENT_CALL_KEY: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    static CURRENT_REMOTE: std::cell::RefCell<Option<RemoteLaunch>> = const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteLaunch {
+    pub params: crate::exec_remote::FrozenParams,
+    // Remote dispatch runs only on Unix; Windows carries the policy but never dials.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub connection_file: Option<PathBuf>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub harness: String,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub session: String,
+}
+
+pub(crate) fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<RemoteLaunch>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_REMOTE.with(|s| *s.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(CURRENT_REMOTE.with(|s| s.replace(policy)));
+    run()
 }
 
 /// Run `run` with `call_key` as the current call's key, restoring the
@@ -210,17 +234,21 @@ impl BgTaskStatus {
 /// When a background bash task is killed for running too long (its hard kill).
 ///
 /// Every spawn names one explicitly, so no caller can drop the default by
-/// passing an empty timeout by accident.
+/// passing an empty timeout by accident. There is deliberately no "never"
+/// variant: a delegated worker that blocked on a command with no hard kill once
+/// sat behind a stuck test run for fifteen hours. Instead a worker's wait is
+/// capped (`bash.worker_wait_max_ms`), and each wait it makes pushes a
+/// [`HardKill::Default`] task's kill later (see
+/// [`registry::BgTaskRegistry::renew_hard_kill`]), so a long build the worker
+/// keeps watching runs to completion while one it stops watching is still
+/// killed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardKill {
-    /// The registry's default, [`registry::DEFAULT_BG_TIMEOUT`] (30 minutes).
+    /// The registry's default, [`registry::DEFAULT_BG_TIMEOUT`] (30 minutes),
+    /// extended by a delegated worker's waits on the task.
     Default,
-    /// Never killed for running too long. Only a delegated worker's
-    /// `wait: true` call without a timeout uses this: the worker blocks until
-    /// the command finishes and cannot be woken later, so an implicit kill
-    /// would only cut a long build short.
-    Never,
     /// Killed once it has run this long (the caller's explicit `timeout`).
+    /// Never extended: the caller chose the limit.
     After(Duration),
 }
 
@@ -231,13 +259,18 @@ impl HardKill {
         timeout_ms.map_or(Self::Default, |ms| Self::After(Duration::from_millis(ms)))
     }
 
-    /// How long the task may run, or `None` when it is never killed for it.
-    pub fn limit(self) -> Option<Duration> {
+    /// How long the task may run before its first renewal.
+    pub fn limit(self) -> Duration {
         match self {
-            Self::Default => Some(registry::DEFAULT_BG_TIMEOUT),
-            Self::Never => None,
-            Self::After(limit) => Some(limit),
+            Self::Default => registry::DEFAULT_BG_TIMEOUT,
+            Self::After(limit) => limit,
         }
+    }
+
+    /// Whether a delegated worker's wait may push the kill later. Only the
+    /// implicit default is; an explicit timeout is the caller's own limit.
+    pub fn renewable(self) -> bool {
+        matches!(self, Self::Default)
     }
 }
 
@@ -417,7 +450,43 @@ pub fn spawn(
     }
 
     let cleanup_plan = spawn_plan.clone();
-    let spawn_result = if pty {
+    #[cfg(unix)]
+    ctx.bash_background()
+        .set_db_schema_hints(ctx.config().bash.db_schema_hints);
+    let remote = CURRENT_REMOTE
+        .with(|s| s.borrow().clone())
+        .filter(|launch| {
+            !shell.is_powershell()
+                && launch.params.remote_exec.as_ref().is_some_and(|policy| {
+                    crate::exec_remote::policy::matches(policy, command, pty, false)
+                })
+        });
+    #[cfg(unix)]
+    let remote_result = remote.map(|launch| {
+        ctx.bash_background().spawn_remote(
+            launch,
+            spawn_plan.clone(),
+            command,
+            shell_path.clone(),
+            session_id.to_string(),
+            workdir.clone(),
+            env.clone(),
+            hard_kill,
+            storage_dir.clone(),
+            max_running,
+            notify_on_completion,
+            compressed,
+            project_root.clone(),
+        )
+    });
+    #[cfg(not(unix))]
+    let remote_result: Option<Result<String, String>> = {
+        let _ = remote;
+        None
+    };
+    let spawn_result = if let Some(result) = remote_result {
+        result
+    } else if pty {
         ctx.bash_background().spawn_pty_with_shell(
             spawn_plan,
             command,
@@ -561,6 +630,35 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
         StoragePlatform::current(),
         fallback_home.as_deref(),
         current_dir.as_deref(),
+    )
+}
+
+/// Resolve the current test environment's default, excluding AFT-specific
+/// overrides. HOME and XDG may deliberately name a fixture, not the live store.
+#[cfg(test)]
+pub(crate) fn storage_dir_without_overrides_for_test() -> PathBuf {
+    let lookup = |name: &str| {
+        if matches!(name, "AFT_STORAGE_DIR" | "AFT_CACHE_DIR") {
+            None
+        } else {
+            std::env::var_os(name)
+        }
+    };
+    storage_dir_from_test_environment(&lookup)
+}
+
+/// Let the persistence fence use the production ladder with account-owned homes
+/// instead of the temporary homes installed by a test or its runner.
+#[cfg(test)]
+pub(crate) fn storage_dir_from_test_environment(
+    lookup: &impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    storage_dir_from(
+        None,
+        &lookup,
+        StoragePlatform::current(),
+        std::env::home_dir().as_deref(),
+        std::env::current_dir().ok().as_deref(),
     )
 }
 

@@ -11,6 +11,8 @@ use crate::protocol::PushFrame;
 #[cfg(test)]
 use crate::watcher_filter::RescanReason;
 use crate::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -149,14 +151,15 @@ static SEMANTIC_REFRESH_RECOVERY_GATE: OnceLock<Mutex<Option<SemanticRefreshReco
 
 #[cfg(test)]
 struct WatcherPhaseCommitGate {
-    target: PathBuf,
     reached_tx: crossbeam_channel::Sender<()>,
     release_rx: crossbeam_channel::Receiver<()>,
 }
 
 #[cfg(test)]
-static WATCHER_PHASE_COMMIT_GATE: std::sync::OnceLock<Mutex<Option<WatcherPhaseCommitGate>>> =
-    std::sync::OnceLock::new();
+// Parallel libtests must not replace another path's in-flight barrier.
+static WATCHER_PHASE_COMMIT_GATE: std::sync::OnceLock<
+    Mutex<HashMap<PathBuf, WatcherPhaseCommitGate>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 struct WatcherRescanGate {
@@ -220,28 +223,27 @@ fn install_watcher_phase_commit_gate_for_test(
 ) {
     let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    *WATCHER_PHASE_COMMIT_GATE
-        .get_or_init(|| Mutex::new(None))
+    WATCHER_PHASE_COMMIT_GATE
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .expect("watcher phase commit gate mutex poisoned") = Some(WatcherPhaseCommitGate {
-        target,
-        reached_tx,
-        release_rx,
-    });
+        .expect("watcher phase commit gate mutex poisoned")
+        .insert(
+            target,
+            WatcherPhaseCommitGate {
+                reached_tx,
+                release_rx,
+            },
+        );
     (reached_rx, release_tx)
 }
 
 #[cfg(test)]
 fn wait_on_watcher_phase_commit_gate_for_test(path: &Path) {
-    let mut slot = WATCHER_PHASE_COMMIT_GATE
-        .get_or_init(|| Mutex::new(None))
+    let gate = WATCHER_PHASE_COMMIT_GATE
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .expect("watcher phase commit gate mutex poisoned");
-    if !slot.as_ref().is_some_and(|gate| gate.target == path) {
-        return;
-    }
-    let gate = slot.take();
-    drop(slot);
+        .expect("watcher phase commit gate mutex poisoned")
+        .remove(path);
     if let Some(gate) = gate {
         let _ = gate.reached_tx.send(());
         let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
@@ -469,7 +471,7 @@ impl StandaloneConfigureMaintenance {
 
     pub fn drain_one(&mut self, ctx: &Arc<AppContext>) -> bool {
         let _scope = crate::executor::install_standalone_scope(Arc::clone(ctx));
-        crate::commands::configure::drain_deferred_configure_maintenance_unit(ctx, &mut self.inner)
+        crate::commands::configure::drain_standalone_configure_unit(ctx, &mut self.inner)
     }
 }
 
@@ -607,7 +609,7 @@ pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: 
                 .inspect_manager()
                 .dead_code_blocked_on_callgraph(inspect_dir, project_root);
             ctx.set_status_bar_tier2_dead_code_blocked_on_callgraph(blocked);
-            ctx.status_emitter().signal(ctx.build_status_snapshot());
+            ctx.signal_status_changed();
         }
     }
 }
@@ -848,7 +850,7 @@ pub fn drain_search_index_events(ctx: &AppContext) {
     }
 
     if installed_index || disconnected {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
 }
 
@@ -1013,7 +1015,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         let _ = ctx.request_tier2_refresh_pull();
     }
     if terminal {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
 }
 
@@ -1410,7 +1412,7 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
     }
 
     if status_changed {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
 }
 
@@ -2018,7 +2020,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
     }
 
     if status_changed {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
 }
 
@@ -2554,12 +2556,9 @@ pub fn refresh_callgraph_store_for_watcher(
 /// coalescing; this drain only reacts to compact control events and surviving
 /// paths because the cache/index state below is not Send.
 pub fn drain_watcher_events(ctx: &AppContext) {
-    loop {
-        let outcome = drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
-        if !outcome.has_more {
-            break;
-        }
-    }
+    // A request gets one slice, not one slice repeatedly until a checkout burst
+    // empties. The continuation stays queued for subsequent requests/idle turns.
+    drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
 }
 
 fn watcher_drain_phase_name(stage: WatcherDrainApplyPhase) -> &'static str {
@@ -2815,18 +2814,27 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 |path| {
                     if heavy_root_work_allowed && apply_ram_search_updates {
                         let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                            let max_file_size = ctx
+                                .search_index()
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .as_ref()
+                                .map(crate::search_index::SearchIndex::max_file_size);
+                            let Some(max_file_size) = max_file_size else {
+                                return;
+                            };
+                            let remove = watcher_path_is_ignored_by_current_matcher(ctx, path);
+                            let update = crate::search_index::prepare_search_update(
+                                path,
+                                max_file_size,
+                                remove,
+                            );
                             let mut index_ref = ctx
                                 .search_index()
                                 .write()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if let Some(index) = index_ref.as_mut() {
-                                if path.exists()
-                                    && !watcher_path_is_ignored_by_current_matcher(ctx, path)
-                                {
-                                    index.update_file(path);
-                                } else {
-                                    index.remove_file(path);
-                                }
+                                index.apply_search_update(update);
                             }
                         });
                     }
@@ -3052,7 +3060,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
 
     aft::slog_info!("invalidated {} files", paths.len());
     if status_changed {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
     ctx.tick_tier2_refresh_scheduler(state.scheduler_changed_path_count);
     state.phase = WatcherDrainPhase::Collect;
@@ -3094,6 +3102,15 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         state.view_publication_paths.clear();
         return;
     }
+    if let Some(due) = ctx
+        .view_publication_retry()
+        .lock()
+        .due()
+        .filter(|due| Instant::now() < *due)
+    {
+        state.view_publication_due = Some(due);
+        return;
+    }
     let changed = state
         .view_publication_paths
         .iter()
@@ -3120,12 +3137,20 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
                 state.view_publication_paths.clear();
                 return;
             }
-            aft::slog_warn!(
-                "content-addressed view publication failed root={} error={}",
-                root.display(),
-                error
-            );
-            state.view_publication_due = Some(Instant::now() + Duration::from_secs(1));
+            // Inline publication records and logs the failure in the same retry
+            // state used by detached jobs. Preserve this drain's path union.
+            let retry_due = ctx.view_publication_retry().lock().due();
+            if retry_due.is_none() {
+                // Admission or thread-spawn failures happen before the shared
+                // publication loop can record them; keep their diagnostic.
+                aft::slog_warn!(
+                    "content-addressed view publication failed root={} error={}",
+                    root.display(),
+                    error
+                );
+            }
+            state.view_publication_due =
+                retry_due.or_else(|| Some(Instant::now() + Duration::from_secs(1)));
         }
     }
 }
@@ -3165,6 +3190,7 @@ fn rebuild_gitignore_for_drain(
 }
 
 pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
+    let _in_flight = ctx.watcher_drain_guard();
     let started = Instant::now();
     let configure_generation = ctx.configure_generation();
     let content_generation = ctx.configure_content_generation();
@@ -3320,7 +3346,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             "project root deleted; dropping watcher to avoid delete-storm: {:?}",
             ctx.canonical_cache_root_opt()
         );
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
         return outcome;
     }
     if let Some(error) = watcher_failed {
@@ -3330,7 +3356,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             "file watcher unavailable; continuing without live external-change invalidation: {}",
             error
         );
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
         return outcome;
     }
 
@@ -3391,7 +3417,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         state.scheduler_changed_path_count =
             aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1;
         if state.status_changed {
-            ctx.status_emitter().signal(ctx.build_status_snapshot());
+            ctx.signal_status_changed();
         }
         ctx.tick_tier2_refresh_scheduler(state.scheduler_changed_path_count);
         // Acknowledge the rescan only if the whole refresh sequence ran under
@@ -3409,6 +3435,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             state.ignore_changed_paths.clear();
             state.ignore_changed_path_count = 0;
             if ctx.config().views.enabled {
+                ctx.reset_view_publication_retry();
                 state.view_publication_paths.clear();
                 state.view_publication_due = Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
             }
@@ -3436,6 +3463,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 state.ignore_changed_paths.clear();
                 state.ignore_changed_path_count = 0;
                 if ctx.config().views.enabled {
+                    ctx.reset_view_publication_retry();
                     state.view_publication_paths.clear();
                     state.view_publication_due =
                         Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
@@ -3459,7 +3487,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
 
             if paths.is_empty() {
                 if state.status_changed {
-                    ctx.status_emitter().signal(ctx.build_status_snapshot());
+                    ctx.signal_status_changed();
                 }
                 ctx.tick_tier2_refresh_scheduler(usize::from(ignore_changed));
                 state.status_changed = false;
@@ -3471,6 +3499,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 };
                 paths.retain(|path| !git_head_paths.contains(path));
                 if ctx.config().views.enabled {
+                    ctx.reset_view_publication_retry();
                     state.view_publication_paths.extend(paths.iter().cloned());
                     state.view_publication_due =
                         Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
@@ -3517,7 +3546,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             }
         } else if ignore_changed {
             if state.status_changed {
-                ctx.status_emitter().signal(ctx.build_status_snapshot());
+                ctx.signal_status_changed();
             }
             ctx.tick_tier2_refresh_scheduler(1);
             state.status_changed = false;
@@ -3614,7 +3643,15 @@ fn lsp_params_for_log(params: Option<serde_json::Value>) -> String {
 
 pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBatchOutcome {
     let drained = {
-        let mut lsp = ctx.lsp();
+        let Some(mut lsp) = ctx.try_lsp() else {
+            // Keep demand alive without waiting for a producer's round trip.
+            // Maintenance must retry zero progress on its next tick, not in
+            // an immediate completion/requeue loop while this lock is held.
+            return DrainBatchOutcome {
+                processed: 0,
+                has_more: true,
+            };
+        };
         lsp.drain_events_bounded(max_events)
     };
     let outcome = DrainBatchOutcome {
@@ -3662,9 +3699,38 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
         }
     }
     if status_changed {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
     outcome
+}
+
+#[cfg(test)]
+mod request_lsp_contention_tests {
+    use super::*;
+
+    #[test]
+    fn request_lsp_drain_defers_a_held_manager_without_waiting() {
+        let ctx = Arc::new(AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config::default(),
+        ));
+        let held = ctx.lsp();
+        let worker_ctx = Arc::clone(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = drain_lsp_events_bounded(&worker_ctx, 10);
+            tx.send(outcome).unwrap();
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        worker.join().unwrap();
+        let outcome = outcome.expect("request drain must not acquire a contended manager");
+        assert_eq!(outcome.processed, 0);
+        assert!(
+            outcome.has_more,
+            "contention must preserve maintenance demand"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3776,6 +3842,48 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().lock() = Some(rx);
         (ctx, tx)
+    }
+
+    #[test]
+    fn perf_audit_watcher_search_io_outside_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::new());
+        let ctx = Arc::new(ctx);
+        let paths = (0..16)
+            .map(|i| {
+                let path = root.join(format!("file_{i:03}.rs"));
+                std::fs::write(&path, "fn marker() {}\n").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        tx.send(WatcherDispatchEvent::Paths(paths)).unwrap();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let locked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let probe_ctx = Arc::clone(&ctx);
+        let probe_reads = reads.clone();
+        let probe_locked = locked.clone();
+        crate::search_index::audit_set_io_probe(Some(Box::new(move || {
+            probe_reads.set(probe_reads.get() + 1);
+            if probe_ctx.search_index().try_read().is_err() {
+                probe_locked.set(probe_locked.get() + 1);
+            }
+        })));
+        let mut slices = 0;
+        while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+            slices += 1;
+            assert!(slices < 64);
+        }
+        crate::search_index::audit_set_io_probe(None);
+        assert_eq!(
+            reads.get(),
+            16,
+            "probe must reach the real file preparation"
+        );
+        assert_eq!(locked.get(), 0, "file I/O under search-index write lock");
+        let index = ctx.search_index().read().unwrap();
+        assert_eq!(index.as_ref().unwrap().file_count(), 16);
     }
 
     struct IgnoreRuleRefreshTestReset;
@@ -4564,6 +4672,63 @@ mod tests {
             "configure must install the ignore matcher before pending paths replay"
         );
         ctx.stop_watcher_runtime();
+    }
+
+    #[test]
+    fn watcher_query_reports_in_flight_changes_until_application_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let source = root.join("changed.rs");
+        std::fs::write(&source, "fn pending_marker() {}\n").unwrap();
+        let (ctx, watcher_tx) = watcher_context(&root);
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::new());
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(vec![source.clone()]))
+            .unwrap();
+        let ctx = Arc::new(ctx);
+        let (reached_rx, release_tx) = install_watcher_phase_commit_gate_for_test(source);
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || {
+            while drain_watcher_events_bounded(&drain_ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {}
+        });
+        let reached = reached_rx.recv_timeout(Duration::from_secs(5));
+        let pending = ctx.watcher_query_has_pending_changes();
+        let continuation_taken = ctx.watcher_drain_slice().lock().is_none();
+        release_tx.send(()).unwrap();
+        drain.join().unwrap();
+        reached.expect("watcher apply barrier");
+        assert!(continuation_taken, "the active apply owns the continuation");
+        assert!(
+            pending,
+            "an empty continuation slot must not hide in-flight changes"
+        );
+        assert!(
+            !ctx.watcher_query_has_pending_changes(),
+            "completed application retires the active demand"
+        );
+    }
+
+    #[test]
+    fn watcher_phase_commit_gates_are_path_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.rs");
+        let second = temp.path().join("second.rs");
+        let (first_reached, first_release) =
+            install_watcher_phase_commit_gate_for_test(first.clone());
+        let (second_reached, second_release) =
+            install_watcher_phase_commit_gate_for_test(second.clone());
+        let first_apply =
+            std::thread::spawn(move || wait_on_watcher_phase_commit_gate_for_test(&first));
+        let second_apply =
+            std::thread::spawn(move || wait_on_watcher_phase_commit_gate_for_test(&second));
+        let first_result = first_reached.recv_timeout(Duration::from_secs(2));
+        let second_result = second_reached.recv_timeout(Duration::from_secs(2));
+        let _ = first_release.send(());
+        let _ = second_release.send(());
+        first_apply.join().unwrap();
+        second_apply.join().unwrap();
+        first_result.expect("first path's barrier must survive installing the second");
+        second_result.expect("second path's barrier must be independent");
     }
 
     #[test]
@@ -6683,6 +6848,29 @@ mod watcher_slice_tests {
     use super::*;
     use crate::config::Config;
     use crate::context::{default_language_provider_factory, AppContext, ViewRuntimeSnapshot};
+
+    #[test]
+    fn request_watcher_drain_applies_at_most_one_slice() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(root.path());
+        let total = WATCHER_PATH_DRAIN_BATCH_CAP * 2 + 1;
+        tx.send(WatcherDispatchEvent::Paths(
+            (0..total)
+                .map(|index| root.path().join(format!("changed-{index}.rs")))
+                .collect(),
+        ))
+        .unwrap();
+        drain_watcher_events(&ctx);
+        let applied = ctx.pending_tier2_paths().len();
+        assert!(
+            applied > 0 && applied <= WATCHER_PATH_DRAIN_BATCH_CAP,
+            "request applied {applied} paths (burst {total})"
+        );
+        while ctx.watcher_drain_has_work() {
+            drain_watcher_events(&ctx);
+        }
+        assert_eq!(ctx.pending_tier2_paths().len(), total);
+    }
 
     fn context_with_watcher(
         root: &Path,

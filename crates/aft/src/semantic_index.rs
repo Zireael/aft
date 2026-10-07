@@ -436,6 +436,22 @@ pub(crate) fn record_embedding_backend_build_failure_for_test(project_root: &Pat
     );
 }
 
+/// Hold a loopback port without listening so a backend connection fails while
+/// no parallel test can claim the address. Dropping a temporary listener would
+/// release the port before the asynchronous backend probe connects to it.
+#[cfg(test)]
+pub(crate) fn reserved_refused_backend_for_test() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("create backend socket");
+    socket
+        .bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .expect("reserve backend port without listening");
+    let addr = socket.local_addr().expect("backend address");
+    (socket, addr)
+}
+
 fn begin_semantic_index_build(
     project_root: &Path,
 ) -> (
@@ -764,6 +780,8 @@ struct BuildRequestBudget {
 #[derive(Debug, Clone, Copy)]
 enum EmbeddingRequestPolicy {
     Build(BuildRequestBudget),
+    /// The view worker owns retry backoff; an identity probe sends one request.
+    Probe(Duration),
     Query(QueryBudget),
 }
 
@@ -771,13 +789,14 @@ impl EmbeddingRequestPolicy {
     fn max_attempts(self) -> usize {
         match self {
             Self::Build(_) => EMBEDDING_REQUEST_MAX_ATTEMPTS,
-            Self::Query(_) => 1,
+            Self::Probe(_) | Self::Query(_) => 1,
         }
     }
 
     fn request_timeout(self) -> Duration {
         match self {
             Self::Build(budget) => Duration::from_millis(budget.deadline_ms),
+            Self::Probe(timeout) => timeout,
             Self::Query(budget) => Duration::from_millis(budget.timeout_ms),
         }
     }
@@ -1954,7 +1973,9 @@ where
         let request = make_request().timeout(policy.request_timeout());
 
         let exchange = match policy {
-            EmbeddingRequestPolicy::Build(_) => execute_embedding_exchange(request),
+            EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => {
+                execute_embedding_exchange(request)
+            }
             EmbeddingRequestPolicy::Query(_) => execute_query_embedding_exchange(request)?,
         };
         let (status, raw) = match exchange {
@@ -2257,6 +2278,21 @@ impl SemanticEmbeddingModel {
             fingerprint.synapse_equivalent_to = identity.equivalent_to.clone();
         }
         Ok(fingerprint)
+    }
+
+    /// Resolve a view's producer with one HTTP probe, leaving retry scheduling
+    /// to the checkout worker rather than multiplying requests inside each retry.
+    pub(crate) fn fingerprint_for_view(
+        &mut self,
+        config: &SemanticBackendConfig,
+    ) -> Result<SemanticIndexFingerprint, String> {
+        if self.dimension.is_none() && self.uses_http_embedding_backend() {
+            self.embed_texts(
+                vec!["semantic index fingerprint probe".to_string()],
+                EmbeddingRequestPolicy::Probe(Duration::from_millis(self.timeout_ms)),
+            )?;
+        }
+        self.fingerprint(config)
     }
 
     fn uses_http_embedding_backend(&self) -> bool {
@@ -2630,7 +2666,7 @@ impl SemanticEmbeddingModel {
         policy: EmbeddingRequestPolicy,
     ) -> Result<Vec<Vec<f32>>, String> {
         let query_cache_key = match policy {
-            EmbeddingRequestPolicy::Build(_) => None,
+            EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => None,
             EmbeddingRequestPolicy::Query(_) => texts.first().cloned(),
         };
         let cached_vectors = query_cache_key.as_ref().and_then(|query| {
@@ -2838,7 +2874,7 @@ impl SemanticEmbeddingModel {
             }
             SemanticEmbeddingEngine::Synapse(client) => {
                 let vectors = match policy {
-                    EmbeddingRequestPolicy::Build(_) => client
+                    EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => client
                         .embed_batch(&texts)
                         .map_err(|error| error.to_string())?,
                     EmbeddingRequestPolicy::Query(budget) => {
@@ -6756,7 +6792,7 @@ impl SemanticIndex {
             let mut writer = BufWriter::new(file);
             let bytes_written = self.write_to_writer(&mut writer)?;
             writer.flush()?;
-            writer.get_ref().sync_all()?;
+            crate::durability::sync_file(writer.get_ref(), data_path)?;
             Ok(bytes_written)
         })();
         let bytes_written = match write_result {
@@ -6793,7 +6829,8 @@ impl SemanticIndex {
             let _ = fs::remove_file(&tmp_path);
             return Err(error);
         }
-        crate::fs_lock::sync_parent(data_path);
+        // Keep the snapshot data flush: a full re-embed can cost paid API calls.
+        // An unsynced rename may revert to the previous synced snapshot.
         Ok(bytes_written)
     }
 
@@ -6891,7 +6928,6 @@ impl SemanticIndex {
         if let Some(ready) = env::var_os("AFT_TEST_SEMANTIC_SEGMENT_TEAR_READY") {
             let cut = (frame.len() / 2).max(SEMANTIC_SEGMENT_FRAME_HEADER_BYTES);
             file.write_all(&frame[..cut])?;
-            file.sync_all()?;
             fs::write(ready, b"ready")?;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
@@ -6899,7 +6935,9 @@ impl SemanticIndex {
         }
 
         file.write_all(frame)?;
-        file.sync_all()
+        // Frames are checksummed. A lost or torn tail re-embeds only its files,
+        // so incremental appends need visibility, not power-loss durability.
+        Ok(())
     }
 
     fn compact_path_if_unchanged(
@@ -7146,10 +7184,8 @@ impl SemanticIndex {
                 match OpenOptions::new()
                     .write(true)
                     .open(&data_path)
-                    .and_then(|file| {
-                        file.set_len(layout.valid_bytes as u64)?;
-                        file.sync_all()
-                    }) {
+                    .and_then(|file| file.set_len(layout.valid_bytes as u64))
+                {
                     Ok(()) => {}
                     Err(error) => {
                         slog_warn!("failed to truncate torn semantic segment: {}", error);
@@ -7606,10 +7642,7 @@ impl SemanticIndex {
                         let truncate_result = OpenOptions::new()
                             .write(true)
                             .open(&data_path)
-                            .and_then(|file| {
-                                file.set_len(loaded.valid_bytes as u64)?;
-                                file.sync_all()
-                            });
+                            .and_then(|file| file.set_len(loaded.valid_bytes as u64));
                         if let Err(error) = truncate_result {
                             slog_warn!("failed to truncate torn semantic segment: {}", error);
                         }
@@ -9504,6 +9537,82 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durability_semantic_snapshot_count() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = project.path().join("lib.rs");
+        write_rust_file(&source, "original");
+        let index = build_test_index(project.path(), std::slice::from_ref(&source));
+        crate::durability::take();
+        assert!(index.write_to_disk(storage.path(), "durability"));
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 1, "{events:?}");
+    }
+
+    #[test]
+    fn durability_semantic_append_count() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = project.path().join("lib.rs");
+        write_rust_file(&source, "original");
+        let mut index = build_test_index(project.path(), std::slice::from_ref(&source));
+        assert!(index.write_to_disk(storage.path(), "durability"));
+        write_rust_file(&source, "changed");
+        index
+            .refresh_stale_files(
+                project.path(),
+                std::slice::from_ref(&source),
+                &mut test_vector_for_texts,
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        crate::durability::take();
+        assert!(index.write_to_disk(storage.path(), "durability"));
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        let loaded = SemanticIndex::read_from_disk(
+            storage.path(),
+            "durability",
+            project.path(),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(loaded.entry_count(), index.entry_count());
+    }
+
+    #[test]
+    fn durability_semantic_torn_tail_repair_count() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = project.path().join("lib.rs");
+        write_rust_file(&source, "original");
+        let index = build_test_index(project.path(), std::slice::from_ref(&source));
+        assert!(index.write_to_disk(storage.path(), "durability"));
+        let path = storage.path().join("semantic/durability/semantic.bin");
+        let valid_bytes = fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"torn")
+            .unwrap();
+        crate::durability::take();
+        let loaded = SemanticIndex::read_from_disk(
+            storage.path(),
+            "durability",
+            project.path(),
+            false,
+            None,
+        )
+        .unwrap();
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        assert_eq!(fs::metadata(path).unwrap().len(), valid_bytes);
+        assert_eq!(loaded.entry_count(), index.entry_count());
+    }
     use super::*;
     use crate::config::{SemanticBackend, SemanticBackendConfig};
     use crate::parser::FileParser;
@@ -13568,13 +13677,21 @@ public class Greeter {
     }
 
     #[test]
+    fn refused_backend_fixture_keeps_its_port_reserved() {
+        let (_backend, addr) = reserved_refused_backend_for_test();
+        assert!(
+            TcpListener::bind(addr).is_err(),
+            "a parallel listener must not be able to claim the refused backend's port"
+        );
+    }
+
+    #[test]
     fn remote_backend_probe_names_a_refused_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
+        let (_backend, addr) = reserved_refused_backend_for_test();
+        let port = addr.port();
 
         let error = probe_remote_backend(&format!("http://127.0.0.1:{port}/v1"))
-            .expect_err("nothing listens on a released port");
+            .expect_err("nothing listens on the reserved port");
         assert!(
             error.starts_with("embedding backend unreachable"),
             "{error}"

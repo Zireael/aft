@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "views-edit-reconcile-and-embedding-retention"
+  ],
+  "note": "Views: one stat-first reconciliation per edit, completed embedding batches kept across failures, batched pin writes; no ranking-fence file."
+}

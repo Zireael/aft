@@ -12,7 +12,9 @@ For the removal order and harness-specific registration steps, see [Uninstall](.
 
 OMP uses this same CortexKit user file; register its Pi-compatible plugin with `npx @cortexkit/aft@latest setup --harness omp`.
 
-`bash.watch_sync_max_ms` bounds synchronous `bash_watch` calls in a main session, which should only cover a short remaining wait on a task; it defaults to 120 seconds because longer synchronous waits keep the agent turn occupied. For longer commands, use `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. A delegated (subagent) session is not bounded by it: it cannot be woken once its turn ends, so its `bash_watch` without a timeout waits until the command finishes. Values are clamped to 1000..=1800000 with a warning; set it to `1800000` in user or project config to restore the old 30-minute cap.
+`bash.watch_sync_max_ms` bounds synchronous `bash_watch` calls in a main session, which should only cover a short remaining wait on a task; it defaults to 120 seconds because longer synchronous waits keep the agent turn occupied. For longer commands, use `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. A delegated (subagent) session is not bounded by it; it uses `bash.worker_wait_max_ms` instead. Values are clamped to 1000..=1800000 with a warning; set it to `1800000` in user or project config to restore the old 30-minute cap.
+
+`bash.worker_wait_max_ms` bounds how long a delegated (subagent) session waits on one command before control returns to it: a `bash_watch` without a timeout, and a `bash` call that blocks until the command finishes (`wait: true`, or every foreground call when `bash.subagent_background` is false). At the limit the command is not killed: it keeps running in the background, and the worker is told it is still running, how long it has run, and its latest output, so it can wait again or `bash_kill` it. While the worker keeps waiting, each wait pushes the command's default 30-minute hard kill to at least this long after the wait, so a long build it keeps watching runs to completion, while one it stops watching is still killed. An explicit `timeout` is never extended. The default is `1800000` (30 minutes); a value below `60000` is a config error that drops the `bash` block, not a silent clamp. User and project config may both set it, and harness blocks override it like the other `bash` keys.
 
 On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
 
@@ -312,11 +314,11 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "background": false,
 
     // Allow subagents to run background bash. When false, `background: true`
-    // is converted to a foreground call that blocks up to the hard cap (the
-    // 30-minute default unless `timeout` is passed; only a `wait: true` call
-    // without a timeout runs with no hard kill), and an async `bash_watch`
-    // becomes a sync wait that lasts until the command finishes. Default true
-    // because workers are
+    // is converted to a foreground call that blocks until the command
+    // finishes, at most `worker_wait_max_ms` (after which the command moves to
+    // the background and the subagent is told how to keep waiting), and an
+    // async `bash_watch` becomes a sync wait of up to `worker_wait_max_ms`.
+    // Default true because workers are
     // multi-turn and use bash_watch to wait. OpenCode applies it to sessions
     // with a parent session; Pi applies it to headless runs (`pi -p`,
     // `--mode json`) and to processes started with MAGIC_CONTEXT_PI_SUBAGENT=1,
@@ -337,12 +339,26 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // through such messages; even then, a message containing `&detach` forces the
     // detach (the token is stripped before the model sees the message).
     "detach_on_user_message": true,
+    // Read-only schema trailers after missing-table/column errors. Default true;
+    // user and project tiers. SQLite on Unix; literal paths only (no variables,
+    // globs or memory databases; file: URIs require mode=ro, and startup -cmd/
+    // -init flags are skipped because they may change the connection).
+    // Finished commands only, including
+    // background completions, independent of compression. Probe: same launch
+    // sandbox, 1.5s timeout, 256 KiB output cap; trailer: 2 KiB with omissions.
+    "db_schema_hints": true,
 
     // Maximum time a synchronous bash_watch call may wait. Defaults to 120000ms;
     // values outside 1000..=1800000 are clamped with a warning. Sync waits are
     // intended for a short remaining wait; to restore the old 30-minute cap,
     // set this to 1800000 in the user or project config.
     "watch_sync_max_ms": 120000,
+
+    // How long a delegated (subagent) session waits on one command before
+    // control returns to it (a bash_watch without a timeout, or a blocking
+    // bash call). The command keeps running in the background. Default
+    // 1800000 (30 minutes); values below 60000 are a config error.
+    "worker_wait_max_ms": 1800000,
 
     // Linux-only and user-tier only. Put non-PTY tool shells in transient
     // systemd user scopes when the user manager is reachable. Default false.
@@ -555,10 +571,17 @@ Set `sandbox.enabled` to route first-party bash and PTY commands through Seatbel
 
 The mandatory credential floor is `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.azure`, `~/.config/gcloud`, and `~/.config/cortexkit`. Linux canonicalizes these paths and constructs a read allowlist that omits them. A writable project, cache, temporary directory, or `write_allow` path that overlaps this floor is refused because Landlock cannot subtract write rights. Ordinary `read_deny` paths inside writable roots are supported: writes remain allowed while read grants are split around the denied path.
 
+The floor also denies CortexKit's data and state trees (`~/.local/share/cortexkit/` and `~/.local/state/cortexkit/`, plus absolute XDG data/state locations and AFT's resolved storage). The daemon connection file is separately denied wherever the trusted `subc.connection_file` resolves, including outside those trees; `~` and relative settings resolve against HOME. Environment-selected connection files and the default runtime/production connection paths are denied too. These paths hold daemon authentication and other agents' snapshots, output, and undo history, not just the current project's data.
+
+Only the session's project roots and the current task's private temporary directory get read/write exceptions within private trees. Other worktrees, tasks, modules, and state remain hidden. The active `gh` shim directory and its resolved executable, and the active content-keyed managed Git hooks directory, get read/execute access but never write access. Seatbelt excludes these narrow exceptions from the tree denies and allows only ancestor metadata needed for path traversal. Landlock omits the private trees from ordinary read grants and reintroduces the exact exceptions; it does not grant their parents. If a Linux writable grant encompasses a private tree, crosses the connection-file deny, or would make managed executables writable, setup fails closed with `sandbox_unavailable` explaining the overlap. This restructures the allow set rather than attempting an unsupported nested Landlock deny.
+
+Background stdout/stderr and exit markers use descriptors opened before confinement. Native launches already disable path-based pipeline-status capture, so the shell needs no path grant to the capture files or the whole `io/` directory. Only the private temporary directory beneath `io/` is readable/writable. Linux also retains the existing exact read grants for the daemon-verified command, wrapper, and environment payload files, never their control-directory parent. `gh --status` still executes through the shim, but reports unavailable private state rather than receiving a state-directory exception.
+
 | Protection | macOS Seatbelt | Linux Landlock |
 | --- | --- | --- |
 | Credential floor reads and writes | Denied | Denied by omission; overlapping writable roots are refused |
-| Project, task artifact, cache, and private task-temp access | Read/write | Read/write |
+| CortexKit data/state and daemon connection file | Denied except exact project/task temp and read-only managed executables | Denied by omission with the same exact exceptions; unrepresentable writable overlaps are refused |
+| Project, cache, and private task-temp access | Read/write | Read/write |
 | Other existing HOME children | Readable; HOME remains unwritable | Readable only when present at launch; new children are denied until the next launch |
 | System files | Readable; unwritable | Curated read-only roots; `/proc` is readable, `/sys` is limited, `/run/user`, `/var/run`, `/dev/shm`, `/dev/kmsg`, and shared `/tmp` are omitted |
 | Git metadata | Writable so `git add` and `git commit` work | Writable inside project roots |
@@ -567,6 +590,8 @@ The mandatory credential floor is `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.azure`, `~
 | Unix-domain socket connections such as Docker and SSH agent sockets | Denied by path | Not mediated; connections remain allowed |
 | TCP, UDP, DNS, and raw sockets | Open | Open |
 | Unsupported native platform | `sandbox_unavailable` | `sandbox_unavailable` |
+
+On Linux, the existing repository-hook read denial requires granting project reads per child present at launch, rather than granting the complete project root. Within one sandboxed command, files newly created at the project root after launch cannot be read, even though they can be written. A subsequent command recomputes the read grants and can read those files. This is a pre-existing Landlock limitation of the nested `.git/hooks` read deny, not a denial of the session's worktree by the CortexKit data floor. macOS does not have this limitation.
 
 ### Linux guarantee boundary
 
@@ -672,6 +697,8 @@ calls. Servers are spawned lazily — only when a file matching their extensions
 only if their binary can be resolved from project `node_modules/.bin`, AFT's managed cache, or
 `PATH`. Python-family servers additionally check the selected nested workspace's `.venv` or
 `venv` first.
+
+AFT sets `GIT_OPTIONAL_LOCKS=0` for every language server so Git status calls by server descendants skip optional index locks; mandatory Git write locks are unaffected.
 
 **Built-in servers** (auto-registered, no config needed):
 

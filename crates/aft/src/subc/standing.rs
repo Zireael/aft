@@ -1,10 +1,10 @@
 //! Subc-owned standing-root maintenance.
 //!
 //! This module deliberately has no watcher, scheduler, or timer. `subc::mod`
-//! calls `tick` from its existing maintenance timer arm, and every root pass is
-//! submitted through the existing executor's coalescable maintenance lane.
+//! requests `tick` on a worker from its existing maintenance timer arm. Every
+//! root pass uses the existing executor's coalescable maintenance lane.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -19,6 +19,28 @@ use crate::standing_roots::{StandingRootEntry, StandingRoots};
 /// The standing cadence is intentionally the same arm cadence that already
 /// drives `due_maintenance_jobs`; no standing timer or scheduler is created.
 pub(super) const STANDING_MAINTENANCE_INTERVAL: std::time::Duration = super::DRAIN_TICK_PERIOD;
+
+pub(super) struct StandingWorker {
+    requests: std::sync::mpsc::SyncSender<()>,
+}
+
+impl StandingWorker {
+    pub(super) fn start(mut work: impl FnMut() + Send + 'static) -> Self {
+        let (requests, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                work();
+            }
+        });
+        Self { requests }
+    }
+
+    pub(super) fn request(&self) {
+        // At most one follow-up pass is queued while a reconciliation is busy.
+        // Resolution remains live on each pass, with no stale identity cache.
+        let _ = self.requests.try_send(());
+    }
+}
 
 #[cfg(test)]
 static LAST_STANDING_VERIFY_STRATEGY: std::sync::atomic::AtomicU8 =
@@ -73,6 +95,11 @@ pub(super) struct StandingActor {
     app: Arc<App>,
     executor: Arc<Executor>,
     roots: StandingRoots,
+    reconciliation: Mutex<()>,
+    startup: std::sync::Once,
+    /// The configuration startup reconciliation reads: defaults, plus the
+    /// daemon's storage directory when one was given.
+    startup_config: Config,
     observed_config: Mutex<Config>,
     reconciliation_failures: Mutex<ReconciliationFailureLog>,
     /// Root ids registered solely to host unbound standing work. Session actors
@@ -81,23 +108,59 @@ pub(super) struct StandingActor {
 }
 
 impl StandingActor {
+    #[cfg(test)]
+    pub(super) fn hold_locks_for_test(&self, while_held: impl FnOnce()) {
+        let _reconciliation = self.reconciliation.lock();
+        let _config = self.observed_config.lock();
+        let _failures = self.reconciliation_failures.lock();
+        let _owned = self.owned_actors.lock();
+        while_held();
+    }
+
     pub(super) fn new(app: Arc<App>, executor: Arc<Executor>) -> Self {
+        let config = Config::default();
+        #[cfg(test)]
+        let config = app.isolate_test_config(config);
         Self {
             app,
             executor,
             roots: StandingRoots::default(),
-            observed_config: Mutex::new(Config::default()),
+            reconciliation: Mutex::new(()),
+            startup: std::sync::Once::new(),
+            startup_config: config.clone(),
+            observed_config: Mutex::new(config),
             reconciliation_failures: Mutex::new(ReconciliationFailureLog::default()),
             owned_actors: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Startup reconciliation is intentionally direct and empty until subc has
-    /// observed a user-tier configuration snapshot from a successful RouteBind.
+    /// Point startup reconciliation at the daemon's storage directory, so it
+    /// never opens the default store when the daemon runs with another one.
+    pub(super) fn with_startup_storage_dir(mut self, storage_dir: &std::path::Path) -> Self {
+        let config = Config {
+            storage_dir: Some(storage_dir.to_path_buf()),
+            ..Config::default()
+        };
+        #[cfg(test)]
+        let config = self.app.isolate_test_config(config);
+        self.startup_config = config;
+        self
+    }
+
+    /// Reconcile the initial empty snapshot off the frame loop. A first bind can
+    /// reach this actor before its worker, so every reconciliation boundary must
+    /// ensure startup has run without later replacing a bound snapshot.
     pub(super) fn reconcile_at_startup(&self) {
-        if let Err(error) = self.roots.reconcile(&Config::default()) {
-            log::warn!("standing roots startup reconciliation failed: {error}");
-        }
+        let _reconciliation = self.reconciliation.lock();
+        self.reconcile_startup_once();
+    }
+
+    fn reconcile_startup_once(&self) {
+        self.startup.call_once(|| {
+            if let Err(error) = self.roots.reconcile(&self.startup_config) {
+                log::warn!("standing roots startup reconciliation failed: {error}");
+            }
+        });
     }
 
     /// Observe the current configuration only at a subc boundary. Session actor
@@ -130,6 +193,8 @@ impl StandingActor {
     /// not a timer or scheduler, and stale standing publication remains fenced
     /// even if a worker reaches its checkpoint late.
     pub(super) fn begin_session_bind(&self, ctx: &AppContext) {
+        let _reconciliation = self.reconciliation.lock();
+        self.reconcile_startup_once();
         let snapshot = ctx.config();
         let snapshot = snapshot.as_ref().clone();
         if let Err(error) = self.roots.reconcile(&snapshot) {
@@ -166,6 +231,8 @@ impl StandingActor {
     /// Entry order and `search`, `semantic`, `callgraph` kind order are retained
     /// by `StandingRoots::entries` and `IndexKind::ALL` respectively.
     pub(super) fn tick(&self) {
+        let _reconciliation = self.reconciliation.lock();
+        self.reconcile_startup_once();
         self.observe_config_snapshot();
         let snapshot = self.observed_config.lock().clone();
         let report = match self.roots.reconcile(&snapshot) {
@@ -197,28 +264,46 @@ impl StandingActor {
         }
 
         self.retire_removed_actors(&report.removed);
-        self.resume_entries_without_bound_session(&report.active_entries);
+        let contended = self.resume_entries_without_bound_session(&report.active_entries);
         for entry in report.active_entries {
-            self.submit_entry_pass(entry, &snapshot);
+            if !contended.contains(&entry.artifact_key) {
+                self.submit_entry_pass(entry, &snapshot);
+            }
         }
     }
 
     /// Session selection and standing selection are exclusive for one shared
     /// artifact key. A session unbind is detected from the normal subc lifecycle
     /// state and resumes only the paused standing lifecycle.
-    fn resume_entries_without_bound_session(&self, entries: &[StandingRootEntry]) {
+    fn resume_entries_without_bound_session(
+        &self,
+        entries: &[StandingRootEntry],
+    ) -> HashSet<String> {
+        let mut contended = HashSet::new();
         let sessions = self
             .executor
             .actor_entries()
             .into_iter()
-            .filter_map(|(_, ctx)| {
-                if ctx.subc_unbound_quiesced() {
-                    return None;
-                }
+            .filter_map(|(root_id, ctx)| {
                 let root = ctx
                     .canonical_cache_root_opt()
                     .or_else(|| ctx.config().project_root.clone())?;
-                Some(ctx.memoized_artifact_cache_key(&root))
+                let key = ctx.memoized_artifact_cache_key(&root);
+                match ctx.try_subc_unbound_quiesced() {
+                    Some(true) => None,
+                    Some(false) => Some(key),
+                    None => {
+                        // A busy session may still own this artifact family.
+                        // Do not resume it or wait under standing reconciliation:
+                        // unrelated roots and new binds must keep progressing.
+                        log::debug!(
+                            "standing roots skipping {} this pass: root lifecycle admission busy",
+                            root_id.as_path().display()
+                        );
+                        contended.insert(key.clone());
+                        Some(key)
+                    }
+                }
             })
             .collect::<Vec<_>>();
         for entry in entries {
@@ -234,6 +319,7 @@ impl StandingActor {
                 }
             }
         }
+        contended
     }
 
     fn retire_removed_actors(&self, removed: &[String]) {
@@ -376,6 +462,49 @@ impl StandingActor {
     }
 }
 
+#[cfg(test)]
+mod startup_storage_tests {
+    use super::*;
+    #[test]
+    fn standing_startup_uses_explicit_storage_not_the_default_root() {
+        let _env = crate::test_env::process_env_lock();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(value) = &self.0 {
+                    std::env::set_var("AFT_STORAGE_DIR", value);
+                } else {
+                    std::env::remove_var("AFT_STORAGE_DIR");
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("AFT_STORAGE_DIR"));
+        std::env::remove_var("AFT_STORAGE_DIR");
+        let root = tempfile::tempdir().unwrap();
+        let ctx = super::super::test_support::test_ctx();
+        let actor = StandingActor::new(ctx.app(), Arc::new(Executor::new()))
+            .with_startup_storage_dir(root.path());
+        let default =
+            crate::bash_background::storage_dir_without_overrides_for_test().join("aft.db");
+        // Other tests in the same process may already have created a database
+        // at the default root (CI shares one hermetic home), so compare its
+        // state before and after instead of requiring it to be absent.
+        let snapshot = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|meta| (meta.len(), meta.modified().ok()))
+        };
+        let before = snapshot(&default);
+        actor.reconcile_at_startup();
+        assert!(root.path().join("aft.db").is_file());
+        assert_eq!(
+            snapshot(&default),
+            before,
+            "standing startup with an explicit storage dir must not touch the default root"
+        );
+    }
+}
+
 fn strict_verify_current_state(
     ctx: &AppContext,
     entry: &StandingRootEntry,
@@ -500,6 +629,67 @@ fn root_fingerprint(root: &std::path::Path) -> Option<(u64, Option<u128>)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn late_startup_reconciliation_preserves_a_bound_standing_snapshot() {
+        use crate::config::{IndexConfig, IndexRootConfig};
+
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let literal = root.path().to_string_lossy().into_owned();
+        let ctx = AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                index: IndexConfig {
+                    roots: vec![IndexRootConfig {
+                        path: literal.clone(),
+                        indexes: vec![IndexKind::Search],
+                    }],
+                },
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let actor = StandingActor::new(ctx.app(), Arc::new(Executor::new()));
+        // The frame loop may receive a bind before the standing worker runs.
+        actor.begin_session_bind(&ctx);
+        assert_eq!(actor.roots.entries().len(), 1);
+        actor.reconcile_at_startup();
+        assert_eq!(
+            actor.roots.entries().len(),
+            1,
+            "late startup must not replace the session's snapshot with an empty one"
+        );
+        assert!(
+            actor.roots.admit_build(&literal).is_none(),
+            "the bind's publication revocation must remain in force"
+        );
+    }
+
+    #[test]
+    fn standing_tick_requests_do_no_frame_thread_reconciliation() {
+        let frame_thread = std::thread::current().id();
+        let on_frame = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&on_frame);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = super::StandingWorker::start(move || {
+            if std::thread::current().id() == frame_thread {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = tx.send(());
+        });
+        for _ in 0..12 {
+            worker.request();
+        }
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("standing pass executes");
+        assert_eq!(
+            on_frame.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "frame-thread reconciliation passes"
+        );
+    }
     use super::*;
 
     #[test]

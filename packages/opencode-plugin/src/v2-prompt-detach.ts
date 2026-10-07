@@ -53,6 +53,7 @@ export interface V2PromptDetachRuntime {
    * `bash.detach_on_user_message` applies to the next message.
    */
   getConfig(): AftConfig;
+  registerSession?: (sessionID: string) => void;
 }
 
 /** A text edit in one strip stage: `[start, end)` became `length` characters. */
@@ -149,6 +150,7 @@ export function createV2PromptDetachHook(
   return (event) =>
     Effect.sync(() => {
       try {
+        runtime.registerSession?.(event.sessionID);
         interruptBashWaitsForV2Prompt(runtime, event);
       } catch (error) {
         const reason = failureReason(error);

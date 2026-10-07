@@ -4,6 +4,7 @@ import {
   getManualInstallHint,
   isOrtAutoDownloadSupported,
   markAnnouncementSeen,
+  observeFreshSessionStart,
   resolveCortexKitStorageRoot,
   setActiveLogger,
   shouldShowAnnouncement,
@@ -846,6 +847,11 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       const eventType = eventInput.event.type;
       observeOpenCodeBgNotificationEvent(eventInput.event);
       const sessionID = extractSessionID(eventInput.event.properties);
+      if (eventType === "session.created" && sessionID) {
+        const sessionDir =
+          (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;
+        observeFreshSessionStart(pool, sessionDir, sessionID, "new");
+      }
       // OpenCode's lifecycle vocabulary publishes session.deleted for explicit
       // remove() cleanup, not session.shutdown. Deletion-only cleanup is enough:
       // transport idle eviction and connection-exit quiesce handle abandoned

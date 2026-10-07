@@ -68,6 +68,18 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let storage_dir = crate::bash_background::task_storage_dir(ctx);
+    // A delegated worker reading a task's status is waiting on it (its
+    // `bash_watch` polls this): keep the task's default hard kill at least one
+    // worker wait limit away. See `BgTaskRegistry::renew_hard_kill`.
+    if req.worker_session() {
+        ctx.bash_background().renew_hard_kill(
+            &task_id,
+            req.session(),
+            std::time::Duration::from_millis(
+                crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
+            ),
+        );
+    }
     if ctx.bash_background().has_erased_watch_reference(&task_id) {
         return Response::error(&req.id, "task_erased", format_erased_task_message(&task_id));
     }
@@ -88,6 +100,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 &mut snapshot,
                 output_mode.as_deref(),
             );
+            if snapshot.info.mode == BgMode::Pty && snapshot.info.status.is_terminal() {
+                ctx.bash_background()
+                    .append_db_hint(&task_id, &mut snapshot.output_preview);
+            }
             if snapshot.sandbox_native
                 && snapshot.sandbox_unavailable
                 && snapshot.exit_code == Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)

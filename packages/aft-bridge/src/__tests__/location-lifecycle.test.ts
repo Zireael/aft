@@ -2,15 +2,17 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { BridgeTransportUnavailableError, BridgeTransportUnknownOutcomeError } from "../bridge.js";
 import {
   acquireBridge,
   getBridgeLifecycleTopology,
   releaseBridge,
   sampleBridgeLifecycleCensus,
 } from "../location-lifecycle.js";
+import { BridgePool } from "../pool.js";
 import type { AftProjectTransport, AftTransportPool } from "../transport.js";
 import type { AftTransportFactoryOptions } from "../transport-factory.js";
+import { cachedExecutable } from "./test-utils/cached-executable.js";
 
 class FakePool implements AftTransportPool {
   healthResponse: Record<string, unknown> = { success: true };
@@ -22,6 +24,7 @@ class FakePool implements AftTransportPool {
     cacheStatusSnapshot: () => {},
   } satisfies AftProjectTransport;
   shutdownCalls = 0;
+  toolCallCalls = 0;
   private shutdownState = false;
 
   getBridge(): AftProjectTransport {
@@ -37,6 +40,7 @@ class FakePool implements AftTransportPool {
   }
 
   async toolCall() {
+    this.toolCallCalls += 1;
     return { success: true, text: "ok" };
   }
 
@@ -71,6 +75,94 @@ function options(subc = false): AftTransportFactoryOptions {
 }
 
 describe("Location bridge lifecycle", () => {
+  test("shutdown classifies an in-flight Location call as outcome unknown", async () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), "aft-location-lease-shutdown-"));
+    const script = cachedExecutable(`#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") {
+      process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [] }) + "\\n");
+    } else {
+      process.stdout.write(JSON.stringify({
+        type: "progress",
+        request_id: req.id,
+        kind: "stdout",
+        chunk: "request received",
+      }) + "\\n");
+    }
+  }
+});
+`);
+    const pool = new BridgePool(script, {
+      idleTimeoutMs: Infinity,
+      timeoutMs: 10_000,
+      maxRestarts: 0,
+    });
+    const location = await acquireBridge(projectRoot, options(true), {
+      createPool: async () => pool,
+    });
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("stub transport did not receive the call")),
+        5_000,
+      );
+      markStarted = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    const outcome = location
+      .toolCall(
+        projectRoot,
+        { sessionID: "lease-shutdown" },
+        "read",
+        {},
+        {
+          onProgress: () => markStarted?.(),
+        },
+      )
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+    try {
+      await started;
+      await location.shutdown();
+      expect(await outcome).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
+    } finally {
+      await releaseBridge(location);
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("a released lease rejects before dispatch as transport unavailable", async () => {
+    const pool = new FakePool();
+    const location = await acquireBridge("/fixture/released-lease", options(true), {
+      createPool: async () => pool,
+    });
+
+    await releaseBridge(location);
+    const outcome = await Promise.resolve()
+      .then(() => location.toolCall("/fixture/released-lease", {}, "read", {}))
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+    expect(outcome).toBeInstanceOf(BridgeTransportUnavailableError);
+    expect(outcome).not.toBeInstanceOf(BridgeTransportUnknownOutcomeError);
+    expect(pool.toolCallCalls).toBe(0);
+  });
+
   test("two standalone Locations share one owner until the last release", async () => {
     const created: FakePool[] = [];
     const createPool = async () => {

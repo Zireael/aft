@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "job-cancellation-self-deadlock"
+  ],
+  "note": "No ranking-fence file is touched. JobCancellation::wait_for_cancellation no longer runs the side-effecting cancellation check while holding wait_lock (it self-deadlocked when a root was deleted or abandoned mid-wait, wedging the module once the health report signalled the same job), and the views publication health snapshot reads the cancel state without signalling."
+}

@@ -323,12 +323,23 @@
               "default": true,
               "description": "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe."
             },
+            "db_schema_hints": {
+              "type": "boolean",
+              "default": true,
+              "description": "Append AFT read-only database schema hints after missing-table or missing-column errors. SQLite on Unix only; supported literal database paths only. Project-safe."
+            },
             "watch_sync_max_ms": {
               "type": "integer",
               "minimum": 1000,
               "maximum": 1800000,
               "default": 120000,
               "description": "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap."
+            },
+            "worker_wait_max_ms": {
+              "type": "integer",
+              "minimum": 60000,
+              "default": 1800000,
+              "description": "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe."
             },
             "linux_scope": {
               "type": "boolean",
@@ -1075,12 +1086,23 @@
                     "default": true,
                     "description": "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe."
                   },
+                  "db_schema_hints": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Append AFT read-only database schema hints after missing-table or missing-column errors. SQLite on Unix only; supported literal database paths only. Project-safe."
+                  },
                   "watch_sync_max_ms": {
                     "type": "integer",
                     "minimum": 1000,
                     "maximum": 1800000,
                     "default": 120000,
                     "description": "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap."
+                  },
+                  "worker_wait_max_ms": {
+                    "type": "integer",
+                    "minimum": 60000,
+                    "default": 1800000,
+                    "description": "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe."
                   },
                   "linux_scope": {
                     "type": "boolean",

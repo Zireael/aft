@@ -18,6 +18,7 @@ import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js"
 import {
   asNumber,
   asRecord,
+  asRecordOrEmpty,
   asRecords,
   asString,
   collapsibleResult,
@@ -256,15 +257,26 @@ export function buildAstReplaceSections(payload: unknown, theme: Theme): string[
 /** Exported for renderer unit tests. */
 export function renderAstCall(
   toolName: "ast_grep_search" | "ast_grep_replace",
-  args: Static<typeof SearchParams> | Static<typeof ReplaceParams>,
+  args: unknown,
   theme: Theme,
   context: RenderContextLike,
 ) {
-  const lang = theme.fg("accent", args.lang);
-  const summary =
+  const safeArgs = asRecordOrEmpty(args);
+  const lang = asString(safeArgs.lang);
+  const pattern = asString(safeArgs.pattern);
+  const rewrite = asString(safeArgs.rewrite);
+  const summary = [
+    lang ? theme.fg("accent", lang) : undefined,
     toolName === "ast_grep_replace"
-      ? `${lang} ${theme.fg("toolOutput", `${(args as Static<typeof ReplaceParams>).pattern} → ${(args as Static<typeof ReplaceParams>).rewrite}`)}`
-      : `${lang} ${theme.fg("toolOutput", args.pattern)}`;
+      ? pattern || rewrite
+        ? theme.fg("toolOutput", `${pattern ?? ""} → ${rewrite ?? ""}`)
+        : undefined
+      : pattern
+        ? theme.fg("toolOutput", pattern)
+        : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
   return renderToolCall(
     toolName === "ast_grep_replace" ? "ast replace" : "ast search",
     summary,

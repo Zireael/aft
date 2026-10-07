@@ -26,6 +26,7 @@ import {
   AFT_OPENCODE_PACKAGE,
   ensurePinnedPluginConfig,
   MODERN_V1_VERSION,
+  OPENCODE_HOST_PATCH_DISABLE_ENTRY,
   OPENCODE_HOST_SHELL_DISABLE_ENTRY,
   openCodePluginKey,
   pinnedPluginEntry,
@@ -558,12 +559,14 @@ describe("exact OpenCode config pins", () => {
       const serverPath = join(root, "opencode.json");
       const tuiPath = join(root, "tui.json");
       const server = readConfig(serverPath);
-      // On OpenCode 2 setup also removes the host's own shell tool plugin, the
-      // default while AFT's bash is enabled; OpenCode 1 has no such plugin.
+      // OpenCode 2 setup removes duplicate host tools when AFT can replace
+      // them. OpenCode 1 has neither built-in plugin to remove.
       expect(server).toEqual({
         [key]: [
           pinnedPluginEntry(getSelfVersion()),
-          ...(generation === "v2" ? [OPENCODE_HOST_SHELL_DISABLE_ENTRY] : []),
+          ...(generation === "v2"
+            ? [OPENCODE_HOST_SHELL_DISABLE_ENTRY, OPENCODE_HOST_PATCH_DISABLE_ENTRY]
+            : []),
         ],
       });
       expect(server[other]).toBeUndefined();
@@ -1011,6 +1014,7 @@ async function runFixOverConfig(
   label: string,
   generation: "v1" | "v2",
   config: Record<string, unknown>,
+  aftConfig: Record<string, unknown> = {},
 ): Promise<{
   root: string;
   adapter: ConfiguredOpenCodeAdapter;
@@ -1020,7 +1024,10 @@ async function runFixOverConfig(
   const root = tempRoot(label);
   const fixture = doctorFixture(root, pinnedPluginEntry(getSelfVersion()), generation);
   writeFileSync(fixture.harness.configPaths.harnessConfig, JSON.stringify(config, null, 2));
-  writeFileSync(fixture.harness.configPaths.aftConfig, JSON.stringify({ $schema: AFT_SCHEMA_URL }));
+  writeFileSync(
+    fixture.harness.configPaths.aftConfig,
+    JSON.stringify({ $schema: AFT_SCHEMA_URL, ...aftConfig }),
+  );
   const adapter = new ConfiguredOpenCodeAdapter(root);
   const lines = captureOutput();
 
@@ -1045,6 +1052,31 @@ async function runFixOverConfig(
 }
 
 describe("OpenCode plugin registration follows the host's key", () => {
+  for (const [hostTool, aftTool, otherRemoval] of [
+    ["shell", "bash", "-opencode.tool.patch"],
+    ["patch", "apply_patch", "-opencode.tool.shell"],
+  ] as const) {
+    for (const state of ["enabled", "already disabled", "AFT disabled"] as const) {
+      test(`doctor --fix handles host ${hostTool} ${state}`, async () => {
+        const entry = pinnedPluginEntry(getSelfVersion());
+        const removal = `-opencode.tool.${hostTool}`;
+        const plugins = [entry, otherRemoval];
+        if (state === "already disabled") plugins.push(removal);
+        const result = await runFixOverConfig(
+          `aft-cli-fix-host-${hostTool}-`,
+          "v2",
+          { plugins },
+          state === "AFT disabled" ? { disabled_tools: [aftTool] } : {},
+        );
+        expect(result.server.plugins).toEqual(
+          state === "AFT disabled" ? [entry, otherRemoval] : [entry, otherRemoval, removal],
+        );
+        // --fix prints a plan and repair results, not the read-only doctor report.
+        expect(result.output.includes(`Will add ${removal}`)).toBe(state === "enabled");
+      });
+    }
+  }
+
   test("a V2 host reads `plugins` and a V1 host reads `plugin`", () => {
     const root = tempRoot("aft-cli-registered-key-");
     const entry = pinnedPluginEntry(getSelfVersion());
@@ -1093,9 +1125,14 @@ describe("OpenCode plugin registration follows the host's key", () => {
       plugins: ["other-plugin", entry],
     });
 
-    // --fix also removes OpenCode 2's own shell tool while AFT's bash is on.
+    // --fix removes both duplicate host tools while AFT's replacements are on.
     expect(result.server).toEqual({
-      plugins: ["other-plugin", entry, OPENCODE_HOST_SHELL_DISABLE_ENTRY],
+      plugins: [
+        "other-plugin",
+        entry,
+        OPENCODE_HOST_SHELL_DISABLE_ENTRY,
+        OPENCODE_HOST_PATCH_DISABLE_ENTRY,
+      ],
     });
     expect(result.server.plugin).toBeUndefined();
     expect(result.adapter.hasPluginEntry()).toBe(true);
@@ -1131,7 +1168,12 @@ describe("OpenCode plugin registration follows the host's key", () => {
     // The host-shell entry goes only into the key the V2 host reads.
     expect(result.server).toEqual({
       plugin: ["v1-only-plugin", entry],
-      plugins: ["v2-only-plugin", entry, OPENCODE_HOST_SHELL_DISABLE_ENTRY],
+      plugins: [
+        "v2-only-plugin",
+        entry,
+        OPENCODE_HOST_SHELL_DISABLE_ENTRY,
+        OPENCODE_HOST_PATCH_DISABLE_ENTRY,
+      ],
     });
   });
 
@@ -1156,7 +1198,7 @@ describe("OpenCode plugin registration follows the host's key", () => {
 
     expect(result.server).toEqual({
       plugin: ["other-plugin", `${AFT_OPENCODE_PACKAGE}@0.0.0-older`],
-      plugins: [entry, OPENCODE_HOST_SHELL_DISABLE_ENTRY],
+      plugins: [entry, OPENCODE_HOST_SHELL_DISABLE_ENTRY, OPENCODE_HOST_PATCH_DISABLE_ENTRY],
     });
     expect(result.adapter.hasPluginEntry()).toBe(true);
   });

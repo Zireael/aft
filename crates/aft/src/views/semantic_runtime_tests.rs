@@ -33,16 +33,22 @@ fn vector(text: &str) -> Vec<f32> {
 #[derive(Default)]
 struct Model {
     texts: AtomicUsize,
+    calls: AtomicUsize,
 }
 
 impl Model {
     fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         self.texts.fetch_add(texts.len(), Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(texts.iter().map(|text| vector(text)).collect())
     }
 
     fn texts(&self) -> usize {
         self.texts.load(Ordering::SeqCst)
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
@@ -157,6 +163,401 @@ fn two_worktrees_two_sessions_embed_each_chunk_once() {
     }
 }
 
+#[test]
+fn family_fill_rechecks_completed_work_after_acquiring_claim() {
+    let storage = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let files = [("src/file.rs", "pub fn one_chunk() -> u8 { 1 }\n")];
+    write_tree(first.path(), &files);
+    write_tree(second.path(), &files);
+    let a = open(storage.path(), "a", first.path());
+    let b = Arc::new(open(storage.path(), "b", second.path()));
+    let model = Arc::new(Model::default());
+    let callback_model = Arc::clone(&model);
+    let callback_b = Arc::clone(&b);
+    // Finish the competing fill exactly between a's store miss and claim.
+    // No sleep or host scheduling assumption is involved.
+    super::super::semantic::before_claim_for_test(move || {
+        let report = refresh(&callback_b, &callback_model);
+        assert_eq!((report.embedded_keys, report.installed), (1, 1));
+    });
+    let report = refresh(&a, &model);
+    let usage = a
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap()
+        .usage()
+        .unwrap();
+    eprintln!(
+        "completed claim race: texts={} calls={} outer_embedded={} stored_rows={}",
+        model.texts(),
+        model.calls(),
+        report.embedded_keys,
+        usage.rows
+    );
+    assert!(query(&a, "one chunk").complete());
+    assert_eq!(
+        rows(first.path(), &query(&a, "one chunk").results),
+        cold(first.path(), "one chunk").0
+    );
+    assert_eq!(
+        model.texts(),
+        1,
+        "a completed claim must not embed the same stored key again"
+    );
+    assert_eq!(model.calls(), 1);
+    assert_eq!(report.embedded_keys, 0);
+    assert_eq!(usage.rows, 1);
+    assert_eq!(
+        a.installed()
+            .generation()
+            .manifest()
+            .to_json_bytes()
+            .unwrap(),
+        b.installed()
+            .generation()
+            .manifest()
+            .to_json_bytes()
+            .unwrap()
+    );
+    assert_eq!(
+        rows(first.path(), &query(&a, "one chunk").results),
+        rows(second.path(), &query(&b, "one chunk").results)
+    );
+}
+
+#[test]
+fn completed_embedding_batches_survive_a_later_batch_failure() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(
+        root.path(),
+        &[
+            ("a.rs", "pub fn first_chunk() -> u8 { 1 }\n"),
+            ("b.rs", "pub fn second_chunk() -> u8 { 2 }\n"),
+            ("c.rs", "pub fn third_chunk() -> u8 { 3 }\n"),
+        ],
+    );
+    let runtime = open(storage.path(), "batch-failure", root.path());
+    let model = Model::default();
+    let budget = FillBudget {
+        max_batch: 1,
+        ..FillBudget::default()
+    };
+    let report = runtime
+        .refresh(budget, &mut |texts| {
+            let vectors = model.embed(texts)?;
+            if model.calls() == 2 {
+                Err("embedding backend interrupted".into())
+            } else {
+                Ok(vectors)
+            }
+        })
+        .unwrap();
+    let store = runtime
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap();
+    eprintln!(
+        "later batch failure: texts={} calls={} embedded_keys={} installed={} rows={}",
+        model.texts(),
+        model.calls(),
+        report.embedded_keys,
+        report.installed,
+        store.usage().unwrap().rows
+    );
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(
+        (report.embedded_keys, report.installed),
+        (1, 1),
+        "a later batch error must not discard an already complete file run"
+    );
+    assert_eq!(store.usage().unwrap().rows, 1);
+    runtime
+        .refresh(budget, &mut |texts| model.embed(texts))
+        .unwrap();
+    assert_eq!(
+        model.texts(),
+        4,
+        "retry must not re-embed the completed first file"
+    );
+    assert_eq!(model.calls(), 4);
+    assert_eq!(store.usage().unwrap().rows, 3);
+    let answer = query(&runtime, "chunk");
+    assert!(answer.complete());
+    assert_eq!(
+        rows(root.path(), &answer.results),
+        cold(root.path(), "chunk").0
+    );
+}
+
+#[test]
+fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_texts() {
+    let storage = tempfile::tempdir().unwrap();
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    for root in &roots {
+        for i in 0..2048 {
+            std::fs::write(
+                root.path().join(format!("file_{i:04}.rs")),
+                format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+    }
+    let runtimes: Vec<_> = roots
+        .iter()
+        .enumerate()
+        .map(|(i, root)| open(storage.path(), &format!("flaky-worktree-{i}"), root.path()))
+        .collect();
+    let store = runtimes[0]
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap();
+    let model = Model::default();
+    let completed = std::cell::RefCell::new(std::collections::HashSet::new());
+    let successful_texts = std::cell::Cell::new(0usize);
+    let mut failed_texts = 0usize;
+    let mut embed = |texts: Vec<String>| {
+        // One chunk per file makes completed text count independent of the
+        // actual store's row count. Each completed request must already have
+        // reached the store before another request is sent.
+        assert_eq!(
+            store.usage().unwrap().rows as usize,
+            successful_texts.get(),
+            "completed batches were not persisted before the next request"
+        );
+        for text in &texts {
+            assert!(
+                !completed.borrow().contains(text),
+                "a stored text was embedded again after retry"
+            );
+        }
+        let count = texts.len();
+        let retained = texts.clone();
+        let vectors = model.embed(texts)?;
+        if model.calls().is_multiple_of(7) {
+            failed_texts += count;
+            Err("embedding backend interrupted every seventh batch".into())
+        } else {
+            completed.borrow_mut().extend(retained);
+            successful_texts.set(successful_texts.get() + count);
+            Ok(vectors)
+        }
+    };
+    let budget = FillBudget {
+        max_files: 4096,
+        ..FillBudget::default()
+    };
+    let mut new_keys = 0;
+    for runtime in &runtimes {
+        let before = model.calls();
+        for attempt in 0..64 {
+            let report = runtime.refresh(budget, &mut embed).unwrap();
+            new_keys += report.embedded_keys;
+            if report.errors.is_empty() && report.deferred == 0 {
+                break;
+            }
+            assert!(attempt < 63, "fixture failed to settle");
+        }
+        assert!(query(runtime, "item").complete());
+        if runtime.access.scope() != "flaky-worktree-0" {
+            assert_eq!(
+                model.calls(),
+                before,
+                "a sibling must reuse all stored vectors"
+            );
+        }
+    }
+    for round in 0..8 {
+        // A new whole-file key can legitimately have the same chunk text
+        // (the template need not include a changed body). Reject duplicates
+        // within a content revision/retry schedule, not across new keys.
+        completed.borrow_mut().clear();
+        let source = format!("pub fn revised_item() -> u32 {{ {} }}\n", round + 9000);
+        for (i, (runtime, root)) in runtimes.iter().zip(&roots).enumerate() {
+            let file = root.path().join("file_0000.rs");
+            std::fs::write(&file, &source).unwrap();
+            runtime.driver.record_absolute_change(&file);
+            let before = model.calls();
+            for attempt in 0..64 {
+                let report = runtime.refresh(budget, &mut embed).unwrap();
+                new_keys += report.embedded_keys;
+                if report.errors.is_empty() && report.deferred == 0 {
+                    break;
+                }
+                assert!(attempt < 63, "fixture failed to settle");
+            }
+            if i > 0 {
+                assert_eq!(
+                    model.calls(),
+                    before,
+                    "same-content sibling edit sent a model request"
+                );
+            }
+            assert!(query(runtime, "revised item").complete());
+        }
+    }
+    drop(embed);
+    assert_eq!(successful_texts.get(), 2056);
+    assert_eq!(new_keys, 2056);
+    assert_eq!(store.usage().unwrap().rows, 2056);
+    assert_eq!(failed_texts, 321);
+    assert_eq!(model.texts(), 2377);
+    assert_eq!(model.calls(), 46);
+    for (runtime, root) in runtimes.iter().zip(&roots) {
+        assert_eq!(
+            rows(root.path(), &query(runtime, "revised item").results),
+            cold(root.path(), "revised item").0
+        );
+    }
+    eprintln!("periodic failure, three worktrees: successful texts={} failed texts={failed_texts} sent texts={} calls={} new keys={new_keys} stored rows={}", successful_texts.get(), model.texts(), model.calls(), store.usage().unwrap().rows);
+}
+
+#[test]
+fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admission() {
+    let storage = tempfile::tempdir().unwrap();
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    for root in &roots {
+        for i in 0..2048 {
+            std::fs::write(
+                root.path().join(format!("file_{i:04}.rs")),
+                format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+    }
+    let runtimes: Vec<_> = roots
+        .iter()
+        .enumerate()
+        .map(|(i, root)| open(storage.path(), &format!("worktree-{i}"), root.path()))
+        .collect();
+    let model = Model::default();
+    let budget = FillBudget {
+        max_files: 4096,
+        ..FillBudget::default()
+    };
+    let mut embedded_keys = 0;
+    for (i, runtime) in runtimes.iter().enumerate() {
+        let report = runtime
+            .refresh(budget, &mut |texts| model.embed(texts))
+            .unwrap();
+        embedded_keys += report.embedded_keys;
+        assert_eq!(report.embedded_keys, if i == 0 { 2048 } else { 0 });
+        assert_eq!(report.model_calls, if i == 0 { 32 } else { 0 });
+    }
+    let store = runtimes[0]
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap();
+    for runtime in &runtimes[1..] {
+        assert_eq!(
+            runtime
+                .owner
+                .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+                .unwrap()
+                .path(),
+            store.path()
+        );
+    }
+    for round in 0..8 {
+        let source = format!("pub fn revised_item() -> u32 {{ {} }}\n", round + 9000);
+        for (i, (runtime, root)) in runtimes.iter().zip(&roots).enumerate() {
+            let file = root.path().join("file_0000.rs");
+            {
+                let _intent = crate::views::intent::record_paths([file.as_path()]);
+                std::fs::write(&file, &source).unwrap();
+            }
+            let before = model.texts();
+            let report = runtime
+                .refresh(budget, &mut |texts| model.embed(texts))
+                .unwrap();
+            embedded_keys += report.embedded_keys;
+            assert_eq!(report.embedded_keys, usize::from(i == 0));
+            assert_eq!(report.model_calls, usize::from(i == 0));
+            assert_eq!(
+                model.texts() - before,
+                usize::from(i == 0),
+                "second/third worktree repeated an embedding"
+            );
+            // Repeated no-op writes to the same content must not send texts.
+            let _intent = crate::views::intent::record_paths([file.as_path()]);
+            std::fs::write(&file, &source).unwrap();
+            drop(_intent);
+            let report = runtime
+                .refresh(budget, &mut |texts| model.embed(texts))
+                .unwrap();
+            assert_eq!((report.embedded_keys, report.model_calls), (0, 0));
+        }
+    }
+    assert_eq!(model.texts(), 2056);
+    assert_eq!(model.calls(), 40);
+    assert_eq!(embedded_keys, 2056);
+    assert_eq!(store.usage().unwrap().rows, 2056);
+
+    // A source completion rejected at admission still stores its immutable
+    // payload first. Retry and a sibling must reuse it, not re-embed it.
+    let a = &runtimes[0];
+    let source = "pub fn admission_was_cancelled() -> u32 { 99999 }\n";
+    let file = roots[0].path().join("file_0000.rs");
+    std::fs::write(&file, source).unwrap();
+    a.driver.record_absolute_change(&file);
+    let snapshot = a
+        .loader
+        .refresh(&a.access, Arc::clone(a.installed().generation()))
+        .unwrap();
+    let path = super::super::RelPath::new(b"file_0000.rs".to_vec()).unwrap();
+    let mut moved = super::super::snapshot::LiveDelta::new(Arc::clone(snapshot.generation()));
+    moved.apply(
+        path,
+        super::super::snapshot::LiveEntry::new(
+            super::super::snapshot::DiskState::of_bytes(b"other bytes"),
+            1,
+        ),
+    );
+    let cancelled = moved.snapshot();
+    let report = a
+        .plane
+        .fill(
+            &a.owner,
+            &snapshot,
+            budget,
+            &mut |texts| model.embed(texts),
+            &|| cancelled.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        (report.embedded_keys, report.installed, report.dropped),
+        (1, 0, 1)
+    );
+    let before = model.texts();
+    let retry = a.refresh(budget, &mut |texts| model.embed(texts)).unwrap();
+    assert_eq!(
+        (retry.embedded_keys, retry.model_calls, retry.installed),
+        (0, 0, 1)
+    );
+    let file = roots[1].path().join("file_0000.rs");
+    std::fs::write(&file, source).unwrap();
+    runtimes[1].driver.record_absolute_change(&file);
+    let sibling = runtimes[1]
+        .refresh(budget, &mut |texts| model.embed(texts))
+        .unwrap();
+    assert_eq!((sibling.embedded_keys, sibling.model_calls), (0, 0));
+    assert_eq!(model.texts(), before);
+    assert_eq!(model.texts(), 2057);
+    assert_eq!(model.calls(), 41);
+    assert_eq!(store.usage().unwrap().rows, 2057);
+    for (runtime, root) in runtimes.iter().zip(&roots) {
+        let answer = query(runtime, "revised item");
+        assert!(answer.complete());
+        assert_eq!(
+            rows(root.path(), &answer.results),
+            cold(root.path(), "revised item").0
+        );
+    }
+    eprintln!("three worktrees, repeated edits and cancelled admission: texts={} calls={} stored_rows={} payload_bytes={}", model.texts(), model.calls(), store.usage().unwrap().rows, store.usage().unwrap().payload_bytes);
+}
+
 /// An edit the watcher reports and an edit AFT writes each reach the fill:
 /// the new content is embedded and the next query scores it.
 #[test]
@@ -230,6 +631,238 @@ fn pending_semantic(runtime: &CheckoutSemantic) -> usize {
         .count()
 }
 
+fn large_pin_fixture() -> (tempfile::TempDir, tempfile::TempDir, CheckoutSemantic) {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for i in 0..2048 {
+        std::fs::write(
+            root.path().join(format!("file_{i:04}.rs")),
+            format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+    let runtime = open(storage.path(), "pins", root.path());
+    (storage, root, runtime)
+}
+
+fn fill_large(runtime: &CheckoutSemantic) {
+    let report = runtime
+        .plane()
+        .fill(
+            &runtime.owner,
+            &runtime.installed(),
+            FillBudget {
+                max_files: 4096,
+                ..FillBudget::default()
+            },
+            &mut |texts| Model::default().embed(texts),
+            &|| runtime.installed(),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            report.installed,
+            report.embedded_keys,
+            report.embedded_texts
+        ),
+        (2048, 2048, 2048)
+    );
+}
+
+#[test]
+fn large_semantic_fill_batches_pin_writes() {
+    use crate::pins::work_counters::{key_file_bytes, key_file_work};
+    let (_storage, root, runtime) = large_pin_fixture();
+    let (writes, syncs) = key_file_work();
+    let bytes = key_file_bytes();
+    fill_large(&runtime);
+    let after = key_file_work();
+    eprintln!(
+        "fill pins: writes={} bytes={} key syncs={}",
+        after.0 - writes,
+        key_file_bytes() - bytes,
+        after.1 - syncs
+    );
+    let answer = query(&runtime, "item");
+    assert!(answer.complete());
+    assert_eq!(
+        rows(root.path(), &answer.results),
+        cold(root.path(), "item").0
+    );
+    assert_eq!((after.0 - writes, after.1 - syncs), (1, 0));
+    assert_eq!(key_file_bytes() - bytes, 2048 * 65);
+}
+
+#[test]
+fn large_semantic_materialization_batches_pins_and_touches() {
+    use crate::pins::work_counters::{key_file_bytes, key_file_work};
+    let (_storage, root, runtime) = large_pin_fixture();
+    fill_large(&runtime);
+    let answer = query(&runtime, "item");
+    let (writes, syncs) = key_file_work();
+    let bytes = key_file_bytes();
+    crate::blob_store::v2::take_touch_transactions();
+    let (snapshot, revision) = runtime.driver.installed_cut();
+    runtime
+        .loader
+        .fold(&runtime.access, &snapshot, revision)
+        .unwrap();
+    let after = key_file_work();
+    let transactions = crate::blob_store::v2::take_touch_transactions();
+    let written_bytes = key_file_bytes() - bytes;
+    eprintln!(
+        "fold pins: writes={} bytes={} key syncs={} touch transactions={transactions}",
+        after.0 - writes,
+        written_bytes,
+        after.1 - syncs
+    );
+    assert_eq!(pending_semantic(&runtime), 0);
+    assert_eq!(
+        rows(root.path(), &query(&runtime, "item").results),
+        rows(root.path(), &answer.results)
+    );
+    let manifest = runtime
+        .installed()
+        .generation()
+        .manifest()
+        .to_json_bytes()
+        .unwrap();
+    let store = runtime
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap();
+    let blobs: Vec<_> = runtime
+        .installed()
+        .generation()
+        .manifest()
+        .ready_keys()
+        .map(|key| (key, store.get(&key).unwrap().unwrap()))
+        .collect();
+    runtime.load().unwrap();
+    assert_eq!(
+        runtime
+            .installed()
+            .generation()
+            .manifest()
+            .to_json_bytes()
+            .unwrap(),
+        manifest
+    );
+    for (key, payload) in blobs {
+        assert_eq!(store.get(&key).unwrap().unwrap(), payload);
+    }
+    assert_eq!((after.0 - writes, after.1 - syncs), (2, 0));
+    assert_eq!(written_bytes, 2048 * 65 * 2);
+    assert_eq!(transactions, 1);
+}
+
+/// A large, already-filled checkout must not read or embed unchanged sources
+/// again just to publish one edit. Compare to the strict loader and an
+/// independent cold index, not to another copy of the fast path.
+#[test]
+fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(root.path()).unwrap();
+    for i in 0..2048 {
+        let path = root.join(format!("file_{i:04}.rs"));
+        std::fs::write(&path, format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n")).unwrap();
+        // Windows refuses to change times through a read-only handle.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(60)),
+            )
+            .unwrap();
+    }
+    let runtime = open(storage.path(), "large", &root);
+    let model = Model::default();
+    let budget = FillBudget {
+        max_files: 4096,
+        ..FillBudget::default()
+    };
+    runtime
+        .refresh(budget, &mut |texts| model.embed(texts))
+        .unwrap();
+    runtime.driver().take_reconcile_work();
+    let before = model.texts();
+    let target = root.join("file_0000.rs");
+    let changed = "pub fn rewritten_item() -> u32 { 9999 }\n";
+    {
+        let _intent = crate::views::intent::record_paths([target.as_path()]);
+        std::fs::write(&target, changed).unwrap();
+    }
+    let report = runtime
+        .refresh(budget, &mut |texts| model.embed(texts))
+        .unwrap();
+    let work = runtime.driver().take_reconcile_work();
+    eprintln!(
+        "edit: {work:?}; embedded texts={}, keys={}",
+        model.texts() - before,
+        report.embedded_keys
+    );
+    assert_eq!(
+        model.texts() - before,
+        1,
+        "unchanged content was re-embedded"
+    );
+    let answer = query(&runtime, "rewritten item");
+    assert!(answer.complete(), "{answer:?}");
+    assert_eq!(
+        rows(&root, &answer.results),
+        cold(&root, "rewritten item").0
+    );
+    let snapshot = runtime.installed();
+    let manifest = snapshot.generation().manifest().to_json_bytes().unwrap();
+    let store = runtime
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap();
+    let blobs: Vec<_> = snapshot
+        .generation()
+        .manifest()
+        .ready_keys()
+        .map(|key| (key, store.get(&key).unwrap().unwrap()))
+        .collect();
+    runtime.load().unwrap();
+    assert_eq!(
+        runtime
+            .installed()
+            .generation()
+            .manifest()
+            .to_json_bytes()
+            .unwrap(),
+        manifest
+    );
+    for (key, payload) in blobs {
+        assert_eq!(store.get(&key).unwrap().unwrap(), payload);
+    }
+    assert_eq!(
+        rows(&root, &query(&runtime, "rewritten item").results),
+        rows(&root, &answer.results)
+    );
+    assert_eq!(
+        work.walks, 1,
+        "an edit needs one strict membership reconciliation, not fold walks"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            work.reads, 1,
+            "unchanged files should cost a stat, not a source read"
+        );
+        assert_eq!(work.content_hash_bytes, changed.len());
+        assert_eq!(work.attachments, 1);
+        assert_eq!(
+            work.stats, 2049,
+            "one stat per member plus a post-read stability stat"
+        );
+    }
+}
+
 /// A catch-up that takes several budgeted rounds serves each round's vectors
 /// at once but publishes them in one fold at the end, because every fold
 /// re-walks the whole checkout.
@@ -274,6 +907,468 @@ fn fast_schedule(root: &Path) -> FillSchedule {
         paused: Box::new(|| false),
         max_batch: 64,
     }
+}
+
+/// A real HTTP backend, initially refusing connections, with counts separated
+/// into identity probes and source texts. Binding is delayed until the test
+/// has observed the worker's first failure.
+struct RecoveringBackend {
+    addr: std::net::SocketAddr,
+    probes: Arc<AtomicUsize>,
+    texts: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RecoveringBackend {
+    fn offline() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        Self {
+            addr,
+            probes: Arc::new(AtomicUsize::new(0)),
+            texts: Arc::new(AtomicUsize::new(0)),
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        }
+    }
+
+    fn config(&self) -> crate::config::SemanticBackendConfig {
+        crate::config::SemanticBackendConfig {
+            backend: crate::config::SemanticBackend::OpenAiCompatible,
+            base_url: Some(format!("http://{}", self.addr)),
+            model: "retry-test".into(),
+            timeout_ms: 1000,
+            ..Default::default()
+        }
+    }
+
+    fn start(&mut self, status: u16) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(self.addr).unwrap();
+        self.stop.store(false, Ordering::SeqCst);
+        let probes = Arc::clone(&self.probes);
+        let texts = Arc::clone(&self.texts);
+        let stop = Arc::clone(&self.stop);
+        self.worker = Some(std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                let (start, length) = loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                        let length: usize = String::from_utf8_lossy(&bytes[..end])
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break (end + 4, length);
+                        }
+                    }
+                };
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[start..start + length]).unwrap();
+                let inputs = body["input"].as_array().unwrap();
+                let data: Vec<_> = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input)| {
+                        let text = input.as_str().unwrap();
+                        if text == "semantic index fingerprint probe" {
+                            probes.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            texts.fetch_add(1, Ordering::SeqCst);
+                        }
+                        serde_json::json!({"index": index, "embedding": vector(text)})
+                    })
+                    .collect();
+                let body = if status == 200 {
+                    serde_json::json!({"data": data}).to_string()
+                } else {
+                    "wrong model".to_string()
+                };
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }));
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.addr);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+impl Drop for RecoveringBackend {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[test]
+fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let mut backend = RecoveringBackend::offline();
+    // A previous session already stored every vector. Retrying identity must
+    // reuse these vectors, not re-embed the checkout when the backend returns.
+    backend.start(200);
+    let semantic = backend.config();
+    let mut model = crate::semantic_index::EmbeddingModel::from_config(&semantic).unwrap();
+    let fingerprint = model.fingerprint(&semantic).unwrap();
+    let seed = CheckoutSemantic::new(
+        storage.path(),
+        "family",
+        "scope",
+        root.path(),
+        SemanticProducer::current(fingerprint.as_string(), fingerprint.embed_text_caps),
+        Weak::new(),
+    )
+    .unwrap();
+    seed.load().unwrap();
+    seed.refresh(FillBudget::default(), &mut |texts| model.embed(texts))
+        .unwrap();
+    let seed_work = seed.driver().take_reconcile_work();
+    let stored_texts = backend.texts.load(Ordering::SeqCst);
+    drop(seed);
+    drop(model);
+    backend.shutdown();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, wake) = slot.begin();
+    let status = Arc::new(RwLock::new(crate::context::SemanticIndexStatus::Disabled));
+    let drivers = InstalledDriver::default();
+    let config = WorkerConfig {
+        root: root.path().to_path_buf(),
+        storage: storage.path().to_path_buf(),
+        family: "family".into(),
+        scope: "scope".into(),
+        semantic: backend.config(),
+        status: Arc::clone(&status),
+        drivers: drivers.clone(),
+        schedule: fast_schedule(root.path()),
+    };
+    let weak = Arc::downgrade(&slot);
+    let worker = std::thread::spawn(move || run_worker(weak, epoch, wake, config));
+    assert_eq!(observer.next(), "unavailable");
+    assert!(
+        matches!(&*status.read().unwrap(), crate::context::SemanticIndexStatus::Failed(reason) if reason.contains("next retry due") && reason.contains("embedding model"))
+    );
+    // A second refused connection proves a timer fires without any wake.
+    let retried = observer.rx.recv_timeout(Duration::from_secs(5)).ok();
+    if retried != Some("unavailable") {
+        slot.clear();
+        worker.join().unwrap();
+        panic!("the failed fingerprint never retried without a wake: {retried:?}");
+    }
+    assert!(
+        drivers.get().is_none(),
+        "a failed probe must not walk the checkout"
+    );
+    backend.start(200);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let recovered = loop {
+        match observer.rx.recv_deadline(deadline) {
+            Ok("unavailable") => continue,
+            event => break event.ok(),
+        }
+    };
+    let runtime = slot.runtime();
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(
+        recovered,
+        Some("settled"),
+        "the failed fingerprint latched the semantic lane"
+    );
+    assert!(matches!(
+        *status.read().unwrap(),
+        crate::context::SemanticIndexStatus::Ready { .. }
+    ));
+    assert_eq!(
+        backend.probes.load(Ordering::SeqCst),
+        2,
+        "one seed probe and one recovery probe"
+    );
+    assert_eq!(
+        backend.texts.load(Ordering::SeqCst),
+        stored_texts,
+        "recovery re-embedded stored sources"
+    );
+    let runtime = runtime.unwrap();
+    assert!(query(&runtime, "alpha").complete());
+    assert!(
+        runtime.plane().take_source_reads().is_empty(),
+        "recovery fill read sources whose vectors were already stored"
+    );
+    let work = runtime.driver().take_reconcile_work();
+    assert_eq!(work.walks, 1, "failed probes re-walked the checkout");
+    assert!(
+        work.reads <= seed_work.reads,
+        "recovery re-read unchanged files: {work:?}"
+    );
+}
+
+#[test]
+fn permanent_fingerprint_failure_does_not_retry() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let mut backend = RecoveringBackend::offline();
+    backend.start(400);
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, wake) = slot.begin();
+    let status = Arc::new(RwLock::new(crate::context::SemanticIndexStatus::Disabled));
+    let config = WorkerConfig {
+        root: root.path().to_path_buf(),
+        storage: storage.path().to_path_buf(),
+        family: "family".into(),
+        scope: "scope".into(),
+        semantic: backend.config(),
+        status: Arc::clone(&status),
+        drivers: InstalledDriver::default(),
+        schedule: fast_schedule(root.path()),
+    };
+    let (done, finished) = crossbeam_channel::bounded(1);
+    let weak = Arc::downgrade(&slot);
+    let worker = std::thread::spawn(move || {
+        run_worker(weak, epoch, wake, config);
+        done.send(()).unwrap();
+    });
+    let stopped = finished.recv_timeout(Duration::from_secs(5)).is_ok();
+    let state = slot.state();
+    let armed = lock(&slot.retry).is_some();
+    slot.clear();
+    worker.join().unwrap();
+    assert!(stopped, "a permanent failure kept the retry worker alive");
+    assert!(!armed, "a permanent failure armed a retry");
+    assert!(
+        matches!(state, Some(CheckoutSemanticState::Unavailable(reason)) if reason.contains("wrong model") && !reason.contains("next retry"))
+    );
+    assert!(
+        matches!(&*status.read().unwrap(), crate::context::SemanticIndexStatus::Failed(reason) if reason.contains("wrong model"))
+    );
+    assert_eq!(backend.probes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn view_fingerprint_retry_sends_one_probe_even_for_server_errors() {
+    let mut backend = RecoveringBackend::offline();
+    backend.start(503);
+    let config = backend.config();
+    let mut model = crate::semantic_index::EmbeddingModel::from_config(&config).unwrap();
+    let error = model.fingerprint_for_view(&config).unwrap_err();
+    assert!(
+        crate::semantic_index::embedding_failure_is_transient(&error),
+        "{error}"
+    );
+    assert_eq!(
+        backend.probes.load(Ordering::SeqCst),
+        1,
+        "one scheduled attempt sent multiple probes"
+    );
+    backend.shutdown();
+    backend.start(200);
+    model.fingerprint_for_view(&config).unwrap();
+    assert_eq!(backend.probes.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.texts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn query_retry_is_rate_limited_and_only_advances_transient_deadlines() {
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, wake) = slot.begin();
+    let weak = Arc::downgrade(&slot);
+    assert!(!slot.request_retry_at(Instant::now()));
+    schedule_retry(
+        &weak,
+        epoch,
+        "[transient] offline",
+        Duration::from_secs(300),
+        Duration::from_secs(5),
+    );
+    let allowed = lock(&slot.retry).as_ref().unwrap().query_allowed_at;
+    assert!(!slot.request_retry_at(allowed - Duration::from_nanos(1)));
+    assert!(slot.request_retry_at(allowed));
+    assert!(
+        !slot.request_retry_at(allowed),
+        "one query burst bypassed the limiter"
+    );
+    assert_eq!(lock(&slot.retry).as_ref().unwrap().due, allowed);
+    clear_retry(&weak, epoch);
+    assert!(!slot.request_retry_at(allowed + Duration::from_secs(10)));
+    slot.clear();
+    assert!(!wait_retry(&weak, epoch, &wake));
+}
+
+#[test]
+fn semantic_query_status_sample_expedites_retry_without_a_loaded_runtime() {
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = crate::context::AppContext::new(
+        crate::context::default_language_provider_factory(),
+        crate::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let slot = ctx.checkout_semantic();
+    let (epoch, wake) = slot.begin();
+    let reason = "semantic: unavailable: embedding model offline".to_owned();
+    *ctx.semantic_index_status().write().unwrap() =
+        crate::context::SemanticIndexStatus::Failed(reason.clone());
+    slot.fail(epoch, reason);
+    // Advance only the rate-limit clock, without sleeping or contacting a
+    // backend. The query must consume this allowance through the real context.
+    let now = Instant::now();
+    *lock(&slot.retry) = Some(RetryDeadline {
+        due: now + Duration::from_secs(300),
+        query_allowed_at: now - Duration::from_secs(1),
+    });
+    assert!(slot.runtime().is_none());
+    assert!(matches!(
+        *ctx.semantic_index_status().read().unwrap(),
+        crate::context::SemanticIndexStatus::Failed(_)
+    ));
+    assert_eq!(
+        wake.try_recv(),
+        Ok(()),
+        "query readiness did not wake the failed lane"
+    );
+    ctx.semantic_index_status();
+    assert_eq!(
+        wake.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Empty),
+        "query burst bypassed the rate limit"
+    );
+    slot.clear();
+}
+
+#[test]
+fn transient_fill_recovery_does_not_reread_or_reembed_stored_content() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let model = Arc::new(Model::default());
+    refresh(&runtime, &model);
+    let stored_texts = model.texts();
+    let target = root.path().join("src/gamma.rs");
+    std::fs::write(&target, "pub fn new_gamma() {}\n").unwrap();
+    runtime.driver().record_absolute_change(&target);
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let online = Arc::new(AtomicBool::new(false));
+    let status = Arc::new(RwLock::new(crate::context::SemanticIndexStatus::ready()));
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let root = root.path().to_path_buf();
+        let online = Arc::clone(&online);
+        let model = Arc::clone(&model);
+        let status = Arc::clone(&status);
+        std::thread::spawn(move || {
+            serve_fills_with_status(
+                &weak,
+                epoch,
+                &wake,
+                &fast_schedule(&root),
+                Some(&status),
+                &mut |texts| {
+                    if !online.load(Ordering::SeqCst) {
+                        Err("[transient] embedding backend unreachable".into())
+                    } else {
+                        model.embed(texts)
+                    }
+                },
+            );
+        })
+    };
+    assert_eq!(observer.next(), "retry");
+    assert!(
+        matches!(&*status.read().unwrap(), crate::context::SemanticIndexStatus::Failed(reason) if reason.contains("next retry due"))
+    );
+    assert!(query(&runtime, "alpha").unavailable.is_some());
+    runtime.driver().take_reconcile_work();
+    runtime.plane().take_source_reads();
+    online.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let settled = loop {
+        match observer.rx.recv_deadline(deadline) {
+            Ok("retry") => continue,
+            event => break event.ok(),
+        }
+    };
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(settled, Some("settled"));
+    let work = runtime.driver().take_reconcile_work();
+    assert_eq!(
+        (work.walks, work.reads),
+        (0, 0),
+        "retry repeated source work: {work:?}"
+    );
+    let reads = runtime.plane().take_source_reads();
+    assert_eq!(
+        reads.keys().collect::<Vec<_>>(),
+        vec![&target],
+        "retry read an unchanged, already-embedded source: {reads:?}"
+    );
+    assert_eq!(
+        model.texts() - stored_texts,
+        1,
+        "retry re-embedded unchanged sources"
+    );
+    assert!(query(&runtime, "gamma").complete());
+    assert!(matches!(
+        *status.read().unwrap(),
+        crate::context::SemanticIndexStatus::Ready { .. }
+    ));
+}
+
+#[test]
+fn permanent_fill_failure_preserves_reason_without_retry() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let root = root.path().to_path_buf();
+        let calls = Arc::clone(&calls);
+        std::thread::spawn(move || {
+            serve_fills(&weak, epoch, &wake, &fast_schedule(&root), &mut |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("embedding dimension mismatch".into())
+            });
+        })
+    };
+    let event = observer.next();
+    let armed = lock(&slot.retry).is_some();
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(event, "settled");
+    assert!(!armed, "dimension mismatch armed a retry");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runtime.unavailable_reason().as_deref(),
+        Some("embedding dimension mismatch")
+    );
 }
 
 /// A lane whose checkout is loaded and served, as the worker leaves it.
@@ -323,7 +1418,7 @@ fn transient_embed_errors_retry_until_complete_without_a_wake() {
             serve_fills(&weak, epoch, &wake, &schedule, &mut |texts: Vec<String>| {
                 // The backend is unreachable for the first three calls.
                 if calls.fetch_add(1, Ordering::SeqCst) < 3 {
-                    return Err("embedding backend unreachable".to_string());
+                    return Err("[transient] embedding backend unreachable".to_string());
                 }
                 Ok(texts.iter().map(|text| vector(text)).collect())
             });

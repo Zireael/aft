@@ -43,6 +43,20 @@ export interface ToolCallOptions extends AftTransportOptions {
  */
 export const WORKER_SESSION_FIELD = "worker_session";
 
+/**
+ * Tool-call body field naming the catalog preset the caller runs under
+ * (subc-protocol 0.29 `ToolCallRequest.preset`). The module refuses a tool
+ * call that names no preset on a route the daemon stamped with a scope, so
+ * the subc transport names one on every call: `worker` for a worker session,
+ * `head` otherwise. It travels beside the call, never in the arguments.
+ */
+export const PRESET_FIELD = "preset";
+
+/** The catalog preset for a call from a worker or a primary session. */
+export function callPresetFor(workerSession: boolean): "worker" | "head" {
+  return workerSession ? "worker" : "head";
+}
+
 // A single project's transport (today: one BinaryBridge per project root).
 export interface AftProjectTransport {
   send(
@@ -78,6 +92,8 @@ export interface AftProjectTransport {
 
 // The pool of project transports (today: BridgePool).
 export interface AftTransportPool {
+  /** Host-observed creation, never resume/reload. Optional for older pool implementations. */
+  observeSessionStart?(projectRoot: string, session: string): void;
   getBridge(projectRoot: string): AftProjectTransport;
   getActiveBridgeForRoot(projectRoot: string): AftProjectTransport | null;
   /**
@@ -109,6 +125,16 @@ export interface AftTransportPool {
    * routes. Idempotent.
    */
   closeSession(projectRoot: string, session: string): Promise<void>;
+}
+
+/** A host startup/reload/resume does not prove a session has no pre-existing work. */
+export function observeFreshSessionStart(
+  pool: AftTransportPool,
+  root: string,
+  session: string | undefined,
+  reason: unknown,
+): void {
+  if (session && (reason === "new" || reason === "fork")) pool.observeSessionStart?.(root, session);
 }
 
 export interface AftTransport<ToolCallContext = string | undefined> {

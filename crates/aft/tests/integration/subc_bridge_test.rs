@@ -788,6 +788,7 @@ fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
         compressed_tokens: None,
         tokens_skipped: false,
         status_reason: None,
+        output_incomplete: false,
         live_descendants: Some(Vec::new()),
         live_descendants_omitted: 0,
         live_descendants_summary: None,
@@ -1664,10 +1665,10 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(roots.storage.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     ));
     let app = ctx.app();
     let executor = Arc::new(Executor::with_config(executor_config));
@@ -1875,10 +1876,10 @@ where
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     ));
     let executor = Arc::new(Executor::with_config(bridge_executor_config()));
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -2557,6 +2558,45 @@ fn subc_bridge_module_draining_closes_every_daemon_request_credit() {
     );
 }
 
+#[test]
+fn subc_bridge_deleted_root_reclaim_goodbyes_follow_terminals_and_allow_fresh_bind() {
+    run_subc_bridge_test(
+        "subc_bridge_deleted_root_reclaim_goodbyes_follow_terminals_and_allow_fresh_bind",
+        Duration::from_secs(60),
+        drive_deleted_root_reclaim_goodbyes_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_deleted_root_reclaim_late_call_is_route_reclaimed() {
+    run_subc_bridge_test(
+        "subc_bridge_deleted_root_reclaim_late_call_is_route_reclaimed",
+        Duration::from_secs(60),
+        |input| async {
+            let (mut session, _root, frames, late_error) = reclaim_bound_test_root(input).await;
+            eprintln!(
+                "reclaim late-call refusal: {}",
+                String::from_utf8_lossy(&late_error.body)
+            );
+            assert_error_frame(&late_error, 121, 999, "route_reclaimed");
+            let error: ErrorBody =
+                serde_json::from_slice(&late_error.body).expect("late error body");
+            assert!(error.message.contains("project root was removed"));
+            assert!(error.message.contains("reopened"));
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.header.ty == FrameType::StreamEnd)
+                    .count(),
+                2
+            );
+            send_connection_goodbye(&mut session.stream).await;
+        },
+        |_, _, _| {},
+    );
+}
+
 /// The root's executor gets a single reader slot, so one long read occupies it
 /// and every bash wait poll on that root queues behind the read.
 fn single_reader_executor_config() -> ExecutorConfig {
@@ -2775,10 +2815,10 @@ fn subc_bridge_rejects_malformed_fed_harness_on_bind() {
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     ));
     let executor = Arc::new(Executor::with_config(ExecutorConfig {
         pool_size: 2,
@@ -2983,6 +3023,76 @@ fn subc_bridge_health_check_returns_root_status_report() {
     );
 }
 
+/// A channel-0 request AFT cannot decode costs only that request. Here the
+/// scope stamp's `attributes` carries a field the deny-unknown-fields type
+/// does not know: the bind is refused by name, and the next valid bind and a
+/// health check on the same connection are still answered. Before, the
+/// decode error ended the frame loop and with it every route on the module.
+#[test]
+fn subc_bridge_undecodable_control_request_is_refused_without_ending_the_loop() {
+    run_subc_bridge_test(
+        "subc_bridge_undecodable_control_request_is_refused_without_ending_the_loop",
+        Duration::from_secs(30),
+        drive_undecodable_control_request_daemon,
+        |_, _, _| {},
+    );
+}
+
+async fn drive_undecodable_control_request_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+
+    let mut request = serde_json::to_value(ModuleControlRequest::RouteBind {
+        route_channel: 11,
+        epoch: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".to_string(),
+        },
+        identity: BindIdentity::new(
+            root1.clone(),
+            "opencode".to_string(),
+            "session-11".to_string(),
+        ),
+        principal: Some(Principal::Direct),
+        consumer_capabilities: None,
+        admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
+    })
+    .expect("route bind body");
+    // The control request is internally tagged (`op`), so the bind fields sit
+    // at the top level.
+    request["scope"] = json!({
+        "owner": {"kind": "direct"},
+        "ref": "scope-ref",
+        "scope_epoch": 1,
+        "kind": "worker",
+        "attributes": {"agent_id": "agent", "a_field_no_reader_knows": true},
+        "owner_authorized": true,
+    });
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            120,
+            serde_json::to_vec(&request).expect("route bind bytes"),
+        )
+        .expect("route bind frame"),
+    )
+    .await;
+    expect_route_bind_error(&mut stream, 120, "undecodable_control_request").await;
+
+    send_route_bind_with_session(&mut stream, 12, 121, &root1, "session-12").await;
+    expect_route_bind_ack(&mut stream, 121).await;
+    send_control_request(&mut stream, 122, ModuleControlRequest::HealthCheck {}).await;
+    let _report = expect_health_check_report(&mut stream, 122).await;
+    send_connection_goodbye(&mut stream).await;
+}
+
 #[test]
 fn subc_bridge_health_check_reports_pending_route_bind() {
     run_subc_bridge_test(
@@ -3165,6 +3275,20 @@ fn subc_bridge_bash_hand_off_text_follows_the_worker_role() {
     );
 }
 
+/// A delegated worker's blocking bash call over subc (`wait: true`, and a
+/// `block_to_completion` call) returns at the worker wait limit with the
+/// command still running in the background, as on the standalone path.
+#[test]
+fn subc_bridge_worker_blocking_bash_detaches_at_the_worker_wait_limit() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_worker_blocking_bash_detaches_at_the_worker_wait_limit",
+        Duration::from_secs(60),
+        || vec![set_test_env("AFT_TEST_WORKER_WAIT_MAX_MS", "1500")],
+        drive_bash_worker_wait_limit_daemon,
+        |_, _, _| {},
+    );
+}
+
 #[test]
 fn subc_bridge_bash_records_call_key_and_refuses_malformed_keys() {
     run_subc_bridge_test(
@@ -3335,10 +3459,10 @@ fn subc_rejects_forwarded_configure_tool_call_in_production() {
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     ));
     let executor = Arc::new(Executor::with_config(ExecutorConfig {
         pool_size: 2,
@@ -3540,10 +3664,10 @@ fn subc_registers_not_ready_and_flips_ready_when_live_roots_is_refused() {
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     ));
     let executor = Arc::new(Executor::with_config(ExecutorConfig {
         pool_size: 2,
@@ -4547,6 +4671,84 @@ async fn drive_bash_worker_role_daemon(input: FakeDaemonInput) {
         )
         .await;
         let _ = read_frame_timeout(&mut stream, "worker role bash kill").await;
+    }
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    for (corr, mode) in [(140_u64, "wait"), (141_u64, "block_to_completion")] {
+        let mut arguments = json!({
+            "command": "printf 'started\\n'; sleep 30",
+            "foreground_orchestrate": true,
+            "compressed": false,
+        });
+        arguments[mode] = json!(true);
+        let body = json!({ "name": "bash", "arguments": arguments, "worker_session": true });
+        let started = Instant::now();
+        send_frame(
+            &mut stream,
+            Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                1,
+                1,
+                corr,
+                serde_json::to_vec(&body).expect("worker limit tool call body"),
+            )
+            .expect("worker limit tool call frame"),
+        )
+        .await;
+        let frame = read_frame_timeout(&mut stream, "worker limit bash").await;
+        let elapsed = started.elapsed();
+        assert_eq!(frame.header.corr, corr);
+        assert!(!tool_result_is_error(&frame), "{mode}");
+        let text = tool_result_text(&frame);
+        assert!(
+            elapsed >= Duration::from_millis(1_400) && elapsed < Duration::from_secs(15),
+            "{mode}: the call must return at the 1.5s limit, took {elapsed:?}"
+        );
+        assert!(
+            text.contains("still running after 1.5s"),
+            "{mode}: {text:?}"
+        );
+        assert!(text.contains("it was not killed"), "{mode}: {text:?}");
+        assert!(
+            text.contains("AFT kills this task at "),
+            "{mode} should name its kill deadline: {text:?}"
+        );
+        assert!(
+            text.contains("its default background limit"),
+            "{mode} should name the default deadline source: {text:?}"
+        );
+        assert!(text.contains("Recent output:\nstarted"), "{mode}: {text:?}");
+        let task_id = extract_bash_task_id(&text);
+        send_tool_call(
+            &mut stream,
+            1,
+            corr + 100,
+            "bash_status",
+            json!({ "params": { "task_id": task_id } }),
+        )
+        .await;
+        let status =
+            tool_response_json(&read_frame_timeout(&mut stream, "worker limit status").await);
+        assert_eq!(
+            status["status"], "running",
+            "{mode}: the command keeps running: {status:?}"
+        );
+        send_tool_call(
+            &mut stream,
+            1,
+            corr + 200,
+            "bash_kill",
+            json!({ "params": { "task_id": task_id } }),
+        )
+        .await;
+        let _ = read_frame_timeout(&mut stream, "worker limit bash kill").await;
     }
     send_connection_goodbye(&mut stream).await;
 }
@@ -6873,7 +7075,9 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         }
     }
 
-    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+    // Positive waits are generous: a loaded Windows runner can take well over
+    // 5 s before the module opens its fleet consumer connection.
+    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
         .await
         .expect("fleet consumer connection timeout")
         .expect("accept fleet consumer");
@@ -6882,7 +7086,7 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         &key,
         &daemon_id,
         "subc-test",
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     )
     .await
     .expect("authenticate fleet consumer");
@@ -7067,7 +7271,9 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         }
     }
 
-    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+    // Positive waits are generous: a loaded Windows runner can take well over
+    // 5 s before the module opens its fleet consumer connection.
+    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
         .await
         .expect("fleet consumer connection timeout")
         .expect("accept fleet consumer");
@@ -7076,7 +7282,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         &key,
         &daemon_id,
         "subc-test",
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     )
     .await
     .expect("authenticate fleet consumer");
@@ -8407,6 +8613,14 @@ async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDae
             text.contains("Detached because AFT is restarting"),
             "bash {corr} text: {text:?}"
         );
+        assert!(
+            text.contains("AFT kills this task at "),
+            "bash {corr} should name its kill deadline: {text:?}"
+        );
+        assert!(
+            text.contains("the `timeout` you passed"),
+            "bash {corr} should name the explicit deadline source: {text:?}"
+        );
         let response = tool_response_json(frame);
         assert_eq!(response["status"], "running", "bash {corr}: {response}");
         task_ids.push(
@@ -8559,6 +8773,178 @@ async fn pump_daemon_credits(
         };
         ledger.observe(&frame);
     }
+}
+
+/// Exercises the actual frame loop, leaving the fake daemon's routes open until
+/// the module tells it to close them. A late request is deliberately forwarded
+/// even after Goodbye, to cover a carrier racing with route closure.
+async fn reclaim_bound_test_root(
+    input: FakeDaemonInput,
+) -> (FakeDaemonSession, tempfile::TempDir, Vec<Frame>, Frame) {
+    let mut session = open_fake_daemon_session(input).await;
+    let root_dir = tempfile::tempdir().expect("reclaimed root tempdir");
+    let root = root_dir.path();
+    let root_id = ProjectRootId::from_path(root).expect("reclaimed root id");
+    for channel in [121, 122, 123] {
+        send_route_bind_with_session(
+            &mut session.stream,
+            channel,
+            u64::from(channel),
+            root,
+            &format!("session-reclaimed-{channel}"),
+        )
+        .await;
+        expect_route_bind_ack(&mut session.stream, u64::from(channel)).await;
+    }
+    let mut ledger = DaemonCreditLedger::default();
+    for channel in [121, 122] {
+        send_bg_events_subscribe(&mut session.stream, channel, 950).await;
+        ledger.open(channel, 950, "held bg_events on deleted root");
+    }
+    // The control reply is a FIFO barrier: both subscriptions have reached the
+    // frame loop before the directory disappears.
+    send_control_request(
+        &mut session.stream,
+        980,
+        ModuleControlRequest::HealthCheck {},
+    )
+    .await;
+    loop {
+        let frame = read_frame_timeout(&mut session.stream, "subscription barrier").await;
+        if frame.header.channel == 0 && frame.header.corr == 980 {
+            assert_eq!(frame.header.ty, FrameType::Response);
+            break;
+        }
+        ledger.observe(&frame);
+    }
+    assert_eq!(ledger.open.len(), 2, "streams must be held before deletion");
+    std::fs::remove_dir_all(root).expect("delete bound root");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut frames = Vec::new();
+    while session.executor.actor_registered(&root_id) {
+        assert!(
+            Instant::now() < deadline,
+            "deleted root was never reclaimed"
+        );
+        if let Some(frame) = read_any_frame_until(
+            &mut session.stream,
+            (Instant::now() + Duration::from_millis(100)).min(deadline),
+            "root reclaim",
+        )
+        .await
+        {
+            ledger.observe(&frame);
+            frames.push(frame);
+        }
+    }
+    // Restoring the same path must not resurrect the forgotten route. The
+    // session needs a fresh bind, just as a reclaimed worktree's carrier does.
+    std::fs::create_dir_all(root).expect("restore project directory");
+    std::fs::write(root.join("restored.txt"), "restored root is live\n").expect("restored file");
+    send_tool_call(
+        &mut session.stream,
+        121,
+        999,
+        "read",
+        json!({"filePath": root.join("restored.txt")}),
+    )
+    .await;
+    let late_error = loop {
+        let frame = read_frame_timeout(&mut session.stream, "late reclaimed-route call").await;
+        if frame.header.channel == 121 && frame.header.corr == 999 {
+            break frame;
+        }
+        ledger.observe(&frame);
+        frames.push(frame);
+    };
+    assert!(
+        ledger.open.is_empty(),
+        "held credits not answered: {:?}",
+        ledger.open_requests()
+    );
+    assert!(
+        ledger.unmatched_terminals.is_empty(),
+        "duplicate terminals: {:?}",
+        ledger.unmatched_terminals
+    );
+    eprintln!(
+        "deleted-root frame-loop reproduction: held terminals={}, route GOODBYEs={:?}, old-route refusal={}",
+        frames.iter().filter(|frame| frame.header.ty == FrameType::StreamEnd).count(),
+        frames.iter().filter(|frame| frame.header.ty == FrameType::Goodbye).map(|frame| (frame.header.channel, frame.header.epoch)).collect::<Vec<_>>(),
+        String::from_utf8_lossy(&late_error.body),
+    );
+    (session, root_dir, frames, late_error)
+}
+
+async fn drive_deleted_root_reclaim_goodbyes_daemon(input: FakeDaemonInput) {
+    let (mut session, root_dir, frames, late_error) = reclaim_bound_test_root(input).await;
+    let goodbyes = frames
+        .iter()
+        .filter(|frame| frame.header.ty == FrameType::Goodbye)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        goodbyes.len(),
+        3,
+        "daemon must receive one route Goodbye per reclaimed route"
+    );
+    assert_eq!(
+        goodbyes
+            .iter()
+            .map(|frame| (frame.header.channel, frame.header.epoch))
+            .collect::<HashSet<_>>(),
+        HashSet::from([(121, 1), (122, 1), (123, 1)])
+    );
+    for frame in &goodbyes {
+        assert_eq!(frame.header.ver, PROTOCOL_VERSION);
+        assert_eq!(frame.header.corr, 0);
+        assert!(frame.body.is_empty());
+    }
+    let first_goodbye = frames
+        .iter()
+        .position(|frame| frame.header.ty == FrameType::Goodbye)
+        .unwrap();
+    let last_terminal = frames
+        .iter()
+        .rposition(|frame| frame.header.ty == FrameType::StreamEnd)
+        .expect("held stream terminal");
+    assert!(
+        last_terminal < first_goodbye,
+        "all held terminals must precede route closure"
+    );
+    assert_error_frame(&late_error, 121, 999, "route_reclaimed");
+
+    // Reuse the channel with a new epoch, keeping both path and session. This
+    // also checks that the reclaimed epoch watermark does not poison a rebind.
+    send_route_bind_with_harness_session_principal_and_doc_epoch(
+        &mut session.stream,
+        121,
+        2,
+        1000,
+        root_dir.path(),
+        "opencode",
+        "session-reclaimed-121",
+        Some(Principal::Direct),
+        minimal_bind_doc(),
+    )
+    .await;
+    expect_route_bind_ack(&mut session.stream, 1000).await;
+    send_tool_call_epoch(
+        &mut session.stream,
+        121,
+        2,
+        1001,
+        "read",
+        json!({"filePath": root_dir.path().join("restored.txt")}),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut session.stream, "fresh bind read").await;
+    assert_eq!(
+        (frame.header.channel, frame.header.epoch, frame.header.corr),
+        (121, 2, 1001)
+    );
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert!(tool_result_text(&frame).contains("restored root is live"));
+    send_connection_goodbye(&mut session.stream).await;
 }
 
 /// Reproduces a restart drain that ran to the daemon's forced-teardown ceiling

@@ -1,0 +1,12 @@
+{
+  "after_outputs": {
+    "outline": "target/inspect-truth-corpus/_results/outline/52f09206136a11e1cd18ebf8348d58200bae6e55",
+    "typeorm": "target/inspect-truth-corpus/_results/typeorm/52f09206136a11e1cd18ebf8348d58200bae6e55",
+    "ripgrep": "target/inspect-truth-corpus/_results/ripgrep/52f09206136a11e1cd18ebf8348d58200bae6e55",
+    "axum": "target/inspect-truth-corpus/_results/axum/52f09206136a11e1cd18ebf8348d58200bae6e55",
+    "soft-serve": "target/inspect-truth-corpus/_results/soft-serve/52f09206136a11e1cd18ebf8348d58200bae6e55",
+    "fastapi": "target/inspect-truth-corpus/_results/fastapi/52f09206136a11e1cd18ebf8348d58200bae6e55",
+    "aft": "target/inspect-truth-corpus/_results/aft/52f09206136a11e1cd18ebf8348d58200bae6e55"
+  },
+  "entries": []
+}

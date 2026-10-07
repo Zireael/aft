@@ -23,7 +23,7 @@ use url::Url;
 
 use crate::parser::detect_language;
 
-const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(30_000);
 const BODY_CHUNK_TIMEOUT: Duration = Duration::from_millis(15_000);
@@ -90,6 +90,12 @@ struct CacheMeta {
     extension: String,
     #[serde(rename = "fetchedAt")]
     fetched_at: u64,
+    #[serde(default)]
+    download_truncated: bool,
+    #[serde(default)]
+    downloaded_bytes: usize,
+    #[serde(default)]
+    total_bytes: Option<u64>,
 }
 
 pub fn is_http_url(value: &str) -> bool {
@@ -141,15 +147,18 @@ pub fn fetch_url_to_cache(
             ))
         })?;
 
-    if let Some(length) = response.content_length() {
-        if length > MAX_RESPONSE_BYTES {
-            return Err(UrlFetchError::new(format!(
-                "Response too large: {length} bytes (max {MAX_RESPONSE_BYTES})"
-            )));
+    let total_bytes = response.content_length();
+    let (mut body, download_truncated) = read_response_body(response, url)?;
+    let downloaded_bytes = body.len();
+    // A byte ceiling can bisect the final UTF-8 character. Do not turn an
+    // otherwise valid document prefix into an unreadable cache entry.
+    if download_truncated {
+        if let Err(error) = std::str::from_utf8(&body) {
+            if error.error_len().is_none() {
+                body.truncate(error.valid_up_to());
+            }
         }
     }
-
-    let body = read_response_body(response, url)?;
     if from_source_path && body_contains_nul_in_prefix(&body) {
         return Err(UrlFetchError::new(format!(
             "Binary content detected for source URL {url}"
@@ -173,6 +182,9 @@ pub fn fetch_url_to_cache(
         content_type,
         extension: extension.to_string(),
         fetched_at: now_ms(),
+        download_truncated,
+        downloaded_bytes,
+        total_bytes,
     };
     let meta_bytes = serde_json::to_vec(&meta).map_err(|error| {
         UrlFetchError::new(format!("Failed to encode URL cache metadata: {error}"))
@@ -239,6 +251,24 @@ pub fn cache_content_path_for_url(storage_dir: &Path, url: &str, extension: &str
 #[doc(hidden)]
 pub fn cache_meta_path_for_url(storage_dir: &Path, url: &str) -> PathBuf {
     meta_path(storage_dir, &hash_url(url))
+}
+
+/// Disclose a partial download separately from any later rendering cut. Keys
+/// or headings after this prefix have not been inspected.
+pub fn download_notice(path: &Path) -> Option<String> {
+    let meta_path = path.with_extension("meta.json");
+    let meta: CacheMeta = serde_json::from_slice(&fs::read(meta_path).ok()?).ok()?;
+    if !meta.download_truncated {
+        return None;
+    }
+    let total = meta
+        .total_bytes
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| format!("≥{}", meta.downloaded_bytes + 1));
+    Some(format!(
+        "Download truncated at {} of {total} bytes; narrow with a smaller URL or server-side filters (only the downloaded prefix was inspected)",
+        meta.downloaded_bytes
+    ))
 }
 
 #[doc(hidden)]
@@ -357,7 +387,11 @@ fn fresh_cached_path(
     }
 
     let cached = content_path(storage_dir, hash, &meta.extension);
-    if age < CACHE_TTL_MS && cached.exists() {
+    // Old cache entries predate the iterator ceiling and may contain an
+    // unbounded body. Refetch those rather than reintroducing the missed cap.
+    let legacy_oversized = meta.downloaded_bytes == 0
+        && fs::metadata(&cached).is_ok_and(|m| m.len() > MAX_RESPONSE_BYTES);
+    if age < CACHE_TTL_MS && cached.exists() && !legacy_oversized {
         return Ok(Some(cached));
     }
     Ok(None)
@@ -1072,9 +1106,14 @@ enum BodyReadEvent {
     Error(io::ErrorKind, String),
 }
 
-fn read_response_body(mut response: HttpResponse, url: &str) -> Result<Vec<u8>, UrlFetchError> {
-    let (tx, rx) = mpsc::channel();
+fn read_response_body(response: HttpResponse, url: &str) -> Result<(Vec<u8>, bool), UrlFetchError> {
+    // Bound the producer, not just its consumer: an unbounded channel can
+    // queue the entire response before the caller notices the byte ceiling.
+    let (tx, rx) = mpsc::sync_channel(1);
     thread::spawn(move || {
+        // One lookahead byte distinguishes an exact-size body from a cut,
+        // including chunked responses without Content-Length.
+        let mut response = response.take(MAX_RESPONSE_BYTES + 1);
         let mut buffer = [0u8; 16 * 1024];
         loop {
             match response.read(&mut buffer) {
@@ -1102,15 +1141,14 @@ fn read_response_body(mut response: HttpResponse, url: &str) -> Result<Vec<u8>, 
     loop {
         match rx.recv_timeout(BODY_CHUNK_TIMEOUT) {
             Ok(BodyReadEvent::Chunk(chunk)) => {
+                let remaining = (MAX_RESPONSE_BYTES - total) as usize;
+                chunks.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                 total += chunk.len() as u64;
                 if total > MAX_RESPONSE_BYTES {
-                    return Err(UrlFetchError::new(format!(
-                        "Response exceeded {MAX_RESPONSE_BYTES} bytes, aborted"
-                    )));
+                    return Ok((chunks, true));
                 }
-                chunks.extend_from_slice(&chunk);
             }
-            Ok(BodyReadEvent::Done) => return Ok(chunks),
+            Ok(BodyReadEvent::Done) => return Ok((chunks, false)),
             Ok(BodyReadEvent::Error(kind, _message)) if is_body_stall_kind(kind) => {
                 return Err(body_stall_error(url));
             }

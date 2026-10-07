@@ -100,7 +100,7 @@ impl LivePin {
         &self.keys_path
     }
 
-    /// Adds keys and makes the new list durable before returning.
+    /// Adds keys and makes the new list visible to sweeps before returning.
     pub fn protect(&mut self, keys: &[FamilyKey]) -> Result<(), PinError> {
         let before = self.keys.len();
         self.keys.extend(keys.iter().map(FamilyKey::to_hex));
@@ -150,7 +150,6 @@ impl LivePin {
                 .open(&temporary)?;
             write_key_lines(file, self.keys.iter().map(String::as_str))?;
             fs_lock::rename_over(&temporary, &self.keys_path)?;
-            fs_lock::sync_parent(&self.keys_path);
             Ok(())
         })();
         if result.is_err() {
@@ -165,7 +164,6 @@ impl LivePin {
         }
         let _ = fs::remove_file(&self.metadata_path);
         let _ = fs::remove_file(&self.keys_path);
-        fs_lock::sync_parent(&self.metadata_path);
         self.released = true;
     }
 }
@@ -184,6 +182,19 @@ impl Drop for LivePin {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durability_live_pin_counts() {
+        let view = tempfile::tempdir().unwrap();
+        crate::durability::take();
+        let mut pin = LivePin::create_in(view.path(), "family".into(), "view".into()).unwrap();
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 1, "{events:?}");
+        pin.protect(&keys(10)).unwrap();
+        pin.trim(|_| false).unwrap();
+        pin.release();
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+    }
     use super::*;
     use crate::pins::work_counters::key_file_work;
 
@@ -204,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn protecting_a_batch_writes_and_syncs_the_key_file_once() {
+    fn protecting_a_batch_writes_the_key_file_once_without_sync() {
         let view = tempfile::tempdir().unwrap();
         let mut pin = LivePin::create_in(view.path(), "family".into(), "view".into()).unwrap();
         let batch = keys(500);
@@ -213,8 +224,8 @@ mod tests {
         let (writes_after, syncs_after) = key_file_work();
         assert_eq!(
             (writes_after - writes_before, syncs_after - syncs_before),
-            (1, 1),
-            "a batch of 500 keys must cost one write and one fsync"
+            (1, 0),
+            "a batch of 500 keys must cost one write and no sync; keys are read only while the owner lives"
         );
         let mut expected: Vec<String> = batch.iter().map(FamilyKey::to_hex).collect();
         expected.sort();

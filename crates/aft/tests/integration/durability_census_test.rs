@@ -5,7 +5,8 @@
 //! tracer appends one line per call to a trace file, and this test slices the
 //! trace per operation and groups it by store directory.
 //!
-//! Ignored: it is a measurement, not a regression gate. Run it alone:
+//! The syscall count gates run on macOS; portable unit tests also record real
+//! syncs. The original ignored measurements remain available to compare counts:
 //!
 //! ```text
 //! cargo test -p agent-file-tools --test integration -- \
@@ -191,6 +192,7 @@ struct Census {
     report: String,
     out_dir: Option<PathBuf>,
     daemon_pid: u32,
+    verify_counts: bool,
 }
 
 impl Census {
@@ -223,7 +225,71 @@ impl Census {
             &self.project,
             self.daemon_pid,
         );
+        if self.verify_counts {
+            if label.starts_with("configure + startup") {
+                // SQLite keeps its own fsync policy. These stores' extra drive
+                // flushes are different calls and must not creep back in.
+                for store in [
+                    "storage: index",
+                    "storage: symbols",
+                    "storage: callgraph",
+                    "storage: inspect",
+                    "storage: artifact-owners",
+                ] {
+                    let count = events
+                        .iter()
+                        .filter(|event| {
+                            store_of(&event.path, &roots, &self.project) == store
+                                && matches!(event.op.as_str(), "F_FULLFSYNC" | "F_BARRIERFSYNC")
+                        })
+                        .count();
+                    assert_eq!(count, 0, "{label}: {store} extra drive flushes");
+                }
+                return;
+            }
+            let (store, expected) = if label.starts_with("bash ") {
+                ("storage: opencode/bash-tasks", 0)
+            } else if label.starts_with("edit 1:") {
+                ("storage: opencode/backups", 6)
+            } else if label.starts_with("edit ") {
+                ("storage: opencode/backups", 3)
+            } else if label.starts_with("undo ") {
+                // Include the user-file sync, not just stack metadata.
+                let count = count_syncs(&events, |event| {
+                    let store = store_of(&event.path, &roots, &self.project);
+                    store == "storage: opencode/backups" || store == "project (user files)"
+                });
+                assert_eq!(count, 3, "{label}: undo syncs including restored file");
+                return;
+            } else if label.starts_with("checkpoint create") {
+                ("storage: opencode/checkpoints", 8)
+            } else if label.starts_with("checkpoint ") {
+                ("storage: opencode/checkpoints", 0)
+            } else {
+                return;
+            };
+            let count = count_syncs(&events, |event| {
+                let actual = store_of(&event.path, &roots, &self.project);
+                actual == store
+                    || ((label.starts_with("edit 1:") || label.starts_with("checkpoint create"))
+                        && actual == "storage: opencode")
+            });
+            assert_eq!(count, expected, "{label}: {store} sync count");
+        }
     }
+}
+
+fn count_syncs(events: &[Event], include: impl Fn(&Event) -> bool) -> u64 {
+    events
+        .iter()
+        .filter(|event| {
+            include(event)
+                && matches!(
+                    event.op.as_str(),
+                    "F_FULLFSYNC" | "F_BARRIERFSYNC" | "fsync" | "fdatasync"
+                )
+        })
+        .count() as u64
 }
 
 /// Append one operation's per-store table and its ordered list of syncs,
@@ -359,7 +425,7 @@ fn wait_terminal(aft: &mut AftProcess, task_id: &str) -> Value {
 /// Run every measured operation once against one daemon. With `trace` set the
 /// daemon carries the tracer and the report lists per-store counts; without it
 /// only response times are reported, as an uninstrumented baseline.
-fn run_scenario(trace: bool) -> String {
+fn run_scenario(trace: bool, verify_counts: bool) -> String {
     let scratch = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
     let storage_dir = tempfile::tempdir().unwrap();
@@ -407,6 +473,7 @@ fn run_scenario(trace: bool) -> String {
         report: String::new(),
         out_dir,
         daemon_pid: aft.pid(),
+        verify_counts,
     };
     let _ = writeln!(
         census.report,
@@ -591,10 +658,15 @@ fn run_scenario(trace: bool) -> String {
 #[test]
 #[ignore = "measurement: counts fsyncs per store operation; run alone with --nocapture"]
 fn durability_census_per_operation() {
-    let traced = run_scenario(true);
+    let traced = run_scenario(true, false);
     println!("{traced}");
-    let untraced = run_scenario(false);
+    let untraced = run_scenario(false, false);
     println!("{untraced}");
+}
+
+#[test]
+fn durability_syscall_operation_counts() {
+    println!("{}", run_scenario(true, true));
 }
 
 /// Cost of one sync of a small freshly written file on this disk, for each
@@ -669,6 +741,15 @@ fn census_mark(label: &str) {
 #[test]
 #[ignore = "measurement: counts fsyncs for semantic, search-cache and pin writes; run alone with --nocapture"]
 fn durability_census_in_process_stores() {
+    trace_in_process_stores(false);
+}
+
+#[test]
+fn durability_syscall_in_process_counts() {
+    trace_in_process_stores(true);
+}
+
+fn trace_in_process_stores(verify_counts: bool) {
     let scratch = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(scratch.path()).unwrap();
     let library = build_interposer(&root);
@@ -709,6 +790,28 @@ fn durability_census_in_process_stores() {
                     "/nonexistent-project",
                     event.pid,
                 );
+                if verify_counts {
+                    let expected = match previous.as_str() {
+                        "semantic: first persist (full snapshot)" | "pins: live pin create" => {
+                            Some(1)
+                        }
+                        "semantic: persist after one changed file (segment append)" => Some(0),
+                        name if name.starts_with("search index: cache write")
+                            || name.starts_with("pins: protect")
+                            || name == "pins: release" =>
+                        {
+                            Some(0)
+                        }
+                        _ => None,
+                    };
+                    if let Some(expected) = expected {
+                        assert_eq!(
+                            count_syncs(&events, |_| true),
+                            expected,
+                            "{previous}: real syscall count"
+                        );
+                    }
+                }
             }
             events.clear();
             if name != "end" {

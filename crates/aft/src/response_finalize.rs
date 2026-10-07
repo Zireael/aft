@@ -10,11 +10,37 @@ use serde_json::Value;
 use crate::context::AppContext;
 use crate::protocol::Response;
 
+/// Emergency ceiling, deliberately above every normal tool budget. A cut here
+/// is a bug in the tool's own cap, not normal pagination.
+pub const REPLY_CEILING_BYTES: usize = 2 * 1024 * 1024;
+
+pub fn enforce_reply_ceiling(tool: &str, text: &mut String) {
+    let total = text.len();
+    if total <= REPLY_CEILING_BYTES {
+        return;
+    }
+    log::warn!("AFT reply ceiling: tool={tool} rendered_bytes={total} ceiling_bytes={REPLY_CEILING_BYTES}; the tool's own cap failed");
+    let footer = format!("\nthis reply was cut at {REPLY_CEILING_BYTES} of {total} bytes by AFT's reply ceiling; the tool's own cap failed, please report");
+    let mut end = REPLY_CEILING_BYTES - footer.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(&format!("\nthis reply was cut at {end} of {total} bytes by AFT's reply ceiling; the tool's own cap failed, please report"));
+}
+
+fn enforce_response_ceiling(tool: &str, response: &mut Response) {
+    if let Some(Value::String(text)) = response.data.get_mut("text") {
+        enforce_reply_ceiling(tool, text);
+    }
+}
+
 pub fn append_repeat_breaker_reminder(
     text: &mut String,
     session_id: &str,
     intervention: &repeat_breaker::RepeatIntervention,
     worker_session: bool,
+    bash_watch_available: bool,
 ) {
     let count = intervention.count;
     let span_seconds = intervention.span.as_secs();
@@ -28,11 +54,13 @@ pub fn append_repeat_breaker_reminder(
     // that ends its turn has delivered its result and cannot be woken when the
     // awaited task finishes. It is told to wait on the task instead.
     let escalated = repeat_breaker::escalation_starts_at(count);
-    let instruction = match (worker_session, escalated) {
-        (false, true) => "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
-        (false, false) => "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
-        (true, true) => "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
-        (true, false) => "If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
+    let instruction = match (worker_session, bash_watch_available, escalated) {
+        (false, _, true) => "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
+        (false, _, false) => "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
+        (true, true, true) => "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
+        (true, true, false) => "If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
+        (true, false, true) => "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, use bash_status on the task ID you already hold to inspect it, or bash_kill to stop it, instead of repeating this call.",
+        (true, false, false) => "If you are waiting on a task or CI run, use bash_status on the task ID you already hold to inspect it, or bash_kill to stop it, instead of repeating this call.",
     };
     let observation = if intervention.outputs_identical {
         format!(
@@ -100,15 +128,14 @@ pub fn finalize_response_with_bg_completions(
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
     let publish = publish_fleet_status(response, ctx, session_id);
-    if !response.data.get("text").is_some_and(Value::is_string) {
-        return;
+    if response.data.get("text").is_some_and(Value::is_string) {
+        if let Some(line) = status_bar_line(ctx, publish, attach_command) {
+            if let Some(Value::String(text)) = response.data.get_mut("text") {
+                append_trailing_line(text, &line);
+            }
+        }
     }
-    let Some(line) = status_bar_line(ctx, publish, attach_command) else {
-        return;
-    };
-    if let Some(Value::String(text)) = response.data.get_mut("text") {
-        append_trailing_line(text, &line);
-    }
+    enforce_response_ceiling(attach_command, response);
 }
 
 /// Finalization for a tool result whose agent-visible text is held apart from the response
@@ -130,6 +157,7 @@ pub fn finalize_tool_response(
     if let Some(line) = status_bar_line(ctx, publish, attach_command) {
         append_trailing_line(text, &line);
     }
+    enforce_reply_ceiling(attach_command, text);
 }
 
 fn append_trailing_line(text: &mut String, line: &str) {
@@ -137,6 +165,13 @@ fn append_trailing_line(text: &mut String, line: &str) {
         text.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
     }
     text.push_str(line);
+}
+
+/// Schema lookups are AFT-added trailers, not command output. Both terminal
+/// snapshots and completion previews call this after their output size caps.
+#[cfg(unix)]
+pub(crate) fn append_db_schema_hint(text: &mut String, hint: &str) {
+    append_trailing_line(text, hint);
 }
 
 /// Finalize an agent-visible response using the root selected by dispatch. The finalizer owns
@@ -156,6 +191,7 @@ pub fn finalize_response_for_dispatch_root(
     }
     let _ = publish_fleet_status(response, ctx, session_id);
     attach_alert_block(response, alerts, session_id, dispatch_root, attach_command);
+    enforce_response_ceiling(attach_command, response);
 }
 
 fn attach_alert_block(
@@ -201,6 +237,121 @@ pub enum DispatchOutcome {
 pub type PendingResponsePoll = Box<dyn FnMut(&AppContext) -> Option<Response> + Send>;
 pub type PendingResponseShutdown = Box<dyn FnMut(&AppContext) -> Response + Send>;
 
+/// Completion-only wake shared by a subc connection. Generation accounting
+/// coalesces bursts without losing a completion that races a registry poll.
+#[derive(Clone, Default)]
+pub(crate) struct DeferredResponseWake(std::sync::Arc<DeferredWakeState>);
+
+#[derive(Default)]
+struct DeferredWakeState {
+    generation: std::sync::atomic::AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+thread_local! {
+    static DEFERRED_WAKE: std::cell::RefCell<Option<DeferredResponseWake>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct DeferredWakeScope(Option<DeferredResponseWake>);
+
+impl Drop for DeferredWakeScope {
+    fn drop(&mut self) {
+        DEFERRED_WAKE.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+pub(crate) struct DeferredCompletionWake(Option<DeferredResponseWake>);
+
+impl Drop for DeferredCompletionWake {
+    fn drop(&mut self) {
+        if let Some(wake) = &self.0 {
+            wake.0
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            wake.0.notify.notify_one();
+        }
+    }
+}
+
+impl DeferredResponseWake {
+    pub(crate) fn install(&self) -> DeferredWakeScope {
+        DeferredWakeScope(DEFERRED_WAKE.with(|slot| slot.replace(Some(self.clone()))))
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.0.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) async fn notified(&self) {
+        self.0.notify.notified().await;
+    }
+}
+
+/// Capture before spawning, and keep the guard inside the producer until after
+/// sending its response. Drop also wakes the transport when a producer panics.
+pub(crate) fn deferred_completion_wake() -> DeferredCompletionWake {
+    DeferredCompletionWake(DEFERRED_WAKE.with(|slot| slot.borrow().clone()))
+}
+
+/// A one-shot sender that wakes the admitted connection after its value is
+/// queued, or after disconnecting if the producer returns without a value.
+pub struct PendingResponseSender<T> {
+    // Field drop order matters: disconnect before publishing the wake.
+    sender: std::sync::mpsc::SyncSender<T>,
+    _completion_wake: DeferredCompletionWake,
+}
+
+impl<T> PendingResponseSender<T> {
+    pub fn send(self, value: T) -> Result<(), std::sync::mpsc::SendError<T>> {
+        self.sender.send(value)
+    }
+}
+
+pub struct PendingResponseReceiver<T> {
+    receiver: std::sync::mpsc::Receiver<T>,
+    wake_installed: bool,
+}
+
+impl<T> PendingResponseReceiver<T> {
+    pub fn try_recv(&self) -> Result<T, std::sync::mpsc::TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+/// Capture the request's wake before transferring the sender to a producer.
+/// The receiver's type certifies that completion cannot omit that signal.
+pub fn pending_response_channel<T>() -> (PendingResponseSender<T>, PendingResponseReceiver<T>) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let completion_wake = deferred_completion_wake();
+    let wake_installed = completion_wake.0.is_some();
+    (
+        PendingResponseSender {
+            sender,
+            _completion_wake: completion_wake,
+        },
+        PendingResponseReceiver {
+            receiver,
+            wake_installed,
+        },
+    )
+}
+
+/// Deferred responses must choose a readiness mechanism: a wake-bound channel,
+/// or periodic polling for state/deadline-based producers. A raw struct literal
+/// cannot silently opt out of both mechanisms.
+///
+/// ```compile_fail
+/// use aft::response_finalize::PendingResponse;
+/// let _pending = PendingResponse {
+///     request_id: "unwoken".into(),
+///     session_id: "session".into(),
+///     attach_command: "read".into(),
+///     poll: Box::new(|_| None),
+///     cancellation: None,
+///     on_shutdown: None,
+///     poll_interval: None,
+/// };
+/// ```
 pub struct PendingResponse {
     pub request_id: String,
     pub session_id: String,
@@ -214,6 +365,79 @@ pub struct PendingResponse {
     /// shutdown. Long-running inspect uses this to avoid silently dropping its
     /// only agent-visible terminal frame.
     pub on_shutdown: Option<PendingResponseShutdown>,
+    poll_interval: Option<std::time::Duration>,
+}
+
+impl PendingResponse {
+    /// For state-based waits that can resolve on a deadline without any producer
+    /// sending a value. The transport must retain this timer even when idle.
+    pub fn polling(
+        request_id: String,
+        session_id: String,
+        attach_command: String,
+        poll: PendingResponsePoll,
+    ) -> Self {
+        Self {
+            request_id,
+            session_id,
+            attach_command,
+            poll,
+            cancellation: None,
+            on_shutdown: None,
+            poll_interval: Some(std::time::Duration::from_millis(100)),
+        }
+    }
+
+    /// Channel-backed producers cannot forget the completion wake: only the
+    /// receiver paired with a wake-bound sender can select completion-only polling.
+    pub fn from_receiver<T: Send + 'static>(
+        request_id: String,
+        session_id: String,
+        attach_command: String,
+        receiver: PendingResponseReceiver<T>,
+        mut poll: impl FnMut(&AppContext, Result<T, std::sync::mpsc::TryRecvError>) -> Option<Response>
+            + Send
+            + 'static,
+    ) -> Self {
+        // Standalone callers and callers without an admitted connection scope
+        // cannot publish this wake. Fail safe with a timer rather than trusting
+        // a channel whose sender has no transport to notify.
+        let poll_interval =
+            (!receiver.wake_installed).then_some(std::time::Duration::from_millis(100));
+        Self {
+            request_id,
+            session_id,
+            attach_command,
+            poll: Box::new(move |ctx| poll(ctx, receiver.try_recv())),
+            cancellation: None,
+            on_shutdown: None,
+            poll_interval,
+        }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: crate::executor::JobCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub fn with_shutdown(mut self, on_shutdown: PendingResponseShutdown) -> Self {
+        self.on_shutdown = Some(on_shutdown);
+        self
+    }
+
+    /// A channel-backed request may also need an independent overall deadline.
+    pub fn with_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        assert!(
+            !interval.is_zero(),
+            "pending response poll interval must be positive"
+        );
+        self.poll_interval = Some(interval);
+        self
+    }
+
+    pub fn poll_interval(&self) -> Option<std::time::Duration> {
+        self.poll_interval
+    }
 }
 
 pub struct ResolvedPending {
@@ -454,8 +678,11 @@ fn publish_fleet_status(
         .map(crate::harness::Harness::wire_label)
         .unwrap_or_else(|| "unknown".to_string());
     // The holder composes complete segments only: a partial set is published as quiet text.
-    let aft_text = ctx
-        .status_bar_counts()
+    let Some(values) = ctx.try_status_bar_count_values() else {
+        return FleetStatusPublish::Suppressed;
+    };
+    let aft_text = values
+        .legacy_projection()
         .as_ref()
         .map(aft_status_segment)
         .unwrap_or_default();
@@ -489,7 +716,7 @@ fn status_bar_line(
             reader_renders: false,
         } => {}
     }
-    let values = ctx.status_bar_count_values();
+    let values = ctx.try_status_bar_count_values()?;
     let nothing_known = [
         values.errors,
         values.warnings,
@@ -520,6 +747,56 @@ mod tests {
     use crate::harness::Harness;
     use crate::parser::TreeSitterProvider;
     use crate::protocol::Response;
+
+    #[test]
+    fn pending_response_channel_without_connection_scope_retains_timer() {
+        let (_sender, receiver) = super::pending_response_channel::<Response>();
+        let pending = PendingResponse::from_receiver(
+            "unscoped".into(),
+            "session".into(),
+            "read".into(),
+            receiver,
+            |_, completion| completion.ok(),
+        );
+        assert_eq!(
+            pending.poll_interval(),
+            Some(std::time::Duration::from_millis(100))
+        );
+        let wake = super::DeferredResponseWake::default();
+        let (_sender, receiver) = {
+            let _scope = wake.install();
+            super::pending_response_channel::<Response>()
+        };
+        let pending = PendingResponse::from_receiver(
+            "scoped".into(),
+            "session".into(),
+            "read".into(),
+            receiver,
+            |_, completion| completion.ok(),
+        );
+        assert!(
+            pending.poll_interval().is_none(),
+            "admitted channel producers stay completion-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_response_channel_wakes_after_producer_disconnect() {
+        let wake = super::DeferredResponseWake::default();
+        let (sender, receiver) = {
+            let _scope = wake.install();
+            super::pending_response_channel::<Response>()
+        };
+        std::thread::spawn(move || drop(sender));
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
+            .await
+            .expect("disconnected producer wake");
+        assert_eq!(wake.generation(), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
 
     #[test]
     fn only_an_opencode_session_can_have_its_bar_rendered_by_a_fleet_reader() {
@@ -664,16 +941,17 @@ mod tests {
     fn shutdown_delivery_emits_terminal_before_removing_entry() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let mut pending = PendingResponses::default();
-        pending.register(PendingResponse {
-            request_id: "inspect-shutdown".to_string(),
-            session_id: String::new(),
-            attach_command: String::new(),
-            poll: Box::new(|_| None),
-            cancellation: None,
-            on_shutdown: Some(Box::new(|_| {
+        pending.register(
+            PendingResponse::polling(
+                "inspect-shutdown".to_string(),
+                String::new(),
+                String::new(),
+                Box::new(|_| None),
+            )
+            .with_shutdown(Box::new(|_| {
                 Response::error("inspect-shutdown", "daemon_shutdown", "shutdown")
             })),
-        });
+        );
 
         let resolved = pending.drain_on_shutdown_with(&ctx);
         assert_eq!(resolved.len(), 1);
@@ -715,6 +993,68 @@ pub fn attach_checkout_query_gaps(response: &mut Response, ctx: &AppContext) {
                 }
             }
         }
+    }
+}
+
+pub const WATCHER_PENDING_NOTICE: &str = "Watcher changes pending: indexed or cached results may omit unapplied file changes. Retry after maintenance catches up; a missing result is not evidence of absence.";
+
+/// Capture before execution: finishing maintenance cannot make an already
+/// computed index-backed answer fresh retroactively. Live disk reads are exempt,
+/// and so are `outline` and `zoom`: they parse the file on disk, and the symbol
+/// cache they consult is checked against each file's current mtime and size.
+pub fn watcher_query_pending(ctx: &AppContext, command: &str) -> bool {
+    matches!(
+        command,
+        "grep"
+            | "glob"
+            | "search"
+            | "semantic_search"
+            | "inspect"
+            | "callgraph"
+            | "callers"
+            | "call_tree"
+            | "impact"
+            | "trace_to"
+            | "trace_to_symbol"
+            | "trace_data"
+    ) && ctx.watcher_query_has_pending_changes()
+}
+
+pub fn attach_watcher_query_gap(response: &mut Response, pending: bool) {
+    if !pending || !response.success {
+        return;
+    }
+    if let Some(data) = response.data.as_object_mut() {
+        data.insert("complete".into(), Value::Bool(false));
+        let gap = serde_json::json!({"kind":"watcher_pending", "reason":"file changes not yet applied to indexed or cached producers"});
+        let gaps = data
+            .entry("gaps")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(gaps) = gaps.as_array_mut() {
+            if !gaps.contains(&gap) {
+                gaps.push(gap);
+            }
+        }
+        if let Some(Value::String(text)) = data.get_mut("text") {
+            if !text.contains(WATCHER_PENDING_NOTICE) {
+                append_trailing_line(text, WATCHER_PENDING_NOTICE);
+            }
+        }
+    }
+}
+
+pub(crate) fn append_watcher_query_notice(text: &mut String, response: &Response) {
+    if response
+        .data
+        .get("gaps")
+        .and_then(Value::as_array)
+        .is_some_and(|gaps| {
+            gaps.iter()
+                .any(|gap| gap.get("kind").and_then(Value::as_str) == Some("watcher_pending"))
+        })
+        && !text.contains(WATCHER_PENDING_NOTICE)
+    {
+        append_trailing_line(text, WATCHER_PENDING_NOTICE);
     }
 }
 

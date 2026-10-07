@@ -299,9 +299,9 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
 }
 
 /// Render a completed write the way upstream `gh` would where plexus says
-/// enough: a speech verb prints its URL, a close or reopen prints the state
-/// it applied (and the URL of the comment it posted, when there was one), and
-/// other fields go through the governed renderer. Plexus omits any field
+/// enough: a speech verb prints its URL, and other fields go through the
+/// governed renderer. Native close/reopen confirmations are rendered with
+/// their request context by `render_thread_state_confirmation`. Plexus omits any field
 /// GitHub did not return, so every field is optional; a reply with no detail
 /// prints a plain completion line.
 ///
@@ -329,6 +329,33 @@ pub(super) fn render_completed(result: &Value) -> Result<String, RouteOutcome> {
     }
     let field_order: Vec<Value> = object.keys().map(|key| json!(key)).collect();
     render_governed_response(result, &field_order)
+}
+
+/// gh v2.86.0's issue/pr close/reopen commands print these confirmations on
+/// stderr (pkg/cmd/{issue,pr}/{close,reopen}). The relay may return only state,
+/// so use the already-canonical request for the repository and number. Include
+/// a title only when GitHub returned one; do not invent it or make another read.
+fn render_thread_state_confirmation(result: &Value, request: &Value) -> Option<String> {
+    let (past, noun, segment) = match request.get("verb")?.as_str()? {
+        "issue close" => ("Closed", "issue", "issues"),
+        "issue reopen" => ("Reopened", "issue", "issues"),
+        "pr close" => ("Closed", "pull request", "pull"),
+        "pr reopen" => ("Reopened", "pull request", "pull"),
+        _ => return None,
+    };
+    let repository = request.get("repository")?.as_str()?;
+    let number = request.get("number")?;
+    let number = if let Some(number) = number.as_str() {
+        super::parse_thread_target(number, segment)?.1
+    } else {
+        number.as_u64()?
+    };
+    let title = result
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|title| format!(" ({title})"))
+        .unwrap_or_default();
+    Some(format!("✓ {past} {noun} {repository}#{number}{title}\n"))
 }
 
 fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
@@ -372,6 +399,10 @@ fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
 pub(super) struct BindingsCheck {
     pub(super) manifest_version: u64,
     pub(super) repo_binding_generation: u64,
+    /// Handles already returned by the normal bindings check; never fetched
+    /// just to improve a refusal. Older cached checks have no handle detail.
+    #[serde(default)]
+    pub(super) handles: BTreeMap<String, String>,
 }
 
 fn load_check(paths: &StatePaths) -> Option<BindingsCheck> {
@@ -602,6 +633,20 @@ impl Exchange<'_> {
         Ok(BindingsCheck {
             manifest_version: manifest.manifest_version,
             repo_binding_generation: generation,
+            handles: reply
+                .get("result")
+                .unwrap_or(&reply)
+                .get("bindings")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|row| {
+                    Some((
+                        row.get("repository")?.as_str()?.to_ascii_lowercase(),
+                        row.get("app_handle_id")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect(),
         })
     }
 }
@@ -670,16 +715,22 @@ async fn exchange(
         }
         match reply {
             Reply::Completed { result, .. } => {
-                let output = match render_completed(&result) {
-                    Ok(output) => output,
-                    Err(outcome) => return outcome,
+                let outcome = if let Some(output) =
+                    render_thread_state_confirmation(&result, &body["params"]["request"])
+                {
+                    RouteOutcome::ResultStderr(output)
+                } else {
+                    match render_completed(&result) {
+                        Ok(output) => RouteOutcome::Result(output),
+                        Err(outcome) => return outcome,
+                    }
                 };
                 if let Some(RouteOutcome::RelayRefusal { text, .. }) = &mismatch {
                     // The write already happened; say so, and leave the check
                     // cleared so the next governed write refuses up front.
                     eprintln!("gh-shim: warning: {text}");
                 }
-                return RouteOutcome::Result(output);
+                return outcome;
             }
             Reply::Malformed(message) => {
                 // The request was sent; an unreadable reply cannot prove the
@@ -909,7 +960,52 @@ pub(super) fn route(
             ));
         }
     }
-    outcome
+    describe_session_agent_mismatch(outcome, agent_binding, manifest, paths)
+}
+
+/// Preserve the mint refusal verbatim after a caller-facing identity summary.
+/// The repository's identity comes from the active manifest, not the ids in an
+/// upstream error. The session id is only reported when prefrontal names it.
+fn describe_session_agent_mismatch(
+    outcome: RouteOutcome,
+    binding: &AgentBinding,
+    manifest: &Manifest,
+    paths: &StatePaths,
+) -> RouteOutcome {
+    let RouteOutcome::RelayRefusal { code, text } = &outcome else {
+        return outcome;
+    };
+    if code != "assertion_session_agent_mismatch" {
+        return outcome;
+    }
+    let Some(agent) = manifest.bindings.get(&binding.repo) else {
+        return outcome;
+    };
+    let session_agent = text
+        .split_once("belongs to agent ")
+        .and_then(|(_, tail)| tail.split_once(", not the requested agent "))
+        .map(|(agent, _)| agent)
+        .filter(|agent| {
+            !agent.is_empty()
+                && agent
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '[' | ']'))
+        })
+        .unwrap_or("unknown (prefrontal did not name the session's agent)");
+    let handle = load_check(paths)
+        .filter(|check| check.manifest_version == manifest.manifest_version)
+        .and_then(|check| check.handles.get(&binding.repo).cloned())
+        .filter(|handle| super::valid_github_login(handle));
+    let identity = handle
+        .map(|handle| format!("{handle} ({agent})"))
+        .unwrap_or_else(|| agent.clone());
+    RouteOutcome::RelayRefusal {
+        code: code.clone(),
+        text: format!(
+            "{} is bound to {identity}; this session is {session_agent}; {text}",
+            binding.repo
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -17,10 +17,11 @@ use crate::config::{
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
     InspectConfig, OpenCodeHostConfig, RerankBackendKind, RerankConfig, SandboxConfig,
     SearchConfig, SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
-    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
-    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES,
-    MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
-    MIN_BASH_WATCH_SYNC_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES,
+    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES, MAX_IDLE_ROOT_TTL_MINUTES,
+    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS,
+    MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES,
     MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::feature_config::{self, PolicyPhase};
@@ -386,11 +387,31 @@ pub struct RawLspServerEntry {
     pub initialization_options: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RawBash {
     Bool(bool),
     Features(RawBashFeatures),
+}
+
+/// `bash` is a boolean or an object. Written by hand rather than as an
+/// untagged enum, which would replace every error inside the object with "did
+/// not match any variant": a value below a minimum must be reported with the
+/// key it is about.
+impl<'de> Deserialize<'de> for RawBash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::Bool(enabled) => Ok(Self::Bool(enabled)),
+            Value::Object(map) => serde_json::from_value::<RawBashFeatures>(Value::Object(map))
+                .map(Self::Features)
+                .map_err(de::Error::custom),
+            other => Err(de::Error::custom(format!(
+                "bash must be a boolean or an object, not {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -404,6 +425,7 @@ pub struct RawBashFeatures {
     pub host_fallback: Option<bool>,
     pub subagent_background: Option<bool>,
     pub detach_on_user_message: Option<bool>,
+    pub db_schema_hints: Option<bool>,
     pub long_running_reminder_enabled: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
     pub long_running_reminder_interval_ms: Option<u64>,
@@ -411,6 +433,8 @@ pub struct RawBashFeatures {
     pub foreground_wait_window_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
     pub watch_sync_max_ms: Option<u64>,
+    #[serde(deserialize_with = "deserialize_opt_worker_wait_max_ms")]
+    pub worker_wait_max_ms: Option<u64>,
     pub linux_scope: Option<bool>,
     pub powershell_tool: Option<bool>,
 }
@@ -1482,6 +1506,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 detach_on_user_message: override_features
                     .detach_on_user_message
                     .or(base.detach_on_user_message),
+                db_schema_hints: override_features.db_schema_hints.or(base.db_schema_hints),
                 long_running_reminder_enabled: override_features
                     .long_running_reminder_enabled
                     .or(base.long_running_reminder_enabled),
@@ -1494,6 +1519,9 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 watch_sync_max_ms: override_features
                     .watch_sync_max_ms
                     .or(base.watch_sync_max_ms),
+                worker_wait_max_ms: override_features
+                    .worker_wait_max_ms
+                    .or(base.worker_wait_max_ms),
                 linux_scope: override_features.linux_scope.or(base.linux_scope),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
             }))
@@ -1513,10 +1541,12 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             host_fallback: None,
             subagent_background: None,
             detach_on_user_message: None,
+            db_schema_hints: None,
             long_running_reminder_enabled: None,
             long_running_reminder_interval_ms: None,
             foreground_wait_window_ms: None,
             watch_sync_max_ms: None,
+            worker_wait_max_ms: None,
             linux_scope: None,
             powershell_tool: None,
         },
@@ -2274,10 +2304,12 @@ struct ResolvedBashConfig {
     host_fallback: bool,
     subagent_background: bool,
     detach_on_user_message: bool,
+    db_schema_hints: bool,
     long_running_reminder_enabled: Option<bool>,
     long_running_reminder_interval_ms: Option<u64>,
     foreground_wait_window_ms: u64,
     watch_sync_max_ms: u64,
+    worker_wait_max_ms: u64,
     linux_scope: bool,
     powershell_tool: bool,
 }
@@ -2290,7 +2322,9 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     config.bash.enabled = bash.enabled;
     config.bash.host_fallback = bash.host_fallback;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
+    config.bash.db_schema_hints = bash.db_schema_hints;
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
+    config.bash.worker_wait_max_ms = bash.worker_wait_max_ms;
     config.bash.linux_scope = bash.linux_scope;
     config.bash.powershell_tool = bash.powershell_tool;
     config.experimental_bash_rewrite = bash.rewrite;
@@ -2337,6 +2371,11 @@ fn resolve_bash_config(
     let raw_foreground_wait = top_features.and_then(|features| features.foreground_wait_window_ms);
     let raw_watch_sync_max = top_features.and_then(|features| features.watch_sync_max_ms);
     let watch_sync_max_ms = resolve_clamped_bash_watch_sync_max_ms(raw_watch_sync_max, warnings);
+    // Below-minimum values never get here: the raw schema rejects them, which
+    // drops the `bash` block like any other invalid value.
+    let worker_wait_max_ms = top_features
+        .and_then(|features| features.worker_wait_max_ms)
+        .unwrap_or(DEFAULT_BASH_WORKER_WAIT_MAX_MS);
     let top_linux_scope = top_features
         .and_then(|features| features.linux_scope)
         .unwrap_or(false);
@@ -2355,10 +2394,14 @@ fn resolve_bash_config(
         host_fallback: false,
         subagent_background: true,
         detach_on_user_message: true,
+        db_schema_hints: top_features
+            .and_then(|features| features.db_schema_hints)
+            .unwrap_or(true),
         long_running_reminder_enabled: reminder_enabled,
         long_running_reminder_interval_ms: reminder_interval,
         foreground_wait_window_ms,
         watch_sync_max_ms,
+        worker_wait_max_ms,
         linux_scope: top_linux_scope,
         powershell_tool: false,
     };
@@ -2610,6 +2653,19 @@ where
         Some(value) if value < 1_000 => Err(de::Error::custom(
             "bridge.request_timeout_ms must be at least 1000",
         )),
+        other => Ok(other),
+    }
+}
+
+fn deserialize_opt_worker_wait_max_ms<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    match value {
+        Some(value) if value < MIN_BASH_WORKER_WAIT_MAX_MS => Err(de::Error::custom(format!(
+            "bash.worker_wait_max_ms must be at least {MIN_BASH_WORKER_WAIT_MAX_MS}"
+        ))),
         other => Ok(other),
     }
 }
@@ -2875,6 +2931,57 @@ mod tests {
         assert_eq!(
             project_override.config.bash.watch_sync_max_ms,
             MAX_BASH_WATCH_SYNC_MAX_MS
+        );
+    }
+
+    /// `bash.worker_wait_max_ms` defaults to 30 minutes, a project may set it
+    /// (it only changes how long a worker waits), and a value below the
+    /// one-minute minimum is rejected with a message naming the key instead of
+    /// being clamped: the invalid `bash` block is dropped, the strict check a
+    /// live reload runs refuses the file, and the other sections still apply.
+    #[test]
+    fn bash_worker_wait_max_defaults_accepts_project_and_rejects_below_minimum() {
+        assert_eq!(
+            resolve_config(&[]).config.bash.worker_wait_max_ms,
+            DEFAULT_BASH_WORKER_WAIT_MAX_MS
+        );
+
+        let project_override = resolve_config(&[
+            tier("user", r#"{ "bash": { "worker_wait_max_ms": 600000 } }"#),
+            tier("project", r#"{ "bash": { "worker_wait_max_ms": 120000 } }"#),
+        ]);
+        assert!(project_override.errors.is_empty());
+        assert_eq!(project_override.config.bash.worker_wait_max_ms, 120_000);
+        assert!(project_override
+            .dropped
+            .iter()
+            .all(|drop| !drop.key.contains("worker_wait_max_ms")));
+
+        let below = tier(
+            "user",
+            r#"{ "format_on_edit": false, "bash": { "compress": false, "worker_wait_max_ms": 59999 } }"#,
+        );
+        let error = strict_tier_error(&below, None).expect("below-minimum value is an error");
+        assert!(
+            error.contains("bash.worker_wait_max_ms must be at least 60000"),
+            "{error}"
+        );
+        let resolved = resolve_config(&[below]);
+        assert_eq!(
+            resolved.config.bash.worker_wait_max_ms,
+            DEFAULT_BASH_WORKER_WAIT_MAX_MS
+        );
+        // The whole invalid `bash` block is dropped, so `compress` stays on.
+        assert!(resolved.config.experimental_bash_compress);
+        assert!(!resolved.config.format_on_edit);
+
+        let minimum = resolve_config(&[tier(
+            "user",
+            &format!(r#"{{ "bash": {{ "worker_wait_max_ms": {MIN_BASH_WORKER_WAIT_MAX_MS} }} }}"#),
+        )]);
+        assert_eq!(
+            minimum.config.bash.worker_wait_max_ms,
+            MIN_BASH_WORKER_WAIT_MAX_MS
         );
     }
 

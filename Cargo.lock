@@ -24,11 +24,13 @@ name = "agent-file-tools"
 version = "0.58.2"
 dependencies = [
  "aft-tokenizer",
+ "apollo-parser",
  "ast-grep-core",
  "async-trait",
  "base64 0.22.1",
  "blake3",
  "content_inspector",
+ "cortexkit-exec-remote-types",
  "cortexkit-paths",
  "cortexkit-role-harness",
  "cortexkit-role-tool-provider",
@@ -43,6 +45,7 @@ dependencies = [
  "getrandom 0.3.4",
  "glob",
  "globset",
+ "graphql-parser",
  "half",
  "hf-hub",
  "htmd",
@@ -77,7 +80,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "rustc-demangle",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustls",
  "rustls-platform-verifier",
  "serde",
@@ -231,6 +234,17 @@ name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+
+[[package]]
+name = "apollo-parser"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11f6e2be4b3474e5890d34d3e483d49ec9b5cbf9e358bc62c9cc5423376df54b"
+dependencies = [
+ "memchr",
+ "rowan",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "arrayref"
@@ -576,6 +590,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cortexkit-exec-remote-types"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11f1e27441ead0c35d9b2ad98c91701608c23b6428396ff6a92eafe1e912937f"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "cortexkit-paths"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -592,9 +617,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.4.5"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "068c305434e881773a662aab07193edae5a961b82bbf409712a01aa093af2a23"
+checksum = "73ebda321fc7f00d1604b17e5e7e54139f8053d267c75ce60325b23bcc973994"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -605,9 +630,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider-conformance"
-version = "0.4.5"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bfed5e7ef0f6ed1db0f5a349eab687fb76502f2901e0888f6f122113cc91d04"
+checksum = "8455bb4bd0da2770ed67d10c3bbdc94394c880d17d86bb41e67ed5c42d367907"
 dependencies = [
  "async-trait",
  "cortexkit-role-harness",
@@ -626,6 +651,12 @@ dependencies = [
  "cc",
  "tree-sitter",
 ]
+
+[[package]]
+name = "countme"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7704b5fdd17b18ae31c4c1da5a2e0305a2bf17b5249300a9ee9ed7b72114c636"
 
 [[package]]
 name = "cow-utils"
@@ -1302,6 +1333,16 @@ dependencies = [
  "log",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "graphql-parser"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a818c0d883d7c0801df27be910917750932be279c7bc82dc541b8769425f409"
+dependencies = [
+ "combine",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2404,7 +2445,7 @@ dependencies = [
  "allocator-api2",
  "hashbrown 0.17.1",
  "oxc_data_structures",
- "rustc-hash",
+ "rustc-hash 2.1.2",
 ]
 
 [[package]]
@@ -2518,7 +2559,7 @@ dependencies = [
  "oxc_span",
  "oxc_str",
  "oxc_syntax",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "seq-macro",
 ]
 
@@ -2535,7 +2576,7 @@ dependencies = [
  "oxc_span",
  "oxc_str",
  "phf",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "unicode-id-start",
 ]
 
@@ -2554,7 +2595,7 @@ dependencies = [
  "once_cell",
  "papaya",
  "percent-encoding",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustix",
  "self_cell",
  "serde",
@@ -2583,7 +2624,7 @@ dependencies = [
  "oxc_span",
  "oxc_str",
  "oxc_syntax",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "self_cell",
 ]
 
@@ -2912,7 +2953,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustls",
  "socket2",
  "thiserror 2.0.18",
@@ -2932,7 +2973,7 @@ dependencies = [
  "lru-slab",
  "rand",
  "ring",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "rustls",
  "rustls-pki-types",
  "slab",
@@ -3194,6 +3235,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rowan"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "417a3a9f582e349834051b8a10c8d71ca88da4211e4093528e36b9845f6b5f21"
+dependencies = [
+ "countme",
+ "hashbrown 0.14.5",
+ "rustc-hash 1.1.0",
+ "text-size",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3212,6 +3265,12 @@ name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -3700,9 +3759,9 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subc-client-rs"
-version = "0.25.0"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8aa97bb9176d93f0a5bd2582e61fd0e7441c828ac94ecf3b733be03daa6dd40"
+checksum = "d671a838c7777805070da19080045ef5149882636b3bd8193c5e913a590c7315"
 dependencies = [
  "async-trait",
  "serde",
@@ -3718,9 +3777,9 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.27.0"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cfbeb68a27b8e01681e5e33a39f8cdd37d10a47cc2e42a1d2fa30c10de071c1"
+checksum = "4cb088c665dcce2507c7e480087b2d0235caa5e9adbfb2277545022869b909de"
 dependencies = [
  "serde",
  "serde_json",
@@ -3739,9 +3798,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.28.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e543313883f0155add4063a1469d791eb8b0ed03d26a42eeae58c59add4a4f7"
+checksum = "d65caff6df13f6ccbc6fc855e9826af4cbcd13fcaf26ae9ce26871ed4429e471"
 dependencies = [
  "serde",
  "serde_json",
@@ -3749,9 +3808,9 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf6824508ab1c68ae04bc563e2ef84ab90c910f7b1b31bccb9dfb211c0707bb4"
+checksum = "1edb5dfb8ff70b1f585c2d13337dbabab75a06a20531eedfba31ceee3a565047"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
@@ -3834,6 +3893,12 @@ dependencies = [
  "new_debug_unreachable",
  "utf-8",
 ]
+
+[[package]]
+name = "text-size"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f18aa187839b2bdb1ad2fa35ead8c4c2976b64e4363c386d45ac0f7ee85c9233"
 
 [[package]]
 name = "textwrap"
@@ -4577,6 +4642,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

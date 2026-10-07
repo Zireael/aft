@@ -452,6 +452,7 @@ pub(crate) fn finish_tool_call_response(
     if let Some(trace) = phase_trace.as_mut() {
         trace.mark_finalize_done();
     }
+    crate::response_finalize::enforce_reply_ceiling(bare_name, &mut text);
     ToolCallResult { text, response }
 }
 
@@ -473,6 +474,8 @@ pub(crate) struct RepeatObservation {
     /// Picks the reminder's wording: a delegated worker is never told to end
     /// its turn.
     worker_session: bool,
+    /// Prevents reminders from naming a wait tool absent from the caller's catalog.
+    bash_watch_available: bool,
 }
 
 impl RepeatObservation {
@@ -502,6 +505,7 @@ impl RepeatObservation {
         args: &Value,
         preview: bool,
         worker_session: bool,
+        bash_watch_available: bool,
     ) -> Option<Self> {
         if crate::subc::is_subc_native_plumbing_tool(tool) || preview {
             return None;
@@ -511,6 +515,7 @@ impl RepeatObservation {
             tool: tool.to_string(),
             semantic_key: crate::response_finalize::repeat_breaker::semantic_key(tool, args),
             worker_session,
+            bash_watch_available,
         })
     }
 
@@ -534,6 +539,7 @@ impl RepeatObservation {
                 &self.session_id,
                 &intervention,
                 self.worker_session,
+                self.bash_watch_available,
             );
         }
     }
@@ -562,6 +568,9 @@ pub fn run_tool_call(
         &args,
         ctx.preview,
         ctx.worker_session,
+        format_context
+            .bash_watch_available
+            .unwrap_or(ctx.worker_session),
     );
     // Only a dispatched call is finalized; a translation or request-shape refusal never was.
     let mut finalize_after_breaker = false;
@@ -580,12 +589,15 @@ pub fn run_tool_call(
                     .as_deref()
                     .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
             );
+            let watcher_pending =
+                crate::response_finalize::watcher_query_pending(app_ctx, &prepared.request.command);
             let mut response = if prepared.request.command == "inspect" {
                 crate::commands::inspect::handle_inspect_tool_call(&prepared.request, app_ctx)
             } else {
                 dispatch(prepared.request, app_ctx)
             };
             crate::response_finalize::attach_checkout_query_gaps(&mut response, app_ctx);
+            crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
             if response.success && response.data.get("backup_skipped_reason").is_none() {
                 let session = ctx
                     .session_id
@@ -632,6 +644,7 @@ pub fn run_tool_call(
         }
     }
 
+    crate::response_finalize::enforce_reply_ceiling(bare_name, &mut result.text);
     ToolCallOutcome::Unary(result)
 }
 
@@ -695,6 +708,7 @@ fn tool_call_result_from_response(
     if surface_downgraded {
         append_hashline_downgrade_text(&mut text);
     }
+    crate::response_finalize::enforce_reply_ceiling(bare_name, &mut text);
     ToolCallResult { text, response }
 }
 

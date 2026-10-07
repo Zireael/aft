@@ -452,7 +452,17 @@ rendered at.
 
 `real-query-baseline.json` and its `manifest.sha256` sidecar are the byte-equality
 reference: the `engine_unwired` class asserts every ranked row is byte-equal to
-it. Moving that pair is an audited act, never a repair to make a red gate green.
+it. A presentation-only repair may declare `presentation_rows`, a map from
+episode id to `{"before": ["exact reference lines"], "after": ["exact replay lines"]}`.
+Only `summary_text` on those rows may differ, and both arrays must match exactly.
+The gate refuses unlisted changes, mismatched lines and listed rows that did not
+change, naming the row and field. Ranked paths, pattern summaries, metrics and
+all existing family checks remain strict. This field is refused on other
+descriptor classes. Copy its lines from a real release-binary replay, not an
+invented expectation; re-record the reference in a subsequent train once the
+presentation repair has landed.
+
+Moving that pair is an audited act, never a repair to make a red gate green.
 Re-record only after the cause of the difference is established, on one binary,
 with `cost-gate.sh --search-quality --mode record-reference`, and say in the
 commit message which change moved the rows and why it was the right direction.

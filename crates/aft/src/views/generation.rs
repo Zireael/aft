@@ -23,13 +23,14 @@ impl ViewStore {
 
     pub(super) fn derived_owner(&self, generation: &str) -> Result<String> {
         super::validate_generation(generation)?;
-        match fs::read_to_string(self.view_dir().join(format!("derived-{generation}.ref"))) {
+        let path = self.view_dir().join(format!("derived-{generation}.ref"));
+        match fs::read_to_string(&path) {
             Ok(owner) => {
                 super::validate_generation(&owner)?;
                 Ok(owner)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(generation.to_owned()),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(ViewError::io_at("reading", &path, error)),
         }
     }
 
@@ -45,10 +46,13 @@ impl ViewStore {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)?;
+            .open(&path)
+            .map_err(|error| ViewError::io_at("creating", &path, error))?;
         use std::io::Write as _;
-        file.write_all(owner.as_bytes())?;
-        file.sync_all()?;
+        file.write_all(owner.as_bytes())
+            .map_err(|error| ViewError::io_at("writing", &path, error))?;
+        file.sync_all()
+            .map_err(|error| ViewError::io_at("syncing", &path, error))?;
         super::sync_parent(&path)
     }
 
@@ -465,10 +469,11 @@ fn remove_unpublished_derived_locked(path: &Path) -> Result<()> {
     for suffix in ["", "-wal", "-shm"] {
         let mut candidate = path.as_os_str().to_owned();
         candidate.push(suffix);
-        match fs::remove_file(PathBuf::from(candidate)) {
+        let candidate = PathBuf::from(candidate);
+        match fs::remove_file(&candidate) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(ViewError::io_at("removing", &candidate, error)),
         }
     }
     Ok(())

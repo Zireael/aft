@@ -75,6 +75,9 @@ enum BashSpawnControl {
         wait_window_ms: u64,
         detach_on_user_message: bool,
         worker_session: bool,
+        /// The worker wait limit bounding this wait, when it is a delegated
+        /// worker's blocking call (`wait: true` or `block_to_completion`).
+        worker_cap_ms: Option<u64>,
     },
 }
 
@@ -128,13 +131,22 @@ struct DeferredWaitObservation {
 /// terminal snapshot may render cached output from disk. Doing either inline
 /// stops the frame loop, so no route's frames are read or written until the
 /// lock frees. Here the frame loop only awaits.
+///
+/// `renew_window` is set for a delegated worker's capped wait: the worker is
+/// waiting on its command, so each wake keeps the task's default hard kill at
+/// least that far away, and the kill cannot fire before the cap hands control
+/// back to the worker.
 async fn observe_deferred_bash_wait(
     registry: crate::bash_background::BgTaskRegistry,
     task_id: String,
     session_id: String,
     wait_mode: bool,
+    renew_window: Option<Duration>,
 ) -> DeferredWaitObservation {
     tokio::task::spawn_blocking(move || {
+        if let Some(window) = renew_window {
+            registry.renew_hard_kill(&task_id, &session_id, window);
+        }
         let target_finished = registry
             .observed_status(&task_id, &session_id, 0)
             .is_none_or(|snapshot| snapshot.info.status.is_terminal());
@@ -156,9 +168,14 @@ async fn observe_deferred_bash_wait(
 /// Hands a held call's command to the background the way a drain detach does
 /// (the task keeps running and delivers its completion later), off the
 /// executor and off the module loop's thread: promotion writes task metadata.
-fn detach_held_bash_in_background(target: drain::BashDetachTarget) {
+pub(super) fn detach_held_bash_in_background(target: drain::BashDetachTarget, cancelled: bool) {
     tokio::task::spawn_blocking(move || {
-        if target.server_completion {
+        if target.server_completion
+            && (cancelled
+                || !target
+                    .registry
+                    .is_remote_task(&target.task_id, &target.session_id))
+        {
             let _ = target.registry.kill(&target.task_id, &target.session_id);
         } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
             log::warn!(
@@ -203,15 +220,40 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                     route.epoch,
                     corr,
                     target.flags,
-                    "cancelled",
-                    "server-owned call ended during module drain",
+                    if target
+                        .registry
+                        .is_remote_task(&target.task_id, &target.session_id)
+                    {
+                        "outcome_unknown_module_draining"
+                    } else {
+                        "cancelled"
+                    },
+                    &if target
+                        .registry
+                        .is_remote_task(&target.task_id, &target.session_id)
+                    {
+                        format!("remote task {} survives module drain; inspect bash_status after reconnecting, never rerun the command",target.task_id)
+                    } else {
+                        "server-owned call ended during module drain".into()
+                    },
                 )?)
             }
             (drain::BashLoopAnswer::Drain, Some(identity)) => {
                 let response = Response::success(
                     &target.request_id,
                     json!({
-                        "output": crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id, target.worker_session),
+                        "output": format!(
+                        "{}{}",
+                        crate::commands::bash_orchestrate::format_module_drain_detach_message(
+                            &target.task_id,
+                            target.worker_session,
+                            target
+                                .format_context
+                                .bash_watch_available
+                                .unwrap_or(target.worker_session),
+                        ),
+                        crate::commands::bash_orchestrate::kill_deadline_note(&target.registry, &target.task_id, &target.session_id, target.worker_session),
+                    ),
                         "task_id": target.task_id,
                         "status": "running",
                     }),
@@ -236,7 +278,7 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                 "request cancelled",
             )?),
         };
-        detach_held_bash_in_background(target);
+        detach_held_bash_in_background(target, matches!(reason, drain::BashLoopAnswer::Cancel));
         if let Some(frame) = frame {
             send_reliable_writer_frame(tx, metrics, frame, "held bash answer").await?;
         }
@@ -350,11 +392,21 @@ fn bash_background_launch_response(
     task_id: &str,
     is_pty: bool,
     worker_session: bool,
+    bash_watch_available: bool,
+    deadline_note: &str,
 ) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty, worker_session),
+            "output": format!(
+                "{}{deadline_note}",
+                crate::commands::bash_orchestrate::format_background_launch(
+                    task_id,
+                    is_pty,
+                    worker_session,
+                    bash_watch_available,
+                )
+            ),
             "task_id": task_id,
             "status": "running",
             "mode": if is_pty { "pty" } else { "pipes" },
@@ -444,6 +496,7 @@ pub(super) fn submit_deferred_bash(
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     worker_session: bool,
     server_completion: bool,
+    remote_key: Option<crate::db::remote_exec::PolicyKey>,
 ) {
     let claim = metrics.held_bash_calls.insert(route, corr);
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
@@ -553,7 +606,10 @@ pub(super) fn submit_deferred_bash(
                     crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                         crate::bash_background::with_call_key(call_key, || {
                             (
-                                dispatch(raw_req, ctx),
+                                crate::bash_background::with_remote_policy(
+                                    super::remote_policy::lookup(ctx, remote_key.as_ref()),
+                                    || dispatch(raw_req, ctx),
+                                ),
                                 crate::bash_background::task_storage_dir(ctx),
                             )
                         })
@@ -613,6 +669,15 @@ pub(super) fn submit_deferred_bash(
                         &task_id,
                         is_pty,
                         worker_session,
+                        format_context_for_spawn
+                            .bash_watch_available
+                            .unwrap_or(worker_session),
+                        &crate::commands::bash_orchestrate::kill_deadline_note(
+                            ctx.bash_background(),
+                            &task_id,
+                            &session_for_spawn,
+                            worker_session,
+                        ),
                     );
                     return finish_bash_spawn_immediate(
                         response,
@@ -626,12 +691,20 @@ pub(super) fn submit_deferred_bash(
                     );
                 }
 
-                let wait_window_ms =
+                // A server-owned call is killed rather than detached when it
+                // ends, so the worker wait limit (which detaches) leaves it be.
+                let worker_cap_ms = crate::commands::bash_orchestrate::worker_wait_cap_ms(
+                    worker_session && !server_completion,
+                    settings.block_to_completion || settings.wait,
+                    crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
+                );
+                let wait_window_ms = worker_cap_ms.unwrap_or_else(|| {
                     crate::commands::bash_orchestrate::select_foreground_wait_window_ms(
                         ctx.config().foreground_wait_window_ms,
                         settings.timeout,
                         settings.wait,
-                    );
+                    )
+                });
                 let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
                 let project_root = ctx.config().project_root.clone();
                 // Register the session as detachable exactly like the
@@ -652,11 +725,14 @@ pub(super) fn submit_deferred_bash(
                         project_root,
                         storage_dir,
                         deadline,
-                        block_to_completion: settings.block_to_completion || settings.wait,
+                        // A capped worker wait detaches at its deadline.
+                        block_to_completion: (settings.block_to_completion || settings.wait)
+                            && worker_cap_ms.is_none(),
                         timeout: settings.timeout,
                         wait_window_ms,
                         detach_on_user_message,
                         worker_session,
+                        worker_cap_ms,
                     });
                 }
                 response
@@ -712,6 +788,7 @@ pub(super) fn submit_deferred_bash(
                 wait_window_ms,
                 detach_on_user_message,
                 worker_session,
+                worker_cap_ms,
             }) => {
                 let phase = if detach_on_user_message {
                     drain::BashHoldPhase::Wait
@@ -743,6 +820,7 @@ pub(super) fn submit_deferred_bash(
                     wait_window_ms,
                     detach_on_user_message,
                     worker_session,
+                    worker_cap_ms,
                     format_context,
                     cancel,
                     claim,
@@ -794,6 +872,7 @@ async fn run_deferred_bash_wait(
     wait_window_ms: u64,
     detach_on_user_message: bool,
     worker_session: bool,
+    worker_cap_ms: Option<u64>,
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     claim: Arc<drain::BashCallClaim>,
@@ -862,7 +941,8 @@ async fn run_deferred_bash_wait(
                     let session_id = session_id.clone();
                     let task_id = task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        if server_completion { let _ = registry.kill(&task_id, &session_id); }
+                        if server_completion && !registry.is_remote_task(&task_id,&session_id) { let _ = registry.kill(&task_id, &session_id); }
+                        else if registry.is_remote_task(&task_id,&session_id) { let _=registry.promote(&task_id,&session_id); }
                         release_wait_registration(
                             &registry,
                             &session_id,
@@ -897,6 +977,7 @@ async fn run_deferred_bash_wait(
                     task_id.clone(),
                     session_id.clone(),
                     detach_on_user_message,
+                    worker_cap_ms.map(Duration::from_millis),
                 )
                 .await
             } => {
@@ -981,6 +1062,9 @@ async fn run_deferred_bash_wait(
                                         &session_for_poll,
                                         &request_id_for_poll,
                                         worker_session,
+                                        format_context_for_poll
+                                            .bash_watch_available
+                                            .unwrap_or(worker_session),
                                     );
                                 if detach_on_user_message {
                                     ctx.bash_background().end_wait_mode_session(
@@ -1019,6 +1103,9 @@ async fn run_deferred_bash_wait(
                                     &session_for_poll,
                                     &request_id_for_poll,
                                     worker_session,
+                                    format_context_for_poll
+                                        .bash_watch_available
+                                        .unwrap_or(worker_session),
                                 );
                                 ctx.bash_background().end_wait_mode_session(
                                     &session_for_poll,
@@ -1039,6 +1126,13 @@ async fn run_deferred_bash_wait(
                                 snapshot,
                                 deadline,
                                 block_to_completion,
+                                worker_cap_ms.is_some()
+                                    && crate::commands::bash_orchestrate::worker_kill_deadline_within_handoff_margin(
+                                        ctx.bash_background().hard_kill_remaining(
+                                            &task_id_for_poll,
+                                            &session_for_poll,
+                                        ),
+                                    ),
                                 Instant::now(),
                                 &request_id_for_poll,
                             ) {
@@ -1189,6 +1283,7 @@ async fn run_deferred_bash_wait(
                             timeout,
                             wait_window_ms,
                             worker_session,
+                            worker_cap_ms.is_some(),
                             format_context.clone(),
                             repeat.clone(),
                         )
@@ -1225,6 +1320,7 @@ async fn submit_bash_promote(
     timeout: Option<u64>,
     wait_window_ms: u64,
     worker_session: bool,
+    capped_worker_wait: bool,
     format_context: crate::subc_format::FormatContext,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
@@ -1259,6 +1355,10 @@ async fn submit_bash_promote(
                         wait_window_ms,
                         &request_id_for_promote,
                         worker_session,
+                        format_context_for_promote
+                            .bash_watch_available
+                            .unwrap_or(worker_session),
+                        capped_worker_wait,
                     )
                 };
                 let result = finalized_bash_result(
@@ -1537,6 +1637,7 @@ mod grant_path_tests {
                 None,
                 false,
                 true,
+                None,
             );
             let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
                 .await
@@ -1647,6 +1748,7 @@ mod grant_path_tests {
                 None,
                 false,
                 false,
+                None,
             );
         }
 
@@ -1795,6 +1897,7 @@ mod grant_path_tests {
             None,
             false,
             false,
+            None,
         );
 
         let started_by = Instant::now() + Duration::from_secs(3);

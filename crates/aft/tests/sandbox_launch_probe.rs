@@ -1,4 +1,6 @@
 #![cfg(unix)]
+#[path = "helpers/context_storage.rs"]
+mod context_storage;
 
 #[cfg(target_os = "linux")]
 use aft::bash_background::persistence::resolve_task;
@@ -446,7 +448,7 @@ fn v1_profile_is_a_structured_sandbox_unavailable_failure() {
     assert_eq!(output.status.code(), Some(78));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("sandbox_unavailable:"));
-    assert!(stderr.contains("unsupported sandbox profile version 1; expected 2"));
+    assert!(stderr.contains("unsupported sandbox profile version 1; expected 3"));
 }
 
 #[test]

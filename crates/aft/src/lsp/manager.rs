@@ -5,14 +5,11 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use lsp_types::notification::{
-    DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
-    DidSaveTextDocument,
+    DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
 };
 use lsp_types::{
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, FileChangeType, FileEvent,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    VersionedTextDocumentIdentifier,
+    DidChangeWatchedFilesParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, FileChangeType, FileEvent, TextDocumentIdentifier, TextDocumentItem,
 };
 
 use crate::alert_state::AcceptedDiagnosticSnapshot;
@@ -25,7 +22,7 @@ use crate::lsp::client::{
 use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
-use crate::lsp::document::DocumentStore;
+use crate::lsp::document::{DiskSnapshot, DocumentStore};
 use crate::lsp::position::{uri_for_path, uri_to_path};
 use crate::lsp::pull_params::{
     AftDocumentDiagnosticParams, AftDocumentDiagnosticRequest, AftWorkspaceDiagnosticParams,
@@ -280,6 +277,9 @@ pub struct PostEditWaitOutcome {
     /// Reported to the agent via `pending_lsp_servers` so they understand
     /// the result is partial.
     pub pending_servers: Vec<ServerKey>,
+    /// Pending producers proven silent by the client, not merely warming,
+    /// unversioned, or unreachable because the manager was busy.
+    pub unresponsive_servers: Vec<ServerKey>,
     /// Servers whose process exited between notification and deadline.
     /// Reported separately so the agent knows the gap is unrecoverable
     /// without a server restart, not "wait longer."
@@ -352,6 +352,9 @@ pub(crate) struct DocumentPull {
     key: ServerKey,
     canonical_path: PathBuf,
     document_version: Option<i32>,
+    /// The pull itself opened the document in this server (it was not open
+    /// for an edit or an earlier query).
+    opened_for_pull: bool,
     state: DocumentPullState,
 }
 
@@ -437,6 +440,9 @@ where
     G: std::ops::DerefMut<Target = LspManager>,
 {
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    // Start any missing server without the lock; the pulls below then only
+    // open the document and send the requests under it.
+    start_servers_for_file_unlocked(&lock, file_path, config);
     let pulls = lock().begin_file_pulls(file_path, config, deadline)?;
     // All requests are in flight at once; wait for each without the lock.
     let replies = pulls
@@ -448,6 +454,7 @@ where
         .into_iter()
         .map(|pull| {
             let server_key = pull.key.clone();
+            let opened_for_pull = pull.opened_for_pull;
             let outcome = lsp.finish_document_pull(pull);
             // Read the pulled report under the same lock that stored it: a
             // push drained in between would replace it. Until a check has
@@ -470,6 +477,7 @@ where
             PullFileResult {
                 server_key,
                 outcome,
+                opened_for_pull,
             }
         })
         .collect())
@@ -491,6 +499,83 @@ where
     };
     let reply = request.wait(timeout);
     lock().finish_workspace_pull(server_key, reply)
+}
+
+/// Send an interactive request (hover, definition, references, rename) to the
+/// running server that owns `file_path` and wait for its reply.
+///
+/// The manager lock is held only to find the client and write the request.
+/// The wait for the reply, up to eight seconds on a busy server, runs without
+/// it: holding the lock there made every other manager user (the request
+/// loop rendering the status bar for a sibling `read`, an edit's `didChange`)
+/// wait for the slow server too. `lock` acquires the manager (for example
+/// `|| ctx.lsp()`). `None` when no running client owns the file.
+pub fn send_file_request_unlocked<R, G>(
+    lock: impl Fn() -> G,
+    file_path: &Path,
+    config: &Config,
+    params: R::Params,
+) -> Option<Result<R::Result, LspError>>
+where
+    R: lsp_types::request::Request,
+    R::Params: serde::Serialize,
+    R::Result: serde::de::DeserializeOwned,
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    let started = {
+        let mut lsp = lock();
+        let client = lsp.client_for_file_mut(file_path, config)?;
+        client.start_request::<R>(params)
+    };
+    Some(
+        started
+            .and_then(|request| request.wait(crate::lsp::client::INTERACTIVE_REQUEST_TIMEOUT))
+            .and_then(|value| serde_json::from_value(value).map_err(Into::into)),
+    )
+}
+
+/// `workspace/diagnostic` for several servers at once: every request is sent
+/// under one lock, all replies are awaited together without it, and stored
+/// under one lock. Pulling the servers one after another made a directory
+/// query wait for the sum of their replies (up to ten seconds each) instead
+/// of the slowest one. Results are in the order of `server_keys`.
+pub fn pull_workspace_diagnostics_many_unlocked<G>(
+    lock: impl Fn() -> G,
+    server_keys: &[ServerKey],
+    timeout: Option<Duration>,
+) -> Vec<Result<PullWorkspaceResult, LspError>>
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    let timeout = timeout.unwrap_or(LspManager::PULL_WORKSPACE_TIMEOUT);
+    let started: Vec<_> = {
+        let mut lsp = lock();
+        server_keys
+            .iter()
+            .map(|key| lsp.begin_workspace_pull(key))
+            .collect()
+    };
+    // Every request was sent just now, so each still gets its full budget.
+    let deadline = Instant::now() + timeout;
+    let replies: Vec<_> = started
+        .into_iter()
+        .map(|started| {
+            started.map(|request| {
+                request
+                    .map(|request| request.wait(deadline.saturating_duration_since(Instant::now())))
+            })
+        })
+        .collect();
+    let mut lsp = lock();
+    server_keys
+        .iter()
+        .zip(replies)
+        .map(|(key, reply)| match reply {
+            Err(error) => Err(error),
+            Ok(None) => Ok(unsupported_workspace_pull(key)),
+            Ok(Some(reply)) => lsp.finish_workspace_pull(key, reply),
+        })
+        .collect()
 }
 
 /// The diagnostics of both lists, each identical diagnostic once.
@@ -535,6 +620,12 @@ impl EnsureFileOpenResult {
 pub struct PullFileResult {
     pub server_key: ServerKey,
     pub outcome: PullFileOutcome,
+    /// The pull opened the document in this server just to ask about it.
+    /// The caller closes it once done (see
+    /// [`LspManager::close_documents_opened_for_pulls`]), so documents
+    /// nobody edits do not stay open in the server for the rest of the
+    /// session.
+    pub opened_for_pull: bool,
 }
 
 /// Result of `pull_workspace_diagnostics` for a single server.
@@ -575,6 +666,7 @@ pub(crate) struct PostEditDiagnosticsWait {
     lookup_path: PathBuf,
     expected_versions: Vec<(ServerKey, i32)>,
     pre_snapshot: HashMap<ServerKey, PreEditSnapshot>,
+    responses_at_start: HashMap<ServerKey, u64>,
     event_rx: Receiver<LspEvent>,
     wake_rx: Receiver<()>,
     waiter_id: u64,
@@ -601,6 +693,42 @@ impl PostEditDiagnosticsWait {
             recv(self.wake_rx) -> _ => None,
             default(remaining) => None,
         }
+    }
+}
+
+/// A subscription for a caller that waits for language-server events with
+/// the manager lock released (see [`LspManager::subscribe_events`]). It
+/// returns when an event arrives or another drain path handled one, so the
+/// caller re-checks at once instead of sleeping a fixed interval.
+pub(crate) struct LspEventWait {
+    event_rx: Receiver<LspEvent>,
+    wake_rx: Receiver<()>,
+    waiter_id: u64,
+}
+
+impl LspEventWait {
+    /// Block until an event arrives, another drain handles one, or `until`.
+    /// A returned event must be passed to
+    /// [`LspManager::handle_waited_event`].
+    pub(crate) fn next_event(&self, until: Instant) -> Option<LspEvent> {
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        crossbeam_channel::select! {
+            recv(self.event_rx) -> event => event.ok(),
+            recv(self.wake_rx) -> _ => None,
+            default(remaining) => None,
+        }
+    }
+
+    /// Forget a wake raised by drains up to now. Call it with the manager
+    /// locked, right after checking the state: every drain so far is covered
+    /// by that check (the waiter's own handling of an event wakes it too),
+    /// and a drain after it can only happen once the lock is released, so
+    /// its wake is not lost.
+    pub(crate) fn clear_pending_wake(&self) {
+        let _ = self.wake_rx.try_recv();
     }
 }
 
@@ -711,7 +839,14 @@ pub struct LspManager {
     /// with a clean-looking report, so empty publishes for these documents
     /// are ignored until a non-empty publish arrives or AFT opens or edits
     /// the file again (see `is_inspect_close_clearing`).
-    inspect_closed_documents: HashSet<(ServerKey, PathBuf)>,
+    ///
+    /// Each entry carries the order it was added in. Past
+    /// [`INSPECT_CLOSED_DOCUMENTS_CAP`] the oldest are forgotten: a server
+    /// answers a close within moments, so an old entry no longer guards
+    /// anything, and without the cap a long session inspecting many files
+    /// kept one entry per file for good.
+    inspect_closed_documents: HashMap<(ServerKey, PathBuf), u64>,
+    inspect_close_sequence: u64,
     /// The latest pushed diagnostics per file from rust-analyzer instances
     /// that also answer pull requests. In that mode rust-analyzer reports its
     /// own analysis through pull and its `cargo check` results through push,
@@ -729,6 +864,16 @@ pub struct LspManager {
     /// Times the retry window of transient start failures in `failed_spawns`.
     retry_clock: RetryClock,
 }
+#[cfg(test)]
+thread_local! {
+    /// Typed parses of `publishDiagnostics` payloads on this thread.
+    static PUBLISH_DIAGNOSTICS_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many documents closed by a scoped inspect `LspManager` remembers (see
+/// `LspManager::inspect_closed_documents`).
+const INSPECT_CLOSED_DOCUMENTS_CAP: usize = 4_096;
+
 /// How many server-exit log lines `LspManager` keeps for inspection.
 const RECENT_EXIT_LOG_LINES: usize = 16;
 /// Upper bound on exit reports waiting for their reader event. Every spawned
@@ -880,7 +1025,8 @@ impl LspManager {
             pending_exit_reports: HashMap::new(),
             starting: HashMap::new(),
             clients_generation: 0,
-            inspect_closed_documents: HashSet::new(),
+            inspect_closed_documents: HashMap::new(),
+            inspect_close_sequence: 0,
             latest_push_for_pull_servers: HashMap::new(),
             latest_pull_for_rust: HashMap::new(),
             retry_clock: RetryClock::system(),
@@ -1368,6 +1514,122 @@ impl LspManager {
         });
     }
 
+    /// First step of [`ensure_server_for_file_detailed_unlocked`] for one
+    /// server, under the lock. Mirrors the checks of
+    /// [`Self::ensure_server_for_file_detailed`] (running client, remembered
+    /// failure, orphan reap) and reserves the server when it has to start.
+    fn begin_file_server_start(
+        &mut self,
+        def: &ServerDef,
+        key: &ServerKey,
+        file_path: &Path,
+        config: &Config,
+    ) -> FileServerStart {
+        if self.clients.contains_key(key) {
+            return FileServerStart::Running;
+        }
+        if let Some(reservation) = self.starting.get(key) {
+            return FileServerStart::Wait(Arc::clone(&reservation.signal));
+        }
+        if let Some(cached) = self.failure_to_replay(key) {
+            return FileServerStart::Failed(cached);
+        }
+        self.reap_unreferenced_children_for(key);
+        self.log_transient_retry(key);
+        match self.prepare_spawn(def, &key.root, file_path, config) {
+            Ok(prepared) => {
+                self.starting.insert(
+                    key.clone(),
+                    StartReservation {
+                        deferred_events: Vec::new(),
+                        clients_generation: self.clients_generation,
+                        signal: Arc::new(StartSignal::default()),
+                    },
+                );
+                FileServerStart::Spawn(Box::new(prepared))
+            }
+            Err(error) => FileServerStart::Failed(self.record_file_start_failure(
+                def,
+                key,
+                prepare_failure(error),
+            )),
+        }
+    }
+
+    /// Remember a failed start the way [`Self::ensure_server_for_file_detailed`]
+    /// does, and return the result to report.
+    fn record_file_start_failure(
+        &mut self,
+        def: &ServerDef,
+        key: &ServerKey,
+        failure: StartFailure,
+    ) -> ServerAttemptResult {
+        slog_error!("failed to spawn {}: {}", def.name, failure.error);
+        let result = classify_spawn_error(&def.binary, &failure.error);
+        // Remember the failure so subsequent file events skip this
+        // (kind, root) pair instead of producing a fresh spawn attempt +
+        // ERROR log per request.
+        self.record_failed_spawn(key, result, failure.durability)
+    }
+
+    /// Last step of [`ensure_server_for_file_detailed_unlocked`] for one
+    /// server, under the lock: publish the client or record the failure,
+    /// then release the reservation. `None` means the server is running.
+    fn finish_file_server_start(
+        &mut self,
+        def: &ServerDef,
+        key: &ServerKey,
+        result: Result<LspClient, SpawnFailure>,
+    ) -> Option<ServerAttemptResult> {
+        let started_generation = self
+            .starting
+            .get(key)
+            .map(|reservation| reservation.clients_generation);
+        let outcome = match result {
+            // Another path started the same server meanwhile; keep that
+            // client and let this one's drop stop its process.
+            Ok(_) if self.clients.contains_key(key) => {
+                slog_info!(
+                    "lsp start discarded server={} root={} reason=duplicate start; stopping redundant client",
+                    key.kind.id_str(),
+                    key.root.display()
+                );
+                None
+            }
+            // Every client was taken away while this one was starting
+            // (shutdown, idle reap, unbind); do not revive the manager.
+            Ok(_) if started_generation != Some(self.clients_generation) => {
+                slog_info!(
+                    "lsp start discarded server={} root={} reason=shutdown during initialize; stopping client",
+                    key.kind.id_str(),
+                    key.root.display()
+                );
+                Some(ServerAttemptResult::SpawnFailed {
+                    binary: def.binary.clone(),
+                    reason: "language servers were shut down while this one was starting"
+                        .to_string(),
+                })
+            }
+            Ok(client) => {
+                self.note_start_succeeded(key);
+                self.clients.insert(key.clone(), client);
+                self.server_binaries.insert(key.clone(), def.binary.clone());
+                self.documents.entry(key.clone()).or_default();
+                None
+            }
+            Err(failure) => {
+                let failure = self.absorb_spawn_failure(failure);
+                if self.clients.contains_key(key) {
+                    None
+                } else {
+                    Some(self.record_file_start_failure(def, key, failure))
+                }
+            }
+        };
+        self.release_start_reservation(key);
+        outcome
+    }
+
     /// Ensure a server is running for the given file. Spawns if needed.
     /// Returns the active server keys for the file, or an empty vec if none match.
     ///
@@ -1541,9 +1803,13 @@ impl LspManager {
                 .get(key)
                 .is_some_and(|store| store.is_open(&canonical_path))
         });
+        // One read of the file's disk state serves every server's store:
+        // reading and hashing it per server cost one full read each.
+        let disk = DiskSnapshot::read(&canonical_path);
         let initial_content = needs_content
             .then(|| std::fs::read_to_string(&canonical_path).map_err(LspError::Io))
             .transpose()?;
+        let mut drift_content: Option<String> = None;
         let mut newly_opened = Vec::new();
 
         for key in &server_keys {
@@ -1574,6 +1840,14 @@ impl LspManager {
                     (Ok(()), false)
                 };
                 if let Err(err) = send_result {
+                    if matches!(err, LspError::Timeout(_)) {
+                        // The writer owns the queued frame and can finish it
+                        // after the process resumes. Do not send didOpen twice.
+                        self.documents
+                            .entry(key.clone())
+                            .or_default()
+                            .open_with(canonical_path.clone(), &DiskSnapshot::default());
+                    }
                     let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
                     return Err(err);
                 }
@@ -1583,7 +1857,7 @@ impl LspManager {
                 self.documents
                     .entry(key.clone())
                     .or_default()
-                    .open(canonical_path.clone());
+                    .open_with(canonical_path.clone(), &disk);
                 newly_opened.push(key.clone());
                 continue;
             }
@@ -1600,15 +1874,18 @@ impl LspManager {
             let drifted = self
                 .documents
                 .get(key)
-                .is_some_and(|store| store.is_stale_on_disk(&canonical_path));
+                .is_some_and(|store| store.is_stale_against(&canonical_path, &disk));
             if drifted {
-                let content = match std::fs::read_to_string(&canonical_path) {
-                    Ok(content) => content,
-                    Err(err) => {
-                        let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
-                        return Err(LspError::Io(err));
+                if drift_content.is_none() {
+                    match std::fs::read_to_string(&canonical_path) {
+                        Ok(content) => drift_content = Some(content),
+                        Err(err) => {
+                            let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
+                            return Err(LspError::Io(err));
+                        }
                     }
-                };
+                }
+                let content = drift_content.as_deref().unwrap_or_default();
                 let next_version = self
                     .documents
                     .get(key)
@@ -1621,27 +1898,22 @@ impl LspManager {
                     // `didSave`, so without it the compiler errors it
                     // reports keep describing the old contents.
                     client
-                        .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
-                            text_document: VersionedTextDocumentIdentifier::new(
-                                uri.clone(),
-                                next_version,
-                            ),
-                            content_changes: vec![TextDocumentContentChangeEvent {
-                                range: None,
-                                range_length: None,
-                                text: content.clone(),
-                            }],
-                        })
-                        .and_then(|()| send_did_save(client, &uri, &content))
+                        .send_full_did_change(&uri, next_version, content)
+                        .and_then(|()| send_did_save(client, &uri, content))
                 } else {
                     Ok(())
                 };
                 if let Err(err) = send_result {
+                    if let Some(store) = self.documents.get_mut(key) {
+                        // A timed-out write may arrive later. Reserve its
+                        // version, but retain disk drift until a confirmed sync.
+                        store.bump_version_with(&canonical_path, &DiskSnapshot::default());
+                    }
                     let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
                     return Err(err);
                 }
                 if let Some(store) = self.documents.get_mut(key) {
-                    store.bump_version(&canonical_path);
+                    store.bump_version_with(&canonical_path, &disk);
                 }
             }
         }
@@ -1745,6 +2017,8 @@ impl LspManager {
         .to_string();
 
         let mut versions: Vec<(ServerKey, i32)> = Vec::with_capacity(server_keys.len());
+        // Read once for every server's store (see `ensure_file_open`).
+        let disk = DiskSnapshot::read(&canonical_path);
 
         for key in server_keys {
             let current_version = self
@@ -1755,56 +2029,100 @@ impl LspManager {
             if let Some(version) = current_version {
                 let next_version = version + 1;
                 if let Some(client) = self.clients.get_mut(&key) {
-                    client.send_notification::<DidChangeTextDocument>(
-                        DidChangeTextDocumentParams {
-                            text_document: VersionedTextDocumentIdentifier::new(
-                                uri.clone(),
-                                next_version,
-                            ),
-                            content_changes: vec![TextDocumentContentChangeEvent {
-                                range: None,
-                                range_length: None,
-                                text: content.to_string(),
-                            }],
-                        },
-                    )?;
+                    let send = client.send_full_did_change(&uri, next_version, content)
                     // AFT has written this content to disk: tell the server
                     // it was saved. rust-analyzer re-runs `cargo check` only
                     // on `didSave`, so without it the compiler errors it
                     // reports keep describing the file before the edit.
-                    send_did_save(client, &uri, content)?;
+                        .and_then(|()| send_did_save(client, &uri, content));
+                    if let Err(err) = send {
+                        if let Some(store) = self.documents.get_mut(&key) {
+                            store.bump_version_with(&canonical_path, &DiskSnapshot::default());
+                        }
+                        return Err(err);
+                    }
                 }
                 if let Some(store) = self.documents.get_mut(&key) {
-                    store.bump_version(&canonical_path);
+                    store.bump_version_with(&canonical_path, &disk);
                 }
                 versions.push((key, next_version));
                 continue;
             }
 
             if let Some(client) = self.clients.get_mut(&key) {
-                client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-                    text_document: TextDocumentItem::new(
-                        uri.clone(),
-                        language_id.clone(),
-                        0,
-                        content.to_string(),
-                    ),
-                })?;
+                let send =
+                    client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+                        text_document: TextDocumentItem::new(
+                            uri.clone(),
+                            language_id.clone(),
+                            0,
+                            content.to_string(),
+                        ),
+                    });
+                if let Err(err) = send {
+                    if matches!(err, LspError::Timeout(_)) {
+                        self.documents
+                            .entry(key.clone())
+                            .or_default()
+                            .open_with(canonical_path.clone(), &DiskSnapshot::default());
+                    }
+                    return Err(err);
+                }
                 log_did_open_sent(&key, &canonical_path, &language_id);
                 // The content was just written to disk: tell the server it
                 // was saved, so rust-analyzer re-runs `cargo check`.
-                send_did_save(client, &uri, content)?;
+                if let Err(err) = send_did_save(client, &uri, content) {
+                    self.documents
+                        .entry(key.clone())
+                        .or_default()
+                        .open_with(canonical_path.clone(), &DiskSnapshot::default());
+                    return Err(err);
+                }
             }
             self.documents
                 .entry(key.clone())
                 .or_default()
-                .open(canonical_path.clone());
+                .open_with(canonical_path.clone(), &disk);
             // didOpen carries version 0 — that's the version the server
             // will echo on its first publishDiagnostics for this document.
             versions.push((key, 0));
         }
 
         Ok(versions)
+    }
+
+    /// Send `didChange` for every open document whose file changed on disk
+    /// since it was last synced, to the servers already running for it. Used
+    /// when more queued changes arrived than the backlog lists (see
+    /// [`crate::lsp::pending_changes::PENDING_LSP_DOCUMENTS_CAP`]): the lost
+    /// paths are unknown, but every open document they could matter for is
+    /// checked.
+    pub(crate) fn resync_drifted_open_documents(&mut self, config: &Config) -> usize {
+        let drifted: std::collections::BTreeSet<PathBuf> = self
+            .documents
+            .values()
+            .flat_map(|store| {
+                store
+                    .open_documents()
+                    .into_iter()
+                    .filter(|path| store.is_stale_on_disk(path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut resynced = 0;
+        for path in drifted {
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            match self.notify_file_changed_if_running(&path, &content, config) {
+                Ok(()) => resynced += 1,
+                Err(error) => {
+                    crate::slog_warn!("drift resync failed for {}: {error}", path.display())
+                }
+            }
+        }
+        resynced
     }
 
     pub fn notify_file_changed_default(
@@ -2327,8 +2645,7 @@ impl LspManager {
                     text_document: TextDocumentIdentifier::new(uri.clone()),
                 }) {
                     Ok(()) => {
-                        self.inspect_closed_documents
-                            .insert((key.clone(), canonical_path.clone()));
+                        self.note_inspect_closed_document(key, &canonical_path);
                     }
                     Err(err) => {
                         if first_error.is_none() {
@@ -2344,6 +2661,42 @@ impl LspManager {
         match first_error {
             Some(err) => Err(err),
             None => Ok(()),
+        }
+    }
+
+    /// Close the documents a file pull opened only to ask about them (see
+    /// [`PullFileResult::opened_for_pull`]), keeping the diagnostics they
+    /// produced, as a scoped inspect does with
+    /// [`Self::close_inspect_documents`]. A document AFT edits stays open:
+    /// an edit opens it through `didOpen`/`didChange`, not through a pull.
+    /// A document reopened or edited since the pull is left open.
+    pub(crate) fn close_documents_opened_for_pulls(
+        &mut self,
+        file_path: &Path,
+        results: &[PullFileResult],
+    ) {
+        let keys: Vec<ServerKey> = results
+            .iter()
+            .filter(|result| result.opened_for_pull)
+            .map(|result| result.server_key.clone())
+            .filter(|key| {
+                // Still at the version the pull opened: no edit since.
+                canonicalize_for_lsp(file_path).is_ok_and(|canonical| {
+                    self.documents
+                        .get(key)
+                        .and_then(|store| store.version(&canonical))
+                        == Some(0)
+                })
+            })
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        if let Err(error) = self.close_inspect_documents(file_path, &keys) {
+            crate::slog_warn!(
+                "closing {} after a diagnostics pull failed: {error}",
+                file_path.display()
+            );
         }
     }
 
@@ -2543,11 +2896,13 @@ impl LspManager {
             let Ok(event) = self.event_rx.try_recv() else {
                 break;
             };
-            if self.handle_event(&event).is_some() {
+            // `handle_event` returns the file of a stored publish; the
+            // snapshot reuses it instead of parsing the payload again.
+            if let Some(file) = self.handle_event(&event) {
                 diagnostics_changed = true;
-            }
-            if let Some(snapshot) = self.accepted_live_publish_snapshot(&event) {
-                accepted_snapshots.push(snapshot);
+                if let Some(snapshot) = self.accepted_live_publish_snapshot(&event, &file) {
+                    accepted_snapshots.push(snapshot);
+                }
             }
             events.push(event);
         }
@@ -2859,6 +3214,14 @@ impl LspManager {
             lookup_path,
             expected_versions: expected_versions.to_vec(),
             pre_snapshot: pre_snapshot.clone(),
+            responses_at_start: expected_versions
+                .iter()
+                .filter_map(|(key, _)| {
+                    self.clients
+                        .get(key)
+                        .map(|client| (key.clone(), client.received_message_count()))
+                })
+                .collect(),
             event_rx: self.event_rx.clone(),
             wake_rx,
             waiter_id,
@@ -2885,6 +3248,13 @@ impl LspManager {
                 wait.exited.push(key.clone());
                 continue;
             }
+            if self
+                .clients
+                .get(key)
+                .is_some_and(LspClient::is_unresponsive)
+            {
+                continue;
+            }
             if let Some(entry) = self
                 .diagnostics
                 .entries_for_file(&wait.lookup_path)
@@ -2900,7 +3270,21 @@ impl LspManager {
             }
         }
 
-        wait.fresh.len() + wait.exited.len() == wait.expected_versions.len()
+        wait.fresh.len()
+            + wait.exited.len()
+            + wait
+                .expected_versions
+                .iter()
+                .filter(|(key, _)| {
+                    !wait.fresh.contains_key(key)
+                        && !wait.exited.contains(key)
+                        && self
+                            .clients
+                            .get(key)
+                            .is_some_and(LspClient::is_unresponsive)
+                })
+                .count()
+            == wait.expected_versions.len()
     }
 
     pub(crate) fn finish_post_edit_diagnostics_wait(
@@ -2908,7 +3292,88 @@ impl LspManager {
         wait: PostEditDiagnosticsWait,
     ) -> PostEditWaitOutcome {
         self.post_edit_waiters.remove(&wait.waiter_id);
-        Self::post_edit_outcome(wait.expected_versions, wait.fresh, wait.exited)
+        for (key, _) in &wait.expected_versions {
+            if wait.fresh.contains_key(key) || wait.exited.contains(key) {
+                continue;
+            }
+            // A provisional or unversioned report still proves the server
+            // answered. Do not quarantine it merely for lacking authority.
+            let answered = self
+                .diagnostics
+                .entries_for_file(&wait.lookup_path)
+                .into_iter()
+                .any(|(stored_key, entry)| {
+                    stored_key == key
+                        && entry.epoch
+                            > wait
+                                .pre_snapshot
+                                .get(key)
+                                .copied()
+                                .unwrap_or_default()
+                                .epoch
+                });
+            if !answered {
+                if let (Some(client), Some(observed)) =
+                    (self.clients.get(key), wait.responses_at_start.get(key))
+                {
+                    client.mark_unresponsive_if_silent(*observed);
+                }
+            }
+        }
+        let unresponsive_servers = wait
+            .expected_versions
+            .iter()
+            .filter_map(|(key, _)| {
+                if wait.fresh.contains_key(key) || wait.exited.contains(key) {
+                    return None;
+                }
+                self.clients
+                    .get(key)
+                    .filter(|client| client.is_unresponsive())
+                    .map(|_| key.clone())
+            })
+            .collect();
+        let mut outcome = Self::post_edit_outcome(wait.expected_versions, wait.fresh, wait.exited);
+        outcome.unresponsive_servers = unresponsive_servers;
+        outcome
+    }
+
+    /// Register a waiter that blocks on language-server events without the
+    /// manager lock (see [`LspEventWait`]). Call [`Self::unsubscribe_events`]
+    /// when done.
+    pub(crate) fn subscribe_events(&mut self) -> LspEventWait {
+        let waiter_id = self.next_post_edit_waiter_id;
+        self.next_post_edit_waiter_id = self.next_post_edit_waiter_id.wrapping_add(1);
+        let (wake_tx, wake_rx) = bounded(1);
+        self.post_edit_waiters.insert(waiter_id, wake_tx);
+        LspEventWait {
+            event_rx: self.event_rx.clone(),
+            wake_rx,
+            waiter_id,
+        }
+    }
+
+    /// Handle an event an [`LspEventWait`] took off the channel, then drain
+    /// whatever else is queued.
+    pub(crate) fn handle_waited_event(&mut self, event: Option<LspEvent>) {
+        if let Some(event) = event {
+            self.handle_event(&event);
+        }
+        self.drain_events();
+    }
+
+    pub(crate) fn unsubscribe_events(&mut self, wait: LspEventWait) {
+        self.post_edit_waiters.remove(&wait.waiter_id);
+    }
+
+    /// The next moment a rust-analyzer server's check state (or a due save)
+    /// can change without the server sending anything: a deferred save
+    /// falling due, a check start grace ending, or the publish settle window
+    /// closing. A waiter sleeps until the earlier of this and its next event.
+    pub(crate) fn rust_check_next_timed_change(&self, server_key: &ServerKey) -> Option<Instant> {
+        self.clients.get(server_key).and_then(|client| {
+            client.rust_check_next_timed_change(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
+        })
     }
 
     /// Wait for fresh per-server diagnostics matching the just-sent document
@@ -2982,6 +3447,7 @@ impl LspManager {
             accepted_snapshots,
             diagnostics,
             pending_servers,
+            unresponsive_servers: Vec::new(),
             exited_servers: exited,
         }
     }
@@ -3091,10 +3557,12 @@ impl LspManager {
             .into_iter()
             .map(|pull| {
                 let server_key = pull.key.clone();
+                let opened_for_pull = pull.opened_for_pull;
                 let outcome = self.finish_document_pull(pull.wait());
                 PullFileResult {
                     server_key,
                     outcome,
+                    opened_for_pull,
                 }
             })
             .collect())
@@ -3117,7 +3585,12 @@ impl LspManager {
         Ok(opened
             .server_keys
             .into_iter()
-            .map(|key| self.begin_open_document_pull(key, &canonical_path, &uri, deadline))
+            .map(|key| {
+                let opened_for_pull = opened.newly_opened.contains(&key);
+                let mut pull = self.begin_open_document_pull(key, &canonical_path, &uri, deadline);
+                pull.opened_for_pull = opened_for_pull;
+                pull
+            })
             .collect())
     }
 
@@ -3151,6 +3624,7 @@ impl LspManager {
             key,
             canonical_path,
             document_version,
+            opened_for_pull: false,
             state: DocumentPullState::Done(PullFileOutcome::PullNotSupported),
         };
         let supports_pull = self
@@ -3223,6 +3697,7 @@ impl LspManager {
             canonical_path,
             document_version,
             state,
+            ..
         } = pull;
         let reply = match state {
             DocumentPullState::Done(outcome) => return outcome,
@@ -3338,9 +3813,23 @@ impl LspManager {
             .and_then(|c| c.diagnostic_capabilities())
             .and_then(|caps| caps.identifier.clone());
 
+        // Report the result ids of current reports so the server can answer
+        // "unchanged" for those files instead of resending every report;
+        // an unchanged item leaves the stored report as it is.
+        let previous_result_ids = self
+            .diagnostics
+            .result_ids_for_server(server_key)
+            .into_iter()
+            .filter_map(|(file, value)| {
+                Some(lsp_types::PreviousResultId {
+                    uri: uri_for_path(&file).ok()?,
+                    value,
+                })
+            })
+            .collect();
         let params = AftWorkspaceDiagnosticParams {
             identifier,
-            previous_result_ids: Vec::new(),
+            previous_result_ids,
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         };
@@ -3399,6 +3888,7 @@ impl LspManager {
                         let stored = from_lsp_diagnostics(
                             file.clone(),
                             full.full_document_diagnostic_report.items.clone(),
+                            &server_key.kind,
                         );
                         self.diagnostics.publish_with_result_id(
                             server_key.clone(),
@@ -3476,6 +3966,7 @@ impl LspManager {
                 let stored = from_lsp_diagnostics(
                     canonical_path.to_path_buf(),
                     full.full_document_diagnostic_report.items.clone(),
+                    &key.kind,
                 );
                 let count = stored.len();
                 let provisional = self
@@ -3925,15 +4416,18 @@ impl LspManager {
         saw_file_diagnostics
     }
 
+    /// The snapshot of a publish `handle_event` just stored for `file`, when
+    /// it is an accepted live report.
     fn accepted_live_publish_snapshot(
         &self,
         event: &LspEvent,
+        file: &Path,
     ) -> Option<AcceptedDiagnosticSnapshot> {
         let LspEvent::Notification {
             server_kind,
             root,
             method,
-            params: Some(params),
+            params: Some(_),
         } = event
         else {
             return None;
@@ -3941,21 +4435,17 @@ impl LspManager {
         if method != "textDocument/publishDiagnostics" {
             return None;
         }
-
-        let publish_params =
-            serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params.clone()).ok()?;
-        let file = uri_to_path(&publish_params.uri)?;
         let server_key = ServerKey {
             kind: server_kind.clone(),
             root: root.clone(),
         };
-        if self.live_publish_drop_reason(&server_key, &file).is_some() {
+        if self.live_publish_drop_reason(&server_key, file).is_some() {
             return None;
         }
-        let document_version = self.documents.get(&server_key)?.version(&file)?;
+        let document_version = self.documents.get(&server_key)?.version(file)?;
         let entry = self
             .diagnostics
-            .entries_for_file(&file)
+            .entries_for_file(file)
             .into_iter()
             .find_map(|(stored_key, entry)| (stored_key == &server_key).then_some(entry))?;
 
@@ -4096,7 +4586,7 @@ impl LspManager {
                     self.latest_pull_for_rust
                         .retain(|(server, _), _| *server != key);
                     self.inspect_closed_documents
-                        .retain(|(server, _)| *server != key);
+                        .retain(|(server, _), _| *server != key);
                     None
                 }
             }
@@ -4123,20 +4613,23 @@ impl LspManager {
         root: PathBuf,
         params: &serde_json::Value,
     ) -> Option<PathBuf> {
-        let publish_params = match serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(
-            params.clone(),
-        ) {
-            Ok(params) => params,
-            Err(err) => {
-                slog_info!(
+        #[cfg(test)]
+        PUBLISH_DIAGNOSTICS_PARSES.with(|count| count.set(count.get() + 1));
+        // Deserialized from the borrowed payload: cloning it first copied
+        // every diagnostic once more.
+        let publish_params =
+            match <lsp_types::PublishDiagnosticsParams as serde::Deserialize>::deserialize(params) {
+                Ok(params) => params,
+                Err(err) => {
+                    slog_info!(
                     "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-invalid-params error={}",
                     server.id_str(),
                     root.display(),
                     err
                 );
-                return None;
-            }
-        };
+                    return None;
+                }
+            };
         let Some(file) = uri_to_path(&publish_params.uri) else {
             slog_info!(
                 "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-invalid-uri uri={:?}",
@@ -4158,14 +4651,22 @@ impl LspManager {
                 .unwrap_or_else(|| "none".to_string()),
             diagnostic_count
         );
-        let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics);
+        let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
         let key = ServerKey { kind: server, root };
         let mut stored = stored;
         if key.kind == ServerKind::Rust && self.server_supports_pull(&key) {
             // Recorded before the close check below: rust-analyzer's reply to
             // a close still carries the file's `cargo check` results.
-            self.latest_push_for_pull_servers
-                .insert((key.clone(), file.clone()), stored.clone());
+            // An empty push is kept as no entry: a missing entry already
+            // reads as "no pushed diagnostics", and storing empty lists kept
+            // one entry for every file rust-analyzer ever published.
+            if stored.is_empty() {
+                self.latest_push_for_pull_servers
+                    .remove(&(key.clone(), file.clone()));
+            } else {
+                self.latest_push_for_pull_servers
+                    .insert((key.clone(), file.clone()), stored.clone());
+            }
         }
         if self.is_inspect_close_clearing(&key, &file, stored.is_empty()) {
             slog_info!(
@@ -4252,6 +4753,24 @@ impl LspManager {
     /// file, and is ignored for as long as the exception lasts. A non-empty
     /// publish is real news about the file: it is stored and ends the
     /// exception, as does reopening or editing the file through AFT.
+    /// Remember a document a scoped inspect closed (see
+    /// `inspect_closed_documents`), forgetting the oldest past the cap.
+    fn note_inspect_closed_document(&mut self, key: &ServerKey, canonical_path: &Path) {
+        self.inspect_close_sequence = self.inspect_close_sequence.wrapping_add(1);
+        self.inspect_closed_documents.insert(
+            (key.clone(), canonical_path.to_path_buf()),
+            self.inspect_close_sequence,
+        );
+        if self.inspect_closed_documents.len() > INSPECT_CLOSED_DOCUMENTS_CAP {
+            // Drop the oldest quarter at once so the scan runs rarely.
+            let mut sequences: Vec<u64> = self.inspect_closed_documents.values().copied().collect();
+            sequences.sort_unstable();
+            let keep_from = sequences[INSPECT_CLOSED_DOCUMENTS_CAP / 4];
+            self.inspect_closed_documents
+                .retain(|_, sequence| *sequence >= keep_from);
+        }
+    }
+
     fn is_inspect_close_clearing(
         &mut self,
         key: &ServerKey,
@@ -4262,7 +4781,7 @@ impl LspManager {
             return false;
         }
         let lookup = (key.clone(), file.to_path_buf());
-        if !self.inspect_closed_documents.contains(&lookup) {
+        if !self.inspect_closed_documents.contains_key(&lookup) {
             return false;
         }
         let reopened = self
@@ -4281,7 +4800,7 @@ impl LspManager {
     fn end_inspect_close_exception(&mut self, canonical_path: &Path) {
         if !self.inspect_closed_documents.is_empty() {
             self.inspect_closed_documents
-                .retain(|(_, file)| file != canonical_path);
+                .retain(|(_, file), _| file != canonical_path);
         }
         if !self.latest_pull_for_rust.is_empty() {
             self.latest_pull_for_rust
@@ -5181,10 +5700,10 @@ fn send_did_save(
     let Some(save) = client.save_notification() else {
         return Ok(());
     };
-    client.send_notification::<DidSaveTextDocument>(DidSaveTextDocumentParams {
-        text_document: TextDocumentIdentifier::new(uri.clone()),
-        text: (save == SaveNotification::IncludeText).then(|| content.to_string()),
-    })?;
+    client.send_did_save_borrowed(
+        uri,
+        (save == SaveNotification::IncludeText).then_some(content),
+    )?;
     client.record_save_sent(uri);
     slog_info!(
         "lsp_protocol server={} root={} method=textDocument/didSave event=sent uri={}",
@@ -5569,6 +6088,161 @@ impl Drop for ReservationGuard<'_> {
             self.manager.lock().release_start_reservation(&key);
         }
     }
+}
+
+/// What [`ensure_server_for_file_detailed_unlocked`] does next for one
+/// server, decided under the manager lock.
+enum FileServerStart {
+    /// A client is running.
+    Running,
+    /// The server cannot start; report this.
+    Failed(ServerAttemptResult),
+    /// Another thread is starting this server; wait for it, then look again.
+    Wait(Arc<StartSignal>),
+    /// This thread reserved the server and starts it without the lock.
+    Spawn(Box<PreparedSpawn>),
+}
+
+/// How long one wait for another thread's start of the same server lasts
+/// before the waiter looks at the manager again. A start ends on its own
+/// within the `initialize` budget; this only bounds a wait whose signal was
+/// lost to a start that unwound.
+const FILE_START_WAIT_SLICE: Duration = Duration::from_secs(5);
+
+/// Releases a reservation taken by [`ensure_server_for_file_detailed_unlocked`]
+/// if its start unwinds before publishing, so waiters are not left blocked.
+struct FileStartGuard<'a, L, G>
+where
+    L: Fn() -> G,
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    lock: &'a L,
+    key: Option<ServerKey>,
+}
+
+impl<L, G> Drop for FileStartGuard<'_, L, G>
+where
+    L: Fn() -> G,
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            (self.lock)().release_start_reservation(&key);
+        }
+    }
+}
+
+/// [`LspManager::ensure_server_for_file_detailed`] with the server spawn and
+/// its `initialize` handshake (up to 30 seconds) run without the manager
+/// lock. Each server to start is reserved under the lock; a concurrent caller
+/// for the same server waits on that one reservation rather than on the
+/// whole manager, and callers for other servers or for no server at all are
+/// not held up. Outcomes, failure caching and the retry backoff match the
+/// locked method. `lock` acquires the manager (for example `|| ctx.lsp()`).
+pub fn ensure_server_for_file_detailed_unlocked<G>(
+    lock: impl Fn() -> G,
+    file_path: &Path,
+    config: &Config,
+) -> EnsureServerOutcomes
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    let mut outcomes = EnsureServerOutcomes::default();
+    for def in servers_for_file(file_path, config) {
+        let server_id = def.kind.id_str().to_string();
+        let server_name = def.name.to_string();
+        let Some(key) = server_key_for_definition(&def, file_path, config) else {
+            outcomes.attempts.push(ServerAttempt {
+                server_id,
+                server_name,
+                result: ServerAttemptResult::NoRootMarker {
+                    looked_for: def.root_markers.iter().map(|s| s.to_string()).collect(),
+                },
+            });
+            continue;
+        };
+        let failure = loop {
+            let next = lock().begin_file_server_start(&def, &key, file_path, config);
+            match next {
+                FileServerStart::Running => break None,
+                FileServerStart::Failed(result) => break Some(result),
+                FileServerStart::Wait(signal) => {
+                    signal.wait_until(Instant::now() + FILE_START_WAIT_SLICE);
+                }
+                FileServerStart::Spawn(prepared) => {
+                    let mut guard = FileStartGuard {
+                        lock: &lock,
+                        key: Some(key.clone()),
+                    };
+                    let result = prepared.run(None);
+                    guard.key = None;
+                    break lock().finish_file_server_start(&def, &key, result);
+                }
+            }
+        };
+        match failure {
+            Some(result) => outcomes.attempts.push(ServerAttempt {
+                server_id,
+                server_name,
+                result,
+            }),
+            None => {
+                outcomes.attempts.push(ServerAttempt {
+                    server_id,
+                    server_name,
+                    result: ServerAttemptResult::Ok {
+                        server_key: key.clone(),
+                    },
+                });
+                outcomes.successful.push(key);
+            }
+        }
+    }
+    outcomes
+}
+
+/// Start the servers for `file_path` without the manager lock (see
+/// [`ensure_server_for_file_detailed_unlocked`]), for a caller that then
+/// notifies or pulls under the lock. The path is canonicalized first, as the
+/// locked methods do; an unreadable path starts nothing.
+pub fn start_servers_for_file_unlocked<G>(lock: impl Fn() -> G, file_path: &Path, config: &Config)
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    if let Ok(canonical_path) = canonicalize_for_lsp(file_path) {
+        ensure_server_for_file_detailed_unlocked(lock, &canonical_path, config);
+    }
+}
+
+/// The servers that would serve `file_path`, found without the manager lock
+/// and without starting anything. A caller that could not reach the manager
+/// in time reports these as pending rather than claiming nothing to wait for.
+pub fn expected_server_keys_for_file(file_path: &Path, config: &Config) -> Vec<ServerKey> {
+    let Ok(canonical_path) = canonicalize_for_lsp(file_path) else {
+        return Vec::new();
+    };
+    servers_for_file(&canonical_path, config)
+        .into_iter()
+        .filter_map(|def| server_key_for_definition(&def, &canonical_path, config))
+        .collect()
+}
+
+/// [`LspManager::ensure_file_open`] with any server start run without the
+/// manager lock (see [`ensure_server_for_file_detailed_unlocked`]). The
+/// document is opened under the lock once its servers run.
+pub fn ensure_file_open_unlocked<G>(
+    lock: impl Fn() -> G,
+    file_path: &Path,
+    config: &Config,
+) -> Result<EnsureFileOpenResult, LspError>
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    let canonical_path = canonicalize_for_lsp(file_path)?;
+    ensure_server_for_file_detailed_unlocked(&lock, &canonical_path, config);
+    // Every server is now running or has a remembered failure, so this
+    // starts nothing under the lock unless a client vanished in between.
+    lock().ensure_file_open(&canonical_path, config)
 }
 
 /// rust-analyzer's own LSP request (not part of the LSP specification) that
@@ -6446,9 +7120,12 @@ mod transient_retry_tests {
 #[cfg(test)]
 mod diagnostic_capacity_tests {
     use std::fs;
+    use std::path::{Path, PathBuf};
 
-    use super::LspManager;
+    use super::{LspManager, INSPECT_CLOSED_DOCUMENTS_CAP};
     use crate::config::Config;
+    use crate::lsp::registry::ServerKind;
+    use crate::lsp::roots::ServerKey;
 
     // The lsp.diagnostic_cache_size config knob must actually take effect:
     // set_diagnostic_capacity (called at AppContext construction with the config
@@ -6461,6 +7138,69 @@ mod diagnostic_capacity_tests {
         assert_eq!(manager.diagnostics_store_for_test().capacity_for_test(), 7);
         manager.set_diagnostic_capacity(0); // 0 = unbounded
         assert_eq!(manager.diagnostics_store_for_test().capacity_for_test(), 0);
+    }
+
+    // A change sent to several servers records the file's disk state once,
+    // not once per server.
+    #[test]
+    fn a_change_for_several_servers_reads_the_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let file = root.join("main.ts");
+        std::fs::write(&file, "export const x = 1;\n").unwrap();
+        let keys: Vec<ServerKey> = [
+            ServerKind::TypeScript,
+            ServerKind::Biome,
+            ServerKind::Oxlint,
+        ]
+        .into_iter()
+        .map(|kind| ServerKey {
+            kind,
+            root: root.clone(),
+        })
+        .collect();
+        let mut manager = LspManager::new();
+        let reads = || crate::lsp::document::CONTENT_READS.with(std::cell::Cell::get);
+
+        let before = reads();
+        manager
+            .notify_file_changed_for_server_keys(
+                file.clone(),
+                "export const x = 1;\n",
+                keys.clone(),
+            )
+            .unwrap();
+        assert_eq!(reads() - before, 1, "opening in three stores");
+
+        std::fs::write(&file, "export const x = 2;\n").unwrap();
+        let before = reads();
+        manager
+            .notify_file_changed_for_server_keys(file, "export const x = 2;\n", keys)
+            .unwrap();
+        assert_eq!(reads() - before, 1, "changing in three stores");
+    }
+
+    // Documents closed by scoped inspects are remembered only up to a cap,
+    // newest kept, so a long session does not keep one entry per file.
+    #[test]
+    fn inspect_closed_documents_stay_bounded_and_keep_the_newest() {
+        let mut manager = LspManager::new();
+        let key = ServerKey {
+            kind: ServerKind::TypeScript,
+            root: PathBuf::from("/work"),
+        };
+        let total = INSPECT_CLOSED_DOCUMENTS_CAP * 3;
+        for index in 0..total {
+            manager.note_inspect_closed_document(&key, Path::new(&format!("/work/f{index}.ts")));
+        }
+        assert!(manager.inspect_closed_documents.len() <= INSPECT_CLOSED_DOCUMENTS_CAP);
+        let newest = (
+            key.clone(),
+            PathBuf::from(format!("/work/f{}.ts", total - 1)),
+        );
+        assert!(manager.inspect_closed_documents.contains_key(&newest));
+        let oldest = (key, PathBuf::from("/work/f0.ts"));
+        assert!(!manager.inspect_closed_documents.contains_key(&oldest));
     }
 
     // configure clears cached spawn failures so a just-installed server retries
@@ -6635,7 +7375,7 @@ mod post_edit_waiter_tests {
 mod clear_diagnostics_tests {
     use std::path::PathBuf;
 
-    use super::LspManager;
+    use super::{LspManager, PUBLISH_DIAGNOSTICS_PARSES};
     use crate::lsp::client::LspEvent;
     use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
     use crate::lsp::position::uri_for_path;
@@ -6794,11 +7534,16 @@ mod clear_diagnostics_tests {
             })
             .unwrap();
 
+        let parses_before = PUBLISH_DIAGNOSTICS_PARSES.with(std::cell::Cell::get);
         let drained = manager.drain_events();
+        let parses = PUBLISH_DIAGNOSTICS_PARSES.with(std::cell::Cell::get) - parses_before;
 
         assert!(drained.diagnostics_changed);
         assert_eq!(drained.events.len(), 1);
         assert_eq!(manager.warm_error_warning_counts(), (1, 0));
+        // Storing the publish and building its accepted snapshot share one
+        // typed parse of the payload.
+        assert_eq!(parses, 1, "publishDiagnostics was parsed {parses} times");
     }
 }
 

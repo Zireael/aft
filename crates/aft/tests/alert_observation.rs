@@ -180,8 +180,27 @@ fn reentry_mints_a_new_episode_and_idle_reap_removes_whole_session() {
         .episode_id;
     assert_ne!(first_episode, second_episode);
 
-    let reaped =
+    // The re-entered finding has not been rendered to the agent yet, so idle
+    // pruning must keep the session rather than drop an undelivered alert.
+    let kept =
         state.reap_idle_sessions_at(started + Duration::from_secs(4), Duration::from_secs(2));
+    assert!(kept.is_empty());
+    assert!(state.partitions_for_session("session").next().is_some());
+
+    let cleared = AcceptedObservationBatch::new(vec![observation(
+        "session",
+        root,
+        "server-a",
+        4,
+        Vec::new(),
+    )])
+    .unwrap();
+    state
+        .accept_batch_at(&cleared, started + Duration::from_secs(5))
+        .unwrap();
+
+    let reaped =
+        state.reap_idle_sessions_at(started + Duration::from_secs(7), Duration::from_secs(2));
     assert_eq!(reaped, vec!["session"]);
     assert!(state.partitions_for_session("session").next().is_none());
 }
@@ -263,7 +282,10 @@ fn post_edit_wait_does_not_start_a_server_on_a_cold_root() {
     let file = directory.path().join("cold.ts");
     std::fs::write(directory.path().join("package.json"), "{}").unwrap();
     std::fs::write(&file, "export const value = 1;\n").unwrap();
-    let context = AppContext::from_app(App::default_shared(), Config::default());
+    let context = AppContext::from_app(
+        App::default_shared(),
+        crate::context_storage::isolate(Config::default()),
+    );
 
     let outcome = context.lsp_notify_and_collect_diagnostics(
         &file,

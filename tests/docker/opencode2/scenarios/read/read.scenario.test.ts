@@ -45,6 +45,8 @@ describe("read OpenCode 2 scenarios", () => {
     const root = resolve(import.meta.dir);
     const scenarios = materializeParityScenarios(await loadScenarios(root));
     expect(scenarios.map((scenario) => scenario.id)).toEqual([
+      "read/T1/edit-family/gpt",
+      "read/T1/edit-family/non-gpt",
       "read/T1/happy",
       "read/T2/invalid_arguments",
       "read/T2/missing_target",
@@ -53,6 +55,8 @@ describe("read OpenCode 2 scenarios", () => {
       "read/T3/read_config_deny",
       "read/T6/read-directory-payload-entries/complete",
       "read/T6/read-directory-payload-entries/incomplete",
+      "read/T7/edit-family/gpt",
+      "read/T7/edit-family/non-gpt",
       "read/T7/happy",
     ]);
     await extension.validate?.({
@@ -62,5 +66,26 @@ describe("read OpenCode 2 scenarios", () => {
       matrix: {},
       pinned_host_version: "2.0.3",
     });
+  });
+
+  test("edit-family scenarios check real V2 requests through the loaded extension", async () => {
+    const scenarios = await loadScenarios(resolve(import.meta.dir));
+    const project = await mkdtemp(join(tmpdir(), "read-edit-family-"));
+    try {
+      for (const [suffix, model, names] of [
+        ["non-gpt", "mock-model", ["read", "edit", "write"]],
+        ["gpt", "gpt-5-mock", ["read", "apply_patch"]],
+      ] as const) {
+        const scenario = scenarios.find((entry) => entry.id === `read/T1/edit-family/${suffix}`)!;
+        const context = { scenario, project_root: project, run_root: project, forensic_dir: project, host_generation: "v2" as const };
+        const request = { model, tools: names.map((name) => ({ function: { name } })) };
+        const exchange = { index: 0, label: `check-${suffix}`, request, response: {}, observed_at: "test" };
+        await extension.observe?.(context, { kind: "mock_exchange", exchange });
+        const leaked = { ...request, tools: [...request.tools, { function: { name: suffix === "gpt" ? "edit" : "apply_patch" } }] };
+        await expect(extension.observe!(context, { kind: "mock_exchange", exchange: { ...exchange, request: leaked } })).rejects.toThrow("unexpectedly includes");
+      }
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
   });
 });

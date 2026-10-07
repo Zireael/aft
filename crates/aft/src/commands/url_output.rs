@@ -1,0 +1,270 @@
+//! Bounded previews of remote documents. A partial JSON download is not a
+//! complete JSON document; scan top-level member spans without inventing values
+//! for keys that have not arrived yet.
+
+use std::path::Path;
+
+use crate::protocol::{RawRequest, Response};
+use crate::url_fetch::{download_notice, is_http_url};
+
+pub(crate) const URL_OUTPUT_BYTES: usize = 50 * 1024;
+
+pub(crate) fn cap_text(text: &mut String, ceiling: usize, narrow: &str) {
+    let total = text.len();
+    if total <= ceiling {
+        return;
+    }
+    // Reserve the complete footer before cutting and retreat to a UTF-8
+    // boundary. The reported N counts retained source bytes, not the footer.
+    let footer_budget =
+        format!("\ntruncated at {ceiling} of {total} bytes; narrow with {narrow}").len();
+    let mut end = ceiling.saturating_sub(footer_budget);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(&format!(
+        "\ntruncated at {end} of {total} bytes; narrow with {narrow}"
+    ));
+}
+
+pub(crate) fn request_has_url(req: &RawRequest) -> bool {
+    ["file", "url", "target"].iter().any(|key| {
+        req.params
+            .get(*key)
+            .and_then(|v| v.as_str())
+            .is_some_and(is_http_url)
+    }) || req
+        .params
+        .get("targets")
+        .and_then(|v| v.as_array())
+        .is_some_and(|targets| {
+            targets.iter().any(|target| {
+                ["file", "path", "url"].iter().any(|key| {
+                    target
+                        .get(*key)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(is_http_url)
+                })
+            })
+        })
+}
+
+/// Cap the rendered aggregate, not each symbol separately. This also bounds
+/// multi-symbol and mixed local/URL batches and the formatter's line gutters.
+pub(crate) fn cap_zoom_response(req: &RawRequest, mut response: Response) -> Response {
+    if !request_has_url(req) {
+        return response;
+    }
+    let ctx = crate::subc_format::FormatContext {
+        zoom_target_label: req
+            .params
+            .get("file")
+            .or_else(|| req.params.get("url"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        ..Default::default()
+    };
+    let mut text = crate::subc_format::format_response_unbounded("zoom", &response, &ctx);
+    if text.len() > URL_OUTPUT_BYTES {
+        cap_text(
+            &mut text,
+            URL_OUTPUT_BYTES,
+            "one symbol, a smaller section, or a filtered URL",
+        );
+        if response.success {
+            response.data = serde_json::json!({"text": text, "content": text, "complete": false});
+        } else {
+            response.data["message"] = text.into();
+        }
+    }
+    response
+}
+
+pub(crate) fn disclose_download(path: &Path, response: &mut Response) {
+    if let Some(notice) = download_notice(path) {
+        let key = if response.success {
+            "content"
+        } else {
+            "message"
+        };
+        if let Some(text) = response.data.get_mut(key) {
+            if let Some(content) = text.as_str() {
+                *text = format!("{notice}\n\n{content}").into();
+            }
+        }
+        response.data["complete"] = false.into();
+    }
+}
+
+struct Member<'a> {
+    name: String,
+    value: &'a str,
+    complete: bool,
+}
+
+fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn skip_space(bytes: &[u8], i: &mut usize) {
+    while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+        *i += 1;
+    }
+}
+
+fn top_level_members(source: &str) -> Vec<Member<'_>> {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    skip_space(bytes, &mut i);
+    if bytes.get(i) != Some(&b'{') {
+        return Vec::new();
+    }
+    i += 1;
+    let mut members = Vec::new();
+    loop {
+        skip_space(bytes, &mut i);
+        if bytes.get(i) != Some(&b'"') {
+            break;
+        }
+        let Some(end) = string_end(bytes, i) else {
+            break;
+        };
+        let Ok(name) = serde_json::from_str::<String>(&source[i..end]) else {
+            break;
+        };
+        i = end;
+        skip_space(bytes, &mut i);
+        if bytes.get(i) != Some(&b':') {
+            break;
+        }
+        i += 1;
+        skip_space(bytes, &mut i);
+        let start = i;
+        let mut depth = 0usize;
+        let mut complete = true;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => match string_end(bytes, i) {
+                    Some(end) => {
+                        i = end;
+                        continue;
+                    }
+                    None => {
+                        i = bytes.len();
+                        complete = false;
+                        break;
+                    }
+                },
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' if depth > 0 => depth -= 1,
+                b',' | b'}' if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        complete &= i < bytes.len() && depth == 0;
+        members.push(Member {
+            name,
+            value: source[start..i].trim_end(),
+            complete,
+        });
+        if bytes.get(i) != Some(&b',') {
+            break;
+        }
+        i += 1;
+    }
+    members
+}
+
+pub(crate) fn json_preview(req: &RawRequest, source: &str, symbol: Option<&str>) -> Response {
+    let members = top_level_members(source);
+    if let Some(symbol) = symbol {
+        if let Some(member) = members.iter().find(|m| m.name == symbol) {
+            let mut content = member.value.to_string();
+            if !member.complete {
+                content.insert_str(
+                    0,
+                    "Partial value from downloaded prefix (not complete JSON):\n",
+                );
+            }
+            let complete = member.complete && content.len() <= URL_OUTPUT_BYTES - 1024;
+            cap_text(
+                &mut content,
+                URL_OUTPUT_BYTES - 1024,
+                "a filtered URL selecting a smaller value",
+            );
+            return Response::success(
+                &req.id,
+                serde_json::json!({
+                    "name": symbol, "kind": "json_value", "content": content,
+                    "complete": complete,
+                }),
+            );
+        }
+    }
+    let mut text = match symbol {
+        Some(symbol) => format!("Top-level key {symbol:?} not found in downloaded prefix.\n"),
+        None => String::new(),
+    };
+    text.push_str("JSON top-level keys and value sizes in downloaded prefix:\n");
+    if members.is_empty() {
+        text.push_str(
+            "No top-level object keys available (array, scalar, or incomplete object).\n",
+        );
+    }
+    for member in members {
+        text.push_str(&format!(
+            "- {:?}: {}{} bytes\n",
+            member.name,
+            if member.complete { "" } else { "≥" },
+            member.value.len()
+        ));
+    }
+    text.push_str(
+        "Select a listed top-level key with symbols, or narrow the URL with server-side filters.",
+    );
+    let complete = text.len() <= URL_OUTPUT_BYTES - 1024;
+    cap_text(
+        &mut text,
+        URL_OUTPUT_BYTES - 1024,
+        "a filtered URL with fewer top-level keys",
+    );
+    Response::success(
+        &req.id,
+        serde_json::json!({"content": text, "kind": "json_keys", "complete": complete}),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn member_spans_ignore_nested_delimiters_and_escaped_quotes() {
+        let source = r#"{"a.b":{"nested":["},\"",1]},"unicode":"界","partial":[{"x":1}"#;
+        let members = top_level_members(source);
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0].name, "a.b");
+        assert_eq!(members[0].value, r#"{"nested":["},\"",1]}"#);
+        assert!(members[0].complete);
+        assert_eq!(members[1].value, "\"界\"");
+        assert!(!members[2].complete);
+    }
+
+    #[test]
+    fn text_cap_counts_bytes_and_preserves_utf8_and_footer() {
+        let mut text = "界".repeat(50000);
+        cap_text(&mut text, URL_OUTPUT_BYTES, "symbols");
+        assert!(text.len() <= URL_OUTPUT_BYTES);
+        assert!(text.ends_with("of 150000 bytes; narrow with symbols"));
+    }
+}

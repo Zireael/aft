@@ -72,7 +72,6 @@ const FILE_TRIGRAM_COUNT_MAGIC: &[u8; 8] = b"AFTFTC01";
 const INDEX_VERSION: u32 = 4;
 /// Highest trigram cache format this build reads (and the one it writes).
 pub const INDEX_FORMAT_VERSION: u32 = INDEX_VERSION;
-const PREVIEW_BYTES: usize = 8 * 1024;
 const SPIMI_SOFT_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 const SPIMI_HARD_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 const SPILL_RECORD_ESTIMATED_BYTES: usize = 16;
@@ -387,6 +386,10 @@ pub struct SearchIndex {
     // This reverse lookup is writer-only. Snapshots never read it, so exclusive
     // SearchIndex write access keeps it synchronized with the versioned postings.
     delta_file_trigrams: HashMap<u32, Vec<u32>>,
+    // Base IDs cannot be reused while immutable base postings still refer to
+    // them. Delta IDs can: removal first erases every posting for the ID, and
+    // snapshots retain the old tables through copy-on-write.
+    free_delta_file_ids: Vec<u32>,
     pub files: Arc<Vec<FileEntry>>,
     pub path_to_id: Arc<HashMap<PathBuf, u32>>,
     pub ready: bool,
@@ -702,6 +705,12 @@ impl SearchIndex {
 }
 
 impl SearchIndexSnapshot {
+    pub(crate) fn file_modified(&self, path: &Path) -> Option<SystemTime> {
+        self.path_to_id
+            .get(path)
+            .and_then(|id| self.files.get(*id as usize))
+            .map(|file| file.modified)
+    }
     /// Number of unique trigrams in the combined base index and delta postings.
     pub fn trigram_count(&self) -> usize {
         let base_count = self.base.as_ref().map_or(0, |base| base.lookup.len());
@@ -1437,6 +1446,31 @@ enum PreparedSearchPath {
     Skipped,
 }
 
+/// Prepared outside the index write lock. Applying this value only changes RAM
+/// tables; path resolution, metadata, bytes, hashing and trigram extraction have
+/// already finished.
+pub(crate) struct PreparedSearchUpdate {
+    path: PathBuf,
+    file: PreparedSearchPath,
+}
+
+pub(crate) fn prepare_search_update(
+    path: &Path,
+    max_file_size: u64,
+    remove: bool,
+) -> PreparedSearchUpdate {
+    let path = canonicalize_existing_or_deleted_path_with_memo(
+        path,
+        &mut ParentCanonicalizationMemo::default(),
+    );
+    let file = if remove {
+        PreparedSearchPath::Skipped
+    } else {
+        prepare_search_path(&path, max_file_size)
+    };
+    PreparedSearchUpdate { path, file }
+}
+
 #[derive(Clone, Debug, Default)]
 struct QueryBuild {
     and_runs: Vec<Vec<u8>>,
@@ -1484,6 +1518,7 @@ impl SearchIndex {
             base: None,
             delta: Arc::new(DeltaState::default()),
             delta_file_trigrams: HashMap::new(),
+            free_delta_file_ids: Vec::new(),
             files: Arc::new(Vec::new()),
             path_to_id: Arc::new(HashMap::new()),
             ready: false,
@@ -1502,6 +1537,17 @@ impl SearchIndex {
 
     pub fn build(root: &Path) -> Self {
         Self::build_with_limit(root, DEFAULT_MAX_FILE_SIZE)
+    }
+
+    /// An empty in-memory corpus to populate through a bounded disk walk.
+    /// Marking it ready prevents query lanes from starting an unbounded build;
+    /// the caller must disclose the walk's coverage separately.
+    pub(crate) fn empty_ready_for_root(root: &Path) -> Self {
+        Self {
+            project_root: root.to_path_buf(),
+            ready: true,
+            ..Self::new()
+        }
     }
 
     pub fn build_with_limit(root: &Path, max_file_size: u64) -> Self {
@@ -1803,12 +1849,16 @@ impl SearchIndex {
     ) {
         let canonical_path =
             canonicalize_existing_or_deleted_path_with_memo(path, canonical_parents);
+        self.remove_resolved_file(path, &canonical_path);
+    }
+
+    fn remove_resolved_file(&mut self, path: &Path, canonical_path: &Path) {
         let file_id = {
             let path_to_id = Arc::make_mut(&mut self.path_to_id);
             if let Some(file_id) = path_to_id.remove(path) {
                 file_id
-            } else if canonical_path.as_path() != path {
-                let Some(file_id) = path_to_id.remove(&canonical_path) else {
+            } else if canonical_path != path {
+                let Some(file_id) = path_to_id.remove(canonical_path) else {
                     return;
                 };
                 file_id
@@ -1856,6 +1906,9 @@ impl SearchIndex {
             file.modified = UNIX_EPOCH;
             file.content_hash = cache_freshness::zero_hash();
         }
+        if file_id >= self.base_file_count {
+            self.free_delta_file_ids.push(file_id);
+        }
         if let Some(count) = Arc::make_mut(&mut self.file_trigram_count).get_mut(file_id as usize) {
             *count = 0;
         }
@@ -1877,36 +1930,28 @@ impl SearchIndex {
         // canonical key as the initial corpus build so scoped queries can see it.
         let canonical_path =
             canonicalize_existing_or_deleted_path_with_memo(path, canonical_parents);
-        self.remove_file_with_canonicalization_memo(&canonical_path, canonical_parents);
+        let file = prepare_search_path(&canonical_path, self.max_file_size);
+        self.apply_search_update(PreparedSearchUpdate {
+            path: canonical_path,
+            file,
+        });
+    }
 
-        let metadata = match fs::metadata(&canonical_path) {
-            Ok(metadata) if metadata.is_file() => metadata,
-            _ => return,
-        };
+    pub(crate) fn max_file_size(&self) -> u64 {
+        self.max_file_size
+    }
 
-        let metadata = search_file_metadata(&metadata);
-
-        if is_binary_path(&canonical_path, metadata.size) {
-            self.track_unindexed_file_with_metadata(&canonical_path, metadata);
-            return;
+    pub(crate) fn apply_search_update(&mut self, update: PreparedSearchUpdate) {
+        self.remove_resolved_file(&update.path, &update.path);
+        match update.file {
+            PreparedSearchPath::Indexed(file) => {
+                self.index_prepared_new_file(&update.path, file);
+            }
+            PreparedSearchPath::Unindexed(metadata) => {
+                self.track_unindexed_file_with_metadata(&update.path, metadata);
+            }
+            PreparedSearchPath::Skipped => {}
         }
-
-        if metadata.size > self.max_file_size {
-            self.track_unindexed_file_with_metadata(&canonical_path, metadata);
-            return;
-        }
-
-        let content = match fs::read(&canonical_path) {
-            Ok(content) => content,
-            Err(_) => return,
-        };
-
-        if is_binary_bytes(&content) {
-            self.track_unindexed_file_with_metadata(&canonical_path, metadata);
-            return;
-        }
-
-        self.index_file_with_metadata(&canonical_path, &content, metadata);
     }
 
     pub fn grep(
@@ -1978,6 +2023,7 @@ impl SearchIndex {
                 self.base = Some(Arc::new(base));
                 self.delta = Arc::new(DeltaState::default());
                 self.delta_file_trigrams.clear();
+                self.free_delta_file_ids.clear();
                 self.delta_packed_bytes = 0;
                 self.base_file_count = u32::try_from(plan.files.len()).unwrap_or(u32::MAX);
                 self.files = Arc::new(plan.files);
@@ -2391,6 +2437,7 @@ impl SearchIndex {
             base: Some(Arc::new(base)),
             delta: Arc::new(DeltaState::default()),
             delta_file_trigrams: HashMap::new(),
+            free_delta_file_ids: Vec::new(),
             files: Arc::new(files),
             path_to_id: Arc::new(path_to_id),
             ready: false,
@@ -2706,13 +2753,22 @@ impl SearchIndex {
         path: &Path,
         metadata: SearchFileMetadata,
     ) -> Option<u32> {
-        let file_id = u32::try_from(self.files.len()).ok()?;
-        Arc::make_mut(&mut self.files).push(FileEntry {
+        let file_id = match self.free_delta_file_ids.pop() {
+            Some(file_id) => file_id,
+            None => u32::try_from(self.files.len()).ok()?,
+        };
+        let file = FileEntry {
             path: path.to_path_buf(),
             size: metadata.size,
             modified: metadata.modified,
             content_hash: cache_freshness::zero_hash(),
-        });
+        };
+        let files = Arc::make_mut(&mut self.files);
+        if let Some(slot) = files.get_mut(file_id as usize) {
+            *slot = file;
+        } else {
+            files.push(file);
+        }
         Arc::make_mut(&mut self.path_to_id).insert(path.to_path_buf(), file_id);
         ensure_count_slot(Arc::make_mut(&mut self.file_trigram_count), file_id);
         Some(file_id)
@@ -3572,8 +3628,8 @@ enum MatchVisit {
     Stop,
     /// The occurrence is on a line that already produced a match.
     SameLine,
-    /// The occurrence was the first on its line; the next line starts at
-    /// `next_line_start`.
+    /// The occurrence was the first on its line; skipping to the next line
+    /// avoids searching the rest of that line again.
     Recorded { next_line_start: usize },
 }
 
@@ -3616,7 +3672,7 @@ fn search_candidate_file(
     };
     bytes_verified.fetch_add(content.len(), Ordering::Relaxed);
     // Defense in depth: even though indexing tries to filter binaries via
-    // `is_binary_path` + full-content `is_binary_bytes`, we double-check at
+    // The index classifies bytes at ingestion; we double-check at
     // query time. content_inspector is fast (~bytes-per-cycle on a small
     // preview) and this guarantees we never surface matches inside binary
     // files even if the indexer somehow let one through (e.g. file changed
@@ -3681,40 +3737,35 @@ fn search_candidate_file(
         match matcher {
             SearchMatcher::Literal(literal) => {
                 let needle = &literal.needle;
-                let lowered;
-                let haystack: &[u8] = if literal.case_insensitive_ascii {
-                    lowered = content.to_ascii_lowercase();
-                    &lowered
-                } else {
-                    &content
-                };
-                let finder = memchr::memmem::Finder::new(needle);
-                let mut start = 0;
-
-                while let Some(position) = finder.find(&haystack[start..]) {
-                    let offset = start + position;
-                    start = match visit(offset, offset + needle.len()) {
-                        MatchVisit::Stop => break,
-                        MatchVisit::SameLine => offset + 1,
-                        // The finder reports every occurrence, overlapping
-                        // ones included, so resuming at the next line finds
-                        // exactly the occurrence a one-byte step would have
-                        // reported next, without visiting the rest of this
-                        // line.
-                        MatchVisit::Recorded { next_line_start } => next_line_start.max(offset + 1),
+                if !needle.contains(&b'\n') {
+                    let lowered;
+                    let haystack: &[u8] = if literal.case_insensitive_ascii {
+                        lowered = content.to_ascii_lowercase();
+                        &lowered
+                    } else {
+                        &content
                     };
+                    let finder = memchr::memmem::Finder::new(needle);
+                    let mut start = 0;
+                    while start <= haystack.len() {
+                        let Some(position) = finder.find(&haystack[start..]) else {
+                            break;
+                        };
+                        let offset = start + position;
+                        start = match visit(offset, offset + needle.len()) {
+                            MatchVisit::Stop => break,
+                            MatchVisit::SameLine => offset + 1,
+                            MatchVisit::Recorded { next_line_start } => {
+                                next_line_start.max(offset + 1)
+                            }
+                        };
+                    }
                 }
             }
             SearchMatcher::Regex(regex) => {
-                // Regex matches are not skipped ahead: a later match on the
-                // same line can run past its newline, and where the next
-                // non-overlapping match starts depends on it. Same-line
-                // matches are still dropped before any line text is built.
-                for matched in regex.find_iter(&content) {
-                    if let MatchVisit::Stop = visit(matched.start(), matched.end()) {
-                        break;
-                    }
-                }
+                pattern_compile::for_each_line_match(regex, &content, |start, end| {
+                    !matches!(visit(start, end), MatchVisit::Stop)
+                });
             }
         }
     }
@@ -3770,29 +3821,33 @@ fn matching_lines_in_content(
     match matcher {
         SearchMatcher::Literal(literal) => {
             let needle = &literal.needle;
-            let lowered;
-            let haystack: &[u8] = if literal.case_insensitive_ascii {
-                lowered = content.to_ascii_lowercase();
-                &lowered
-            } else {
-                content
-            };
-            let finder = memchr::memmem::Finder::new(needle);
-            let mut start = 0;
-            while let Some(position) = finder.find(&haystack[start..]) {
-                let offset = start + position;
-                // Resume at the next line once this one is recorded: the rest
-                // of the line can only repeat it (see `search_candidate_file`).
-                start = record(offset, offset + needle.len())
-                    .map_or(offset + 1, |next_line_start| {
-                        next_line_start.max(offset + 1)
-                    });
+            if !needle.contains(&b'\n') {
+                let lowered;
+                let haystack: &[u8] = if literal.case_insensitive_ascii {
+                    lowered = content.to_ascii_lowercase();
+                    &lowered
+                } else {
+                    content
+                };
+                let finder = memchr::memmem::Finder::new(needle);
+                let mut start = 0;
+                while start <= haystack.len() {
+                    let Some(position) = finder.find(&haystack[start..]) else {
+                        break;
+                    };
+                    let offset = start + position;
+                    start = record(offset, offset + needle.len())
+                        .map_or(offset + 1, |next_line_start| {
+                            next_line_start.max(offset + 1)
+                        });
+                }
             }
         }
         SearchMatcher::Regex(regex) => {
-            for matched in regex.find_iter(content) {
-                record(matched.start(), matched.end());
-            }
+            pattern_compile::for_each_line_match(regex, content, |start, end| {
+                record(start, end);
+                true
+            });
         }
     }
     (matches, matched_lines)
@@ -3892,7 +3947,9 @@ fn metadata_for_indexed_content(path: &Path, size_hint: u64) -> SearchFileMetada
 }
 
 fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
-    match read_search_corpus_file(path, max_file_size) {
+    // The trigram index does not consume the generated flag. Other corpus
+    // readers still request it, preserving their eligibility policy.
+    match read_search_corpus_file_inner(path, max_file_size, false) {
         SearchCorpusEligibility::Eligible(file) => {
             PreparedSearchPath::Indexed(PreparedIndexedFile {
                 metadata: file.metadata,
@@ -3906,19 +3963,36 @@ fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
 }
 
 pub(crate) fn read_search_corpus_file(path: &Path, max_file_size: u64) -> SearchCorpusEligibility {
+    read_search_corpus_file_inner(path, max_file_size, true)
+}
+
+fn read_search_corpus_file_inner(
+    path: &Path,
+    max_file_size: u64,
+    classify_generated: bool,
+) -> SearchCorpusEligibility {
+    #[cfg(test)]
+    AUDIT_IO_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow_mut().as_mut() {
+            probe();
+        }
+    });
     let metadata = match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => search_file_metadata(&metadata),
         _ => return SearchCorpusEligibility::Skipped,
     };
 
-    if is_binary_path(path, metadata.size) || metadata.size > max_file_size {
+    if metadata.size > max_file_size {
         return SearchCorpusEligibility::Unindexed(metadata);
     }
 
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read();
     // Bound the read itself as well as admission: the file can grow after stat.
-    let mut bytes = Vec::new();
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(metadata.size.min(max_file_size)).unwrap_or(0));
+    #[cfg(test)]
+    audit_record(|work| work.corpus_opens += 1);
     let read = File::open(path).and_then(|file| {
         file.take(max_file_size.saturating_add(1))
             .read_to_end(&mut bytes)
@@ -3930,9 +4004,13 @@ pub(crate) fn read_search_corpus_file(path: &Path, max_file_size: u64) -> Search
         return SearchCorpusEligibility::Unindexed(metadata);
     }
 
+    #[cfg(test)]
+    if classify_generated {
+        audit_record(|work| work.corpus_opens += 1);
+    }
     SearchCorpusEligibility::Eligible(SearchCorpusFile {
         metadata,
-        generated: crate::inspect::is_generated_file(path, path),
+        generated: classify_generated && crate::inspect::is_generated_file(path, path),
         bytes,
     })
 }
@@ -4326,6 +4404,7 @@ fn build_streaming_index(
         base: Some(Arc::new(base)),
         delta: Arc::new(DeltaState::default()),
         delta_file_trigrams: HashMap::new(),
+        free_delta_file_ids: Vec::new(),
         files: Arc::new(files),
         path_to_id: Arc::new(path_to_id),
         ready: false,
@@ -4410,13 +4489,12 @@ fn write_cache_file_from_sources(
         writer.write_all(&lookup_blob)?;
         let file_bytes = writer.stream_position()?;
         writer.flush()?;
-        writer.get_ref().sync_all()?;
+        // CRC-checked caches rebuild from source after power loss. The rename,
+        // not a sync, keeps concurrent readers from seeing a partial write.
         drop(writer);
 
         fs::rename(&tmp_cache, &cache_path)?;
-        sync_parent_dir(&cache_path);
-        // The file was fsynced above, so its full length reached the device;
-        // that length is the physical credit, not an estimate.
+        // Credit the bytes handed to the kernel; this cache is not a durable log.
         crate::write_ledger::credit(
             domain,
             plan.project_root.display().to_string(),
@@ -4652,10 +4730,8 @@ fn flush_spill_segment(
     }
     let segment_bytes = writer.stream_position()?;
     writer.flush()?;
-    writer.get_ref().sync_all()?;
-    // Spill segments are deleted once the merge finishes, but they were
-    // fsynced to disk first, so large builds write them in addition to
-    // cache.bin and the census must count them.
+    // Spill segments are read and deleted by this build. Kernel visibility is
+    // enough; they have no recovery role after the process exits.
     counter.credit(segment_bytes, segment_bytes);
     block.clear();
     Ok(path)
@@ -4974,9 +5050,7 @@ fn sweep_transient_search_cache_dirs_with_limits(
             cursors.remove(root);
         }
     }
-    if summary.removed > 0 {
-        crate::fs_lock::sync_parent(root);
-    }
+    if summary.removed > 0 {}
     summary
 }
 
@@ -5145,14 +5219,6 @@ fn crc32_file_range(path: &Path, start: u64, len: u64) -> std::io::Result<u32> {
         remaining -= bytes_read as u64;
     }
     Ok(hasher.finalize())
-}
-
-fn sync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
 }
 
 fn open_cache_file_read(path: &Path) -> std::io::Result<File> {
@@ -5558,7 +5624,8 @@ pub(crate) fn build_path_filters(
 }
 
 pub(crate) fn walk_project_files(root: &Path, filters: &PathFilters) -> Vec<PathBuf> {
-    walk_project_files_from(root, root, filters)
+    walk_project_files_from_inner(root, root, filters, None, false)
+        .expect("unbounded project walk cannot exceed a file limit")
 }
 
 pub fn walk_project_files_bounded_default(
@@ -5720,6 +5787,8 @@ fn io_error_means_missing_on_disk(error: &std::io::Error) -> bool {
 /// Whether `path` is known to be absent from disk. One `stat`; an unreadable
 /// path counts as present.
 pub(crate) fn path_missing_on_disk(path: &Path) -> bool {
+    #[cfg(test)]
+    audit_record(|work| work.presence_checks += 1);
     fs::metadata(path).is_err_and(|error| io_error_means_missing_on_disk(&error))
 }
 
@@ -5952,7 +6021,7 @@ pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
 /// Metadata and display keys are snapshotted before sorting: the comparator must
 /// remain a total order even if files change or disappear during the sort.
 pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
-    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true);
+    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true, None);
 }
 
 /// Sort paths emitted by one filesystem walk without resolving every path again.
@@ -5962,29 +6031,47 @@ pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path
 /// `canonicalize` for every match only repeats filesystem lookups the walk just
 /// performed.
 pub(crate) fn sort_walked_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
-    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, false);
+    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, false, None);
+}
+
+/// Indexed paths already have canonical keys and mtimes. Unindexed roots still
+/// use the disk-backed ordering, so mixed-root glob retains the same contract.
+pub(crate) fn sort_paths_by_cached_mtime_desc(
+    paths: &mut [PathBuf],
+    stable_root: &Path,
+    mtimes: &HashMap<PathBuf, SystemTime>,
+) {
+    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true, Some(mtimes));
 }
 
 fn sort_paths_by_mtime_desc_with_key_normalization(
     paths: &mut [PathBuf],
     stable_root: &Path,
     canonicalize_paths: bool,
+    cached_mtimes: Option<&HashMap<PathBuf, SystemTime>>,
 ) {
     use std::collections::HashMap;
     let stable_root = crate::inspect::job::canonicalize_normalized(stable_root);
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::with_capacity(paths.len());
     let mut display_paths: HashMap<PathBuf, String> = HashMap::with_capacity(paths.len());
     for path in paths.iter() {
-        mtimes
-            .entry(path.clone())
-            .or_insert_with(|| path_modified_time(path));
+        mtimes.entry(path.clone()).or_insert_with(|| {
+            cached_mtimes
+                .and_then(|times| times.get(path))
+                .copied()
+                .or_else(|| path_modified_time(path))
+        });
         display_paths.entry(path.clone()).or_insert_with(|| {
             let resolved = if path.is_absolute() {
                 path.clone()
             } else {
                 stable_root.join(path)
             };
-            let comparison_path = if canonicalize_paths {
+            let comparison_path = if canonicalize_paths
+                && !cached_mtimes.is_some_and(|times| times.contains_key(path))
+            {
+                #[cfg(test)]
+                audit_record(|work| work.sort_canonicalizes += 1);
                 crate::inspect::job::canonicalize_normalized(&resolved)
             } else {
                 crate::inspect::job::normalize_path(&resolved)
@@ -6646,9 +6733,7 @@ pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
             cursors.remove(&index_root);
         }
     }
-    if summary.removed > 0 {
-        crate::fs_lock::sync_parent(&index_root);
-    }
+    if summary.removed > 0 {}
     crate::slog_info!(
         "search index orphan sweep root={} scanned={} removed={} skipped_derived={} skipped_memo={} skipped_fresh={} skipped_live={} skipped_locked={} skipped_unreadable={} budget_exhausted={}",
         index_root.display(),
@@ -7223,6 +7308,11 @@ pub(crate) fn count_ignore_rule_discovery_dirs_legacy_stack(root: &Path) -> usiz
 
 impl PathFilters {
     pub(crate) fn matches(&self, root: &Path, path: &Path) -> bool {
+        if self.includes.is_none() && self.excludes.is_none() {
+            return true;
+        }
+        #[cfg(test)]
+        audit_record(|work| work.filter_keys += 1);
         // Compare normalized copies: the search root arrives non-verbatim while
         // indexed entries may carry the Windows `\\?\` form, and a raw
         // strip_prefix between the two forms fails, which read as "no match".
@@ -7269,6 +7359,8 @@ fn resolve_match_path(project_root: &Path, path: &Path) -> PathBuf {
 }
 
 fn path_modified_time(path: &Path) -> Option<SystemTime> {
+    #[cfg(test)]
+    audit_record(|work| work.sort_stats += 1);
     #[cfg(test)]
     cache_freshness::record_metadata_call(path);
     fs::metadata(path)
@@ -7743,23 +7835,6 @@ fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: 
     true
 }
 
-fn is_binary_path(path: &Path, size: u64) -> bool {
-    if size == 0 {
-        return false;
-    }
-
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return true,
-    };
-
-    let mut preview = vec![0u8; PREVIEW_BYTES.min(size as usize)];
-    match file.read(&mut preview) {
-        Ok(read) => is_binary_bytes(&preview[..read]),
-        Err(_) => true,
-    }
-}
-
 fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
     let mut starts = vec![0usize];
     for (index, byte) in content.iter().copied().enumerate() {
@@ -7850,8 +7925,247 @@ fn to_glob_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+// Thread-local operation counters keep concurrent tests from charging each
+// other's filesystem work. They observe the call sites, not elapsed time.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AuditWork {
+    pub cancel_probes: usize,
+    pub corpus_opens: usize,
+    pub sort_stats: usize,
+    pub sort_canonicalizes: usize,
+    pub watcher_global: usize,
+    pub watcher_head: usize,
+    pub filter_keys: usize,
+    pub presence_checks: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static AUDIT_WORK: std::cell::Cell<AuditWork> = std::cell::Cell::new(AuditWork::default());
+    static AUDIT_IO_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+    static AUDIT_CANCEL_ELAPSED: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn audit_cancel_elapsed(started: Instant) -> Duration {
+    AUDIT_CANCEL_ELAPSED.with(|slot| slot.get().unwrap_or_else(|| started.elapsed()))
+}
+
+#[cfg(test)]
+pub(crate) fn audit_set_io_probe(probe: Option<Box<dyn FnMut()>>) {
+    AUDIT_IO_PROBE.with(|slot| *slot.borrow_mut() = probe);
+}
+
+#[cfg(test)]
+pub(crate) fn audit_record(record: impl FnOnce(&mut AuditWork)) {
+    AUDIT_WORK.with(|slot| {
+        let mut work = slot.get();
+        record(&mut work);
+        slot.set(work);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn audit_work_reset() {
+    AUDIT_WORK.with(|slot| slot.set(AuditWork::default()));
+}
+
+#[cfg(test)]
+pub(crate) fn audit_work() -> AuditWork {
+    AUDIT_WORK.with(std::cell::Cell::get)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn perf_audit_empty_filters_skip_path_keys() {
+        let root = Path::new("/project");
+        audit_work_reset();
+        for i in 0..1000 {
+            assert!(PathFilters::default().matches(root, &root.join(format!("src/file_{i}.rs"))));
+        }
+        assert_eq!(audit_work().filter_keys, 0);
+        let filters = build_path_filters(&["**/*.rs".to_string()], &[]).unwrap();
+        assert!(filters.matches(root, &root.join("src/main.rs")));
+        assert!(!filters.matches(root, &root.join("src/main.txt")));
+    }
+    #[test]
+    fn perf_audit_cancellation_probe_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = crate::executor::JobCancellation::new().with_root(dir.path());
+        let _guard = crate::executor::install_job_cancellation(token.clone());
+        AUDIT_CANCEL_ELAPSED.with(|slot| slot.set(Some(Duration::ZERO)));
+        audit_work_reset();
+        for _ in 0..100_000 {
+            assert!(!crate::executor::current_job_cancelled());
+        }
+        let work = audit_work();
+        assert_eq!(work.cancel_probes, 391, "{work:?}");
+        fs::remove_dir(dir.path()).unwrap();
+        assert!((0..256).any(|_| crate::executor::current_job_cancelled()));
+        assert!(token.cancel_already_requested());
+        AUDIT_CANCEL_ELAPSED.with(|slot| slot.set(None));
+    }
+
+    #[test]
+    fn cancellation_time_probe_and_explicit_signal_are_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = crate::executor::JobCancellation::new().with_root(dir.path());
+        assert!(!token.cancel_requested_before_commit());
+        fs::remove_dir(dir.path()).unwrap();
+        AUDIT_CANCEL_ELAPSED.with(|slot| slot.set(Some(Duration::from_millis(50))));
+        assert!(token.cancel_requested_before_commit());
+        AUDIT_CANCEL_ELAPSED.with(|slot| slot.set(None));
+        let dir = tempfile::tempdir().unwrap();
+        let token = crate::executor::JobCancellation::new().with_root(dir.path());
+        assert!(!token.cancel_requested_before_commit());
+        token.request_cancel();
+        assert!(token.cancel_requested_before_commit());
+    }
+
+    #[test]
+    fn perf_audit_corpus_opens_once() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..256 {
+            let path = dir.path().join(format!("source_{i:03}.rs"));
+            fs::write(
+                &path,
+                format!("// generated by fixture\nfn marker_{i}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        audit_work_reset();
+        for i in 0..256 {
+            let path = dir.path().join(format!("source_{i:03}.rs"));
+            assert!(matches!(
+                prepare_search_path(&path, DEFAULT_MAX_FILE_SIZE),
+                PreparedSearchPath::Indexed(_)
+            ));
+        }
+        let work = audit_work();
+        assert_eq!(work.corpus_opens, 256, "{work:?}");
+    }
+
+    #[test]
+    fn corpus_reader_preserves_generated_and_binary_eligibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        for bytes in [
+            b"// generated by fixture\nfn marker() {}\n".as_slice(),
+            b"fn marker() {}\n",
+            b"\xff\n// generated by fixture\n",
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let expected_generated = crate::inspect::is_generated_file(&path, &path);
+            match read_search_corpus_file(&path, DEFAULT_MAX_FILE_SIZE) {
+                SearchCorpusEligibility::Eligible(file) => {
+                    assert_eq!(file.bytes, bytes);
+                    assert_eq!(file.generated, expected_generated);
+                }
+                _ => panic!("text remains eligible"),
+            }
+        }
+        fs::write(&path, b"binary\0content").unwrap();
+        assert!(matches!(
+            read_search_corpus_file(&path, DEFAULT_MAX_FILE_SIZE),
+            SearchCorpusEligibility::Unindexed(_)
+        ));
+        fs::write(&path, "oversize content").unwrap();
+        assert!(matches!(
+            read_search_corpus_file(&path, 3),
+            SearchCorpusEligibility::Unindexed(_)
+        ));
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            read_search_corpus_file(&path, DEFAULT_MAX_FILE_SIZE),
+            SearchCorpusEligibility::Skipped
+        ));
+    }
+
+    #[test]
+    fn perf_audit_build_walk_skips_mtime_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..256 {
+            fs::write(
+                dir.path().join(format!("source_{i:03}.rs")),
+                "fn marker() {}\n",
+            )
+            .unwrap();
+        }
+        audit_work_reset();
+        let paths = walk_project_files(dir.path(), &PathFilters::default());
+        assert_eq!(paths.len(), 256);
+        let work = audit_work();
+        assert_eq!(work.sort_stats, 0, "{work:?}");
+        assert_eq!(work.sort_canonicalizes, 0, "{work:?}");
+    }
+
+    #[test]
+    fn perf_audit_delta_slots_stay_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edited.rs");
+        fs::write(&path, "fn old_marker() {}\n").unwrap();
+        let mut index = SearchIndex::build(dir.path());
+        let before = index.snapshot();
+        for i in 0..256 {
+            fs::write(&path, format!("fn new_marker_{i}() {{}}\n")).unwrap();
+            index.update_file(&path);
+        }
+        assert!(
+            index.files.len() <= 2,
+            "{} file slots for one live file",
+            index.files.len()
+        );
+        assert_eq!(before.candidates(&decompose_regex("old_marker")).len(), 1);
+        assert_eq!(
+            index.candidates(&decompose_regex("new_marker_255")).len(),
+            1
+        );
+        let reference = SearchIndex::build_with_limit_serial(dir.path(), DEFAULT_MAX_FILE_SIZE);
+        assert_eq!(
+            index
+                .grep("new_marker_255", true, &[], &[], dir.path(), 100)
+                .matches,
+            reference
+                .grep("new_marker_255", true, &[], &[], dir.path(), 100)
+                .matches
+        );
+    }
+
+    #[test]
+    fn durability_search_cache_write_count() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("source.txt"), "abcdef").unwrap();
+        let mut index = SearchIndex::build(project.path());
+        crate::durability::take();
+        assert!(index.write_to_disk(cache.path(), None));
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        assert!(SearchIndex::read_from_disk(cache.path(), project.path()).is_some());
+    }
+
+    #[test]
+    fn durability_search_spill_write_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut block = vec![SpillRecord {
+            trigram: 1,
+            file_id: 0,
+            next_mask: 0,
+            loc_mask: 0,
+        }];
+        let counter = crate::write_ledger::register(
+            crate::write_ledger::Domain::SearchIndexBuild,
+            "durability-spill",
+        );
+        crate::durability::take();
+        let path = flush_spill_segment(dir.path(), 0, &mut block, &counter).unwrap();
+        assert!(path.is_file());
+        assert!(block.is_empty());
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+    }
     use std::process::Command;
 
     use super::*;
@@ -9966,6 +10280,85 @@ mod tests {
 
         assert_eq!(result.total_matches, 1);
         assert_eq!(result.matches.len(), 1);
+    }
+
+    #[test]
+    fn indexed_regex_grep_patterns_are_line_oriented() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("stderr.log");
+        fs::write(&file, "\n  566 pass\nx\n").expect("write file");
+        let index = SearchIndex::build(&project);
+        assert!(index.is_ready());
+
+        let whitespace = index.grep(r"^\s+[0-9]+ pass", true, &[], &[], &project, 10);
+        assert_eq!(whitespace.matches.len(), 1);
+        assert_eq!(whitespace.matches[0].line, 2);
+        assert_eq!(whitespace.matches[0].line_text, "  566 pass");
+        assert_eq!(whitespace.matches[0].match_text, "  566 pass");
+
+        let negated_class = index.grep(r"[^x]+", true, &[], &[], &project, 10);
+        assert_eq!(negated_class.matches.len(), 1);
+        assert_eq!(negated_class.matches[0].line, 2);
+        assert_eq!(negated_class.matches[0].match_text, "  566 pass");
+        assert!(negated_class
+            .matches
+            .iter()
+            .all(|matched| !matched.match_text.contains('\n')));
+
+        let explicit_newline = index.grep(r"pass\nx", true, &[], &[], &project, 10);
+        assert!(explicit_newline.matches.is_empty());
+
+        let regex = match pattern_compile::compile(r"[^x]+", CompileOpts::default()) {
+            CompileResult::Ok(CompiledPattern::Regex { compiled, .. }) => compiled,
+            other => panic!("compile regex: {other:?}"),
+        };
+        let never_keep = |_matched: &GrepMatch| false;
+        let (collected, collected_lines) = matching_lines_in_content(
+            &file,
+            b"\n  566 pass\nx\n",
+            &SearchMatcher::Regex(regex),
+            10,
+            &never_keep,
+        );
+        assert_eq!(collected_lines, 1);
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].line, 2);
+        assert_eq!(collected[0].match_text, "  566 pass");
+
+        let literal_newline = match pattern_compile::compile(
+            "pass\nx",
+            CompileOpts {
+                literal: true,
+                ..CompileOpts::default()
+            },
+        ) {
+            CompileResult::Ok(pattern) => pattern,
+            other => panic!("compile literal newline: {other:?}"),
+        };
+        let result = index.search_grep(&literal_newline, &[], &[], &project, 10);
+        assert!(result.matches.is_empty());
+    }
+
+    #[test]
+    fn indexed_cross_line_regex_rescans_starting_line() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("cross-line.log");
+        std::fs::write(&file, "foo hit\nbar\nprefix foo hit\nbar\n")
+            .expect("write cross-line fixture");
+        let index = SearchIndex::build(&project);
+        let result = index.grep(r"foo.*\nbar|hit", true, &[], &[], &project, 10);
+
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].line, 1);
+        assert_eq!(result.matches[0].line_text, "foo hit");
+        assert_eq!(result.matches[0].match_text, "hit");
+        assert_eq!(result.matches[1].line, 3);
+        assert_eq!(result.matches[1].line_text, "prefix foo hit");
+        assert_eq!(result.matches[1].match_text, "hit");
     }
 
     #[test]

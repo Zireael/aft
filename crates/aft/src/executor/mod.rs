@@ -474,6 +474,7 @@ pub struct BindBlockerSnapshot {
     pub blockers: Vec<String>,
     pub oldest_queued_writer_age_ms: Option<u64>,
     pub in_flight_readers: Vec<BindBlockerReaderSnapshot>,
+    pub in_flight_writer: Option<MutatingLaneSnapshot>,
     pub reader_admissions_while_promoted_writer_waited: u64,
 }
 
@@ -661,15 +662,86 @@ impl JobCancellation {
         self.signal_cancel();
     }
 
+    /// True when a cancel has already won the state race. A pure read: unlike
+    /// [`Self::cancel_requested_before_commit`] it never checks the root on
+    /// disk or the abandon grace and never signals, so it is safe to call
+    /// while holding `wait_lock` and from observers such as health reports.
+    pub fn cancel_already_requested(&self) -> bool {
+        self.state() == JOB_CANCEL_STATE_CANCELLED
+    }
+
     /// True when a cancel won the state race and the job must abort.
+    ///
+    /// This also cancels the job when its root was deleted or abandoned, which
+    /// signals and so takes `wait_lock`. Never call it while holding that lock
+    /// (it is not reentrant), and keep it out of read-only observers.
     pub fn cancel_requested_before_commit(&self) -> bool {
-        // A deleted checkout cannot publish useful work. Check here as well as
-        // at admission so deletion during a batch does not wait for the reaper.
-        if self.root.as_ref().is_some_and(|root| !root.is_dir()) {
-            self.request_cancel();
+        let state = self.state();
+        match state {
+            JOB_CANCEL_STATE_CANCELLED => return true,
+            JOB_CANCEL_STATE_COMMITTED => return false,
+            _ => {}
         }
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.cancel_if_abandoned(|| self.request_cancel());
+            if self.cancel_already_requested() {
+                return true;
+            }
+        }
+        if self.root.is_none() {
+            return false;
+        }
+        // Every checkpoint observes explicit cancellation and the in-memory
+        // lifecycle signal. Only the filesystem deletion probe is bounded to
+        // one per 256 checkpoints or 50ms on each worker, whichever comes
+        // first. A weak identity prevents a new token reusing an allocation
+        // from inheriting the previous job's delay.
+        // The first running checkpoint probes again after admission: setup may
+        // have blocked before the command got a chance to observe its root.
+        thread_local! {
+            static LAST_PROBE: std::cell::RefCell<Option<(std::sync::Weak<JobCancellationInner>, u8, u16, Instant)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let probe = LAST_PROBE.with(|slot| {
+            let mut last = slot.borrow_mut();
+            if let Some((identity, previous_state, items, when)) = last.as_mut() {
+                if identity.as_ptr() == Arc::as_ptr(&self.inner) && *previous_state == state {
+                    *items += 1;
+                    #[cfg(not(test))]
+                    let elapsed = when.elapsed();
+                    #[cfg(test)]
+                    let elapsed = crate::search_index::audit_cancel_elapsed(*when);
+                    if *items < 256 && elapsed < Duration::from_millis(50) {
+                        return false;
+                    }
+                    *items = 0;
+                    *when = Instant::now();
+                    return true;
+                }
+            }
+            *last = Some((Arc::downgrade(&self.inner), state, 0, Instant::now()));
+            true
+        });
+        if !probe {
+            return self.state() == JOB_CANCEL_STATE_CANCELLED;
+        }
+        #[cfg(test)]
+        crate::search_index::audit_record(|work| work.cancel_probes += 1);
+        // A deleted checkout cannot publish useful work. Check here as well as
+        // at admission so deletion during a batch does not wait for the reaper.
+        // Permission/transient I/O failures do not prove that it was deleted.
+        if self
+            .root
+            .as_ref()
+            .is_some_and(|root| match std::fs::metadata(root.as_path()) {
+                Ok(metadata) => !metadata.is_dir(),
+                Err(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ),
+            })
+        {
+            self.request_cancel();
         }
         self.state() == JOB_CANCEL_STATE_CANCELLED
     }
@@ -682,11 +754,18 @@ impl JobCancellation {
         if self.cancel_requested_before_commit() {
             return true;
         }
-        let mut guard = self.inner.wait_lock.lock();
-        if self.cancel_requested_before_commit() {
-            return true;
+        {
+            let mut guard = self.inner.wait_lock.lock();
+            // Only the pure state read may run under `wait_lock`: the full check
+            // can decide the root is deleted or abandoned and signal, and
+            // signalling takes this same lock. Doing that here deadlocked the
+            // waiting job and then every caller that signalled it, including
+            // the health report on the module's frame loop.
+            if self.cancel_already_requested() {
+                return true;
+            }
+            self.inner.wake.wait_for(&mut guard, timeout);
         }
-        self.inner.wake.wait_for(&mut guard, timeout);
         self.cancel_requested_before_commit()
     }
 
@@ -731,7 +810,11 @@ pub fn current_job_cancellation() -> Option<JobCancellation> {
 }
 
 pub fn current_job_cancelled() -> bool {
-    current_job_cancellation().is_some_and(|token| token.cancel_requested_before_commit())
+    CURRENT_JOB_CANCELLATION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(JobCancellation::cancel_requested_before_commit)
+    })
 }
 
 pub struct JobCancellationContextGuard {
@@ -1027,6 +1110,7 @@ impl Executor {
     /// rather than replacing the per-root [`AppContext`]. Returns `true` when a
     /// new actor was inserted.
     pub fn register_actor(&self, root_id: ProjectRootId, ctx: Arc<AppContext>) -> bool {
+        ctx.bind_status_context();
         let memory_root = root_id.as_path().to_path_buf();
         let inserted = {
             let mut state = self.inner.state.lock();
@@ -2193,6 +2277,19 @@ impl SchedulerState {
             })
             .collect::<Vec<_>>();
         in_flight_readers.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        // The bind's own configure job can hold the mutating slot while it
+        // runs. It is not a blocker of the bind; reporting it as one would
+        // tell the caller to wait for a different job when the bind's own
+        // configure is what is slow.
+        let in_flight_writer = actor
+            .and_then(|actor| actor.mutating_inflight.as_ref())
+            .filter(|job| job.request_id != request_id)
+            .map(|job| MutatingLaneSnapshot {
+                root_id: root_id.clone(),
+                request_id: job.request_id.clone(),
+                command: job.command.clone(),
+                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+            });
 
         let mut blockers = Vec::new();
         if let Some(actor) = actor {
@@ -2272,6 +2369,7 @@ impl SchedulerState {
             blockers,
             oldest_queued_writer_age_ms,
             in_flight_readers,
+            in_flight_writer,
             reader_admissions_while_promoted_writer_waited: actor
                 .map(|actor| actor.reader_admissions_while_promoted_writer_waited)
                 .unwrap_or(0),

@@ -10,6 +10,15 @@
 //! - `payload.details.diagnostics` (auto-emitted or selected)
 //! - `payload.details.diagnostics_uncovered_files` (auto-emitted when scoped files have no
 //!   authoritative diagnostics; the per-file rows in `gaps` stay complete)
+//! - Summary previews `top`, `test_only_top`, and `generated_top` use
+//!   `inspect::manager::scoped_top_preview` with `TOP_PREVIEW_ITEMS` only after
+//!   scope filtering. They are examples, not enumerations; their sibling counts
+//!   describe the full filtered lists and drill-down carries the list envelopes.
+//! - The status header previews at most `MAX_INSPECT_HEADER_PARTS` incomplete
+//!   parts, shortest scanner explanations first, then diagnostic causes. It
+//!   adds `+N more` rather than a list envelope because this is a headline;
+//!   all scanner reasons remain in the body and structured gaps, and diagnostic
+//!   overflow reasons are rendered in the body. This cap never changes `complete`.
 //!
 //! Truncation causes:
 //! - `cap`: Selecting cut, per-list `topK` limiting.

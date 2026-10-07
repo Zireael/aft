@@ -1,18 +1,23 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::context::AppContext;
-use crate::grep_executor::bounded_fallback_walk_files;
+use crate::grep_executor::{
+    bounded_fallback_walk_files_for_target, diagnose_scope_counts, ScopeFileCounts,
+};
 use crate::protocol::{RawRequest, Response};
-use crate::search_index::{build_path_filters, resolve_search_scope, sort_paths_by_mtime_desc};
+use crate::search_index::{
+    build_path_filters, resolve_search_scope, sort_paths_by_cached_mtime_desc,
+};
 
 use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResolution};
 
 #[derive(Debug)]
 struct GlobDiscovery {
     files: Vec<PathBuf>,
+    indexed_mtimes: HashMap<PathBuf, SystemTime>,
     walk_truncated: bool,
     source: &'static str,
     entries_visited: usize,
@@ -84,6 +89,23 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     let total_started = Instant::now();
     let mut parent_gaps = Vec::new();
+    let mut indexed_mtimes = HashMap::new();
+    let ignored_targets = search_roots
+        .iter()
+        .map(|root| {
+            req.params
+                .get("path")
+                .and_then(|value| value.as_str())
+                .is_some()
+                && !crate::grep_executor::is_same_directory(root, &project_root)
+                && crate::grep_executor::target_is_ignored(root)
+        })
+        .collect::<Vec<_>>();
+    let parent_answer = if ignored_targets.iter().any(|ignored| *ignored) {
+        None
+    } else {
+        crate::views::parent::glob_fan_out(ctx, &search_roots, pattern)
+    };
     let (
         mut files,
         walk_truncated,
@@ -93,7 +115,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         scope_has_files,
         scope_probe,
         skipped_foreign_mounts,
-    ) = if let Some(answer) = crate::views::parent::glob_fan_out(ctx, &search_roots, pattern) {
+    ) = if let Some(answer) = parent_answer {
         // A parent folder session answers from its child repositories' indexes.
         parent_gaps = answer.gaps;
         (
@@ -113,7 +135,9 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             &search_roots[0],
             pattern,
             DEFAULT_MAX_RESULTS + 1,
+            ignored_targets[0],
         );
+        indexed_mtimes = discovery.indexed_mtimes;
         (
             discovery.files,
             discovery.walk_truncated,
@@ -127,7 +151,17 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         let discoveries: Vec<GlobDiscovery> = search_roots
             .iter()
-            .map(|root| glob_root(ctx, &project_root, root, pattern, DEFAULT_MAX_RESULTS + 1))
+            .zip(&ignored_targets)
+            .map(|(root, ignored)| {
+                glob_root(
+                    ctx,
+                    &project_root,
+                    root,
+                    pattern,
+                    DEFAULT_MAX_RESULTS + 1,
+                    *ignored,
+                )
+            })
             .collect();
         let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
         let entries_visited = discoveries.iter().map(|d| d.entries_visited).sum();
@@ -140,6 +174,14 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         } else {
             "mixed/fallback"
         };
+        for discovery in &discoveries {
+            indexed_mtimes.extend(
+                discovery
+                    .indexed_mtimes
+                    .iter()
+                    .map(|(path, time)| (path.clone(), *time)),
+            );
+        }
         let files = merge_glob_files(discoveries.into_iter().flat_map(|d| d.files).collect());
         (
             files,
@@ -162,7 +204,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     );
     // Glob's public contract is newest-first. Sort before truncating so the cap
     // keeps the most recently modified matches instead of the lexically first.
-    sort_paths_by_mtime_desc(&mut files, &project_root);
+    sort_paths_by_cached_mtime_desc(&mut files, &project_root, &indexed_mtimes);
     // Backstop against a stale index (for example a borrowed snapshot that
     // still lists another checkout's files): only paths present on disk in this
     // checkout are returned. Only the page is checked, and the page is refilled
@@ -192,13 +234,32 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         body["walk_truncated"] = serde_json::Value::Bool(true);
     }
     if !scope_has_files {
+        let counts = {
+            let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
+            search_roots.iter().zip(&ignored_targets).try_fold(
+                ScopeFileCounts::default(),
+                |mut counts, (root, ignored)| {
+                    counts.add(diagnose_scope_counts(root, root, &filters, *ignored)?);
+                    Some(counts)
+                },
+            )
+        };
         // Say in the text itself that nothing was searched, so an empty scope
         // never reads as a searched directory with zero files.
         body["text"] = serde_json::Value::String(format!(
             "{}\n\n{}",
             body["text"].as_str().unwrap_or_default(),
-            crate::commands::grep::NO_FILES_IN_SCOPE_NOTE
+            counts.map(|counts| counts.empty_note(true)).unwrap_or_else(|| {
+                "(0 files searched: the bounded walk could not determine why no files matched the scope; nothing was searched.)".to_string()
+            })
         ));
+        if let Some(counts) = counts {
+            body["files_examined"] = serde_json::json!(counts.examined);
+            body["ignored_items"] = serde_json::json!(counts.ignored);
+            body["files_excluded_by_patterns"] = serde_json::json!(counts.filtered);
+        } else {
+            body["complete"] = serde_json::json!(false);
+        }
     }
     if missing_on_disk > 0 {
         body["missing_on_disk_dropped"] = serde_json::json!(missing_on_disk);
@@ -269,6 +330,7 @@ fn glob_root(
     search_root: &Path,
     pattern: &str,
     max_results: usize,
+    ignored_target: bool,
 ) -> GlobDiscovery {
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
@@ -278,7 +340,9 @@ fn glob_root(
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match search_index.as_ref() {
-            Some(index) if index.ready && search_scope.use_index => Some(index.snapshot()),
+            Some(index) if index.ready && search_scope.use_index && !ignored_target => {
+                Some(index.snapshot())
+            }
             _ => None,
         }
     };
@@ -288,9 +352,18 @@ fn glob_root(
     let indexed = indexed_snapshot.map(|snapshot| {
         let (files, scope_has_files, entries_visited) =
             snapshot.glob_profiled(pattern, &search_scope.root, false);
+        let indexed_mtimes = files
+            .iter()
+            .filter_map(|path| {
+                snapshot
+                    .file_modified(path)
+                    .map(|time| (path.clone(), time))
+            })
+            .collect();
         GlobDiscovery {
             entries_visited,
             files,
+            indexed_mtimes,
             walk_truncated: false,
             source: "index",
             walk_time: Duration::ZERO,
@@ -313,12 +386,12 @@ fn glob_root(
         // index walk never follows. Walk it rather than report zero files; the
         // walk applies ignore rules only to entries nested inside the named
         // root. A project-wide glob answers from the index even when empty.
-        Some(_) => fallback_glob(project_root, &search_scope.root, pattern),
+        Some(_) => fallback_glob(project_root, &search_scope.root, pattern, ignored_target),
         None => {
             if search_scope.use_index {
                 super::configure::trigger_search_index_reload_if_evicted(ctx);
             }
-            if !search_scope.use_index {
+            if !search_scope.use_index && !ignored_target {
                 let walk_started = Instant::now();
                 if let Some(outcome) =
                     super::grep::ripgrep_glob(&search_scope.root, pattern, max_results)
@@ -328,6 +401,7 @@ fn glob_root(
                     let scope_has_files = !outcome.files.is_empty() || outcome.walk_truncated;
                     return GlobDiscovery {
                         files: outcome.files,
+                        indexed_mtimes: HashMap::new(),
                         walk_truncated: outcome.walk_truncated,
                         source: "fallback",
                         entries_visited: outcome.entries_visited,
@@ -338,7 +412,7 @@ fn glob_root(
                     };
                 }
             }
-            fallback_glob(project_root, &search_scope.root, pattern)
+            fallback_glob(project_root, &search_scope.root, pattern, ignored_target)
         }
     }
 }
@@ -358,6 +432,7 @@ fn fallback_glob(
     _project_root: &std::path::Path,
     search_root: &std::path::Path,
     pattern: &str,
+    ignored_target: bool,
 ) -> GlobDiscovery {
     let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
     // Match the glob pattern relative to the search root so that a bare
@@ -367,7 +442,8 @@ fn fallback_glob(
     // match. The `ripgrep_glob` path already passes `search_root` as both
     // arguments, so this keeps the two fallback routes in agreement.
     let walk_started = Instant::now();
-    let outcome = bounded_fallback_walk_files(search_root, search_root, &filters);
+    let outcome =
+        bounded_fallback_walk_files_for_target(search_root, search_root, &filters, ignored_target);
     let walk_time = walk_started.elapsed();
     let scope_started = Instant::now();
     // Reuse the filtered walk; an incomplete walk cannot prove an empty scope.
@@ -375,6 +451,7 @@ fn fallback_glob(
         !outcome.files.is_empty() || outcome.walk_truncated || outcome.skipped_foreign_mounts > 0;
     GlobDiscovery {
         files: outcome.files,
+        indexed_mtimes: HashMap::new(),
         walk_truncated: outcome.walk_truncated,
         source: "fallback",
         entries_visited: outcome.entries_visited,
@@ -514,6 +591,61 @@ fn format_directory_label(directory: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perf_audit_glob_only_touches_returned_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        for i in 0..1000 {
+            let path = project.join(format!("file_{i:04}.rs"));
+            std::fs::write(&path, format!("fn marker_{i}() {{}}\n")).unwrap();
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_unix_time(1_700_000_000 + i, 0),
+            )
+            .unwrap();
+        }
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(project.clone()),
+                ..Default::default()
+            },
+        );
+        *ctx.search_index().write().unwrap() =
+            Some(crate::search_index::SearchIndex::build(&project));
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "audit", "command": "glob", "pattern": "*.rs"
+        }))
+        .unwrap();
+        crate::search_index::audit_work_reset();
+        let response = handle_glob(&request, &ctx);
+        let body = serde_json::to_value(response).unwrap();
+        assert_eq!(body["files"].as_array().unwrap().len(), 100);
+        assert_eq!(body["total"], 1000);
+        let expected = (900..1000)
+            .rev()
+            .map(|i| project.join(format!("file_{i:04}.rs")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_vec(&body["files"]).unwrap(),
+            serde_json::to_vec(
+                &expected
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            body["text"],
+            format_glob_text(&expected, "*.rs", &project, true)
+        );
+        let work = crate::search_index::audit_work();
+        assert_eq!(work.sort_stats, 0, "{work:?}");
+        assert_eq!(work.sort_canonicalizes, 0, "{work:?}");
+        assert_eq!(work.presence_checks, 100, "{work:?}");
+    }
 
     fn files(paths: &[&str]) -> Vec<PathBuf> {
         paths.iter().map(PathBuf::from).collect()

@@ -132,6 +132,32 @@ export function isTitleGenerationRequest(request: unknown): boolean {
   });
 }
 
+/** Check the actual provider request, not a model name inferred from the fixture. */
+export function assertRequestToolSurface(
+  exchange: RecordedMockExchange,
+  expected: { model: string; present: readonly string[]; absent: readonly string[] },
+): string[] {
+  const request = asRecord(exchange.request);
+  if (request?.model !== expected.model) {
+    fail("host_failed", `tool surface request used ${String(request?.model)}, expected ${expected.model}`);
+  }
+  if (!Array.isArray(request.tools) || request.tools.length === 0) {
+    fail("host_failed", "tool surface request contains no tools");
+  }
+  const names = request.tools.flatMap((value) => {
+    const entry = asRecord(value);
+    const fn = asRecord(entry?.function) ?? entry;
+    return typeof fn?.name === "string" ? [fn.name] : [];
+  }).sort();
+  for (const name of expected.present) {
+    if (!names.includes(name)) fail("host_failed", `tool surface request is missing ${name}`, { model: request.model, names });
+  }
+  for (const name of expected.absent) {
+    if (names.includes(name)) fail("host_failed", `tool surface request unexpectedly includes ${name}`, { model: request.model, names });
+  }
+  return names;
+}
+
 export class DeterministicScenarioMock {
   readonly scenario: ScenarioDefinition;
   readonly turnLogPath: string;

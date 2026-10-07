@@ -1228,8 +1228,9 @@ fn semantic_payload(producer: &SemanticProducer, rows: &[(ChunkShape, Vec<u8>)])
 /// current chunking version. A file is imported only when its bytes in the
 /// checkout still hash to the snapshot's hash and this release chunks those
 /// bytes into exactly the snapshot's rows (names, lines, snippets and
-/// embedded texts); its vectors are then what a cold fill would compute for
-/// the same texts. Every other file is left for the plane to embed.
+/// embedded texts). Its vectors belong to the same producer and inputs as a
+/// cold fill, though a model invocation need not reproduce their float bytes.
+/// Every other file is left for the plane to embed.
 fn convert_semantic(
     bytes: &[u8],
     root: &Path,
@@ -1463,6 +1464,7 @@ pub fn run_import(
         report: &mut report,
         pins: Vec::new(),
         stored: BTreeSet::new(),
+        rejected_semantic: BTreeSet::new(),
     };
     for row in owned {
         run.drive(row)?;
@@ -1486,6 +1488,9 @@ struct Run<'a> {
     pins: Vec<LivePin>,
     /// Artifacts whose payloads this run stored under one of `pins`.
     stored: BTreeSet<Artifact>,
+    /// Keys the import could not use; their files remain pending rather than
+    /// preventing unrelated files and planes from being published.
+    rejected_semantic: BTreeSet<[u8; 32]>,
 }
 
 impl Run<'_> {
@@ -1745,13 +1750,49 @@ impl Run<'_> {
         };
         let store = self.registration.open_store(plane)?;
         for (entry, key) in bundle.entries.iter().zip(&keys) {
-            match store.put_or_touch(key, &entry.payload)? {
-                PutOrTouch::Inserted { .. } | PutOrTouch::Reused { .. } => {}
-                PutOrTouch::Quarantined => {
+            match store.put_or_touch(key, &entry.payload) {
+                Ok(PutOrTouch::Inserted { .. } | PutOrTouch::Reused { .. }) => {}
+                Err(StoreError::ConflictingPayload(_)) if artifact == Artifact::Semantic => {
+                    // Semantic keys address the input and producer, not the
+                    // model's output floats. Another invocation of the same
+                    // model can differ in its low bits. Keep the first valid
+                    // payload immutable instead of aborting the whole import.
+                    let producer = self.request.semantic().ok_or_else(|| {
+                        ImportError::Corrupt("semantic plane vanished".to_owned())
+                    })?;
+                    let relative = segment_store::rel_path_to_os(&entry.rel_path)?;
+                    let usable = store.get(key)?.is_some_and(|payload| {
+                        crate::semantic_index::SemanticVectors::decode_view_payload(
+                            &payload,
+                            &relative,
+                            &crate::semantic_index::ViewPayloadProducer {
+                                chunker_version: &producer.chunker_version,
+                                template_version: &producer.template_version,
+                                model_fingerprint: &producer.model_fingerprint,
+                            },
+                        )
+                        .is_ok()
+                    });
+                    if usable {
+                        store.touch(&[*key])?;
+                        crate::slog_info!(
+                            "legacy semantic import keeps existing payload key={key}"
+                        );
+                    } else {
+                        self.rejected_semantic.insert(entry.key);
+                        crate::slog_warn!("legacy semantic import skipped unusable key={key}");
+                    }
+                }
+                Ok(PutOrTouch::Quarantined) if artifact == Artifact::Semantic => {
+                    self.rejected_semantic.insert(entry.key);
+                    crate::slog_warn!("legacy semantic import skipped quarantined key={key}");
+                }
+                Ok(PutOrTouch::Quarantined) => {
                     return Err(ImportError::Corrupt(format!(
                         "family store quarantined imported key {key}"
                     )))
                 }
+                Err(error) => return Err(error.into()),
             }
         }
         let segment_hex = match segment {
@@ -1831,7 +1872,13 @@ impl Run<'_> {
             semantic_files = registered
                 .iter()
                 .filter(|(row, _)| row.artifact == Artifact::Semantic)
-                .map(|(_, bundle)| bundle.entries.len())
+                .map(|(_, bundle)| {
+                    bundle
+                        .entries
+                        .iter()
+                        .filter(|entry| !self.rejected_semantic.contains(&entry.key))
+                        .count()
+                })
                 .sum();
             let name = GenerationName::for_manifest(&manifest)?;
             let keys = manifest.ready_keys().collect::<Vec<_>>();
@@ -1905,7 +1952,13 @@ impl Run<'_> {
         }
         if let Some(bundle) = semantic {
             for entry in &bundle.entries {
-                let ready = PlaneState::ready(&FamilyKey::new(FamilyPlane::Semantic, entry.key));
+                let ready = if self.rejected_semantic.contains(&entry.key) {
+                    PlaneState::pending(
+                        "the legacy semantic payload could not be imported for this key",
+                    )
+                } else {
+                    PlaneState::ready(&FamilyKey::new(FamilyPlane::Semantic, entry.key))
+                };
                 match entries.get_mut(&entry.rel_path) {
                     Some((content, _, planes)) if *content == entry.content => {
                         planes.semantic = Some(ready);

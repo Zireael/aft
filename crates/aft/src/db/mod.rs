@@ -18,6 +18,7 @@ pub mod bash_tasks;
 pub mod bash_watches;
 pub mod compression_events;
 pub mod github_read_cache;
+pub mod remote_exec;
 pub mod removal;
 pub mod standing_roots;
 pub mod state;
@@ -28,7 +29,20 @@ pub mod state;
 #[cfg(test)]
 mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+
+const MIGRATION_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+
+const MIGRATION_V14: &str = r#"
+CREATE TABLE IF NOT EXISTS remote_exec_policies (
+  project_root TEXT NOT NULL, harness TEXT NOT NULL, session TEXT NOT NULL,
+  principal TEXT NOT NULL, owner TEXT NOT NULL, scope_ref TEXT NOT NULL,
+  epoch TEXT NOT NULL, preset TEXT NOT NULL, params TEXT NOT NULL,
+  last_used INTEGER NOT NULL,
+  UNIQUE(project_root,harness,session,principal,owner,scope_ref,epoch,preset)
+);
+CREATE INDEX IF NOT EXISTS idx_remote_exec_policies_used ON remote_exec_policies(last_used);
+"#;
 
 const MIGRATION_V13: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_bash_tasks_terminal_retention
@@ -569,6 +583,8 @@ pub(crate) enum OpenMode {
 }
 
 pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, OpenError> {
+    #[cfg(test)]
+    crate::test_storage::assert_database(path);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -663,6 +679,8 @@ pub(crate) fn peek_schema_version(path: &Path) -> Option<u32> {
     if !path.is_file() {
         return None;
     }
+    #[cfg(test)]
+    SCHEMA_PEEKS.with(|count| count.set(count.get() + 1));
     let conn = open_readonly(path).ok()?;
     conn.busy_timeout(Duration::ZERO).ok()?;
     let has_table: bool = conn
@@ -676,6 +694,16 @@ pub(crate) fn peek_schema_version(path: &Path) -> Option<u32> {
         return None;
     }
     current_schema_version(&conn).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCHEMA_PEEKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn schema_peek_count_for_test() -> u64 {
+    SCHEMA_PEEKS.with(std::cell::Cell::get)
 }
 
 /// Apply the per-connection PRAGMAs required for every AFT SQLite connection.
@@ -722,7 +750,7 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
     // The bare read above keeps current-schema opens read-only. A lagging opener
     // may still have observed a stale version, so every planned step re-reads it
     // after acquiring SQLite's write lock and skips work another opener committed.
-    for version in (db_version + 1)..=CURRENT_SCHEMA_VERSION {
+    for &version in MIGRATION_VERSIONS.iter().filter(|&&v| v > db_version) {
         apply_migration(conn, version)?;
     }
 
@@ -735,6 +763,12 @@ fn current_schema_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
         [],
         |row| row.get::<_, u32>(0),
     )
+}
+
+/// Re-check a resident database without waiting for another process's lock or
+/// opening a second descriptor. Restore its normal busy wait before release.
+pub(crate) fn schema_version_without_wait(conn: &mut TrackedConnection) -> rusqlite::Result<u32> {
+    with_busy_wait(conn, Duration::ZERO, |conn| current_schema_version(conn))
 }
 
 fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError> {
@@ -839,6 +873,7 @@ fn migration_already_applied(conn: &Connection, version: u32) -> rusqlite::Resul
                 |row| row.get::<_, u32>(0),
             )
             .map(|object_count| object_count == 1),
+        14 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('remote_exec_policies','idx_remote_exec_policies_used')", [], |r| r.get::<_,u32>(0)).map(|n| n == 2),
         _ => Ok(false),
     }
 }
@@ -858,6 +893,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         11 => conn.execute_batch(MIGRATION_V11),
         12 => conn.execute_batch(MIGRATION_V12),
         13 => conn.execute_batch(MIGRATION_V13),
+        14 => conn.execute_batch(MIGRATION_V14),
         _ => Ok(()),
     }
 }
@@ -1199,7 +1235,7 @@ mod tests {
     fn every_migration_is_safe_to_apply_twice() {
         let conn = Connection::open_in_memory().unwrap();
 
-        for version in 1..=CURRENT_SCHEMA_VERSION {
+        for &version in MIGRATION_VERSIONS {
             apply_migration_statements(&conn, version).unwrap_or_else(|error| {
                 panic!("migration V{version} failed on its first application: {error}")
             });

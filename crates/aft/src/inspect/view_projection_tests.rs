@@ -78,6 +78,107 @@ fn views_tier2_published_plane_never_refreshes_legacy() {
 }
 
 #[test]
+fn inspect_checkout_view_warm_verification_does_not_rehash_corpus() {
+    // IO counters and refusal reports are thread-local. Invalidation tickets
+    // are keyed by this private project directory, which has no watcher, so
+    // other libtest threads cannot move this fixture's ticket or counters.
+    let (_project, _storage, mut job, mut request) = view_projection_fixture();
+    for i in 0..3000 {
+        write_projection_cache_file(&job.project_root.join(format!("source_{i}.ts")), &format!("export function source_{i}() {{ return {i}; }}\n"));
+    }
+    for args in [vec!["add", "."], vec!["-c", "user.name=AFT", "-c", "user.email=aft@example.com", "commit", "--quiet", "-m", "large fixture"]] {
+        let mut git = std::process::Command::new("git");
+        crate::test_env::apply_hermetic_git_env(git.current_dir(&job.project_root));
+        assert!(git.args(args).status().unwrap().success());
+    }
+    request.desired_head = crate::views::assembly::head_tree_fingerprint(&crate::alias::head_tree_entries(&job.project_root).unwrap());
+    crate::views::assembly::publish_checkout(&request).unwrap();
+    job.scope_files = crate::callgraph::walk_project_files(&job.project_root).collect();
+    let snapshot = InspectSnapshot::new_with_capabilities(job.project_root.clone(), job.inspect_dir.clone(), job.config.clone(), job.symbol_cache.clone(), false, false);
+    let manager = InspectManager::new();
+    let stats = job.scope_files.iter().map(|path| {
+        let metadata = std::fs::metadata(path).unwrap();
+        (path.clone(), metadata.len(), metadata.modified().unwrap())
+    }).collect::<Vec<_>>();
+    crate::views::read::take_verification_io();
+    let cold_view = manager.current_checkout_view(&snapshot, Some(&stats));
+    assert!(cold_view.is_some(), "cold checkout view refused: {:?}; root={:?} desired_head={} observed_files={}", take_checkout_view_refusal(), job.project_root, request.desired_head, stats.len());
+    let cold = crate::views::read::take_verification_io();
+    assert!(manager.current_checkout_view(&snapshot, Some(&stats)).is_some(), "warm checkout view refused: {:?}", take_checkout_view_refusal());
+    let warm = crate::views::read::take_verification_io();
+    eprintln!("inspect_view_verification fixture_files={} cold={cold:?} warm={warm:?}", job.scope_files.len());
+    assert_eq!(warm.files_read, 0, "unchanged view verification reread source files: {warm:?}");
+    assert_eq!(warm.bytes_hashed, 0, "unchanged view verification rehashed source bytes: {warm:?}");
+    assert_eq!(warm.files_statd, 0, "blocking inspection must reuse the root stats it already collected");
+    assert_eq!(cold.files_read, 3002, "first verification must actually read the entire source set");
+    assert!(manager.current_checkout_view(&snapshot, None).is_some(), "standalone checkout view refused: {:?}", take_checkout_view_refusal());
+    let standalone = crate::views::read::take_verification_io();
+    eprintln!("inspect_view_verification standalone={standalone:?}");
+    assert_eq!(standalone.files_statd, 3002);
+    assert_eq!(standalone.files_read, 0);
+    // A watcher event must defeat the memo even if an external writer preserved
+    // both size and mtime. The known root stats deliberately remain unchanged.
+    let edited = job.project_root.join("source_0.ts");
+    let modified = std::fs::metadata(&edited).unwrap().modified().unwrap();
+    std::fs::write(&edited, "export function source_0() { return 9; }\n").unwrap();
+    // Windows requires write access to change a file's timestamps.
+    std::fs::OpenOptions::new().write(true).open(&edited).unwrap().set_modified(modified).unwrap();
+    crate::cache_freshness::invalidate_verify_memo(&job.project_root);
+    assert!(manager.current_checkout_view(&snapshot, Some(&stats)).is_none());
+    assert!(crate::views::read::take_verification_io().files_read > 0);
+}
+
+#[test]
+fn inspect_checkout_view_refusal_diagnostics_name_compared_values() {
+    let (_project, storage, job, request) = view_projection_fixture();
+    let mut snapshot = InspectSnapshot::new_with_capabilities(job.project_root.clone(), job.inspect_dir.clone(), job.config.clone(), job.symbol_cache.clone(), false, false);
+    let manager = InspectManager::new();
+    let refusal = |snapshot: &InspectSnapshot, stats: Option<&[(PathBuf, u64, SystemTime)]>| {
+        assert!(manager.current_checkout_view(snapshot, stats).is_none());
+        take_checkout_view_refusal().expect("every checkout refusal must name its branch")
+    };
+    let unpublished = refusal(&snapshot, None);
+    assert!(unpublished.contains("projection_unpublished:") && unpublished.contains("current_generation=None"), "{unpublished}");
+    crate::views::assembly::publish_checkout(&request).unwrap();
+
+    Arc::make_mut(&mut snapshot.config).views.enabled = false;
+    let disabled = refusal(&snapshot, None);
+    assert!(disabled.contains("config_gate: views.enabled=false indexes.callgraph=true"), "{disabled}");
+    Arc::make_mut(&mut snapshot.config).views.enabled = true;
+
+    crate::views::cache_head_fingerprint(job.project_root.clone(), "different-head".to_string());
+    let head = refusal(&snapshot, None);
+    assert!(head.contains("projection_head_mismatch:") && head.contains(&request.desired_head) && head.contains("cached_head=different-head"), "{head}");
+    crate::views::cache_head_fingerprint(job.project_root.clone(), request.desired_head.clone());
+
+    // Windows separators are escaped by Debug. Exercise escaping on Unix too,
+    // where a backslash is a legal character in a filename.
+    let outside = storage.path().join(if cfg!(windows) { "outside.ts" } else { "outside\\fixture.ts" });
+    let stats = [(outside.clone(), 0, UNIX_EPOCH)];
+    let root = refusal(&snapshot, Some(&stats));
+    // The diagnostics print Debug paths, not raw path strings. Match their
+    // escaping without changing any path used by the production comparison.
+    assert!(root.contains("coverage_root_mismatch:") && root.contains(&format!("path={outside:?}")) && root.contains(&format!("root={:?}", job.project_root)), "{root}");
+
+    let added = job.project_root.join("untracked.ts");
+    write_projection_cache_file(&added, "export function untracked() {}\n");
+    let metadata = std::fs::metadata(&added).unwrap();
+    let stats = [(added.clone(), metadata.len(), metadata.modified().unwrap())];
+    let coverage = refusal(&snapshot, Some(&stats));
+    assert!(coverage.contains("coverage_manifest_missing:") && coverage.contains(&format!("path={added:?}")) && coverage.contains("manifest_files=2 observed_files=1"), "{coverage}");
+
+    // Supply only the published paths so the untracked-file coverage guard
+    // does not hide the source-key comparison we want to diagnose next.
+    write_projection_cache_file(&job.project_root.join("target.ts"), "export function changed() {}\n");
+    let stats = job.scope_files.iter().map(|path| {
+        let metadata = std::fs::metadata(path).unwrap();
+        (path.clone(), metadata.len(), metadata.modified().unwrap())
+    }).collect::<Vec<_>>();
+    let source = refusal(&snapshot, Some(&stats));
+    assert!(source.contains("verification_source_key_mismatch:") && source.contains("target.ts") && source.contains("expected_key=") && source.contains("actual_key="), "{source}");
+}
+
+#[test]
 fn views_tier2_pending_plane_never_falls_back_to_legacy() {
     let (_project, _storage, job, _request) = view_projection_fixture();
     let before = LEGACY_VIEW_REFRESHES.with(std::cell::Cell::get);
@@ -310,5 +411,57 @@ fn views_tier2_keyless_generation_reports_callgraph_disabled_not_empty() {
     assert_eq!(
         aggregate["callgraph_unavailable_reason"],
         "call graph is disabled (indexes.callgraph=false)"
+    );
+}
+
+#[test]
+fn views_keyless_callgraph_generation_preserves_unused_exports_but_names_dead_code_gap() {
+    let (_project, _storage, mut job, mut request) = view_projection_fixture();
+    request.callgraph = false;
+    crate::views::assembly::publish_checkout(&request).unwrap();
+    let view = crate::views::ViewStore::open(&request.storage, &request.scope).unwrap();
+    crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
+
+    // Unused exports is an independent import/export analysis, not a call-graph
+    // projection. A generation without graph keys must preserve its real findings
+    // while dead-code reachability remains unknown, never a zero-findings result.
+    job.category = InspectCategory::UnusedExports;
+    let scan = crate::inspect::scanners::unused_exports::run_unused_exports_scan(&job)
+        .outcome
+        .unwrap();
+    let unused = roll_up_unused_exports_contributions(&job, &scan.contributions, None);
+    assert_eq!(unused["count"], 2, "{unused:#}");
+    // Item order is not part of this contract (it differs across platforms);
+    // what matters is that both real findings survive.
+    let mut symbols = unused["items"]
+        .as_array()
+        .expect("unused export items")
+        .iter()
+        .map(|item| item["symbol"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    symbols.sort();
+    assert_eq!(symbols, ["dead", "main"], "{unused:#}");
+
+    job.category = InspectCategory::DeadCode;
+    // No refresh-path check: this specifically exercises the generation guard,
+    // rather than an unrelated mismatch between source bytes and missing keys.
+    job.callgraph_snapshot = build_tier2_callgraph_snapshot_with_refresh(&job, true, &[]);
+    let dead = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+        .outcome
+        .unwrap()
+        .aggregate;
+    assert_eq!(dead["callgraph_available"], false, "{dead:#}");
+    assert_eq!(
+        dead["callgraph_unavailable_reason"],
+        crate::views::read::CALLGRAPH_DISABLED,
+        "{dead:#}"
+    );
+    assert!(
+        dead.get("count").is_none(),
+        "unknown dead code is not zero findings: {dead:#}"
+    );
+    assert_eq!(
+        roll_up_dead_code_contributions(&job, &scan.contributions, None),
+        dead
     );
 }

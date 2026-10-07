@@ -275,6 +275,103 @@ fn fingerprint_mismatch_falls_back_to_a_cold_build() {
 }
 
 #[test]
+fn busy_readiness_defers_assembly_without_a_cold_rebuild() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = publish_marked_base(project.path(), storage.path());
+    let initial = view.current_generation().unwrap();
+    let writer =
+        crate::db::file_identity::IdentityConnection::open(&owner, "busy_readiness_test").unwrap();
+    // WAL writers normally allow reads. An exclusive rollback-journal writer
+    // forces the readiness SELECT itself to encounter real SQLite contention.
+    writer
+        .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
+    let attempt = prepare_checkout(
+        &request(project.path(), storage.path(), "head-1", &[]),
+        &mut |_| Ok(()),
+    );
+    match attempt {
+        Err(ViewError::Sqlite(error)) if crate::db::is_busy_error(&error) => {}
+        Err(error) => panic!("busy readiness must stay a retryable SQLite error, not {error:?}"),
+        Ok(_) => panic!("busy readiness must not permit a publication or cold rebuild"),
+    }
+    assert_eq!(view.current_generation().unwrap(), initial);
+    assert_eq!(
+        cold_build_counts(view.view_dir()),
+        ColdBuildCounts::default()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    drop(writer);
+
+    let repeat = publish_checkout(&request(project.path(), storage.path(), "head-1", &[])).unwrap();
+    assert!(!repeat.published);
+    assert_eq!(repeat.generation, initial);
+    assert_eq!(
+        cold_build_counts(view.view_dir()),
+        ColdBuildCounts::default()
+    );
+}
+
+#[test]
+fn stale_build_output_republishes_an_unchanged_manifest() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = publish_marked_base(project.path(), storage.path());
+    let connection = Connection::open(&owner).unwrap();
+    connection
+        .execute(
+            "UPDATE meta SET v = 'previous-build-output' WHERE k = 'fingerprint'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let report = publish_checkout(&request(project.path(), storage.path(), "head-1", &[])).unwrap();
+    assert!(
+        report.published,
+        "same HEAD and manifest must not suppress a stale derived rebuild"
+    );
+    let derived = view
+        .derived_path(report.generation.as_deref().unwrap())
+        .unwrap();
+    assert!(
+        !has_marker(&derived),
+        "stale derived rows must not be reused or patched"
+    );
+    crate::callgraph_store::ReadonlyCallGraphStore::open_manifest_view(
+        project.path().to_path_buf(),
+        FAMILY.into(),
+        view.view_dir().to_path_buf(),
+        report.generation.as_deref().unwrap(),
+        None,
+    )
+    .expect("rebuilt derived generation must satisfy the real reader's readiness check");
+}
+
+#[test]
+fn stale_build_output_does_not_seed_an_incremental_diff() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, owner) = publish_marked_base(project.path(), storage.path());
+    let connection = Connection::open(&owner).unwrap();
+    connection
+        .execute(
+            "UPDATE meta SET v = 'previous-build-output' WHERE k = 'fingerprint'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let published = publish_edit(project.path(), storage.path(), &view, &[1]);
+    assert!(
+        !has_marker(&published.derived),
+        "stale derived rows must not seed an incremental diff"
+    );
+    assert_matches_cold(storage.path(), &published);
+}
+
+#[test]
 fn small_diff_patches_a_clone_of_the_base() {
     let project = repository(8);
     let storage = tempfile::tempdir().unwrap();

@@ -54,10 +54,12 @@ import { dirname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
+  cachedFileSha256Sync,
   execFile,
   getAftLspBinariesDir,
   relativePathEscapesRoot,
   windowsTarExecutable,
+  writeStampedFileDigest,
 } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
@@ -345,8 +347,10 @@ function cachedBinarySha256(path: string): string {
   const identity = fileIdentity(path);
   const known = binaryDigestMemo.get(path);
   if (known && known.identity === identity) return known.digest;
-  const digest = sha256OfFileSync(path);
-  binaryHashCount += 1;
+  const digest = cachedFileSha256Sync(path, () => {
+    binaryHashCount += 1;
+    return sha256OfFileSync(path);
+  });
   binaryDigestMemo.set(path, { identity, digest });
   return digest;
 }
@@ -1168,6 +1172,7 @@ async function downloadAndInstall(
     // the digest just computed so that check does not hash it a second time.
     if (fileIdentity(targetBinary) === identityBeforeHash) {
       binaryDigestMemo.set(targetBinary, { identity: identityBeforeHash, digest: binarySha256 });
+      writeStampedFileDigest(targetBinary, binarySha256, identityBeforeHash);
     }
     log(`[lsp] installed ${spec.id} ${tag} at ${targetBinary}`);
     log(`[lsp] ${spec.id} ${tag} binary_sha256=${binarySha256}`);

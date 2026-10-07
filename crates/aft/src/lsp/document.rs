@@ -74,12 +74,18 @@ impl DocumentStore {
     /// causes `is_stale_on_disk()` to conservatively report stale on the
     /// next check (forcing a resync).
     pub fn open(&mut self, path: PathBuf) -> i32 {
-        let (mtime, size, content_hash) = read_metadata_and_hash(&path);
+        let snapshot = DiskSnapshot::read(&path);
+        self.open_with(path, &snapshot)
+    }
+
+    /// [`Self::open`] with the file's disk state already read, so a document
+    /// opened in several servers reads and hashes the file once.
+    pub fn open_with(&mut self, path: PathBuf, snapshot: &DiskSnapshot) -> i32 {
         let entry = DocumentEntry {
             version: 0,
-            mtime,
-            size,
-            content_hash,
+            mtime: snapshot.mtime,
+            size: snapshot.size,
+            content_hash: snapshot.content_hash(&path),
         };
         self.entries.insert(path, entry);
         0
@@ -90,12 +96,18 @@ impl DocumentStore {
     /// a `didChange` with fresh content right after this call). Returns the
     /// new version, or `None` if the document is not open.
     pub fn bump_version(&mut self, path: &Path) -> Option<i32> {
-        let (new_mtime, new_size, new_content_hash) = read_metadata_and_hash(path);
+        let snapshot = DiskSnapshot::read(path);
+        self.bump_version_with(path, &snapshot)
+    }
+
+    /// [`Self::bump_version`] with the file's disk state already read.
+    pub fn bump_version_with(&mut self, path: &Path, snapshot: &DiskSnapshot) -> Option<i32> {
+        let content_hash = snapshot.content_hash(path);
         let entry = self.entries.get_mut(path)?;
         entry.version += 1;
-        entry.mtime = new_mtime;
-        entry.size = new_size;
-        entry.content_hash = new_content_hash;
+        entry.mtime = snapshot.mtime;
+        entry.size = snapshot.size;
+        entry.content_hash = content_hash;
         Some(entry.version)
     }
 
@@ -129,13 +141,23 @@ impl DocumentStore {
     /// metadata but cannot be read now (e.g. deleted or permission error),
     /// or if we never recorded metadata for the open entry.
     pub fn is_stale_on_disk(&self, path: &Path) -> bool {
+        self.is_stale_against(path, &DiskSnapshot::read(path))
+    }
+
+    /// [`Self::is_stale_on_disk`] against disk state already read. The file
+    /// is hashed only when its modification time and size both match the
+    /// last sync: an edit that kept both (a coarse-mtime filesystem, two
+    /// writes within one tick) is caught only by its content. A changed
+    /// time or size already proves the file changed, so no hash is needed.
+    pub fn is_stale_against(&self, path: &Path, snapshot: &DiskSnapshot) -> bool {
         let Some(entry) = self.entries.get(path) else {
             // Not open at all — caller should `open` instead of asking about
             // staleness. We still return true so the caller doesn't act on
             // stale assumptions.
             return true;
         };
-        let (current_mtime, current_size, current_content_hash) = read_metadata_and_hash(path);
+        let current_mtime = snapshot.mtime;
+        let current_size = snapshot.size;
 
         match (entry.mtime, current_mtime) {
             (Some(prev), Some(now)) if prev == now => {
@@ -145,7 +167,7 @@ impl DocumentStore {
 
                 match current_size {
                     Some(size) if size > CONTENT_HASH_SIZE_LIMIT_BYTES => false,
-                    Some(_) => match (entry.content_hash, current_content_hash) {
+                    Some(_) => match (entry.content_hash, snapshot.content_hash(path)) {
                         (Some(prev_hash), Some(now_hash)) => prev_hash != now_hash,
                         _ => true,
                     },
@@ -159,26 +181,50 @@ impl DocumentStore {
     }
 }
 
-/// Read filesystem metadata and, for small files, a BLAKE3 content hash.
+/// One file's disk state: metadata read at once, and for small files a
+/// BLAKE3 content hash read on first use and then shared, so every server's
+/// store and every staleness check in one operation reads the file once.
 /// Metadata fields are `None` if the path cannot be statted or if the
 /// platform doesn't support the queried metadata (rare). The hash is `None`
 /// for unreadable files and files above `CONTENT_HASH_SIZE_LIMIT_BYTES`.
-fn read_metadata_and_hash(path: &Path) -> (Option<SystemTime>, Option<u64>, Option<[u8; 32]>) {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let mtime = meta.modified().ok();
-            let size = Some(meta.len());
-            let content_hash = if meta.len() <= CONTENT_HASH_SIZE_LIMIT_BYTES {
-                std::fs::read(path)
-                    .ok()
-                    .map(|bytes| *blake3::hash(&bytes).as_bytes())
-            } else {
-                None
-            };
-            (mtime, size, content_hash)
+#[derive(Debug, Default)]
+pub struct DiskSnapshot {
+    mtime: Option<SystemTime>,
+    size: Option<u64>,
+    content_hash: std::cell::OnceCell<Option<[u8; 32]>>,
+}
+
+impl DiskSnapshot {
+    pub fn read(path: &Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(meta) => Self {
+                mtime: meta.modified().ok(),
+                size: Some(meta.len()),
+                content_hash: std::cell::OnceCell::new(),
+            },
+            Err(_) => Self::default(),
         }
-        Err(_) => (None, None, None),
     }
+
+    fn content_hash(&self, path: &Path) -> Option<[u8; 32]> {
+        *self.content_hash.get_or_init(|| {
+            let size = self.size?;
+            if size > CONTENT_HASH_SIZE_LIMIT_BYTES {
+                return None;
+            }
+            #[cfg(test)]
+            CONTENT_READS.with(|reads| reads.set(reads.get() + 1));
+            std::fs::read(path)
+                .ok()
+                .map(|bytes| *blake3::hash(&bytes).as_bytes())
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Files read for a content hash on this thread.
+    pub(crate) static CONTENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Public helper: read metadata for an arbitrary path. Useful for callers
@@ -210,6 +256,46 @@ mod tests {
         let advanced = modified.checked_add(duration).expect("advanced mtime");
         filetime::set_file_mtime(path, filetime::FileTime::from_system_time(advanced))
             .expect("set advanced mtime");
+    }
+
+    fn content_reads() -> usize {
+        CONTENT_READS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn a_changed_modification_time_proves_staleness_without_reading_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.rs");
+        write_file(&path, "fn a() {}\n");
+        let mut store = DocumentStore::new();
+        store.open(path.clone());
+        advance_mtime(&path, Duration::from_secs(5));
+
+        let before = content_reads();
+        assert!(store.is_stale_on_disk(&path));
+        assert_eq!(content_reads() - before, 0, "a changed mtime needs no hash");
+    }
+
+    #[test]
+    fn one_snapshot_hashes_the_file_once_for_every_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.rs");
+        write_file(&path, "fn a() {}\n");
+        let mut stores = [
+            DocumentStore::new(),
+            DocumentStore::new(),
+            DocumentStore::new(),
+        ];
+
+        let before = content_reads();
+        let snapshot = DiskSnapshot::read(&path);
+        for store in &mut stores {
+            store.open_with(path.clone(), &snapshot);
+        }
+        for store in &stores {
+            assert!(!store.is_stale_against(&path, &snapshot));
+        }
+        assert_eq!(content_reads() - before, 1, "three stores, one read");
     }
 
     #[test]

@@ -489,6 +489,10 @@ export class BinaryBridge implements AftProjectTransport {
   private lastChildActivityAt = 0;
   /** Consecutive non-bash-style request timeouts without an id-matched response. */
   private consecutiveRequestTimeouts = 0;
+  // One timeout-driven replacement may recover a genuine hang. Replacing it
+  // again before any tool succeeds only repeats the same cold startup work.
+  // This survives spawn/configure/version and is re-armed by a tool response.
+  private timeoutRestartAwaitingRecovery = false;
   private errorPrefix: string;
   private readonly logger: Logger | undefined;
   private readonly childEnv: Record<string, string | undefined> | undefined;
@@ -851,7 +855,7 @@ export class BinaryBridge implements AftProjectTransport {
   ): Promise<Record<string, unknown>> {
     try {
       if (this._retiringDueToBinaryChange) {
-        throw new Error(
+        throw new BridgeTransportUnavailableError(
           `${this.errorPrefix} Bridge is retiring after the on-disk binary changed; retry to respawn on the updated binary`,
         );
       }
@@ -1006,7 +1010,8 @@ export class BinaryBridge implements AftProjectTransport {
       // killing it would abort the user's in-flight request waiting on the same
       // work (issue #117). This is enforced bridge-side so no call site can
       // forget it.
-      const keepBridgeOnTimeout = passive || options?.keepBridgeOnTimeout === true;
+      const keepBridgeOnTimeout =
+        passive || command === "bash_drain_completions" || options?.keepBridgeOnTimeout === true;
       let requestSentAt = Date.now();
 
       const child = this.process;
@@ -1038,7 +1043,11 @@ export class BinaryBridge implements AftProjectTransport {
           const childActiveSinceRequest = this.lastChildActivityAt > requestSentAt;
           const consecutiveTimeouts = this.consecutiveRequestTimeouts + 1;
           this.consecutiveRequestTimeouts = consecutiveTimeouts;
-          const keepWarm = childActiveSinceRequest || consecutiveTimeouts < this.hangThreshold;
+          const restartSuppressed = this.timeoutRestartAwaitingRecovery;
+          const keepWarm =
+            restartSuppressed ||
+            childActiveSinceRequest ||
+            consecutiveTimeouts < this.hangThreshold;
           const restartSuffix = keepWarm ? " — bridge kept warm" : " — restarting bridge";
           const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms${restartSuffix}`;
           if (requestSessionId) {
@@ -1050,7 +1059,9 @@ export class BinaryBridge implements AftProjectTransport {
           if (keepWarm) {
             entry.reject(
               new Error(
-                `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms (bridge busy/under load); bridge kept warm — retry`,
+                restartSuppressed
+                  ? `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms; automatic timeout restart already attempted; bridge kept warm to finish startup. Retry later or restart the host explicitly if it remains unresponsive. A timed-out mutation may still complete; inspect before repeating it.`
+                  : `${this.errorPrefix} request "${command}" timed out after ${effectiveTimeoutMs}ms (bridge busy/under load); bridge kept warm — retry`,
               ),
             );
             return;
@@ -1241,7 +1252,9 @@ export class BinaryBridge implements AftProjectTransport {
     this.spawnedBinaryFingerprint = null;
     this.clearRestartResetTimer();
     this.configureWarningClients.clear();
-    this.rejectAllPending(new Error(`${this.errorPrefix} Bridge shutting down`));
+    this.rejectAllPending(
+      new BridgeTransportUnknownOutcomeError(`${this.errorPrefix} Bridge shutting down`),
+    );
 
     if (this.process) {
       const proc = this.process;
@@ -1314,7 +1327,9 @@ export class BinaryBridge implements AftProjectTransport {
     this._retiringDueToBinaryChange = false;
     this.clearRestartResetTimer();
     this.rejectAllPending(
-      new Error(`${this.errorPrefix} Bridge restarting with updated binary: ${newBinaryPath}`),
+      new BridgeTransportUnknownOutcomeError(
+        `${this.errorPrefix} Bridge restarting with updated binary: ${newBinaryPath}`,
+      ),
     );
 
     if (!this.process) return;
@@ -1690,6 +1705,20 @@ export class BinaryBridge implements AftProjectTransport {
         clearTimeout(entry.timer);
         entry.onSettled?.();
         this.consecutiveRequestTimeouts = 0;
+        if (
+          response.success !== false &&
+          ![
+            "configure",
+            "version",
+            "status",
+            "ping",
+            "bash_drain_completions",
+            "bash_ack_completions",
+            "cancel_request",
+          ].includes(entry.command)
+        ) {
+          this.timeoutRestartAwaitingRecovery = false;
+        }
         this.scheduleRestartCountReset();
         this.accountForBashTaskResponse(entry.command, response);
         entry.resolve(response);
@@ -1729,6 +1758,7 @@ export class BinaryBridge implements AftProjectTransport {
     triggeringSessionId?: string,
   ): void {
     this.consecutiveRequestTimeouts = 0;
+    this.timeoutRestartAwaitingRecovery = true;
     this.spawnedBinaryFingerprint = null;
     const abortedSiblings = Array.from(this.pending, ([requestId, entry]) => ({
       request_id: requestId,
@@ -1842,7 +1872,7 @@ export class BinaryBridge implements AftProjectTransport {
     }
   }
 
-  private rejectAllPending(error: Error): void {
+  private rejectAllPending(error: BridgeTransportUnavailableError): void {
     for (const [_id, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.onSettled?.();

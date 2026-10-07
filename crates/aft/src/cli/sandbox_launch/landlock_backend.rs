@@ -24,6 +24,45 @@ pub(super) struct AppliedLandlock {
 }
 
 pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String> {
+    // Recheck after launcher canonicalization: a changed symlink must not turn
+    // the configured connection-file deny into an additive Landlock grant.
+    for (grants, denies) in [
+        (
+            profile
+                .read_allow
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>(),
+            &profile.read_deny,
+        ),
+        (profile.write_allow_roots(), &profile.write_deny),
+    ] {
+        for grant in grants {
+            for deny in denies {
+                if grant.starts_with(deny) || deny.starts_with(grant) {
+                    return Err(format!(
+                        "Landlock grant {} overlaps mandatory deny {}",
+                        grant.display(),
+                        deny.display()
+                    ));
+                }
+            }
+        }
+    }
+    profile
+        .data_policy
+        .validate_grants(
+            profile.read_allow.iter().map(PathBuf::as_path),
+            &profile.data_policy.read_allow,
+        )
+        .map_err(|error| error.to_string())?;
+    profile
+        .data_policy
+        .validate_grants(
+            profile.write_allow_roots(),
+            &profile.data_policy.write_allow,
+        )
+        .map_err(|error| error.to_string())?;
     let yama_same_uid_exposed = yama_same_uid_exposed();
     close_inherited_fds()?;
     // Git and other standard tools open /dev/null read-write; granting only
@@ -162,8 +201,7 @@ fn close_inherited_fds() -> Result<(), String> {
     // parent deliberately remaps the exit and failure markers to 3 and 4 in
     // apply_marker_fd_allowlist; descriptors >= 5 already carry FD_CLOEXEC
     // there, so closing from 5 is defense-in-depth for a non-CLOEXEC leak,
-    // not the primary descriptor-hygiene mechanism. CHILD_PIPE_STATUS_FD is
-    // intentionally in this closed range because this launcher path preserves
+    // not the primary descriptor-hygiene mechanism. This launcher preserves
     // only the exit and failure markers remapped to descriptors 3 and 4.
     let result = unsafe { libc::syscall(libc::SYS_close_range, 5_u32, u32::MAX, 0_u32) };
     if result == 0 {

@@ -19,6 +19,7 @@ import {
   accentPath,
   asNumber,
   asRecord,
+  asRecordOrEmpty,
   asRecords,
   asString,
   collapsibleResult,
@@ -60,15 +61,15 @@ const SafetyParams = Type.Object({
 });
 
 /** Exported for renderer unit tests. */
-export function buildSafetySections(
-  args: Static<typeof SafetyParams>,
-  payload: unknown,
-  theme: Theme,
-): string[] {
+export function buildSafetySections(args: unknown, payload: unknown, theme: Theme): string[] {
+  const safeArgs = asRecordOrEmpty(args);
+  const op = asString(safeArgs.op);
+  const path = asString(safeArgs.path);
+  const name = asString(safeArgs.name);
   const response = asRecord(payload);
   if (!response) return [theme.fg("muted", "No safety result.")];
 
-  if (args.op === "undo") {
+  if (op === "undo") {
     if (response.operation === true) {
       return [
         `${theme.fg("success", "restored operation")} ${theme.fg("accent", asString(response.op_id) ?? "(operation)")}`,
@@ -76,16 +77,14 @@ export function buildSafetySections(
       ];
     }
     return [
-      `${theme.fg("success", "restored")} ${theme.fg("accent", shortenPath(asString(response.path) ?? args.path ?? "(file)"))}`,
+      `${theme.fg("success", "restored")} ${theme.fg("accent", shortenPath(asString(response.path) ?? path ?? "(file)"))}`,
       `${theme.fg("muted", "backup")} ${asString(response.backup_id) ?? "—"}`,
     ];
   }
 
-  if (args.op === "history") {
+  if (op === "history") {
     const entries = asRecords(response.entries);
-    const sections = [
-      theme.fg("accent", shortenPath(asString(response.file) ?? args.path ?? "(file)")),
-    ];
+    const sections = [theme.fg("accent", shortenPath(asString(response.file) ?? path ?? "(file)"))];
     if (entries.length === 0) {
       sections.push(theme.fg("muted", "No history entries."));
       return sections;
@@ -103,10 +102,10 @@ export function buildSafetySections(
     return sections;
   }
 
-  if (args.op === "checkpoint") {
+  if (op === "checkpoint") {
     const skipped = asRecords(response.skipped);
     return [
-      `${theme.fg("success", "checkpoint created")} ${theme.fg("accent", asString(response.name) ?? args.name ?? "(checkpoint)")}`,
+      `${theme.fg("success", "checkpoint created")} ${theme.fg("accent", asString(response.name) ?? name ?? "(checkpoint)")}`,
       `${theme.fg("muted", "files")} ${asNumber(response.file_count) ?? 0}`,
       skipped.length > 0
         ? `${theme.fg("warning", "skipped")}\n${skipped.map((entry) => `  ↳ ${shortenPath(asString(entry.file) ?? "(file)")}: ${asString(entry.error) ?? "unknown error"}`).join("\n")}`
@@ -115,47 +114,53 @@ export function buildSafetySections(
     ].filter((section): section is string => Boolean(section));
   }
 
-  if (args.op === "restore") {
+  if (op === "restore") {
     return [
-      `${theme.fg("success", "checkpoint restored")} ${theme.fg("accent", asString(response.name) ?? args.name ?? "(checkpoint)")}`,
+      `${theme.fg("success", "checkpoint restored")} ${theme.fg("accent", asString(response.name) ?? name ?? "(checkpoint)")}`,
       `${theme.fg("muted", "files")} ${asNumber(response.file_count) ?? 0}`,
       asString(response.durability),
     ].filter((section): section is string => Boolean(section));
   }
 
-  const checkpoints = asRecords(response.checkpoints);
-  const sections = [
-    theme.fg("accent", `${checkpoints.length} checkpoint${checkpoints.length === 1 ? "" : "s"}`),
-  ];
-  if (checkpoints.length === 0) {
-    sections.push(theme.fg("muted", "No checkpoints saved."));
+  if (op === "list") {
+    const checkpoints = asRecords(response.checkpoints);
+    const sections = [
+      theme.fg("accent", `${checkpoints.length} checkpoint${checkpoints.length === 1 ? "" : "s"}`),
+    ];
+    if (checkpoints.length === 0) {
+      sections.push(theme.fg("muted", "No checkpoints saved."));
+      const durability = asString(response.durability);
+      if (durability) sections.push(theme.fg("muted", durability));
+      return sections;
+    }
+    sections.push(
+      checkpoints
+        .map((checkpoint, index) => {
+          const name = asString(checkpoint.name) ?? `checkpoint-${index + 1}`;
+          const count = asNumber(checkpoint.file_count) ?? 0;
+          const created = formatTimestamp(checkpoint.created_at) ?? "unknown time";
+          return `${index + 1}. ${name} ${theme.fg("muted", `${count} file${count === 1 ? "" : "s"} · ${created}`)}`;
+        })
+        .join("\n"),
+    );
     const durability = asString(response.durability);
     if (durability) sections.push(theme.fg("muted", durability));
     return sections;
   }
-  sections.push(
-    checkpoints
-      .map((checkpoint, index) => {
-        const name = asString(checkpoint.name) ?? `checkpoint-${index + 1}`;
-        const count = asNumber(checkpoint.file_count) ?? 0;
-        const created = formatTimestamp(checkpoint.created_at) ?? "unknown time";
-        return `${index + 1}. ${name} ${theme.fg("muted", `${count} file${count === 1 ? "" : "s"} · ${created}`)}`;
-      })
-      .join("\n"),
-  );
-  const durability = asString(response.durability);
-  if (durability) sections.push(theme.fg("muted", durability));
-  return sections;
+
+  const knownDetails = [path, name].filter((value): value is string => Boolean(value));
+  return [theme.fg("muted", "Safety result available."), ...knownDetails];
 }
 
 /** Exported for renderer unit tests. */
-export function renderSafetyCall(
-  args: Static<typeof SafetyParams>,
-  theme: Theme,
-  context: RenderContextLike,
-) {
-  const target = args.path ?? args.name;
-  const summary = [theme.fg("accent", args.op), target ? accentPath(theme, target) : undefined]
+export function renderSafetyCall(args: unknown, theme: Theme, context: RenderContextLike) {
+  const safeArgs = asRecordOrEmpty(args);
+  const op = asString(safeArgs.op);
+  const target = asString(safeArgs.path) ?? asString(safeArgs.name);
+  const summary = [
+    op ? theme.fg("accent", op) : undefined,
+    target ? accentPath(theme, target) : undefined,
+  ]
     .filter(Boolean)
     .join(" ");
   return renderToolCall("safety", summary, theme, context);
@@ -164,15 +169,16 @@ export function renderSafetyCall(
 /** Exported for renderer unit tests. */
 export function renderSafetyResult(
   result: AgentToolResult<unknown>,
-  args: Static<typeof SafetyParams>,
+  args: unknown,
   theme: Theme,
   context: RenderContextLike,
   options: RenderResultOptionsLike = { expanded: true },
 ) {
   if (context.isError) return renderErrorResult(result, "safety failed", theme, context);
   const sections = buildSafetySections(args, extractStructuredPayload(result), theme);
+  const op = asString(asRecordOrEmpty(args).op) ?? "safety";
   return collapsibleResult({
-    summary: `${args.op}: ${sections[0] ?? "completed"}`,
+    summary: `${op}: ${sections[0] ?? "completed"}`,
     full: renderSections(sections, context),
     expanded: options.expanded,
     context,

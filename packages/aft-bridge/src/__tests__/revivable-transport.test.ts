@@ -1,6 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import type {
   BindIdentity,
   RequestOptions,
@@ -74,6 +75,33 @@ describe("RevivableTransportPool", () => {
     else delete slot[key];
   });
 
+  test("dispatch refresh reuses the canonical facade without another realpath", async () => {
+    const client = new FakeClient();
+    const owner = new RevivableTransportPool(makeSubcPool(client), async () => {
+      throw new Error("the live pool must not be revived");
+    });
+    const transport = owner.getBridge(TEST_PROJECT_ROOT);
+    const realpaths = spyOn(fs, "realpathSync");
+    try {
+      for (let i = 0; i < 100; i++) {
+        expect((await owner.toolCall(TEST_PROJECT_ROOT, { sessionID: "hot" }, "read")).text).toBe(
+          "revived",
+        );
+      }
+      // One outer lookup and one concrete-pool lookup per operation, not a
+      // third canonicalization just to refresh the already-known facade.
+      expect(realpaths.mock.calls.length).toBe(200);
+      realpaths.mockClear();
+      for (let i = 0; i < 100; i++) {
+        expect((await transport.send("status", { session_id: "hot" })).text).toBe("revived");
+      }
+      expect(realpaths.mock.calls.length).toBe(100);
+    } finally {
+      realpaths.mockRestore();
+      await owner.shutdown();
+    }
+  });
+
   test("revives a shut-down pool with fresh routes and repeats after the replacement shuts down", async () => {
     const initialClient = new FakeClient();
     const revivedClient = new FakeClient();
@@ -105,6 +133,80 @@ describe("RevivableTransportPool", () => {
     await owner.shutdown();
     expect(owner.isShutdown()).toBe(true);
     expect(revivedClient.closed).toBe(1);
+  });
+
+  test("a deferred pool initializes once on demand and preserves pre-start configuration", async () => {
+    let created = 0;
+    const client = new FakeClient();
+    const overrides: Array<[string, unknown]> = [];
+    const owner = new RevivableTransportPool(null, async () => {
+      created += 1;
+      const pool = makeSubcPool(client);
+      pool.setConfigureOverride = (key, value) => {
+        overrides.push([key, value]);
+      };
+      return pool;
+    });
+    const transport = owner.getBridge(TEST_PROJECT_ROOT);
+    owner.setConfigureOverride("edit_slot_survives", true);
+    await owner.reconfigure(TEST_PROJECT_ROOT, { lsp_paths_extra: ["/cache"] });
+    await owner.closeSession(TEST_PROJECT_ROOT, "unused");
+    expect(owner.activeBridges()).toEqual([]);
+    expect(owner.getActiveBridgeForRoot(TEST_PROJECT_ROOT)).toBeNull();
+    expect(owner.isShutdown()).toBe(false);
+    expect(created).toBe(0);
+    const results = await Promise.all([
+      transport.toolCall("one", "read", {}),
+      transport.toolCall("two", "read", {}),
+    ]);
+    expect(results.map((result) => result.text)).toEqual(["revived", "revived"]);
+    expect(created).toBe(1);
+    expect(overrides).toEqual([
+      ["edit_slot_survives", true],
+      ["lsp_paths_extra", ["/cache"]],
+    ]);
+    await owner.shutdown();
+    expect(client.closed).toBe(1);
+  });
+
+  test("fresh-session hints reported before a deferred pool exists reach the pool it creates", async () => {
+    const observed: Array<[string, string]> = [];
+    let created = 0;
+    const owner = new RevivableTransportPool(null, async () => {
+      created += 1;
+      const pool = makeSubcPool(new FakeClient());
+      pool.observeSessionStart = (root: string, session: string) => {
+        observed.push([root, session]);
+      };
+      return pool;
+    });
+    // Pi reports `session_start` before the first tool call creates the pool.
+    // This must neither throw nor create the pool, and the hint must survive.
+    owner.observeSessionStart(TEST_PROJECT_ROOT, "fresh");
+    for (let i = 0; i < 300; i++) owner.observeSessionStart(TEST_PROJECT_ROOT, `extra-${i}`);
+    expect(created).toBe(0);
+    await owner.getBridge(TEST_PROJECT_ROOT).toolCall("extra-299", "read", {});
+    expect(created).toBe(1);
+    // Bounded: the oldest unused hints are dropped (that session then counts as
+    // unobserved and is retained), the newest reach the pool exactly once.
+    expect(observed.length).toBe(256);
+    expect(observed.at(-1)).toEqual([TEST_PROJECT_ROOT, "extra-299"]);
+    expect(observed.some(([, session]) => session === "fresh")).toBe(false);
+    owner.observeSessionStart(TEST_PROJECT_ROOT, "after-create");
+    expect(observed.at(-1)).toEqual([TEST_PROJECT_ROOT, "after-create"]);
+    expect(observed.length).toBe(257);
+    await owner.shutdown();
+  });
+
+  test("shutting down an unused deferred pool does not initialize it", async () => {
+    let created = 0;
+    const owner = new RevivableTransportPool(null, async () => {
+      created += 1;
+      return makeSubcPool(new FakeClient());
+    });
+    await owner.shutdown("validation finished");
+    expect(created).toBe(0);
+    expect(owner.isShutdown()).toBe(true);
   });
 
   test("reconfigure during or after shutdown records overrides without reviving the pool", async () => {

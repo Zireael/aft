@@ -411,8 +411,14 @@ impl ServerDef {
     }
 }
 
+#[cfg(test)]
+static BUILTIN_SERVER_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Built-in server definitions.
 pub fn builtin_servers() -> Vec<ServerDef> {
+    #[cfg(test)]
+    BUILTIN_SERVER_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     vec![
         builtin_server(
             ServerKind::TypeScript,
@@ -813,10 +819,25 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
         .and_then(|ext| ext.to_str())
         .unwrap_or_default();
 
-    resolved_servers(config)
+    // Without user server entries the definitions are the built-in ones,
+    // built once per process; only those handling this extension are cloned.
+    // Building all of them per call cost dozens of allocations for every
+    // file an LSP path looked at.
+    let candidates: Vec<ServerDef> = if config.lsp_servers.is_empty() {
+        builtin_servers_shared()
+            .iter()
+            .filter(|server| server.matches_extension(extension))
+            .cloned()
+            .collect()
+    } else {
+        resolved_servers(config)
+            .into_iter()
+            .filter(|server| server.matches_extension(extension))
+            .collect()
+    };
+    candidates
         .into_iter()
         .filter(|server| !is_disabled(server, config))
-        .filter(|server| server.matches_extension(extension))
         .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
         // The swap runs after the disabled filter, so `lsp.disabled:
         // ["typescript"]` still turns TypeScript off for native projects;
@@ -1167,6 +1188,13 @@ pub fn is_config_file_path_with_custom(path: &Path, extra_markers: &[String]) ->
     extra_markers.iter().any(|m| m == file_name)
 }
 
+/// The built-in server definitions, built once. They depend on nothing but
+/// this source file.
+fn builtin_servers_shared() -> &'static [ServerDef] {
+    static SERVERS: OnceLock<Vec<ServerDef>> = OnceLock::new();
+    SERVERS.get_or_init(builtin_servers)
+}
+
 fn builtin_config_file_names() -> &'static HashSet<String> {
     static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
     NAMES.get_or_init(|| {
@@ -1266,6 +1294,30 @@ mod tests {
         servers_for_file, ServerDef, ServerKind,
     };
     use crate::config::{Config, UserServerDef};
+
+    /// `servers_for_file` runs for every file an LSP path looks at; it must
+    /// not rebuild every built-in definition each time.
+    #[test]
+    fn servers_for_file_does_not_rebuild_the_builtin_definitions_per_call() {
+        use std::sync::atomic::Ordering;
+        let config = Config::default();
+        // Build the shared list first so the measured calls only read it.
+        let expected = matching_kinds("/tmp/project/src/main.ts", &config);
+        let before = super::BUILTIN_SERVER_BUILDS.load(Ordering::Relaxed);
+        for _ in 0..1_000 {
+            assert_eq!(
+                matching_kinds("/tmp/project/src/main.ts", &config),
+                expected
+            );
+        }
+        let builds = super::BUILTIN_SERVER_BUILDS.load(Ordering::Relaxed) - before;
+        // Other tests in this process may build the list directly meanwhile;
+        // a per-call rebuild would add a thousand.
+        assert!(
+            builds < 100,
+            "1000 lookups rebuilt the definitions {builds} times"
+        );
+    }
 
     fn matching_kinds(path: &str, config: &Config) -> Vec<ServerKind> {
         servers_for_file(Path::new(path), config)

@@ -28,9 +28,10 @@ use super::readiness::{plane_readiness, FillMap, PlaneReadiness, PlaneState};
 use super::snapshot::{DiskState, LiveEntry, OpenGeneration, Snapshot};
 use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 
-/// Bump when receiver hints or their interpretation changes. Legacy extraction
-/// keys are not compatible with this producer and cannot silently seed its graph.
-pub const PRODUCER: &str = "ruled-callgraph-v1";
+/// Bump when extracted evidence or its interpretation changes. Version 3 adds
+/// receiver facts and precise typed dispatch to the deterministic, single-parse
+/// extraction. Earlier blobs must be rebuilt instead of seeding old call edges.
+pub const PRODUCER: &str = "ruled-callgraph-v3";
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {
@@ -151,15 +152,24 @@ impl CallgraphPlane {
         access: &ViewAccess,
         snapshot: &Snapshot,
     ) -> Result<Arc<PinnedReader>, PlaneError> {
-        self.readers
+        let reader = self
+            .readers
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(
                 access.scope().to_string(),
                 snapshot.generation().name().to_string(),
             ))
-            .cloned()
-            .ok_or_else(|| error("pinned callgraph reader is not resident"))
+            .cloned();
+        match reader {
+            Some(reader) => Ok(reader),
+            None => {
+                // A refused keyless generation will never have a resident reader.
+                // Preserve that refusal instead of making it look like a build.
+                queryable_manifest(snapshot.generation().manifest())?;
+                Err(error("pinned callgraph reader is not resident"))
+            }
+        }
     }
 }
 impl PlaneAdapter for CallgraphPlane {
@@ -180,7 +190,7 @@ impl PlaneAdapter for CallgraphPlane {
         access: &ViewAccess,
         generation: &Arc<OpenGeneration>,
     ) -> Result<(), PlaneError> {
-        project_manifest(generation.manifest())?;
+        queryable_manifest(generation.manifest())?;
         let (root, dir): (PathBuf, PathBuf) = match access {
             ViewAccess::Owner(view) => (view.root().to_path_buf(), view.view_dir().to_path_buf()),
             ViewAccess::Reader {
@@ -252,6 +262,15 @@ impl PlaneAdapter for CallgraphPlane {
             readiness
         }
     }
+}
+fn queryable_manifest(manifest: &ManifestV2) -> Result<Manifest, PlaneError> {
+    let projected = project_manifest(manifest)?;
+    // A disabled plane still has a valid empty derived database. It must not
+    // answer navigation or reachability questions as though a graph was built.
+    if super::assembly::manifest_lacks_callgraph(&projected) {
+        return Err(error(super::read::CALLGRAPH_DISABLED));
+    }
+    Ok(projected)
 }
 fn error(reason: impl std::fmt::Display) -> PlaneError {
     PlaneError {

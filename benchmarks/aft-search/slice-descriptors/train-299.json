@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "search-reference-after-prose-previews"
+  ],
+  "note": "Re-record the search-quality reference on the landed prose-preview engine; only ten rows' summary text changes, no ranked path or score moves."
+}

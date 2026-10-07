@@ -287,6 +287,114 @@ fn github_outline_zoom_and_read_share_timeline_ordinals() {
 }
 
 #[test]
+fn github_diff_outline_and_zoom_refuse_with_read_hint() {
+    let project = tempfile::tempdir().expect("create diff refusal project");
+    let mut aft = AftProcess::spawn();
+    configure_gh_read_enabled(&mut aft, project.path());
+    for target in ["pr://42/diff", "pr://owner/repo/42/diff/src/new.rs"] {
+        for request in [
+            json!({"id": "diff-outline", "command": "outline", "target": target}),
+            json!({"id": "diff-zoom", "command": "zoom", "file": target, "symbols": ["1"]}),
+        ] {
+            let response = aft.send(&request.to_string());
+            assert_eq!(response["success"], false, "{response:#}");
+            assert!(
+                response["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Use read for diffs"),
+                "{response:#}"
+            );
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn github_diff_recorded_gh_reads_and_pages_through_protocol() {
+    let project = tempfile::tempdir().expect("create diff fixture project");
+    let bin = project.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let metadata = include_str!("../../src/github_read/fixtures/pr-42-diff-metadata.json");
+    let files = serde_json::from_str::<Value>(metadata).unwrap()["files"].to_string();
+    let patch = include_str!("../../src/github_read/fixtures/pr-42.diff");
+    let script = format!(
+        r#"#!/bin/sh
+case "$1:$2" in
+  pr:view) cat <<'JSON'
+{metadata}
+JSON
+    ;;
+  api:repos/owner/repo/pulls/42/files*) cat <<'JSON'
+{files}
+JSON
+    ;;
+  pr:diff) cat <<'PATCH'
+{patch}
+PATCH
+    ;;
+  *) echo 'unexpected fixture command' >&2; exit 1 ;;
+esac
+"#
+    );
+    fs::write(bin.join("gh"), script).unwrap();
+    fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut aft = spawned_with_fake_gh(&bin);
+    configure_gh_read_enabled(&mut aft, project.path());
+    let whole = read_response(&mut aft, "whole-diff", "pr://42/diff", json!({}));
+    assert_eq!(whole["success"], true, "{whole:#}");
+    assert!(whole["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("PR owner/repo#42 diff — head 0123456\n"));
+    assert!(whole["content"]
+        .as_str()
+        .unwrap()
+        .contains("assets/logo.png: binary file changed"));
+    let page = read_response(
+        &mut aft,
+        "page-diff",
+        "pr://42/diff",
+        json!({"start_line": 7, "limit": 3}),
+    );
+    assert_eq!(page["success"], true, "{page:#}");
+    assert_eq!(page["lines_read"], 3);
+    assert_eq!(page["start_line"], 7);
+    assert_eq!(page["end_line"], 9);
+    assert_eq!(page["truncated"], true);
+    assert!(page["content"]
+        .as_str()
+        .unwrap()
+        .contains("head 0123456\n+new main\ndiff --git a/src/old.rs"));
+    assert!(page["content"]
+        .as_str()
+        .unwrap()
+        .contains("shown 3 of 18 lines (cap)"));
+    let renamed = read_response(
+        &mut aft,
+        "renamed-diff",
+        "pr://owner/repo/42/diff/src/new.rs",
+        json!({}),
+    );
+    assert!(renamed["content"]
+        .as_str()
+        .unwrap()
+        .contains("src/new.rs (renamed from src/old.rs)"));
+    let unknown = read_response(
+        &mut aft,
+        "unknown-diff",
+        "pr://42/diff/src/old.rs",
+        json!({}),
+    );
+    assert_eq!(unknown["success"], false, "{unknown:#}");
+    assert!(unknown["message"]
+        .as_str()
+        .unwrap()
+        .contains("Refused: path is not in this PR"));
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn github_outline_and_zoom_refuse_when_gh_read_is_disabled() {
     let project = tempfile::tempdir().expect("create gate project");
     let mut aft = AftProcess::spawn();
@@ -469,10 +577,10 @@ fn github_read_forced_restrict_refuses_before_any_filesystem_or_gh_work() {
     let project = tempfile::tempdir().expect("create restricted project");
     let ctx = AppContext::new(
         default_language_provider_factory(),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     );
     let request = RawRequest {
         id: "restricted-github-read".to_string(),

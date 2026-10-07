@@ -1149,6 +1149,7 @@ mod tests {
                 consumer_elicitation_capable: false,
                 disabled_tools: Arc::default(),
                 scope: None,
+                made_tool_call: AtomicBool::new(false),
             })),
         );
         let mut root_channels = HashMap::new();

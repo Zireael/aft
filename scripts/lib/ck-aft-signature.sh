@@ -3,22 +3,44 @@
 # supervised AFT module (ck-aft). Sourced by scripts/stage-card.sh and
 # scripts/verify-placed-card.sh so staging and placement check the same rule.
 #
-# The rule: identifier ck-aft (macOS permission grants given to the module are
-# recorded against this identifier, so it must not change between cards),
-# hardened runtime, no get-task-allow, and exactly one hardened-runtime
-# exception, com.apple.security.cs.disable-library-validation. AFT needs it to
-# load the ONNX Runtime library downloaded from Microsoft's releases, which is
-# signed without a Team ID and would otherwise be refused.
+# The rule: identifier ck-aft, signed by a team identity (macOS permission
+# grants given to the module, such as Files & Folders access for its own read
+# and search tools, are recorded against identifier plus team, so neither may
+# change between cards, and an ad-hoc card would be asked again after every
+# rebuild), hardened runtime, no get-task-allow, and exactly one
+# hardened-runtime exception, com.apple.security.cs.disable-library-validation.
+# AFT needs it to load the ONNX Runtime library downloaded from Microsoft's
+# releases, which is signed without a Team ID and would otherwise be refused.
+#
+# The signing identity comes from CK_AFT_SIGN_IDENTITY, else the first valid
+# "Apple Development:" identity in the login keychain. It is never committed.
 
 CK_AFT_IDENTIFIER="ck-aft"
 CK_AFT_ENTITLEMENTS="${CK_AFT_ENTITLEMENTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/ck-aft.entitlements.plist}"
 CK_AFT_EXCEPTION="com.apple.security.cs.disable-library-validation"
 
-# Sign in place with the pinned identifier, hardened runtime and the committed
-# entitlements.
+# Resolve the team signing identity, or fail with the reason.
+ck_aft_sign_identity() {
+  if [ -n "${CK_AFT_SIGN_IDENTITY:-}" ]; then
+    printf '%s\n' "$CK_AFT_SIGN_IDENTITY"
+    return 0
+  fi
+  local found
+  found="$(security find-identity -v -p codesigning 2>/dev/null |
+    sed -n 's/^ *[0-9][0-9]*) [0-9A-F]\{40\} "\(Apple Development: [^"]*\)"$/\1/p' | head -1)"
+  if [ -z "$found" ]; then
+    echo "ck-aft signing: no Apple Development identity in the keychain; set CK_AFT_SIGN_IDENTITY" >&2
+    return 1
+  fi
+  printf '%s\n' "$found"
+}
+
+# Sign in place with the team identity, the pinned identifier, hardened
+# runtime and the committed entitlements.
 ck_aft_sign() {
-  local binary="$1"
-  codesign --force --sign - --identifier "$CK_AFT_IDENTIFIER" -o runtime \
+  local binary="$1" identity
+  identity="$(ck_aft_sign_identity)" || return 1
+  codesign --force --sign "$identity" --identifier "$CK_AFT_IDENTIFIER" -o runtime \
     --entitlements "$CK_AFT_ENTITLEMENTS" "$binary"
 }
 
@@ -27,7 +49,7 @@ ck_aft_sign() {
 # Usage: ck_aft_check_signature <binary> <error-prefix>
 ck_aft_check_signature() {
   local binary="$1" prefix="$2"
-  local details entitlements_xml flags plist keys key
+  local details entitlements_xml flags plist keys key team
 
   if ! codesign --verify --strict "$binary" 2>/dev/null; then
     echo "$prefix: signature invalid: codesign --verify --strict failed for $binary" >&2
@@ -41,6 +63,11 @@ ck_aft_check_signature() {
 
   if ! printf '%s\n' "$details" | grep -qx "Identifier=$CK_AFT_IDENTIFIER"; then
     echo "$prefix: signature identifier is not $CK_AFT_IDENTIFIER" >&2
+    return 1
+  fi
+  team="$(printf '%s\n' "$details" | sed -n 's/^TeamIdentifier=//p')"
+  if [ -z "$team" ] || [ "$team" = "not set" ]; then
+    echo "$prefix: signed ad hoc (no TeamIdentifier): macOS would ask for the module's permissions again after every card" >&2
     return 1
   fi
   flags="$(printf '%s\n' "$details" | sed -n 's/^CodeDirectory .*flags=0x[0-9a-f]*(\([^)]*\)).*/\1/p')"
@@ -76,7 +103,7 @@ ck_aft_check_signature() {
       return 1
     fi
   done
-  echo "    signature ok: identifier $CK_AFT_IDENTIFIER, flags ($flags), exceptions: $CK_AFT_EXCEPTION"
+  echo "    signature ok: identifier $CK_AFT_IDENTIFIER, team $team, flags ($flags), exceptions: $CK_AFT_EXCEPTION"
 }
 
 # Run the one code path the exception exists for: a real ONNX Runtime load.

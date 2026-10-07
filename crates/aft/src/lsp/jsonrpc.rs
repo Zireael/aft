@@ -100,17 +100,21 @@ pub enum ServerMessage {
 
 impl ServerMessage {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        let value: Value = serde_json::from_str(json)?;
+        let mut value: Value = serde_json::from_str(json)?;
 
+        // `params` is moved out of the parsed message rather than cloned: a
+        // `publishDiagnostics` or workspace pull reply can be megabytes.
         if value.get("id").is_some() && value.get("method").is_some() {
             Ok(ServerMessage::Request {
-                id: serde_json::from_value(value.get("id").cloned().unwrap_or(Value::Null))?,
+                id: serde_json::from_value(
+                    value.get_mut("id").map(Value::take).unwrap_or(Value::Null),
+                )?,
                 method: value
                     .get("method")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                params: value.get("params").cloned(),
+                params: take_params(&mut value),
             })
         } else if value.get("id").is_some() {
             Ok(ServerMessage::Response(serde_json::from_value(value)?))
@@ -121,8 +125,14 @@ impl ServerMessage {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                params: value.get("params").cloned(),
+                params: take_params(&mut value),
             })
         }
     }
+}
+
+fn take_params(value: &mut Value) -> Option<Value> {
+    value
+        .as_object_mut()
+        .and_then(|message| message.remove("params"))
 }

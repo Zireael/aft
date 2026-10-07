@@ -33,6 +33,42 @@ use crate::callgraph_store::{
 };
 use crate::cold_build_limiter;
 
+#[cfg(test)]
+use crate::views::read::{record_checkout_view_refusal, take_checkout_view_refusal};
+
+// Recording and message formatting compile only in tests; the fallible reads
+// below still return None on exactly the same branches in production.
+macro_rules! note_checkout_view_refusal {
+    ($($arg:tt)*) => {
+        #[cfg(test)]
+        record_checkout_view_refusal(format!($($arg)*));
+    };
+}
+
+macro_rules! checkout_view_some {
+    ($value:expr, $($reason:tt)*) => {
+        match $value {
+            Some(value) => value,
+            None => {
+                note_checkout_view_refusal!($($reason)*);
+                return None;
+            }
+        }
+    };
+}
+
+macro_rules! checkout_view_ok {
+    ($value:expr, $($reason:tt)*) => {
+        match $value {
+            Ok(value) => value,
+            Err(_error) => {
+                note_checkout_view_refusal!("{}: {_error}", format!($($reason)*));
+                return None;
+            }
+        }
+    };
+}
+
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
 type WaiterTx = Sender<JobOutcome>;
@@ -274,6 +310,7 @@ struct BuilderStateEntry {
     attempt_count: u64,
     last_failure: Option<String>,
     suspension: Option<crate::build_breaker::BuildSuspension>,
+    progress: String,
 }
 
 impl BuilderStateEntry {
@@ -287,6 +324,7 @@ impl BuilderStateEntry {
             attempt_count: 0,
             last_failure: None,
             suspension: None,
+            progress: "checking cached analysis".into(),
         }
     }
 
@@ -515,6 +553,12 @@ fn cached_tier2_aggregate_usable(
     true
 }
 
+struct CheckoutViewVerification {
+    root: PathBuf,
+    ticket: u64,
+    files: BTreeMap<PathBuf, crate::views::read::VerifiedCallgraphFile>,
+}
+
 pub struct InspectManager {
     root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
     request_tx: Sender<InspectJob>,
@@ -541,6 +585,8 @@ pub struct InspectManager {
     /// both surfaces treat a category as busy when it has an entry here, and
     /// fall back to the waiter map if the registry is empty.
     builder_states: Mutex<HashMap<JobKey, BuilderStateEntry>>,
+    completed_build_durations: Mutex<HashMap<InspectCategory, Duration>>,
+    checkout_view_verification: Mutex<Option<CheckoutViewVerification>>,
     automatic_tier2_refresh_allowed: AtomicBool,
     automatic_tier2_skip_logged: AtomicBool,
     automatic_tier2_schedule_count: AtomicU64,
@@ -555,6 +601,7 @@ pub struct InspectManager {
     /// Test observability for distinguishing queued reuse work from a worker that
     /// has actually begun executing it.
     reuse_starts: AtomicU64,
+    source_scan_files: AtomicU64,
     /// Project roots whose latest dead-code pass found the analysis
     /// unavailable because the root is borrow-only. That result is not stored
     /// in the inspect cache, so status readers consult this set instead of a
@@ -647,12 +694,15 @@ impl InspectManager {
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
             builder_states: Mutex::new(HashMap::new()),
+            completed_build_durations: Mutex::new(HashMap::new()),
+            checkout_view_verification: Mutex::new(None),
             automatic_tier2_refresh_allowed: AtomicBool::new(true),
             automatic_tier2_skip_logged: AtomicBool::new(false),
             automatic_tier2_schedule_count: AtomicU64::new(0),
             reuse_completions: AtomicU64::new(0),
             successful_reuse_completions: AtomicU64::new(0),
             reuse_starts: AtomicU64::new(0),
+            source_scan_files: AtomicU64::new(0),
         }
     }
 
@@ -865,6 +915,229 @@ impl InspectManager {
 
     pub(crate) fn tier2_builder_state_detail(&self, category: InspectCategory) -> String {
         self.tier2_builder_state_detail_at(category, unix_millis_now())
+    }
+
+    fn record_build_progress(&self, key: &JobKey, progress: impl Into<String>) {
+        if let Ok(mut states) = self.builder_states.lock() {
+            if let Some(entry) = states.get_mut(key) {
+                entry.progress = progress.into();
+            }
+        }
+    }
+
+    /// Keep unfinished analysis separate from current findings. Cached rows are
+    /// shown only inside a labelled stale result, never as a verified count.
+    pub(crate) fn tier2_incomplete_payload(
+        &self,
+        snapshot: &InspectSnapshot,
+        category: InspectCategory,
+        scope: &JobScope,
+        kind: &str,
+        mut reason: String,
+    ) -> Value {
+        let key = JobKey::for_project_category(category);
+        let mut payload = serde_json::json!({"unavailable": true, "complete": false});
+        if let Ok(states) = self.builder_states.lock() {
+            if let Some(entry) = states.get(&key).filter(|entry| entry.is_in_flight()) {
+                let estimate = self
+                    .completed_build_durations
+                    .lock()
+                    .ok()
+                    .and_then(|durations| durations.get(&category).copied())
+                    .map(|duration| {
+                        duration
+                            .saturating_sub(entry.started_at.elapsed())
+                            .as_millis() as u64
+                    });
+                let estimate_text = estimate.map_or_else(
+                    || "estimate unavailable (no completed build in this session)".to_string(),
+                    |ms| format!("estimated remaining {ms}ms (based on the last completed build; not a deadline)"),
+                );
+                reason = format!(
+                    "{}; progress: {}; {estimate_text}",
+                    entry.detail_at(unix_millis_now()),
+                    entry.progress
+                );
+                payload["building"] = serde_json::json!({
+                    "state": entry.state.unwrap().as_str(), "started_at": entry.started_unix,
+                    "elapsed_ms": entry.started_at.elapsed().as_millis() as u64,
+                    "progress": entry.progress, "estimated_remaining_ms": estimate,
+                    "estimate_basis": "last completed build in this session; unavailable on cold start"
+                });
+            }
+        }
+        // This cache belongs to the checkout, not its artifact owner. Do not
+        // substitute a sibling checkout's aggregate when it is absent.
+        if let Ok(Some(cache)) =
+            InspectCache::open_readonly(snapshot.inspect_dir.clone(), snapshot.project_root.clone())
+        {
+            if let Ok(Some(cached)) = cache.latest_aggregate_any_hash(category) {
+                if cached.get("callgraph_available").and_then(Value::as_bool) != Some(false) {
+                    let generated_at = cache.last_full_run(category).ok().flatten();
+                    let age =
+                        generated_at.map(|at| unix_now_secs().saturating_sub(at.max(0) as u64));
+                    let cached = filter_outcome_for_scope_with_contributions(
+                        JobOutcome::Fresh { payload: cached },
+                        snapshot,
+                        category,
+                        &cache,
+                        scope,
+                    )
+                    .payload()
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                    payload["last_complete"] = serde_json::json!({
+                        "stale": true, "generated_at": generated_at, "age_s": age, "payload": cached
+                    });
+                    reason.push_str(&format!(
+                        "; last complete result is stale (age_s={})",
+                        age.map_or_else(|| "unknown".into(), |age| age.to_string())
+                    ));
+                }
+            }
+        }
+        payload["gaps"] = serde_json::json!([{"kind": kind, "reason": reason}]);
+        payload
+    }
+
+    /// Open only this checkout's published view and prove its source keys still
+    /// describe the files used by the scan. This does not acquire a legacy writer.
+    pub(crate) fn current_checkout_view(
+        &self,
+        snapshot: &InspectSnapshot,
+        observed_stats: Option<&[(PathBuf, u64, SystemTime)]>,
+    ) -> Option<Arc<ReadonlyCallGraphStore>> {
+        #[cfg(test)]
+        let _ = take_checkout_view_refusal();
+        if !snapshot.config.views.enabled || !snapshot.config.indexes.callgraph {
+            note_checkout_view_refusal!(
+                "config_gate: views.enabled={} indexes.callgraph={}",
+                snapshot.config.views.enabled,
+                snapshot.config.indexes.callgraph
+            );
+            return None;
+        }
+        let files = observed_stats
+            .map(|files| files.iter().map(|(path, _, _)| path.clone()).collect())
+            .unwrap_or_else(|| {
+                scope_files(
+                    &snapshot.project_root,
+                    &JobScope::for_project(snapshot.project_root.clone()),
+                )
+            });
+        let (store, generation) = checkout_view_some!(
+            current_view_projection_store(
+                &snapshot.project_root,
+                &snapshot.inspect_dir,
+                &snapshot.config,
+                &[],
+            ),
+            "projection_unavailable: root={:?} inspect_dir={:?}",
+            snapshot.project_root,
+            snapshot.inspect_dir
+        );
+        let storage = checkout_view_some!(
+            snapshot.config.storage_dir.as_ref(),
+            "verification_storage_missing: config.storage_dir=None root={:?}",
+            snapshot.project_root
+        );
+        let view = checkout_view_ok!(
+            crate::views::ViewStore::open(
+                storage,
+                &crate::path_identity::project_scope_key(&snapshot.project_root),
+            ),
+            "verification_view_open: storage={storage:?} root={:?}",
+            snapshot.project_root
+        );
+        let manifest = checkout_view_ok!(
+            view.load_manifest(&generation),
+            "verification_manifest_load: generation={generation} view_dir={:?}",
+            view.view_dir()
+        );
+        // The graph must cover the complete source set, not merely the files
+        // that still exist. Deletions and untracked additions can change liveness.
+        if files
+            .iter()
+            .filter(|path| callgraph_store_indexes_path(path))
+            .any(|path| {
+                let Ok(relative) = path.strip_prefix(&snapshot.project_root) else {
+                    note_checkout_view_refusal!("coverage_root_mismatch: path={path:?} root={:?}", snapshot.project_root);
+                    return true;
+                };
+                crate::views::RelPath::from_os_path(relative)
+                    .map_err(|_error| {
+                        note_checkout_view_refusal!("coverage_relative_path_invalid: path={path:?} relative={relative:?} error={_error}");
+                        _error
+                    })
+                    .ok()
+                    .is_none_or(|relative| {
+                        let missing = manifest.get(&relative).is_none();
+                        if missing {
+                            note_checkout_view_refusal!("coverage_manifest_missing: path={path:?} relative={relative:?} generation={generation} manifest_files={} observed_files={}", manifest.entries().count(), files.len());
+                        }
+                        missing
+                    })
+            })
+        {
+            return None;
+        }
+        let manifest_paths = manifest.entries().filter_map(|(path, entry)| {
+            matches!(entry, crate::views::ManifestEntry::Regular { planes, .. } if planes.callgraph.is_some())
+                .then(|| crate::views::segment_store::rel_path_to_os(path).map_err(|_error| {
+                    note_checkout_view_refusal!("manifest_path_decode: path={path:?} generation={generation} error={_error}");
+                    _error
+                }).ok().map(|path| snapshot.project_root.join(path)))
+        }).collect::<Option<Vec<_>>>();
+        let manifest_paths = checkout_view_some!(
+            manifest_paths,
+            "manifest_paths_unavailable: generation={generation}"
+        );
+        let ticket = crate::cache_freshness::capture_verify_ticket(&snapshot.project_root);
+        let mut verification = checkout_view_ok!(
+            self.checkout_view_verification.lock(),
+            "verification_mutex_poisoned: root={:?}",
+            snapshot.project_root
+        );
+        if verification
+            .as_ref()
+            .is_none_or(|cached| cached.root != snapshot.project_root || cached.ticket != ticket)
+        {
+            *verification = Some(CheckoutViewVerification {
+                root: snapshot.project_root.clone(),
+                ticket,
+                files: BTreeMap::new(),
+            });
+        }
+        if !checkout_view_ok!(
+            crate::views::read::callgraph_paths_match_cached(
+                &manifest,
+                &snapshot.project_root,
+                &manifest_paths,
+                observed_stats,
+                &mut checkout_view_some!(
+                    verification.as_mut(),
+                    "verification_memo_missing: root={:?} ticket={ticket}",
+                    snapshot.project_root
+                )
+                .files,
+            ),
+            "source_verification_error: root={:?} generation={generation}",
+            snapshot.project_root
+        ) {
+            note_checkout_view_refusal!("source_verification_false: root={:?} generation={generation} manifest_files={} observed_files={:?}", snapshot.project_root, manifest_paths.len(), observed_stats.map(<[_]>::len));
+            return None;
+        }
+        let completed_ticket =
+            crate::cache_freshness::capture_verify_ticket(&snapshot.project_root);
+        if completed_ticket != ticket {
+            note_checkout_view_refusal!(
+                "invalidation_ticket_changed: root={:?} before={ticket} after={completed_ticket}",
+                snapshot.project_root
+            );
+            *verification = None;
+            return None;
+        }
+        Some(Arc::new(store))
     }
 
     pub(crate) fn tier2_builder_state_detail_at(
@@ -1407,6 +1680,9 @@ impl InspectManager {
             caches.clear();
         }
         self.clear_callgraph_projection();
+        if let Ok(mut verified) = self.checkout_view_verification.lock() {
+            *verified = None;
+        }
         if let Ok(mut facts) = self.oxc_facts_cache.lock() {
             *facts = OxcFactsCache::new();
         }
@@ -1849,6 +2125,8 @@ impl InspectManager {
         files: &[PathBuf],
         force_reparse_files: &[PathBuf],
     ) -> Result<Option<OxcEngineResult>, String> {
+        self.source_scan_files
+            .fetch_add(files.len() as u64, Ordering::Relaxed);
         if !category_uses_oxc(job.category) {
             return Ok(None);
         }
@@ -1944,11 +2222,22 @@ impl InspectManager {
         scope: JobScope,
         store: Option<Arc<crate::callgraph_store::ReadonlyCallGraphStore>>,
     ) -> JobOutcome {
-        let projected = store.as_ref().and_then(|store| {
-            crate::callgraph_store::project_dead_code_snapshot_from_view(store)
-                .ok()
-                .map(|(_, snapshot, _, _)| Arc::new(snapshot))
-        });
+        if let Err(outcome) = validate_tier2_read_category(category) {
+            return outcome;
+        }
+        if !self.heavy_root_work_allowed() {
+            return JobOutcome::Failed {
+                message: Self::heavy_root_work_block_message(category),
+            };
+        }
+        let projected = store
+            .as_ref()
+            .filter(|_| category == InspectCategory::DeadCode)
+            .and_then(|store| {
+                crate::callgraph_store::project_dead_code_snapshot_from_view(store)
+                    .ok()
+                    .map(|(_, snapshot, _, _)| Arc::new(snapshot))
+            });
         let mut config = (*snapshot.config).clone();
         config.indexes.callgraph = false;
         snapshot.config = Arc::new(config);
@@ -1957,8 +2246,32 @@ impl InspectManager {
             &job.project_root,
             &JobScope::for_project(job.project_root.clone()),
         );
-        let result = run_tier2_scan(&job, None);
-        filter_outcome_for_scope(self.completion_outcome(result), &scope)
+        let oxc = match self.oxc_result_for_scan(&job, &job.scope_files, &[]) {
+            Ok(oxc) => oxc,
+            Err(message) => return JobOutcome::Failed { message },
+        };
+        let result = run_tier2_scan(&job, oxc.as_ref());
+        // A view projection needs no inspect writer either. Persisting with the
+        // temporary no-legacy-fallback config would also poison cache identity.
+        let outcome = match result.outcome {
+            Ok(success) => JobOutcome::Fresh {
+                // Scope full contributions before capping rows, just like the
+                // persisted read path. Otherwise out-of-scope rows can exhaust
+                // the project-wide cap and hide all of this scope's findings.
+                payload: if scope.is_project_wide() {
+                    success.aggregate
+                } else {
+                    let full =
+                        roll_up_tier2_contributions_with_limit(&job, &success.contributions, None);
+                    cap_payload_drill_down(
+                        filter_payload_for_scope(full, &scope),
+                        MAX_DRILL_DOWN_ITEMS,
+                    )
+                },
+            },
+            Err(message) => JobOutcome::Failed { message },
+        };
+        filter_outcome_for_scope(outcome, &scope)
     }
 
     /// Run a Tier-2 category to a terminal outcome for an explicit inspect.
@@ -2382,7 +2695,12 @@ impl InspectManager {
         }
 
         let project_scope = JobScope::for_project(job.project_root.clone());
+        self.record_build_progress(&job.key, "enumerating checkout source files");
         job.scope_files = scope_files(&job.project_root, &project_scope);
+        self.record_build_progress(
+            &job.key,
+            format!("checking cache for {} source files", job.scope_files.len()),
+        );
         log_tier2_benchmark_category_start(&job);
         let cache = match self.cache_for_paths(job.inspect_dir.clone(), job.project_root.clone()) {
             Ok(cache) => cache,
@@ -2622,6 +2940,13 @@ impl InspectManager {
         options: &Tier2ReuseOptions,
     ) -> Result<InspectScanSuccess, String> {
         let mut phases = Tier2PhaseTimings::default();
+        self.record_build_progress(
+            &job.key,
+            format!(
+                "verifying freshness of {} source files",
+                job.scope_files.len()
+            ),
+        );
         phases.projection_skip_reason = Some(if job.category != InspectCategory::DeadCode {
             "not_required"
         } else if job.callgraph_snapshot.is_some() {
@@ -2757,6 +3082,10 @@ impl InspectManager {
             if scan_job.category == InspectCategory::DeadCode
                 && scan_job.callgraph_snapshot.is_none()
             {
+                self.record_build_progress(
+                    &job.key,
+                    "waiting for or projecting the checkout call graph",
+                );
                 let snapshot_started = Instant::now();
                 match self.build_tier2_callgraph_snapshot_with_refresh_and_verdict(
                     &scan_job,
@@ -2785,6 +3114,14 @@ impl InspectManager {
                 std::thread::sleep(Duration::from_millis(10));
             }
             let scan_started = Instant::now();
+            self.record_build_progress(
+                &job.key,
+                format!(
+                    "scanning {} changed files ({} source files total)",
+                    scan_files.len(),
+                    job.scope_files.len()
+                ),
+            );
             let oxc_result =
                 self.oxc_result_for_scan(&scan_job, &scan_job.scope_files, &force_reparse_files)?;
             let scan_result = run_tier2_scan(&scan_job, oxc_result.as_ref());
@@ -2819,6 +3156,7 @@ impl InspectManager {
         }
 
         let db_started = Instant::now();
+        self.record_build_progress(&job.key, "assembling and storing analysis results");
         let mut contribution_set_hash = if has_updates {
             let (hash, db_timings) = cache
                 .apply_contribution_updates_for_config(job.category, updates, job.config.as_ref())
@@ -3343,6 +3681,18 @@ impl InspectManager {
     }
 
     fn route_tier2_reuse_completion(&self, result: InspectResult) {
+        if result.outcome.as_ref().is_ok_and(|success| {
+            !success.scanned_files.is_empty()
+                && success
+                    .aggregate
+                    .get("callgraph_available")
+                    .and_then(Value::as_bool)
+                    != Some(false)
+        }) {
+            if let Ok(mut durations) = self.completed_build_durations.lock() {
+                durations.insert(result.category, result.duration);
+            }
+        }
         let outcome = match result.outcome.clone() {
             Ok(success) => JobOutcome::Fresh {
                 payload: success.aggregate,
@@ -3373,6 +3723,11 @@ impl InspectManager {
     #[doc(hidden)]
     pub fn reuse_start_count_for_test(&self) -> u64 {
         self.reuse_starts.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    pub fn source_scan_files_for_test(&self) -> u64 {
+        self.source_scan_files.load(Ordering::Relaxed)
     }
 
     fn completion_outcome(&self, result: InspectResult) -> JobOutcome {
@@ -4040,22 +4395,45 @@ fn current_view_projection_store(
                 callgraph_store_dir_from_inspect_dir(inspect_dir, project_root)
                     .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
             })
-            .ok_or_else(|| "inspect storage unavailable".to_string())?;
+            .ok_or_else(|| {
+                note_checkout_view_refusal!("projection_storage_missing: config.storage_dir={:?} root={project_root:?} inspect_dir={inspect_dir:?}", config.storage_dir);
+                "inspect storage unavailable".to_string()
+            })?;
         let scope = crate::path_identity::project_scope_key(project_root);
-        let view =
-            crate::views::ViewStore::open(&storage, &scope).map_err(|error| error.to_string())?;
-        let Some(generation) = view
-            .current_generation()
-            .map_err(|error| error.to_string())?
+        let view = crate::views::ViewStore::open(&storage, &scope).map_err(|error| {
+            note_checkout_view_refusal!(
+                "projection_view_open: storage={storage:?} scope={scope} error={error}"
+            );
+            error.to_string()
+        })?;
+        let Some(generation) = view.current_generation().map_err(|error| {
+            note_checkout_view_refusal!(
+                "projection_pointer_read: view_dir={:?} error={error}",
+                view.view_dir()
+            );
+            error.to_string()
+        })?
         else {
+            note_checkout_view_refusal!(
+                "projection_unpublished: view_dir={:?} current_generation=None",
+                view.view_dir()
+            );
             return Ok(None);
         };
-        let pin = crate::pins::QueryPin::acquire(view.view_dir(), &generation)
-            .map_err(|error| error.to_string())?;
+        let pin =
+            crate::pins::QueryPin::acquire(view.view_dir(), &generation).map_err(|error| {
+                note_checkout_view_refusal!(
+                    "projection_pin_acquire: view_dir={:?} generation={generation} error={error}",
+                    view.view_dir()
+                );
+                error.to_string()
+            })?;
         let Some(head_fingerprint) = crate::views::cached_head_fingerprint(project_root) else {
+            note_checkout_view_refusal!("projection_head_uncached: root={project_root:?} scope={scope} generation={generation} cached_head=None");
             return Ok(None);
         };
         if !crate::views::generation_matches_head(&generation, &head_fingerprint) {
+            note_checkout_view_refusal!("projection_head_mismatch: root={project_root:?} generation={generation} cached_head={head_fingerprint}");
             return Ok(None);
         }
         if !refresh_paths.is_empty() {
@@ -4075,7 +4453,10 @@ fn current_view_projection_store(
             &generation,
             Some(Arc::new(pin)),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            note_checkout_view_refusal!("projection_callgraph_open: root={project_root:?} view_dir={:?} generation={generation} error={error}", view.view_dir());
+            error.to_string()
+        })?;
         Ok(Some((store, generation)))
     })();
     match result {
@@ -5619,6 +6000,11 @@ fn filter_outcome_for_scope(outcome: JobOutcome, scope: &JobScope) -> JobOutcome
     }
 }
 
+#[cfg(test)]
+pub(crate) fn filter_payload_for_scope_for_test(payload: Value, scope: &JobScope) -> Value {
+    filter_payload_for_scope(payload, scope)
+}
+
 fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) -> serde_json::Value {
     if scope.is_project_wide() {
         return payload;
@@ -5627,18 +6013,64 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
     // Scoped Tier 2 callers pass an uncapped rollup into this filter and cap
     // drill-down only afterwards, so the recomputed count below remains the
     // true in-scope total rather than the size of a capped sample.
+    let duplicates = payload.get("duplicated_lines").is_some();
+    if duplicates {
+        // A duplicate group may cross the boundary. Keep its scoped occurrences
+        // even if only one remains, and label the count as groups touching scope.
+        for key in ["items", "groups", "generated_items"] {
+            if let Some(values) = payload.get_mut(key).and_then(Value::as_array_mut) {
+                values.retain_mut(|value| {
+                    let Some(files) = value.get_mut("files").and_then(Value::as_array_mut) else {
+                        return false;
+                    };
+                    files.retain(|file| {
+                        file.as_str().is_some_and(|file| {
+                            scope.contains_display_path(display_file_from_occurrence(file))
+                        })
+                    });
+                    let first = files.first().and_then(Value::as_str).map(str::to_string);
+                    if let Some(first) = first {
+                        let lines = value["files"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .filter_map(parse_duplicate_occurrence)
+                            .map(|(_, start, end)| end.saturating_sub(start).saturating_add(1))
+                            .sum::<u64>();
+                        if value.get("duplicated_lines").is_some() {
+                            value["duplicated_lines"] = json!(lines);
+                        }
+                        update_duplicate_group_sample(value, &first);
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+        }
+    }
     if let Some(items) = payload
         .get_mut("items")
         .and_then(|value| value.as_array_mut())
     {
-        let count = filter_values_for_scope(items, scope);
+        let count = if duplicates {
+            items.len()
+        } else {
+            filter_values_for_scope(items, scope)
+        };
+        let headline_count = items
+            .iter()
+            .filter(|item| item["generated"] != true)
+            .count();
         let largest_cycle = items
             .iter()
             .filter_map(|item| item.get("files").and_then(Value::as_array).map(Vec::len))
             .max();
         if let Some(object) = payload.as_object_mut() {
-            object.insert("count".to_string(), serde_json::json!(count));
+            object.insert("count".to_string(), serde_json::json!(headline_count));
             if object.contains_key("largest") {
+                object.insert("scope_relation".to_string(), json!("touches"));
                 object.insert(
                     "largest".to_string(),
                     serde_json::json!(largest_cycle.unwrap_or(0)),
@@ -5657,7 +6089,11 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
         .get_mut("groups")
         .and_then(|value| value.as_array_mut())
     {
-        let count = filter_values_for_scope(groups, scope);
+        let count = if duplicates {
+            groups.len()
+        } else {
+            filter_values_for_scope(groups, scope)
+        };
         if let Some(object) = payload.as_object_mut() {
             object.insert("count".to_string(), serde_json::json!(count));
             object.insert("total_groups".to_string(), serde_json::json!(count));
@@ -5673,6 +6109,49 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
     // carry per-item language, so we can't faithfully recompute it — drop it so
     // the scoped summary doesn't render a misleading project-wide breakdown.
     if let Some(object) = payload.as_object_mut() {
+        for (items_key, count_key, top_key) in [
+            ("test_only_items", "test_only_count", "test_only_top"),
+            ("generated_items", "generated_count", "generated_top"),
+            ("uncertain_items", "uncertain_count", "uncertain_top"),
+        ] {
+            if let Some(items) = object.get_mut(items_key).and_then(Value::as_array_mut) {
+                if !duplicates {
+                    filter_values_for_scope(items, scope);
+                }
+                let count = items.len();
+                let top = scoped_top_preview(items);
+                object.insert(count_key.to_string(), json!(count));
+                object.insert(top_key.to_string(), top);
+            } else {
+                object.remove(count_key);
+                object.remove(top_key);
+            }
+        }
+        if object.contains_key("total_count") {
+            let total = ["count", "test_only_count", "generated_count"]
+                .iter()
+                .filter_map(|key| object.get(*key).and_then(Value::as_u64))
+                .sum::<u64>();
+            object.insert("total_count".to_string(), json!(total));
+        }
+        if object.contains_key("worst") {
+            let worst = object
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .max_by(|left, right| {
+                    left["complexity"]
+                        .as_u64()
+                        .cmp(&right["complexity"].as_u64())
+                        .then_with(|| right["file"].as_str().cmp(&left["file"].as_str()))
+                        .then_with(|| right["function"].as_str().cmp(&left["function"].as_str()))
+                        .then_with(|| right["line"].as_u64().cmp(&left["line"].as_u64()))
+                })
+                .cloned()
+                .unwrap_or(Value::Null);
+            object.insert("worst".to_string(), worst);
+        }
         if object.contains_key("top") {
             if let Some(top) = recompute_scoped_top_preview(object) {
                 object.insert("top".to_string(), top);
@@ -5680,10 +6159,41 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
                 filter_values_for_scope(top, scope);
             }
         }
-        if object.contains_key("duplicated_lines") {
+        if duplicates {
             recompute_duplicate_payload_stats(object);
+            object.insert("scope_relation".to_string(), json!("touches"));
+            // No per-file denominator or suppression census survives in a
+            // project aggregate. Do not pass those repo-wide totals as scoped.
+            for key in [
+                "duplicated_percent",
+                "total_analyzed_lines",
+                "generated_duplicated_lines",
+                "generated_duplicated_file_count",
+                "total_duplicated_lines",
+                "total_duplicated_file_count",
+                "suppressed_groups",
+                "mirror_suppressed_groups",
+                "marker_suppressed_groups",
+            ] {
+                object.remove(key);
+            }
         }
         object.remove("by_language");
+        for key in [
+            "excluded_test_count",
+            "excluded_test_files",
+            "languages_skipped",
+            "scanned_files",
+        ] {
+            object.remove(key);
+        }
+        // Parse failures belong to the files that failed, not to every scope
+        // sharing a cached aggregate. Keep non-file capability gaps unchanged.
+        for key in ["gaps", "parse_errors"] {
+            if let Some(rows) = object.get_mut(key).and_then(Value::as_array_mut) {
+                filter_values_for_scope(rows, scope);
+            }
+        }
     }
 
     payload
@@ -5697,21 +6207,11 @@ fn recompute_duplicate_payload_stats(object: &mut serde_json::Map<String, Value>
         .cloned()
         .unwrap_or_default();
     let (duplicated_lines, duplicated_file_count) = duplicate_line_stats_from_values(&values);
-    let total_analyzed_lines = object
-        .get("total_analyzed_lines")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let duplicated_percent = if total_analyzed_lines == 0 {
-        0.0
-    } else {
-        (duplicated_lines as f64 * 100.0) / total_analyzed_lines as f64
-    };
     object.insert("duplicated_lines".to_string(), json!(duplicated_lines));
     object.insert(
         "duplicated_file_count".to_string(),
         json!(duplicated_file_count),
     );
-    object.insert("duplicated_percent".to_string(), json!(duplicated_percent));
 }
 
 fn duplicate_line_stats_from_values(values: &[Value]) -> (u64, usize) {
@@ -5764,13 +6264,22 @@ fn recompute_scoped_top_preview(
         .get("items")
         .or_else(|| object.get("groups"))
         .and_then(Value::as_array)?;
-    Some(Value::Array(
+    let headline = values
+        .iter()
+        .filter(|item| item["generated"] != true)
+        .cloned()
+        .collect::<Vec<_>>();
+    Some(scoped_top_preview(&headline))
+}
+
+fn scoped_top_preview(values: &[Value]) -> Value {
+    Value::Array(
         values
             .iter()
             .take(super::entry_points::TOP_PREVIEW_ITEMS)
             .map(top_preview_value)
             .collect(),
-    ))
+    )
 }
 
 fn top_preview_value(value: &Value) -> Value {
@@ -5795,6 +6304,13 @@ fn filter_values_for_scope(values: &mut Vec<serde_json::Value>, scope: &JobScope
 }
 
 fn prune_value_for_scope(value: &mut serde_json::Value, scope: &JobScope) -> bool {
+    let is_cycle = value.get("cycle").is_some();
+    if let Some(tests) = value.get_mut("used_by_tests").and_then(Value::as_array_mut) {
+        tests.retain(|test| {
+            test.as_str()
+                .is_some_and(|file| scope.contains_display_path(file))
+        });
+    }
     if let Some(file) = value.get("file").and_then(|file| file.as_str()) {
         return scope.contains_display_path(file);
     }
@@ -5807,7 +6323,7 @@ fn prune_value_for_scope(value: &mut serde_json::Value, scope: &JobScope) -> boo
             file.as_str()
                 .is_some_and(|file| scope.contains_display_path(display_file_from_occurrence(file)))
         });
-        if files.len() < 2 {
+        if files.is_empty() || (!is_cycle && files.len() < 2) {
             return false;
         }
         files.first().and_then(Value::as_str).map(str::to_string)
@@ -5817,6 +6333,27 @@ fn prune_value_for_scope(value: &mut serde_json::Value, scope: &JobScope) -> boo
 
     if let Some(occurrence) = first_scoped_occurrence {
         update_duplicate_group_sample(value, &occurrence);
+    }
+    if is_cycle {
+        // A cycle may depend on files outside the scope. Its scoped display is
+        // a slice of that cycle, never an invented closed cycle in these files.
+        let cycle = value["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        value["cycle"] = json!(cycle);
+        if let Some(edges) = value.get_mut("edges").and_then(Value::as_array_mut) {
+            edges.retain(|edge| {
+                ["from", "to"].iter().all(|key| {
+                    edge[*key]
+                        .as_str()
+                        .is_some_and(|file| scope.contains_display_path(file))
+                })
+            });
+        }
     }
 
     true
@@ -6111,6 +6648,64 @@ mod guard_tests {
         let census = store.stale_path_census().expect("census");
         assert_eq!(census.stale, 0);
         assert_eq!(census.undecodable, 1, "the skipped file must be reported");
+    }
+
+    #[test]
+    fn scoped_filter_narrows_every_summary_and_preview() {
+        let scope = JobScope::from_roots("/repo", vec![PathBuf::from("/repo/src/in")]);
+        let payload = json!({
+            "count": 2, "total_count": 99, "test_only_count": 479, "generated_count": 12,
+            "excluded_test_count": 80, "excluded_test_files": 20,
+            "items": [{"file": "src/out/a.ts", "function": "outside", "complexity": 215},
+                      {"file": "src/in/b.ts", "function": "inside", "complexity": 12}],
+            "worst": {"file": "src/out/a.ts", "function": "outside", "complexity": 215},
+            "test_only_items": [{"file": "src/out/a.ts", "symbol": "outside"},
+                                {"file": "src/in/b.ts", "symbol": "inside"}],
+            "test_only_top": [{"file": "src/out/a.ts", "symbol": "outside"}],
+            "generated_items": [{"file": "src/out/a.ts", "symbol": "outside"}],
+            "generated_top": [{"file": "src/out/a.ts", "symbol": "outside"}]
+        });
+        let filtered = filter_payload_for_scope(payload, &scope);
+        assert_eq!(filtered["worst"]["function"], "inside");
+        assert_eq!(filtered["test_only_count"], 1);
+        assert_eq!(filtered["generated_count"], 0);
+        assert_eq!(filtered["total_count"], 2);
+        assert!(filtered.get("excluded_test_count").is_none());
+        assert!(!filtered.to_string().contains("outside"), "{filtered}");
+
+        let duplicates = filter_payload_for_scope(
+            json!({
+                "count": 2, "total_analyzed_lines": 968281, "duplicated_lines": 100,
+                "duplicated_percent": 0.01, "suppressed_groups": 72,
+                "items": [{"files": ["src/out/a.ts:1-20", "src/out/b.ts:1-20"]},
+                          {"files": ["src/in/b.ts:1-20", "src/out/c.ts:1-20"]}]
+            }),
+            &scope,
+        );
+        assert_eq!(
+            duplicates["count"], 1,
+            "cross-boundary groups must touch the scope"
+        );
+        assert_eq!(duplicates["scope_relation"], "touches");
+        assert!(duplicates.get("total_analyzed_lines").is_none());
+        assert!(duplicates.get("suppressed_groups").is_none());
+        assert!(!duplicates.to_string().contains("src/out"), "{duplicates}");
+
+        let cycles = filter_payload_for_scope(
+            json!({
+                "count": 1, "largest": 3, "items": [{
+                    "cycle": "src/in/a.ts -> src/out/b.ts -> src/in/c.ts",
+                    "files": ["src/in/a.ts", "src/out/b.ts", "src/in/c.ts"],
+                    "edges": [{"from": "src/in/a.ts", "to": "src/out/b.ts"},
+                              {"from": "src/in/c.ts", "to": "src/in/a.ts"}]
+                }]
+            }),
+            &scope,
+        );
+        assert_eq!(cycles["count"], 1);
+        assert_eq!(cycles["largest"], 2);
+        assert_eq!(cycles["scope_relation"], "touches");
+        assert!(!cycles.to_string().contains("src/out"), "{cycles}");
     }
 
     #[test]

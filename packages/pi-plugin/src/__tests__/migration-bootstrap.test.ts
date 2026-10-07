@@ -1,9 +1,10 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as bridge from "@cortexkit/aft-bridge";
 import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 
@@ -60,6 +61,8 @@ describe.serial("Pi migration bootstrap", () => {
       // CI also exports the built binary here, and since it became resolution
       // step 0 it would win over the fake `aft` this test plants on PATH.
       AFT_BINARY_PATH: undefined,
+      MAGIC_CONTEXT_PI_SUBAGENT: "1",
+      XDG_CONFIG_HOME: join(tempDir, "config"),
       PATH: `${binDir}:${process.env.PATH ?? ""}`,
       HOME: home,
       XDG_DATA_HOME: join(tempDir, "data"),
@@ -81,6 +84,7 @@ describe.serial("Pi migration bootstrap", () => {
   });
 
   afterEach(() => {
+    mock.restore();
     process.chdir(prevCwd);
     releaseEnv?.();
     releaseEnv = undefined;
@@ -107,11 +111,31 @@ describe.serial("Pi migration bootstrap", () => {
     } as Parameters<PiPlugin>[0];
   }
 
+  async function prepareFirstRead(plugin: PiPlugin): Promise<() => Promise<unknown>> {
+    const api = makePi();
+    let read: any;
+    api.registerTool = (tool) => {
+      if (tool.name === "read") read = tool;
+    };
+    await plugin(api);
+    expect(read).toBeDefined();
+    expect(existsSync(argsLog)).toBe(false);
+    return () =>
+      read.execute("migration-read", { path: "file.txt" }, undefined, undefined, {
+        cwd: projectDir,
+        hasUI: false,
+      });
+  }
+
   test("pi_plugin_calls_ensureStorageMigrated_with_pi_harness", async () => {
     const legacyRoot = createLegacyRoot();
     const plugin = await loadPlugin();
 
-    await plugin(makePi());
+    spyOn(bridge, "createAftTransportPool").mockImplementation(async () => {
+      throw new Error("migration checked before transport creation");
+    });
+    const read = await prepareFirstRead(plugin);
+    await expect(read()).rejects.toThrow("migration checked before transport creation");
 
     const argv = readFileSync(argsLog, "utf8").trim().split("\n");
     expect(argv).toContain("migrate-storage");
@@ -128,6 +152,11 @@ describe.serial("Pi migration bootstrap", () => {
     writeFakeAft(5);
     const plugin = await loadPlugin();
 
-    await expect(plugin(makePi())).rejects.toThrow(/AFT storage migration failed.*exit 5/);
+    const transport = spyOn(bridge, "createAftTransportPool").mockImplementation(async () => {
+      throw new Error("unmigrated transport must not be created");
+    });
+    const read = await prepareFirstRead(plugin);
+    await expect(read()).rejects.toThrow(/AFT storage migration failed.*exit 5/);
+    expect(transport).not.toHaveBeenCalled();
   });
 });

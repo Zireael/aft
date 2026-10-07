@@ -1,4 +1,7 @@
+import { Effect } from "effect";
+
 import { resolvePromptContext } from "./last-assistant-model.js";
+import { isV2PluginContext } from "./v2-context.js";
 
 export const VISION_HOST_TIMEOUT_MS = 1500;
 type Model = { providerID: string; modelID: string };
@@ -69,12 +72,19 @@ export async function currentSessionVisionCapability(
   let capability = state.capabilities.get(key);
   if (!capability) {
     capability = (async () => {
-      const api = (client as { provider?: { list?: () => Promise<unknown> } }).provider;
+      const api = (client as { provider?: { list?: () => unknown } }).provider;
       if (!api?.list) return undefined;
-      const list = api.list.bind(api);
+      const list = async () => {
+        const result = api.list?.();
+        return isV2PluginContext(client)
+          ? Effect.runPromise(result as Effect.Effect<unknown, unknown>)
+          : await result;
+      };
       const listed = record(await bounded(list));
       const catalog = record(listed?.data) ?? listed;
-      const providers = catalog?.all ?? catalog?.providers;
+      const providers = Array.isArray(listed?.data)
+        ? listed.data
+        : (catalog?.all ?? catalog?.providers);
       if (!Array.isArray(providers)) return undefined;
       const provider = providers.map(record).find((entry) => entry?.id === currentModel.providerID);
       const models = provider?.models;
@@ -83,7 +93,7 @@ export async function currentSessionVisionCapability(
           ? models.find((entry) => record(entry)?.id === currentModel.modelID)
           : record(models)?.[currentModel.modelID],
       );
-      const inputs = record(entry?.modalities)?.input;
+      const inputs = record(entry?.capabilities)?.input ?? record(entry?.modalities)?.input;
       return Array.isArray(inputs)
         ? inputs.includes("image")
         : typeof entry?.attachment === "boolean"

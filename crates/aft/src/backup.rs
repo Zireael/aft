@@ -2402,19 +2402,64 @@ impl BackupStore {
             None => PathFingerprint::of_path(key),
         };
         stack[index].post_state = Some(state);
-        let result = self.write_appended_snapshot_to_disk_locked(
-            session,
-            key,
-            &stack,
-            &[],
-            None,
-            Some(&stack[index]),
-        );
+        let result = self.write_post_states(session, key, &stack);
+        if result.is_ok() {
+            self.mirror_stack_to_db(
+                session,
+                key,
+                &stack,
+                DbMirrorPlan::Append {
+                    evicted_orders: &[],
+                    new_entry: None,
+                    restamped: Some(&stack[index]),
+                },
+            );
+        }
         if result.is_err() {
             stack[index].post_state = None;
         }
         self.restore_in_memory_stack(session, key, Some(stack));
         result
+    }
+
+    fn write_post_states(
+        &self,
+        session: &str,
+        key: &Path,
+        stack: &[BackupEntry],
+    ) -> Result<(), AftError> {
+        let Some(session_dir) = self.session_dir(session) else {
+            return Ok(());
+        };
+        let dir = session_dir.join(Self::path_hash(key));
+        let states: HashMap<_, _> = stack
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .post_state
+                    .as_ref()
+                    .map(|state| (entry.backup_id.clone(), state.to_meta_string()))
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&states).map_err(|error| AftError::IoError {
+            path: dir.display().to_string(),
+            message: error.to_string(),
+        })?;
+        // The unsynced annotation must never replace durable stack metadata:
+        // power loss may tear this file, losing fingerprints but not undo entries.
+        write_temp_atomic_rename(&dir, "post-state.json", &bytes, false).map_err(|error| {
+            AftError::IoError {
+                path: dir.join("post-state.json").display().to_string(),
+                message: error.to_string(),
+            }
+        })?;
+        crate::write_ledger::credit(
+            crate::write_ledger::Domain::Backups,
+            key.display().to_string(),
+            bytes.len() as u64,
+            0,
+        );
+        Ok(())
     }
 
     /// Cheap check that this process's copy of a stack is still what disk
@@ -2839,7 +2884,7 @@ impl BackupStore {
         let Some(session_dir) = self.session_dir(session) else {
             return;
         };
-        if let Err(e) = create_private_dir_all(&session_dir) {
+        if let Err(e) = create_private_durable_dir(&session_dir) {
             crate::slog_warn!("failed to create session dir: {}", e);
             return;
         }
@@ -2877,7 +2922,7 @@ impl BackupStore {
             return;
         }
         if let Some(parent) = harness_backups.parent() {
-            if let Err(error) = create_private_dir_all(parent) {
+            if let Err(error) = create_private_durable_dir(parent) {
                 crate::slog_warn!(
                     "failed to create harness backup dir {}: {}",
                     parent.display(),
@@ -2902,7 +2947,7 @@ impl BackupStore {
                     harness_backups.display(),
                     error
                 );
-                if create_private_dir_all(&harness_backups).is_err() {
+                if create_private_durable_dir(&harness_backups).is_err() {
                     return;
                 }
                 if let Ok(entries) = std::fs::read_dir(&root_backups) {
@@ -2993,7 +3038,7 @@ impl BackupStore {
             }
             // This is a legacy flat-layout path-hash directory. Move it under
             // the default session namespace.
-            if let Err(e) = create_private_dir_all(&default_session_dir) {
+            if let Err(e) = create_private_durable_dir(&default_session_dir) {
                 crate::slog_warn!("failed to create default session dir: {}", e);
                 return;
             }
@@ -3341,13 +3386,12 @@ impl BackupStore {
             path: marker.display().to_string(),
             message: error.to_string(),
         })?;
-        write_temp_fsync_rename(session_dir, "session.json", content.as_bytes()).map_err(
+        write_temp_atomic_rename(session_dir, "session.json", content.as_bytes(), false).map_err(
             |error| AftError::IoError {
                 path: marker.display().to_string(),
                 message: error.to_string(),
             },
         )?;
-        let _ = fsync_dir(session_dir);
         Ok(())
     }
 
@@ -3360,6 +3404,10 @@ impl BackupStore {
             return Ok(None);
         };
         self.record_disk_io_for_tests();
+        create_private_durable_dir(&session_dir).map_err(|error| AftError::IoError {
+            path: session_dir.display().to_string(),
+            message: error.to_string(),
+        })?;
         let lock_dir = session_dir.join(".locks");
         create_private_dir_all(&lock_dir).map_err(|error| AftError::IoError {
             path: lock_dir.display().to_string(),
@@ -3654,7 +3702,7 @@ impl BackupStore {
         }
         let content = std::fs::read_to_string(&meta_path)
             .map_err(|error| format!("failed to read {}: {}", meta_path.display(), error))?;
-        let meta = serde_json::from_str::<serde_json::Value>(&content)
+        let mut meta = serde_json::from_str::<serde_json::Value>(&content)
             .map_err(|error| format!("failed to parse {}: {}", meta_path.display(), error))?;
         check_backup_meta_format(&meta_path, Some(&meta)).map_err(|refusal| refusal.to_string())?;
         let path_str = meta
@@ -3667,6 +3715,27 @@ impl BackupStore {
         }
         let count = meta_entry_count(&meta)
             .ok_or_else(|| format!("backup meta {} missing entry count", meta_path.display()))?;
+        // Old metadata can still contain fingerprints. New annotations are
+        // best-effort and keyed by entry id, so stale sidecar rows cannot stamp
+        // a different entry. A torn sidecar is an empty annotation, not an error.
+        let states = std::fs::read(dir.join("post-state.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<HashMap<String, String>>(&bytes).ok())
+            .unwrap_or_default();
+        if let Some(entries) = meta
+            .get_mut("entries")
+            .and_then(|value| value.as_array_mut())
+        {
+            for entry in entries {
+                if let Some(state) = entry
+                    .get("backup_id")
+                    .and_then(|id| id.as_str())
+                    .and_then(|id| states.get(id))
+                {
+                    entry["post_state"] = serde_json::Value::String(state.clone());
+                }
+            }
+        }
         Ok(Some((DiskMeta { dir, count }, meta)))
     }
 
@@ -3780,7 +3849,7 @@ impl BackupStore {
             return Ok(());
         };
 
-        create_private_dir_all(&session_dir).map_err(|error| AftError::IoError {
+        create_private_durable_dir(&session_dir).map_err(|error| AftError::IoError {
             path: session_dir.display().to_string(),
             message: error.to_string(),
         })?;
@@ -3796,7 +3865,7 @@ impl BackupStore {
             path: meta_path.display().to_string(),
             message: refusal.to_string(),
         })?;
-        create_private_dir_all(&dir).map_err(|error| AftError::IoError {
+        create_private_durable_dir(&dir).map_err(|error| AftError::IoError {
             path: dir.display().to_string(),
             message: error.to_string(),
         })?;
@@ -3805,7 +3874,6 @@ impl BackupStore {
         let retained_start = stack.len().saturating_sub(max_depth);
         let retained = &stack[retained_start..];
         let mut referenced_content = HashSet::new();
-        let mut wrote_content = false;
         let mut ledger_bytes = 0_u64;
 
         for entry in retained {
@@ -3823,17 +3891,17 @@ impl BackupStore {
                     }
                 })?;
                 ledger_bytes = ledger_bytes.saturating_add(bytes.len() as u64);
-                wrote_content = true;
             }
         }
-        if wrote_content {
-            fsync_dir(&dir).map_err(|error| AftError::IoError {
-                path: dir.display().to_string(),
-                message: error.to_string(),
-            })?;
-        }
 
-        let entries: Vec<serde_json::Value> = retained.iter().map(entry_meta_json).collect();
+        let entries: Vec<serde_json::Value> = retained
+            .iter()
+            .map(|entry| {
+                let mut meta = entry_meta_json(entry);
+                meta.as_object_mut().unwrap().remove("post_state");
+                meta
+            })
+            .collect();
         let meta = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "format_version": V2_FORMAT_VERSION,
@@ -3854,10 +3922,19 @@ impl BackupStore {
             }
         })?;
         ledger_bytes = ledger_bytes.saturating_add(meta_content.len() as u64);
+        // One directory flush commits both content and metadata renames.
         fsync_dir(&dir).map_err(|error| AftError::IoError {
             path: dir.display().to_string(),
             message: error.to_string(),
         })?;
+        // Rewriting from retained entries prunes stale sidecar rows. Failure
+        // loses only annotations; the stack has already committed durably.
+        if let Err(error) = self.write_post_states(session, key, retained) {
+            crate::slog_warn!(
+                "backup fingerprints not recorded for {}: {error}",
+                key.display()
+            );
+        }
 
         prune_unreferenced_backup_files(&dir, &referenced_content).map_err(|error| {
             AftError::IoError {
@@ -3865,7 +3942,6 @@ impl BackupStore {
                 message: error.to_string(),
             }
         })?;
-        let _ = fsync_dir(&dir);
         crate::write_ledger::credit(
             crate::write_ledger::Domain::Backups,
             key.display().to_string(),
@@ -4089,6 +4165,13 @@ impl BackupStore {
             .unwrap_or(false);
         if empty {
             self.disk_index.remove(session);
+        }
+        if let Some(session_dir) = self.session_dir(session) {
+            // Removing the last stack is itself an undo completion commit.
+            fsync_dir(&session_dir).map_err(|error| AftError::IoError {
+                path: session_dir.display().to_string(),
+                message: error.to_string(),
+            })?;
         }
         Ok(())
     }
@@ -4692,8 +4775,17 @@ fn restore_regular_file(
     {
         std::fs::remove_file(path)?;
     }
-    std::fs::write(path, content_bytes)?;
-    set_file_mode(path, mode)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(content_bytes)?;
+    set_file_mode(path, mode)?;
+    // Do not pop the undo stack while restored bytes exist only in page cache.
+    // Keep the writer handle through mode restoration: reopening for write
+    // would fail if the backup's original permissions were read-only.
+    crate::durability::sync_file(&file, path)
 }
 
 fn restore_symlink(path: &Path, target: &Path) -> std::io::Result<()> {
@@ -5192,6 +5284,47 @@ pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Publish a new durable store directory and any missing ancestors into their
+/// parents before committing records inside it. Existing directories cost no sync.
+pub(crate) fn create_private_durable_dir(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        // A durable child entry is insufficient when an ancestor can vanish.
+        // Existing ancestors cost nothing; each new one publishes into its own
+        // parent before any records can be committed under this namespace.
+        create_private_durable_dir(parent)?;
+    }
+    let created = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(PRIVATE_DIR_MODE)
+                .create(path)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(path)
+        }
+    };
+    match created {
+        Ok(()) => {
+            crate::durability::record(crate::durability::EventKind::DirectoryCreated, path);
+            if let Some(parent) = path.parent() {
+                crate::durability::sync_dir(parent)?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Writes `content` to `path` (creating or truncating it) with owner-only
 /// permissions (0600 on Unix). A new file is created with that mode; a file
 /// left over from an earlier run keeps its old mode bits on open, so it is
@@ -5216,6 +5349,15 @@ fn write_private_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
 }
 
 fn write_temp_fsync_rename(dir: &Path, final_name: &str, content: &[u8]) -> std::io::Result<()> {
+    write_temp_atomic_rename(dir, final_name, content, true)
+}
+
+fn write_temp_atomic_rename(
+    dir: &Path,
+    final_name: &str,
+    content: &[u8],
+    durable: bool,
+) -> std::io::Result<()> {
     let tmp_name = format!(
         ".{}.{}.{}.tmp",
         final_name,
@@ -5237,9 +5379,13 @@ fn write_temp_fsync_rename(dir: &Path, final_name: &str, content: &[u8]) -> std:
         }
         let mut file = options.open(&tmp_path)?;
         file.write_all(content)?;
-        file.sync_all()?;
+        if durable {
+            crate::durability::sync_file(&file, &final_path)?;
+        }
     }
-    replace_file(&tmp_path, &final_path)
+    replace_file(&tmp_path, &final_path)?;
+    crate::durability::record(crate::durability::EventKind::AtomicReplace, &final_path);
+    Ok(())
 }
 
 fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -5250,7 +5396,7 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
+    crate::durability::sync_dir(path)
 }
 
 #[cfg(not(unix))]
@@ -5535,6 +5681,207 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durability::{sync_count, take, EventKind};
+
+    fn durability_store() -> (BackupStore, tempfile::TempDir, PathBuf) {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("user.txt");
+        fs::write(&path, "original").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        (store, storage, path)
+    }
+
+    #[test]
+    fn durability_backup_count() {
+        let (mut store, _storage, path) = durability_store();
+        take();
+        store.snapshot("durability", &path, "first").unwrap();
+        fs::write(&path, "first edit").unwrap();
+        store.record_post_mutation_states();
+        let first = take();
+        // Three commit syncs plus backups/, session/ and path/ publication.
+        assert_eq!(
+            first
+                .iter()
+                .filter(|e| e.0 == EventKind::DirectoryCreated)
+                .count(),
+            3
+        );
+        assert_eq!(
+            sync_count(&first),
+            if cfg!(unix) { 6 } else { 2 },
+            "{first:?}"
+        );
+        store.snapshot("durability", &path, "second").unwrap();
+        fs::write(&path, "second edit").unwrap();
+        store.record_post_mutation_states();
+        let next = take();
+        assert_eq!(
+            sync_count(&next),
+            if cfg!(unix) { 3 } else { 2 },
+            "{next:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durability_first_backup_parent_order() {
+        let (mut store, _storage, path) = durability_store();
+        take();
+        store.snapshot("durability", &path, "first").unwrap();
+        let events = take();
+        let session = store.session_dir("durability").unwrap();
+        let dir = session.join(BackupStore::path_hash(&canonicalize_key(&path)));
+        let created = events
+            .iter()
+            .position(|e| *e == (EventKind::DirectoryCreated, dir.clone()))
+            .unwrap();
+        let parent = events
+            .iter()
+            .position(|e| *e == (EventKind::DirectorySync, session.clone()))
+            .unwrap();
+        let meta = events
+            .iter()
+            .position(|e| *e == (EventKind::FileSync, dir.join("meta.json")))
+            .unwrap();
+        assert!(created < parent && parent < meta, "{events:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durability_new_store_ancestor_order_and_count() {
+        let storage = tempfile::tempdir().unwrap();
+        let namespace = storage.path().join("namespace");
+        let session = namespace.join("session");
+        let store = session.join("store");
+        take();
+        create_private_durable_dir(&store).unwrap();
+        assert_eq!(
+            take(),
+            vec![
+                (EventKind::DirectoryCreated, namespace.clone()),
+                (EventKind::DirectorySync, storage.path().to_path_buf()),
+                (EventKind::DirectoryCreated, session.clone()),
+                (EventKind::DirectorySync, namespace),
+                (EventKind::DirectoryCreated, store.clone()),
+                (EventKind::DirectorySync, session),
+            ]
+        );
+        // Reusing a durable namespace must not add steady-state syncs.
+        create_private_durable_dir(&store).unwrap();
+        assert!(take().is_empty());
+    }
+
+    #[test]
+    fn durability_undo_count_and_file_before_metadata() {
+        let (mut store, _storage, path) = durability_store();
+        for text in ["original", "edited"] {
+            fs::write(&path, text).unwrap();
+            store.snapshot("durability", &path, "edit").unwrap();
+        }
+        fs::write(&path, "newest").unwrap();
+        take();
+        store.restore_latest("durability", &path).unwrap();
+        let events = take();
+        assert_eq!(
+            sync_count(&events),
+            if cfg!(unix) { 3 } else { 2 },
+            "{events:?}"
+        );
+        let restored = events
+            .iter()
+            .position(|e| *e == (EventKind::FileSync, path.clone()))
+            .expect("restored user file must be synced");
+        let meta = events
+            .iter()
+            .position(|e| e.0 == EventKind::FileSync && e.1.file_name().unwrap() == "meta.json")
+            .unwrap();
+        assert!(restored < meta, "{events:?}");
+        assert_eq!(fs::read_to_string(path).unwrap(), "edited");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durability_undo_syncs_read_only_restoration_using_writer_handle() {
+        let (mut store, _storage, path) = durability_store();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        store.snapshot("durability", &path, "edit").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&path, "edited").unwrap();
+        store.restore_latest("durability", &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    #[test]
+    fn durability_torn_annotation_keeps_every_entry_undoable() {
+        for torn in [Some(&b"{"[..]), Some(&b""[..]), None] {
+            let (mut store, storage, path) = durability_store();
+            for text in ["original", "first edit", "second edit"] {
+                fs::write(&path, text).unwrap();
+                store.snapshot("durability", &path, "edit").unwrap();
+                fs::write(&path, "after edit").unwrap();
+                take();
+                store.record_post_mutation_states();
+            }
+            // Simulate power loss tearing the last unsynced annotation write,
+            // on the actual path the writer replaced, not a hardcoded proxy.
+            let annotation = take()
+                .into_iter()
+                .rev()
+                .find(|e| e.0 == EventKind::AtomicReplace)
+                .unwrap()
+                .1;
+            match torn {
+                Some(bytes) => fs::write(&annotation, bytes).unwrap(),
+                None => fs::remove_file(&annotation).unwrap(),
+            }
+            drop(store);
+            let mut restarted = BackupStore::new();
+            restarted.set_storage_dir(storage.path().to_path_buf(), 72);
+            for expected in ["second edit", "first edit", "original"] {
+                restarted.restore_latest("durability", &path).unwrap();
+                assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn durability_sidecar_overlays_and_prunes_only_retained_ids() {
+        let (mut store, _storage, path) = durability_store();
+        store.snapshot("durability", &path, "edit").unwrap();
+        fs::write(&path, "after edit").unwrap();
+        store.record_post_mutation_states();
+        let key = canonicalize_key(&path);
+        let stack = store
+            .read_stack_from_disk_unlocked("durability", &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stack[0].post_state, Some(PathFingerprint::of_path(&path)));
+        let dir = store
+            .session_dir("durability")
+            .unwrap()
+            .join(BackupStore::path_hash(&key));
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        assert!(meta["entries"][0].get("post_state").is_none());
+        let mut sidecar: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("post-state.json")).unwrap()).unwrap();
+        sidecar["obsolete-backup"] = serde_json::json!("absent");
+        fs::write(
+            dir.join("post-state.json"),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+        store.snapshot("durability", &path, "next").unwrap();
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("post-state.json")).unwrap()).unwrap();
+        assert!(sidecar.get("obsolete-backup").is_none());
+    }
     use crate::harness::Harness;
     use crate::protocol::DEFAULT_SESSION_ID;
     use std::fs;

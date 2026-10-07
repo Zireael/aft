@@ -46,6 +46,11 @@ pub struct FormatContext {
     pub safety_name_arg: Option<String>,
     /// `outputMode` of a `bash_status` call; PTY status text depends on it.
     pub bash_output_mode: Option<String>,
+    /// The caller is a delegated worker. A worker is never woken by a
+    /// completion reminder, so a running task's status never promises one.
+    pub worker_session: bool,
+    /// Whether the caller's tool catalog includes `bash_watch`.
+    pub bash_watch_available: Option<bool>,
 }
 
 impl Default for FormatContext {
@@ -67,6 +72,8 @@ impl Default for FormatContext {
             safety_file_arg: None,
             safety_name_arg: None,
             bash_output_mode: None,
+            worker_session: false,
+            bash_watch_available: None,
         }
     }
 }
@@ -92,6 +99,8 @@ impl FormatContext {
             safety_file_arg: safety_string_arg_for_call(bare_name, arguments, "filePath"),
             safety_name_arg: safety_string_arg_for_call(bare_name, arguments, "name"),
             bash_output_mode: bash_output_mode_for_call(bare_name, arguments),
+            worker_session: false,
+            bash_watch_available: None,
         }
     }
 }
@@ -263,6 +272,7 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "bash_status"
             | "bash_kill"
             | "bash_write"
+            | "bash_watch"
     )
 }
 
@@ -281,6 +291,16 @@ pub fn format_response(
 
 /// Render the text block for a tool `CallToolResult` from the structured AFT `Response`.
 pub fn format_response_with_context(
+    bare_name: &str,
+    response: &Response,
+    ctx: &FormatContext,
+) -> String {
+    let mut text = format_response_unbounded(bare_name, response, ctx);
+    crate::response_finalize::enforce_reply_ceiling(bare_name, &mut text);
+    text
+}
+
+pub(crate) fn format_response_unbounded(
     bare_name: &str,
     response: &Response,
     ctx: &FormatContext,
@@ -317,7 +337,9 @@ pub fn format_response_with_context(
         "zoom" => format_zoom(data, ctx),
         "inspect" => format_inspect(response),
         "status" => format_status(data),
-        "bash" | "powershell" => data["output"].as_str().unwrap_or_default().to_string(),
+        "bash" | "powershell" | "bash_watch" => {
+            data["output"].as_str().unwrap_or_default().to_string()
+        }
         "callgraph" => format_callgraph(
             ctx.callgraph_op.as_deref().unwrap_or("callgraph"),
             data,
@@ -330,11 +352,17 @@ pub fn format_response_with_context(
         "move" => format_move(data, ctx),
         "import" => format_import(data, ctx),
         "safety" => format_safety(data, ctx),
-        "bash_status" => format_bash_status(data, ctx.bash_output_mode.as_deref()),
+        "bash_status" => format_bash_status(
+            data,
+            ctx.bash_output_mode.as_deref(),
+            ctx.worker_session,
+            ctx.bash_watch_available.unwrap_or(ctx.worker_session),
+        ),
         "bash_kill" => format_bash_kill(data),
         "bash_write" => format_bash_write(data),
         _ => unreachable!("core agent tools are exhaustive"),
     };
+    crate::response_finalize::append_watcher_query_notice(&mut text, response);
     if let Some(reason) = data.get("backup_skipped_reason").and_then(Value::as_str) {
         let notice = format!(
             "Undo is unavailable for this change because the backup snapshot was skipped ({reason})."
@@ -989,7 +1017,12 @@ fn bash_task_id(data: &Value) -> &str {
 // Mirrors packages/opencode-plugin/src/tools/bash.ts formatBashStatusText and
 // formatPtyStatus, so a catalog consumer shows the model the same status text
 // the OpenCode tool does.
-fn format_bash_status(data: &Value, output_mode: Option<&str>) -> String {
+fn format_bash_status(
+    data: &Value,
+    output_mode: Option<&str>,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> String {
     let task_id = bash_task_id(data);
     let status = data
         .get("status")
@@ -1005,6 +1038,14 @@ fn format_bash_status(data: &Value, output_mode: Option<&str>) -> String {
     }
     if let Some(summary) = data.get("live_descendants_summary").and_then(Value::as_str) {
         text.push_str(&format!(" · {summary}"));
+    }
+    if data.get("output_incomplete").and_then(Value::as_bool) == Some(true) {
+        let reason = data
+            .get("status_reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("PTY output may be incomplete");
+        text.push_str(&format!("\n[{reason}]"));
     }
     let running = status == "running";
     if data.get("mode").and_then(Value::as_str) == Some("pty") {
@@ -1054,7 +1095,14 @@ fn format_bash_status(data: &Value, output_mode: Option<&str>) -> String {
             text.push_str(preview);
         }
         if running {
-            text.push_str("\nA completion reminder will be delivered automatically; don't poll.");
+            // Mirrors `runningTaskStatusHint` in the plugins.
+            text.push_str(if worker_session && bash_watch_available {
+                "\nTo wait for it, call bash_watch; don't poll."
+            } else if worker_session {
+                "\nIt won't wake you when it finishes. Use bash_status to check whether it has finished."
+            } else {
+                "\nA completion reminder will be delivered automatically; don't poll."
+            });
         }
     }
     text
@@ -1239,9 +1287,13 @@ fn append_lsp_error_lines(output: &mut String, data: &Value, trailing_newline: b
 fn append_lsp_server_notes(output: &mut String, data: &Value) {
     let pending = string_array(data.get("lsp_pending_servers"));
     if !pending.is_empty() {
+        let status = data
+            .get("lsp_status")
+            .and_then(Value::as_str)
+            .unwrap_or("Diagnostics are incomplete for this call");
         output.push_str(&format!(
-            "\n\nNote: LSP server(s) did not respond in time: {}. Diagnostics are incomplete for this call; wait for the LSP update and use the next normal aft_inspect, not repeated polling.",
-            pending.join(", ")
+            "\n\nNote: LSP server(s) did not respond in time: {}. {}; wait for the LSP update and use the next normal aft_inspect, not repeated polling.",
+            pending.join(", "), status
         ));
     }
     let exited = string_array(data.get("lsp_exited_servers"));
@@ -1250,6 +1302,23 @@ fn append_lsp_server_notes(output: &mut String, data: &Value) {
             "\n\nNote: LSP server(s) exited during this edit: {}. Their diagnostics could not be collected.",
             exited.join(", ")
         ));
+    }
+}
+
+#[cfg(test)]
+mod edit_diagnostics_tests {
+    #[test]
+    fn frozen_lsp_edit_rendering_reports_diagnostics_unknown() {
+        let data = serde_json::json!({
+            "replacements": 1, "lsp_complete": false, "lsp_diagnostics": [],
+            "lsp_pending_servers": ["typescript"],
+            "lsp_status": "diagnostics unknown (server not responding)",
+        });
+        let output = super::format_edit_response(&data);
+        assert!(
+            output.contains("diagnostics unknown (server not responding)"),
+            "{output}"
+        );
     }
 }
 
@@ -1930,6 +1999,16 @@ fn format_outline(response: &Response, mode: OutlineMode) -> String {
 // Mirrors packages/opencode-plugin/src/tools/reading.ts formatOutlineFilesText.
 fn format_outline_files_text(data: &Value) -> String {
     let text = format_outline_text(data);
+    // Structure maps already carry their file-budget/walk trailer. Appending
+    // the legacy partial-result footer would bury that trailer and duplicate
+    // the incomplete-discovery warning.
+    if data
+        .get("structure_footer")
+        .and_then(Value::as_str)
+        .is_some_and(|footer| !footer.is_empty())
+    {
+        return text;
+    }
     let envelope = data
         .get("files_list_envelope")
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
@@ -2016,6 +2095,19 @@ fn format_outline_files_text(data: &Value) -> String {
 
 fn format_outline_text(data: &Value) -> String {
     let text = data.get("text").and_then(Value::as_str).unwrap_or("");
+    if let Some(footer) = data
+        .get("structure_footer")
+        .and_then(Value::as_str)
+        .filter(|footer| !footer.is_empty())
+    {
+        if let Some(body) = text.strip_suffix(&format!("\n{footer}")) {
+            let mut without_footer = data.clone();
+            without_footer["text"] = Value::String(body.to_string());
+            without_footer["structure_footer"] = Value::Null;
+            // Genuine skipped-file gaps belong before the final list trailer.
+            return format!("{}\n{footer}", format_outline_text(&without_footer));
+        }
+    }
     let skipped = data.get("skipped_files").and_then(Value::as_array);
     let Some(skipped) = skipped.filter(|s| !s.is_empty()) else {
         return text.to_string();
@@ -2080,6 +2172,9 @@ fn format_outline_text(data: &Value) -> String {
 // Format zoom responses as plain text so direct calls and server-side calls
 // produce identical output.
 fn format_zoom(data: &Value, ctx: &FormatContext) -> String {
+    if let Some(text) = data.get("text").and_then(Value::as_str) {
+        return text.to_string();
+    }
     if let Some(entries) = data.get("targets").and_then(Value::as_array) {
         return format_zoom_multi_target_result(entries);
     }
@@ -2295,14 +2390,22 @@ fn format_inspect(response: &Response) -> String {
         return text;
     }
     let body = if let Some(text) = response.data.get("text").and_then(Value::as_str) {
-        append_rendered_diagnostics(text, &response.data)
+        if response.data["inspect_terminal"] == "partial" {
+            text.to_string()
+        } else {
+            append_rendered_diagnostics(text, &response.data)
+        }
     } else {
         let json =
             serialized_text_or_failure(serde_json::to_string_pretty(response), "inspect response");
         append_rendered_diagnostics(&json, &response.data)
     };
     match inspect_partial_header(&response.data) {
-        Some(header) => format!("{header}\n{body}"),
+        Some(header) if !body.starts_with("PARTIAL — ") => format!("{header}\n{body}"),
+        _ if response.data["inspect_terminal"] == "fresh" && !body.starts_with("FRESH\n") => {
+            format!("FRESH\n{body}")
+        }
+        Some(_) => body,
         None => body,
     }
 }
@@ -2312,9 +2415,8 @@ pub(crate) fn format_inspect_for_test(response: &Response) -> String {
     format_inspect(response)
 }
 
-/// The one-line header of a partial inspect: it completed, but diagnostics
-/// are unknown for the named producers. Mirrors the OpenCode and Pi
-/// renderers.
+/// The server owns the one-line status: any unfinished category is partial.
+/// Plugins pass this rendered header through without adding another one.
 fn inspect_partial_header(data: &Value) -> Option<String> {
     if data.get("inspect_terminal").and_then(Value::as_str) != Some("partial") {
         return None;
@@ -2322,12 +2424,15 @@ fn inspect_partial_header(data: &Value) -> Option<String> {
     let reason = data
         .get("partial_reason")
         .and_then(Value::as_str)
-        .unwrap_or("diagnostics unknown");
-    Some(format!("PARTIAL: {reason} (see below)"))
+        .unwrap_or("analysis incomplete; retry aft_inspect.");
+    Some(format!("PARTIAL — {reason}"))
 }
 
 // Mirrors packages/opencode-plugin/src/tools/inspect.ts appendRenderedDiagnostics.
 fn append_rendered_diagnostics(text: &str, data: &Value) -> String {
+    if text.starts_with("PARTIAL — ") {
+        return text.to_string();
+    }
     if text.lines().any(|line| {
         let lower = line.to_lowercase();
         lower.starts_with("diagnostics:") || lower.starts_with("diagnostics ")
@@ -2602,7 +2707,7 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
         return format!("Unable to format {op}: response omitted required `{field}` collection.");
     }
 
-    let sections = match op {
+    let mut sections = match op {
         "call_tree" => format_call_tree_sections(record, include_unresolved),
         "callers" => format_callers_sections(record),
         "trace_to_symbol" => format_trace_to_symbol_sections(record),
@@ -2610,6 +2715,11 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
         "impact" => format_impact_sections(record),
         _ => format_trace_data_sections(record),
     };
+    if matches!(op, "callers" | "impact") {
+        if let Some(reason) = string_field(record, "incomplete_reason") {
+            sections.insert(0, reason.to_string());
+        }
+    }
     let body = sections.join("\n");
     // A checkout that reads another checkout's callgraph gets a one-line
     // notice that the callers and line numbers below may not match its own
@@ -3722,24 +3832,19 @@ fn format_inspect_terminal(data: &Value) -> Option<String> {
         .get("inspect_terminal")
         .and_then(Value::as_str)
         .map(|kind| kind.to_ascii_lowercase().replace('_', "-"))?;
-    let completed = data
-        .get("completed_phases")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-
     match kind.as_str() {
         "phase-failed" => {
             let detail = compact_inspect_terminal_field(data.get("failure_detail"), "not supplied");
             let reason = compact_inspect_terminal_field(data.get("failure_reason"), "not supplied");
             Some(format!(
-                "inspect could not complete: {detail} ({reason}).\nCompleted phases: {completed}. Retry, or narrow with sections=..."
+                "PHASE-FAILED — inspect could not complete: {detail} ({reason}). Retry aft_inspect, or narrow the scope."
             ))
         }
         "interrupted" => {
-            let phase_label = if completed == 1 { "phase" } else { "phases" };
-            Some(format!(
-                "inspect was interrupted before it could complete (after {completed} completed {phase_label}); no fresh snapshot was produced.\nRetry is safe; retry inspect, or narrow with sections=..."
-            ))
+            Some(
+                "INTERRUPTED — inspect stopped before it could complete; no fresh snapshot was produced. Retry aft_inspect, or narrow the scope."
+                    .to_string()
+            )
         }
         _ => None,
     }
@@ -3753,7 +3858,17 @@ fn compact_inspect_terminal_field(value: Option<&Value>, fallback: &str) -> Stri
     if parts.is_empty() {
         fallback.to_string()
     } else {
-        parts.join(" ")
+        let mut compact = parts.join(" ");
+        for (internal, plain) in [
+            ("lsp_start", "starting language servers"),
+            ("lsp_quiescence", "waiting for language servers"),
+            ("stat_verification", "verifying files are unchanged"),
+            ("callgraph_ready", "preparing call analysis"),
+            ("tier2_rescan", "running code analysis"),
+        ] {
+            compact = compact.replace(internal, plain);
+        }
+        compact
     }
 }
 
@@ -4160,6 +4275,29 @@ mod outline_format_tests {
     }
 
     #[test]
+    fn structure_outline_trailer_stays_last_after_skips() {
+        let footer = "shown 1 of ≥200 files (walk) · narrow: path";
+        let response = Response::success(
+            "1",
+            json!({
+                "text": format!("src/\n  a.rs\n\n{footer}"),
+                "structure_footer": footer,
+                "complete": false,
+                "walk_truncated": true,
+                "discovered": true,
+                "skipped_files": [{"file":"src/b.rs", "reason":"parse_error"}],
+            }),
+        );
+        for mode in [OutlineMode::Text, OutlineMode::DirectoryJson] {
+            let formatted = format_outline(&response, mode);
+            assert!(formatted.contains("src/b.rs — parse_error"), "{formatted}");
+            assert!(formatted.ends_with(footer), "{formatted}");
+            assert_eq!(formatted.matches(footer).count(), 1, "{formatted}");
+            assert!(!formatted.contains("⚠ Partial result"), "{formatted}");
+        }
+    }
+
+    #[test]
     fn files_outline_uses_the_counting_walk_limit_in_partial_footer() {
         let response = Response::success(
             "1",
@@ -4231,6 +4369,55 @@ mod bash_companion_format_tests {
             Path::new("/project"),
         );
         format_response_with_context("bash_status", &Response::success("1", data), &ctx)
+    }
+
+    #[test]
+    fn bash_worker_status_names_only_a_wait_tool_the_catalog_serves() {
+        let data = json!({
+            "task_id": "bash-1",
+            "status": "running",
+            "mode": "pipes",
+            "output_preview": "partial",
+        });
+        let mut ctx = FormatContext {
+            worker_session: true,
+            bash_watch_available: Some(false),
+            ..Default::default()
+        };
+        let without_watch = format_response_with_context(
+            "bash_status",
+            &Response::success("1", data.clone()),
+            &ctx,
+        );
+        assert!(!without_watch.contains("bash_watch"), "{without_watch}");
+        assert!(without_watch.contains("bash_status"), "{without_watch}");
+
+        ctx.bash_watch_available = Some(true);
+        let with_watch =
+            format_response_with_context("bash_status", &Response::success("1", data), &ctx);
+        assert!(
+            with_watch.contains("To wait for it, call bash_watch; don't poll."),
+            "{with_watch}"
+        );
+    }
+
+    #[test]
+    fn pty_incomplete_capture_warning_preserves_command_status() {
+        let reason = "PTY output may be incomplete: output drain deadline expired before EOF";
+        for (exit_code, status) in [(0, "completed"), (17, "failed")] {
+            for mode in ["screen", "raw", "both"] {
+                let text = status_text(
+                    json!({
+                        "task_id": "bash-1", "mode": "pty", "status": status,
+                        "exit_code": exit_code, "output_incomplete": true,
+                        "status_reason": reason, "pty_screen": "prefix", "pty_raw": "prefix",
+                    }),
+                    Some(mode),
+                );
+                assert!(text.contains(&format!("Task bash-1: {status} (exit {exit_code})")));
+                assert!(text.contains(reason), "status text: {text}");
+            }
+        }
     }
 
     #[test]
@@ -4350,5 +4537,40 @@ mod incomplete_diagnostics_tests {
         }});
         let text = format_diagnostics_summary(Some(&summary)).unwrap();
         assert_eq!(text, "diagnostics: unknown (typescript: initialize timed out); 0 errors, 1 warnings, 0 info, 0 hints from rust");
+    }
+}
+
+#[cfg(test)]
+mod inspect_header_tests {
+    use super::*;
+
+    #[test]
+    fn inspect_header_passes_through_non_diagnostic_partial_without_a_second_status() {
+        let text = "PARTIAL — dead code still building; retry aft_inspect.\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints";
+        let response = Response::success(
+            "inspect-header",
+            serde_json::json!({
+                "complete": false, "inspect_terminal": "partial",
+                "partial_reason": "dead code still building; retry aft_inspect.",
+                "text": text,
+                "summary": {"diagnostics": {"errors": 0, "warnings": 0, "info": 0, "hints": 0}}
+            }),
+        );
+        assert_eq!(format_inspect(&response), text);
+    }
+
+    #[test]
+    fn inspect_header_renders_non_diagnostic_partial_for_unheaded_payload() {
+        let response = Response::success(
+            "inspect-header",
+            serde_json::json!({
+                "complete": false, "inspect_terminal": "partial",
+                "partial_reason": "dead code still building; retry aft_inspect.", "text": "body"
+            }),
+        );
+        assert_eq!(
+            format_inspect(&response),
+            "PARTIAL — dead code still building; retry aft_inspect.\nbody"
+        );
     }
 }

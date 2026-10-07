@@ -543,6 +543,11 @@ impl WriteResult {
         result["lsp_complete"] = serde_json::Value::Bool(outcome.complete());
 
         if !outcome.pending_servers.is_empty() {
+            result["lsp_status"] = serde_json::json!(if outcome.unresponsive_servers.is_empty() {
+                "diagnostics unknown (no authoritative response within the diagnostics budget)"
+            } else {
+                "diagnostics unknown (server not responding)"
+            });
             result["lsp_pending_servers"] = serde_json::json!(outcome
                 .pending_servers
                 .iter()

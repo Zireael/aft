@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["oc2-ui-metadata-and-deterministic-timing-tests"],
+  "note": "OpenCode 2 tool result metadata (FileDiff files, glob count, grep matches) and two shutdown/status integration tests made deterministic with a debug-only phase-event hook in subc/mod.rs; no ranking-fence file."
+}

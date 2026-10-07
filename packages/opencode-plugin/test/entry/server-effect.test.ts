@@ -367,6 +367,7 @@ describe("V2 server effect", () => {
   test("registers a session prompt hook that detaches through the Location's pool and live config", async () => {
     const events: string[] = [];
     const detached: string[] = [];
+    const routed: string[] = [];
     const hooks: Array<{ name: string; callback: (event: unknown) => Effect.Effect<void> }> = [];
     let setConfig: ((next: Record<string, unknown>) => void) | undefined;
     const bridge = {
@@ -378,6 +379,7 @@ describe("V2 server effect", () => {
     const dependencies = {
       ...testDependencies(events),
       loadConfig: () => ({ bash: { detach_on_user_message: false } }),
+      toolConsumers: () => ({ registerSession: (sessionID: string) => routed.push(sessionID) }),
       acquireBridge: async (directory: string) => ({
         directory,
         setConfigureOverride: () => {},
@@ -407,7 +409,8 @@ describe("V2 server effect", () => {
 
     await Effect.runPromise(Effect.scoped(makeServerEffect(dependencies)(context)));
 
-    expect(hooks.map((hook) => hook.name)).toEqual(["prompt"]);
+    // Editing tools are now gated in auxiliary requests as well as primary context.
+    expect(hooks.map((hook) => hook.name)).toEqual(["prompt", "compaction", "generate", "context"]);
     const prompt = hooks[0]?.callback;
     if (!prompt) return;
     const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -416,6 +419,7 @@ describe("V2 server effect", () => {
     await Effect.runPromise(prompt({ sessionID: "s1", prompt: { text: "still there?" } }));
     await settle();
     expect(detached).toEqual([]);
+    expect(routed).toEqual(["s1"]);
 
     // A live reload that turns the setting on applies to the next message.
     setConfig?.({ bash: { detach_on_user_message: true } });

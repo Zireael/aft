@@ -8,6 +8,9 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   const scenarios = context.scenarios.filter((scenario) => scenario.tool === "apply_patch");
   const actual = scenarios.map((scenario) => scenario.id).sort();
   if (JSON.stringify(actual) !== JSON.stringify(expectedIds)) throw new Error("apply_patch" + " scenario identity mismatch: " + actual.join(","));
+  for (const scenario of scenarios) {
+    if (scenario.model !== "openai/gpt-5-mock") throw new Error(`${scenario.id} must select the GPT mock so apply_patch is offered`);
+  }
   for (const scenario of scenarios) for (const turn of scenario.turns) if (turn.response.kind === "tool_calls") for (const call of turn.response.calls) {
     if (call.disk_effects !== undefined && call.non_mutating_evidence !== undefined) throw new Error(scenario.id + ":" + call.id + " has two disk classifications");
     if (call.disk_effects === undefined && call.non_mutating_evidence === undefined) throw new Error(scenario.id + ":" + call.id + " lacks a disk classification");

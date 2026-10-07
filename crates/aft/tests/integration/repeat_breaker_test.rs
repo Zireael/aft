@@ -161,7 +161,13 @@ fn observe_tool_as(
         now,
     )?;
     let mut text = output.to_string();
-    append_repeat_breaker_reminder(&mut text, SESSION, &intervention, worker_session);
+    append_repeat_breaker_reminder(
+        &mut text,
+        SESSION,
+        &intervention,
+        worker_session,
+        worker_session,
+    );
     Some(text)
 }
 
