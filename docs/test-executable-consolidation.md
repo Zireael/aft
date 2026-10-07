@@ -188,3 +188,51 @@ libtest failing names, panic blocks and compilation/setup failures at the end.
 
 Local control checks: `python3 scripts/lib/test_windows_gate.py`,
 `bash -n scripts/windows-gate.sh`, `shellcheck -S warning scripts/windows-gate.sh`.
+
+### Native proof and timing
+
+On the OVH Server 2022 x64 VM, Cargo/Rust **1.99.0 MSVC** and PowerShell **5.1**,
+`--filter bash_background::persistence` against origin/main
+`0a6eeb56f711a48afbbe1d1600ef152d5b14cca3` produced:
+
+```text
+Guest exact commit: 0a6eeb56f711a48afbbe1d1600ef152d5b14cca3
+cargo 1.99.0 (5f94df478 2026-08-27)
+host: x86_64-pc-windows-msvc
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4939 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 4930 filtered out; finished in 0.03s
+GATE PASSED
+exit 0
+```
+
+A disposable local-only branch added one `#[cfg(windows)]` panic to that module.
+The native failure was named in live output and repeated by the end summary:
+
+```text
+Guest exact commit: 2c2cf3a13a5b27123fba69412563eb18a00d407f
+test bash_background::persistence::windows_gate_deliberate_failure ... FAILED
+thread 'bash_background::persistence::windows_gate_deliberate_failure' (3548) panicked at crates\aft\src\bash_background\persistence.rs:2729:5:
+NON-VACUITY BREAK: deliberately failing native Windows test
+test result: FAILED. 10 passed; 1 failed; 0 ignored; 0 measured; 4930 filtered out; finished in 0.37s
+GATE FAILED
+exit 1
+```
+
+The other ten tests and isolation preflight stayed green. The proof branch/ref
+was deleted, its test removed, and the guest reset to the clean task commit with
+another passing 1 + 10 test run; no mutant is part of the delivery.
+
+Two further runs of the same filter/commit
+`c76726ed1f70129f259d2920c02eb1a4da1734a9` took **207.70 s cold** (empty gate-owned
+target, registry cache retained; Cargo build 2m 32s) and **42.65 s warm** (Cargo
+0.46s preflight / 0.41s slice). Both exited 0 with 1 + 10 tests passed. Wall time
+includes SSH, bundle upload and cleanup. Target reset was done under the guest
+lock; the final target was left warm. A live reservation smoke also verified a
+busy refusal naming holder/age, a 45s transfer timeout, and lock/run-dir cleanup.
+
+First use found no checkout and initialized it from a full-history bundle.
+After the VM's maintenance snapshot, the existing origin/main checkout and
+2.52 GiB target survived; the red proof used a verified incremental bundle.
+`ssh -G` for both hops then showed the rotated operator key
+`~/.ssh/cortexkit_runner_operator_ed25519`; subsequent runs took it from the
+SSH config, never from a hardcoded identity option.
