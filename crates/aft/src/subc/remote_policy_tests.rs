@@ -747,7 +747,12 @@ fn new_plan_shape_decodes_and_its_default_demand_reaches_the_session() {
         &ctx,
     )
     .unwrap();
+    // A frozen plan is portable, but only Unix hosts can execute remote bash.
+    // Decoding and retaining the policy must not advertise an unusable argument.
+    #[cfg(unix)]
     assert!(bash_properties(&answer, "bash").contains(&"runon".to_string()));
+    #[cfg(not(unix))]
+    assert!(!bash_properties(&answer, "bash").contains(&"runon".to_string()));
     let policy = lookup(&ctx, &RemoteSource::Worker(key(&bind, Some("worker"))))
         .unwrap()
         .params
