@@ -367,3 +367,44 @@ lower-bound census. Run creation times, not failing-test log timestamps, are
 used consistently in the Last seen column. The proposed race fixes above are
 hypotheses supported by assertion text and source inspection, not verified
 root-cause claims or permission to relax the tests.
+
+## Review correction: maintenance/read regression proof
+
+The original held-transaction/early-COMMIT control established fixture
+ownership, but **did not establish that reads avoid maintenance's connection
+mutex**: a request could wait out the 2 s busy budget and still return under
+the 30 s hang ceiling. That earlier proof is superseded by the ordering check
+below; its red fixture control must not be cited as defending this regression.
+
+- `maintenance_write` has a debug/timing-build checkpoint after a real SQLite
+  BUSY result and **after dropping the connection guard**. A spawning test
+  supplies its own disposable `AFT_TEST_MAINTENANCE_RETRY_GATE` directory.
+  The child logs `maintenance write busy retry paused`, publishes a `paused`
+  marker, and cannot resume its busy retry until the test writes `release`.
+  Release builds without timing hooks do not expose the checkpoint. Its
+  abandoned-fixture ceiling is 120 s, longer than the 30 s request hang bound;
+  it removes `paused` on exit so an old marker cannot certify an active retry.
+- The status case waits for that actual busy-retry checkpoint, then requires
+  **five status responses and five `db_get_state` reads before retry release**.
+  The database probe is intentional: status can serve cached aggregates when
+  a connection is held, which otherwise hides the maintenance/read regression.
+  Every pair checks that the retry is still paused and the foreign write
+  transaction is still open. Release is guarded on unwind and normal cleanup.
+- Production mutation: replace `maintenance_write` with the same SQLite BUSY
+  retry loop but acquire the connection mutex once and retain it across all
+  retries/checkpoint waits. The **actual child binary was rebuilt**. Only
+  `shared_db_contention_test::status_answers_while_another_process_holds_the_write_lock`
+  failed: `timed out after 30s waiting for response line from aft stdout (child
+  still running)`. The many-server LSP shutdown control passed (1 pass, 1 fail).
+  This is not a COMMIT/fixture mutation. Applied delta: `crates/aft/src/db/mod.rs`,
+  +12/-52; staged live state before mutation, empty working diff after restore
+  and `touch`; restored actual child rebuilt before green verification.
+- Remote stress helper (removed after execution): four concurrent lanes × five
+  invocations, **20/20**. Output: `status and database reads during paused
+  maintenance passed 20/20 with four concurrent contenders`; 1 helper passed
+  in 7.08 s. No retries or CPU hogs.
+- Final-source remote gates, all `--test-threads 4`: maintenance-write lib
+  contracts **3 passed**; binary `tick_flushes_ready_pending_before_runtime_maintenance`
+  **1 passed**; `shared_db_contention_test` integration suite **4 passed**.
+  Native commands used the plain-cargo ck-motor route and the timing-hook
+  feature. `cargo fmt --all -- --check` passed (rustfmt 1.10.0-stable).

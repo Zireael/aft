@@ -38,9 +38,13 @@ struct Contended {
 
 impl Contended {
     fn start() -> Self {
+        Self::start_with_retry_gate(None)
+    }
+
+    fn start_with_retry_gate(gate: Option<&std::path::Path>) -> Self {
         let project = tempfile::tempdir().expect("project dir");
         let storage = tempfile::tempdir().expect("storage dir");
-        let mut aft = AftProcess::spawn_with_env(&[
+        let mut env = vec![
             ("AFT_CACHE_DIR", storage.path().as_os_str()),
             // Run maintenance every few hundred milliseconds instead of
             // every minute, so several runs fall inside the hold.
@@ -52,13 +56,12 @@ impl Contended {
                 "AFT_TEST_MAINTENANCE_BUSY_BUDGET_MS",
                 std::ffi::OsStr::new(MAINTENANCE_BUSY_BUDGET_MS),
             ),
-            (
-                "RUST_LOG",
-                std::ffi::OsStr::new(
-                    "info,aft::db::write_ledger=debug,aft::db::compression_events=debug",
-                ),
-            ),
-        ]);
+            ("RUST_LOG", std::ffi::OsStr::new("info,aft::db=debug")),
+        ];
+        if let Some(gate) = gate {
+            env.push(("AFT_TEST_MAINTENANCE_RETRY_GATE", gate.as_os_str()));
+        }
+        let mut aft = AftProcess::spawn_with_env(&env);
         let response = aft.send(
             &json!({
                 "id": "cfg",
@@ -202,19 +205,70 @@ fn minute_fold_defers_under_a_foreign_write_lock_and_commits_after_release() {
     );
 }
 
-/// `status` answers from memory. A write lock held by another process must
-/// not delay it, however long this process's maintenance waits for that lock.
+struct MaintenanceRetryGate(tempfile::TempDir);
+
+impl MaintenanceRetryGate {
+    fn new() -> Self {
+        Self(tempfile::tempdir().expect("maintenance retry gate"))
+    }
+
+    fn is_paused(&self) -> bool {
+        self.0.path().join("paused").exists() && !self.0.path().join("release").exists()
+    }
+
+    fn release(&self) {
+        std::fs::write(self.0.path().join("release"), b"resume retry")
+            .expect("release maintenance retry");
+    }
+}
+
+impl Drop for MaintenanceRetryGate {
+    fn drop(&mut self) {
+        // Unblock the child even if an assertion unwinds before normal cleanup.
+        let _ = std::fs::write(self.0.path().join("release"), b"resume retry");
+    }
+}
+
+/// Status and a real database read must both finish while a maintenance busy
+/// retry is paused. Waiting out its busy budget cannot satisfy this ordering.
 #[test]
 fn status_answers_while_another_process_holds_the_write_lock() {
-    let mut contended = Contended::start();
+    let gate = MaintenanceRetryGate::new();
+    let mut contended = Contended::start_with_retry_gate(Some(gate.0.path()));
+    let log_path = contended.log_path();
     let mut calls = 0;
     contended.with_write_lock(|aft, writer| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !gate.is_paused() {
+            assert!(
+                Instant::now() < deadline,
+                "maintenance never encountered the held write lock: {}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         for _ in 0..5 {
             let response = aft.send_with_timeout(
                 &json!({ "id": "status", "command": "status" }).to_string(),
                 Duration::from_secs(30),
             );
             assert_eq!(response["success"], true, "status failed: {response:?}");
+            // Status may serve its cached totals if the mutex is held. Probe
+            // the actual connection too, so a maintenance critical section
+            // that spans SQLite's busy retry cannot be hidden by that fallback.
+            let read = aft.send_with_timeout(
+                &json!({
+                    "id": "read-during-retry", "command": "db_get_state",
+                    "params": { "key": "contention-probe" },
+                })
+                .to_string(),
+                Duration::from_secs(30),
+            );
+            assert_eq!(read["success"], true, "database read failed: {read:?}");
+            assert!(
+                gate.is_paused(),
+                "requests must finish before maintenance resumes"
+            );
             assert!(
                 !writer.is_autocommit(),
                 "the writer must remain locked until every status response has arrived"
@@ -222,11 +276,16 @@ fn status_answers_while_another_process_holds_the_write_lock() {
             calls += 1;
         }
     });
-    contended.finish();
+    gate.release();
+    let log = contended.finish();
+    assert!(
+        log.contains("maintenance write busy retry paused"),
+        "no busy retry: {log}"
+    );
 
     assert_eq!(
         calls, 5,
-        "every status request must run under the write lock"
+        "every status and database read must run during a paused maintenance retry"
     );
 }
 

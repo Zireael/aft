@@ -497,7 +497,15 @@ pub(crate) fn maintenance_write<T>(
                 drop(conn);
                 match result {
                     Ok(value) => return Ok(value),
-                    Err(error) if is_busy_error(&error) => last_busy = Some(error),
+                    Err(error) if is_busy_error(&error) => {
+                        if last_busy.is_none() {
+                            // A test can hold this retry phase open to prove reads
+                            // finish before maintenance resumes, not just eventually.
+                            #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+                            maintenance_retry_checkpoint();
+                        }
+                        last_busy = Some(error);
+                    }
                     Err(error) => return Err(MaintenanceWriteError::Failed(error)),
                 }
             }
@@ -521,6 +529,35 @@ pub(crate) fn maintenance_write<T>(
         std::thread::sleep(sleep.min(deadline - now));
         sleep = (sleep * 2).min(LONGEST_RETRY_SLEEP);
     }
+}
+
+/// Pause after a real SQLite BUSY result, with the connection mutex released.
+/// Release builds without timing hooks do not expose this checkpoint. The
+/// long timeout only bounds an abandoned test fixture and must outlast its
+/// request hang ceiling.
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+fn maintenance_retry_checkpoint() {
+    let Some(directory) = std::env::var_os("AFT_TEST_MAINTENANCE_RETRY_GATE") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let paused = directory.join("paused");
+    let released = directory.join("release");
+    crate::slog_debug!(
+        "maintenance write busy retry paused: gate={}",
+        directory.display()
+    );
+    std::fs::write(&paused, b"sqlite busy retry in progress")
+        .expect("publish maintenance retry gate");
+    let ceiling = std::time::Instant::now() + Duration::from_secs(120);
+    while !released.exists() && std::time::Instant::now() < ceiling {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::remove_file(&paused).ok();
+    crate::slog_debug!(
+        "maintenance write busy retry resumed: gate={}",
+        directory.display()
+    );
 }
 
 /// Run `work` on a connection with a different busy wait, restoring the steady
