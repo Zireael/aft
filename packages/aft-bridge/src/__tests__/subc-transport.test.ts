@@ -1054,8 +1054,8 @@ describe("SubcTransport Rd reconnect", () => {
 
   test("outcome-unknown request failures surface without an in-place retry and keep the shared client", async () => {
     // outcome_unknown is the verdict on one call (its deadline can pass while
-    // the socket is healthy), so it fails that call and route only. Closing the
-    // shared client would tear down every other session's routes with it.
+    // the socket is healthy), so it fails that call only. Neither the route nor
+    // shared client may be closed without evidence that it is gone.
     const outcomeUnknown = new SubcCallError(
       "outcome_unknown",
       "connection dropped after the request was queued",
@@ -1072,7 +1072,7 @@ describe("SubcTransport Rd reconnect", () => {
     expect(client.routeOpens.length).toBe(1);
     expect(client.requests.length).toBe(1);
     expect(client.closed).toBe(0);
-    expect(client.closedRoutes).toEqual([1]);
+    expect(client.closedRoutes).toEqual([]);
   });
 
   test("a not-queued write failure (transient, not_sent-equivalent) drops the client", async () => {
@@ -1099,15 +1099,15 @@ describe("SubcTransport Rd reconnect", () => {
     expect(madeClients).toBe(2);
   });
 
-  test("a plain timeout (non-transient SubcError) KEEPS the client, drops only the route", async () => {
-    // Q1: a lost/late response does NOT prove the connection is dead. Keep the
-    // client (no reconnect); the route is re-opened on the next call. Mutation-
-    // safe: the error is surfaced, never auto-retried.
+  test("a plain timeout keeps both the live route and client without retrying the call", async () => {
+    // A lost/late response proves neither the route nor the connection dead.
+    // Surface the error without retrying; the next call reuses the live carrier.
     let calls = 0;
     let madeClients = 0;
     const client = new FakeClient(async () => {
       calls += 1;
-      if (calls === 1) throw new SubcError("request on channel 1 timed out after 30000ms");
+      if (calls === 1)
+        throw new SubcError("request on channel 1 timed out after 30000ms", "request_deadline");
       return envelope({ id: "r", success: true, text: "second" });
     });
     const pool = new SubcTransportPool({
@@ -1122,40 +1122,27 @@ describe("SubcTransport Rd reconnect", () => {
 
     await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
     expect(client.closed).toBe(0); // client kept alive
-    // The route was dropped, so the next call re-opens it on the SAME client.
+    // The next call reuses the SAME route and client.
     const result = await t.toolCall("s", "edit", {});
     expect(result.text).toBe("second");
     expect(madeClients).toBe(1); // never reconnected
-    expect(client.routeOpens.length).toBe(2); // route re-opened
+    expect(client.routeOpens.length).toBe(1); // live route retained
     expect(calls).toBe(2); // exactly two underlying requests — no auto-retry
   });
 
   test("a route GOODBYE carrying kind=outcome_unknown KEEPS the client until the classifier reads it", async () => {
-    // A module restart sends GOODBYE to every route on the connection, so a
-    // mid-request call rejects with a SubcError (the raw request() path never
-    // produces a managed SubcCallError). isConsumerReconnectTransient reaches
-    // `err instanceof SubcCallError` first, so today that error is
-    // non-transient: route dropped, client KEPT, next call re-opens on the
-    // same connection.
-    //
-    // The fixture carries `kind` even though today's SubcError has only
-    // `code`. That is the point, and it is what makes this more than a
-    // restatement of the timeout test above: cortexkit/subconscious#6 proposes
-    // moving `kind` onto SubcError, and a route GOODBYE is outcome-unknown by
-    // construction (the daemon sends it after the drain wait regardless of
-    // execution status — see the disposition in error-contract.ts). So this is
-    // the error shape the SDK will hand us post-#6. The behaviour flip does not
-    // come from the error changing; it comes from the classifier starting to
-    // READ this field. Modelling the field now is what lets that flip land as a
-    // red test instead of as a live reconnect-policy change on an SDK bump.
-    //
-    // Characterization, not endorsement — the flip is probably correct. When it
-    // lands, flip the assertions and keep the test.
+    // A module reload closes the route, not the shared connection. The raw
+    // client's typed closeReason is the evidence for retiring this carrier.
+    // An additional outcome_unknown kind must not turn that into socket death
+    // or justify retrying the possibly-executed request.
     let calls = 0;
     let madeClients = 0;
-    const goodbye = Object.assign(new SubcError("route closed by subc (GOODBYE)"), {
-      kind: "outcome_unknown",
-    });
+    const goodbye = Object.assign(
+      new SubcError("route closed by subc (GOODBYE)", "route_closed", undefined, "reload"),
+      {
+        kind: "outcome_unknown",
+      },
+    );
     const client = new FakeClient(async () => {
       calls += 1;
       if (calls === 1) throw goodbye;
@@ -1679,7 +1666,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
         madeClients += 1;
         const client = new FakeClient(async () => {
           calls += 1;
-          if (calls <= 3) throw new SubcError("timed out");
+          if (calls <= 3) throw new SubcError("timed out", "request_deadline");
           return envelope({ id: "r", success: true, text: "recovered" });
         });
         // A half-open socket answers nothing, the probe included.
@@ -1712,7 +1699,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
         madeClients += 1;
         const client = new FakeClient(async () => {
           calls += 1;
-          if (calls <= 3) throw new SubcError("timed out");
+          if (calls <= 3) throw new SubcError("timed out", "request_deadline");
           return envelope({ id: "r", success: true, text: "recovered" });
         });
         client.catalogList = async () => {
@@ -1743,7 +1730,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
           calls += 1;
           // fail, fail, succeed, fail, fail — never 3 in a row → never reconnects.
           if (calls === 3) return envelope({ id: "r", success: true, text: "ok" });
-          throw new SubcError("timed out");
+          throw new SubcError("timed out", "request_deadline");
         });
       },
     });
@@ -2301,14 +2288,15 @@ describe("SubcTransportPool lifecycle", () => {
 });
 
 describe("subc AbortSignal transport", () => {
-  test("closes the scoped route once and rejects promptly when the host aborts", async () => {
+  test("retires the scoped route and rejects promptly, closing only when its request settles", async () => {
     let markRequestStarted!: () => void;
     const requestStarted = new Promise<void>((resolve) => {
       markRequestStarted = resolve;
     });
+    const replies: Array<(reply: unknown) => void> = [];
     const client = new FakeClient(async () => {
       markRequestStarted();
-      return new Promise(() => {});
+      return new Promise((resolve) => replies.push(resolve));
     });
     const transport = poolWith(client);
     const { pool } = transport;
@@ -2326,8 +2314,11 @@ describe("subc AbortSignal transport", () => {
     controller.abort();
 
     await expect(request).rejects.toMatchObject({ name: "AbortError" });
-    expect(client.closedRoutes).toEqual([1]);
+    expect(client.closedRoutes).toEqual([]);
     controller.abort();
+    await tick();
+    expect(client.closedRoutes).toEqual([]);
+    replies.shift()!(envelope({ success: true }));
     await tick();
     expect(client.closedRoutes).toEqual([1]);
 
@@ -2344,6 +2335,9 @@ describe("subc AbortSignal transport", () => {
       await tick();
       nextController.abort();
       await expect(nextRequest).rejects.toMatchObject({ name: "AbortError" });
+      expect(client.closedRoutes).not.toContain(expectedRoute);
+      replies.shift()!(envelope({ success: true }));
+      await tick();
       expect(client.closedRoutes.at(-1)).toBe(expectedRoute);
     }
     expect(transport.connects).toBe(1);
@@ -2596,7 +2590,7 @@ describe("SubcTransportPool shared connection vs per-route failures", () => {
 
     expect(clients[0]?.closed).toBe(1);
     expect(logs.filter((line) => line.includes("dropping shared client"))).toEqual([
-      'subc pool: dropping shared client cause=SubcLivenessProbeTimeoutError/liveness_probe_timeout trigger=liveness probe session=s route=3@3 sessions=0 routes=0 after 3 consecutive unanswered calls; last request failed with SubcError/request_deadline message="no reply to a channel-0 catalog.list probe within 5ms"',
+      'subc pool: dropping shared client cause=SubcLivenessProbeTimeoutError/liveness_probe_timeout trigger=liveness probe session=s route=1@1 sessions=1 routes=1 after 3 consecutive unanswered calls; last request failed with SubcError/request_deadline message="no reply to a channel-0 catalog.list probe within 5ms"',
     ]);
     const result = await transport.toolCall("s", "edit", {});
     expect(result.text).toBe("client-2");
