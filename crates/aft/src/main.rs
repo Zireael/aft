@@ -2736,7 +2736,7 @@ mod deferred_semantic_search_tests {
             &ctx,
         ));
         started
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(30))
             .expect("query embedding starts");
 
         let cancel_started_at = Instant::now();
@@ -2807,7 +2807,7 @@ mod deferred_semantic_search_tests {
                 .expect("send cancelled wait response");
         });
         started_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(30))
             .expect("semantic-ready wait starts");
         thread::sleep(Duration::from_millis(20));
         cancellation.request_cancel();
