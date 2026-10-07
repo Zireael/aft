@@ -7075,7 +7075,9 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         }
     }
 
-    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+    // Positive waits are generous: a loaded Windows runner can take well over
+    // 5 s before the module opens its fleet consumer connection.
+    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
         .await
         .expect("fleet consumer connection timeout")
         .expect("accept fleet consumer");
@@ -7084,7 +7086,7 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         &key,
         &daemon_id,
         "subc-test",
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     )
     .await
     .expect("authenticate fleet consumer");
@@ -7269,7 +7271,9 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         }
     }
 
-    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+    // Positive waits are generous: a loaded Windows runner can take well over
+    // 5 s before the module opens its fleet consumer connection.
+    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
         .await
         .expect("fleet consumer connection timeout")
         .expect("accept fleet consumer");
@@ -7278,7 +7282,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         &key,
         &daemon_id,
         "subc-test",
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     )
     .await
     .expect("authenticate fleet consumer");
