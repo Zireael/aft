@@ -205,8 +205,9 @@ remain. All channels/roots are owned by the individual test.
   `AFT_STORAGE_DIR`; the existing spawn helper supplies disposable HOME/XDG.
 - Shutdown now asserts one admitted **1500 ms** LSP phase, one server summary,
   the durable terminal marker, existing phase-event overlap and no surviving
-  child PIDs. Numeric elapsed comparisons (2 s and budget+150 ms) are removed;
-  elapsed logging remains diagnostic. PID disappearance is condition-polled
+  child PIDs. The outer 2 s and tight budget+150 ms comparisons are removed.
+  The corrected check below bounds AFT's own LSP phase at two shared budgets;
+  the outer process-exit elapsed observation remains diagnostic. PID disappearance is condition-polled
   with a 30 s ceiling.
 - Initial remote fixture failure: `InsecureParentDirectory { ... mode: 509 }`
   (0775). Connection directories now explicitly use 0700, independent of the
@@ -328,15 +329,15 @@ step. The reviewer approved these remaining items as separate follow-ups.
 | `watcher_overflow_sends_no_per_file_flood` | `crates/aft/tests/integration/lsp_diagnostics_test.rs:3269` | 36710915667 | **Deferred duplicate forwarding.** Two watched-file notifications arrived where one oversized batch should forward only Cargo.toml. Current helper waits for registration and uses ordered didChange acknowledgement, so it is not merely sleep-then-count. Add a batch-ID queue/drain hook around direct vs contended forwarding; guarantee exactly one delivery and apply the cap before either path. Keep the one-notification and configuration-only assertions. |
 | `callgraph_ops_report_a_keyless_view_generation_as_disabled` | `crates/aft/tests/integration/per_checkout_9.rs:1550` | 37071482497 | **Deferred bootstrap/publication ordering.** Current fixture sends 40 ping requests with 20 ms sleeps while an 8 s republish delay runs. The expected disabled current-view state instead yielded `callgraph_building`, and can race installation/publication. Smallest hook: root-scoped current-view-installed signal plus publication release gate; query the keyless generation only after installation and before release, then prove graph availability after commit. Do not tolerate building/unavailable indiscriminately before the keyed generation exists. |
 | `standalone_view_publication_never_blocks_requests` | `crates/aft/tests/integration/per_checkout_9.rs:1302` | 37320286746 | **Deferred genuine publication gate needed.** A grep took 6002 ms against a 5 s assertion during a timed 20 s publication. A larger sleep or bound still races scheduler delays. Smallest test hook: signal publication started, hold it on a root-local release gate, prove responses while the gate is closed, release and poll the published generation. No inline/blocking publication should satisfy the ordering. |
-| `status_answers_within_a_second_while_another_process_holds_the_write_lock` (historical name) | `crates/aft/tests/integration/shared_db_contention_test.rs:208` (`status_answers_while_another_process_holds_the_write_lock`) | 36626746920, 37155371550 | **Fixed here.** Retain the transaction across all five replies and assert it remains open. A COMMIT-before-requests control fails this exact contract. No response latency SLA remains in this test. |
+| `status_answers_within_a_second_while_another_process_holds_the_write_lock` (historical name) | `crates/aft/tests/integration/shared_db_contention_test.rs:235` (`status_answers_while_another_process_holds_the_write_lock`) | 36626746920, 37155371550 | **Corrected here.** Keep the transaction open and require five status replies plus real database reads while an observed maintenance BUSY retry is held behind a release gate. A rebuilt production mutex-held retry control fails this case; the earlier COMMIT-only control was insufficient. No request latency SLA is used. |
 | `standalone_inspect_preserves_partial_results_when_rust_keeps_indexing` | `crates/aft/tests/integration/standalone_search_deferred_test.rs:1057` | 37422176496 | **Deferred partial-status rendering/certification.** The fake advertises ongoing indexing; the structured response had unknown diagnostics, but the expected `E? W?`/partial text assertion failed. Retain unknown counts and scoped producer exclusion. Smallest follow-up: begin/ongoing-status acknowledgement hook before request plus correlation of status-bar tickets with the same inspect generation; remove its redundant 5 s elapsed assertion only once the producer is gated. |
 | `standalone_status_bar_trails_text_on_change_and_not_on_unchanged_result` | `crates/aft/tests/integration/status_bar_text_test.rs:53` | 36077367695, 36088716976 | **Deferred Tier-2/callgraph generation readiness.** Second inspect failed with `dead_code ... callgraph_unavailable`, not an unchanged-bar comparison. Current test already allows a genuinely changed stale bar rather than requiring silence. Smallest next step: expose the graph/Tier-2 generation installed after the fixture edit and distinguish missing admission from a real failed build; fix dead-code projection readiness or gate fixture setup to that publication. Keep the T2 count and no-identical-repeat assertions. |
 | `subc transport parity sweep > server-rendered text matches NDJSON for representative tool calls` | `packages/opencode-plugin/src/__tests__/e2e/subc-parity.e2e.test.ts:261` | 36724403748 | **Relevant fixture fixes already at base.** The grep difference was a stale indexed file missing from disk on one side. Current fixture excludes its own cache/user-state files and the convergence predicate rejects the exact stale-disk warning before comparison. Preserve byte-for-byte normalized parity. If it recurs, add an index-generation/watcher-drained barrier before parity, not removal of coverage warnings from normalized text. |
 | `subc_bridge_goodbye_cancels_queued_read_before_same_root_rebind` | `crates/aft/tests/integration/subc_bridge_test.rs:2327` | 36831632794 | **Deferred transport teardown classification.** Final result was ConnectionLost rather than the required clean exit. Suspect fake-daemon close before Goodbye is consumed, or EOF winning the loop's classification after a valid Goodbye. Add a Goodbye-processed acknowledgement barrier in the fake transport and distinguish accepted Goodbye from bare EOF; fix whichever ordering the trace shows. Preserve queued-read cancellation and same-root rebind assertions. |
 | `subc_bridge_health_check_returns_root_status_report` | `crates/aft/tests/integration/subc_bridge_test.rs:2997` | 35532736043 | **Cooperative-idle wait already at base; follow up if recurring.** Current test waits on actual actor idleness after Goodbye and asserts the context was quiesced. The failure named queued maintenance still alive. Add root/job cancellation-observed and final-idle hooks to separate queued-job leak from a running worker's final step; fix actor-owned maintenance cancellation if jobs survive that barrier. No immediate idle assertion should replace the poll. |
 | `subc_bridge_l3_coalesces_already_bound_route_burst` | `crates/aft/tests/integration/subc_bridge_test.rs:2400` | 35679021255 | **Deferred teardown classification, not coalescing tolerance.** Same ConnectionLost final-state failure as the Goodbye/rebind case. Share the Goodbye-consumed/EOF classification diagnostic hook with that fixture, then fix clean-close ordering. Keep burst/coalescing assertions independent of teardown evidence. |
-| `subc_drain_exits_with_many_live_lsp_servers_in_one_deadline` | `crates/aft/tests/integration/subc_detach_test.rs:537` | 36788805779 | **Fixed here.** Admitted budget, single shutdown phase/summary, durable exit and no-orphan conditions replace the 2 s scheduler race. Changing the admitted budget in the rebuilt child binary fails the test. |
-| `subc_drain_with_slow_writer_persists_terminal_line` | `crates/aft/tests/integration/subc_detach_test.rs:570` | 37155371550 | **Fixed here / existing overlap hook retained.** Ordered start/end phase events prove overlap, not a savings ratio. Serializing the real child phases fails only this overlap fixture; durable terminal marker still required after slow log flushing. |
+| `subc_drain_exits_with_many_live_lsp_servers_in_one_deadline` | `crates/aft/tests/integration/subc_detach_test.rs:537` | 36788805779 | **Corrected here.** Retain admission, single summary, durable exit and no-orphan conditions without the outer 2 s scheduler race. Require at least three servers and AFT's logged LSP phase elapsed below two shared budgets. A rebuilt sequential per-server shutdown retaining one summary fails the elapsed assertion. |
+| `subc_drain_with_slow_writer_persists_terminal_line` | `crates/aft/tests/integration/subc_detach_test.rs:572` | 37155371550 | **Fixed here / existing overlap hook retained.** Ordered start/end phase events prove overlap, not a savings ratio. Serializing the real child phases fails only this overlap fixture; durable terminal marker still required after slow log flushing. |
 | `trace_to_symbol_no_path_reports_complete_no_path_found` | `crates/aft/tests/integration/trace_to_symbol_test.rs:126` | 37301998630 | **Deferred product liveness.** A tiny unrelated-functions fixture waited 60 s for stdout, child still running. Share cold-build admission/response ownership tracing with the imported-callers case. Fix stalled publication or pending-response drain identified by those phases; retain complete no-path proof rather than interpreting timeout as no path. |
 
 ### Other static risks left for isolated follow-ups
@@ -408,3 +409,60 @@ below; its red fixture control must not be cited as defending this regression.
   **1 passed**; `shared_db_contention_test` integration suite **4 passed**.
   Native commands used the plain-cargo ck-motor route and the timing-hook
   feature. `cargo fmt --all -- --check` passed (rustfmt 1.10.0-stable).
+
+## Review correction: shared vs sequential LSP shutdown
+
+A single phase admission line and server summary did **not** distinguish a
+shared deadline from N sequential per-server deadlines. The earlier admission
+budget mutation is not a proof of concurrency, and dropping both internal
+and outer elapsed checks removed that regression protection. The outer
+process-exit comparison stays removed; AFT's own LSP measurement is restored
+with a deliberately broad bound.
+
+- The primary deadline case uses **four independent servers** (N ≥ 3); the
+  other slow-start, slow-writer and active-ORT fixtures keep their 34 roots.
+  Both fixture construction and the actual shutdown summary require N ≥ 3,
+  preventing a one-server run from vacuously proving a shared budget.
+- Parse AFT's `lsp shutdown_all: ... servers=N ... elapsed_ms=M` and require
+  **M < 2 × LSP_SHUTDOWN_ALL_BUDGET** (currently 3000 ms). This is not the test
+  thread's elapsed time or the outer exit observation. Admission, durable
+  terminal marker, summary count and orphan checks remain.
+- Production mutation: change `shutdown_all_clients` to drain each server
+  sequentially under its own 1500 ms budget, retaining **one truthful summary**
+  and the same `budget_ms=1500` admission line. The real child was rebuilt.
+  Only `subc_detach_test::subc_drain_exits_with_many_live_lsp_servers_in_one_deadline`
+  failed, specifically: `LSP shutdown took 4801 ms for 4 servers; expected less
+  than two shared budgets (3000 ms)`. The paused-maintenance status/read test
+  passed (1 pass, 1 fail). This proves the internal elapsed assertion, not the
+  old outer 2 s SLA, rejects the actual sequential path.
+- Applied delta: `crates/aft/src/lsp/manager.rs`, +17/-66; staged live source
+  before mutation, non-empty working diff during the control, empty after
+  `git checkout --` and `touch`. The restored child binary was rebuilt.
+- Remote stress helper (removed): four concurrent lanes × five invocations,
+  **20/20**, output `logged shared LSP deadline passed 20/20 with four concurrent
+  contenders`; 1 helper passed in 9.44 s. No retries or synthetic load.
+- Final affected integration suites: **14 passed, 0 failed**, `--test-threads 4`,
+  excluding only the existing forbidden CPU-hog case at invocation, not by a
+  source ignore. `cargo fmt --all -- --check` passed.
+- Final local GNU Windows check with four build jobs, isolated HOME/XDG and no
+  `AFT_STORAGE_DIR`: `CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= RUSTFLAGS="-D warnings -A deprecated"
+  cargo check --target x86_64-pc-windows-gnu --tests -p agent-file-tools` passed,
+  `Finished dev profile ... in 2m 30s` (rustc/cargo 1.99.0). No Windows VM used.
+- Scoped Rust `aft_inspect` remained PARTIAL because rust-analyzer was still
+  indexing; it is not counted as a clean diagnostic result. Native lib/bin/
+  integration gates and the GNU test-target compilation are authoritative.
+
+This correction adds only the debug/timing checkpoint and the two strengthened
+regression fixtures. It does not modify release maintenance or LSP shutdown
+behavior, ranking files, package manifests or generated schemas. Original
+CI-history limitations and other deferred follow-ups remain explicit above.
+
+Final correction gates after stress-helper removal and comment cleanup:
+`cargo test -p agent-file-tools --features test-timing-hooks --test integration --
+status_answers_while_another_process_holds_the_write_lock
+subc_drain_exits_with_many_live_lsp_servers_in_one_deadline --test-threads 4
+--nocapture`: **2 passed, 0 failed**. `cargo check -p agent-file-tools --lib
+--release`: **Finished release profile**, passed; reported one unrelated
+pre-existing unused `VecDeque` import in unchanged `src/cache_freshness.rs:4`.
+No warning from the new checkpoint was emitted. The scoped inspector remained
+incomplete, so no clean-inspection claim is made.

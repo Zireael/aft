@@ -535,7 +535,9 @@ fn subc_connection_close_after_drain_exits_zero_and_logs_it() {
 
 #[test]
 fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
-    drain_with_live_lsp_servers("", false, false);
+    // Four independent slow servers distinguish one shared budget from a
+    // per-server budget while keeping the negative control below the hang cap.
+    drain_with_live_lsp_servers_and_writer("", false, false, "40", None, None, 4);
 }
 
 /// Servers that ignore the Shutdown request and SIGTERM, and linger after
@@ -568,16 +570,18 @@ fn subc_drain_with_active_ort_flushes_final_line_before_hard_exit() {
 
 #[test]
 fn subc_drain_with_slow_writer_persists_terminal_line() {
-    drain_with_live_lsp_servers_and_writer("", false, false, "1000", Some("1000"), Some("450"));
+    drain_with_live_lsp_servers_and_writer("", false, false, "1000", Some("1000"), Some("450"), 34);
 }
 
-/// Binds 34 roots that each start a fake rust-analyzer which never answers
-/// Shutdown, drains the module and checks that it exits within the drain
-/// budget with no language server left behind. `server_env` holds extra
+/// Bind independent roots that each start a fake rust-analyzer which never
+/// answers Shutdown, then check the LSP phase's own budget and absence of
+/// surviving children. `server_env` holds extra
 /// `NAME=value` assignments for the fake servers; `under_load` keeps every
 /// CPU busy from the drain until the module has exited.
 fn drain_with_live_lsp_servers(server_env: &str, under_load: bool, active_ort: bool) {
-    drain_with_live_lsp_servers_and_writer(server_env, under_load, active_ort, "40", None, None);
+    drain_with_live_lsp_servers_and_writer(
+        server_env, under_load, active_ort, "40", None, None, 34,
+    );
 }
 
 fn drain_with_live_lsp_servers_and_writer(
@@ -587,13 +591,18 @@ fn drain_with_live_lsp_servers_and_writer(
     writer_delay: &str,
     flush_hold: Option<&str>,
     index_delay: Option<&str>,
+    server_count: usize,
 ) {
+    assert!(
+        server_count >= 3,
+        "shared-deadline proof needs at least three servers"
+    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("test runtime");
     runtime.block_on(async {
-        let projects = (0..34)
+        let projects = (0..server_count)
             .map(|_| tempfile::tempdir().unwrap())
             .collect::<Vec<_>>();
         let storage = tempfile::tempdir().unwrap();
@@ -680,7 +689,7 @@ fn drain_with_live_lsp_servers_and_writer(
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(children.len(), 34, "34 roots must each own a live server");
+        assert_eq!(children.len(), server_count, "every root must own a live server");
         let hog = under_load.then(super::helpers::CpuHog::start);
         send_module_draining(&mut stream).await;
         let drained = Instant::now();
@@ -702,8 +711,8 @@ fn drain_with_live_lsp_servers_and_writer(
             assert!(log.contains("phase=log_flush_done flushed=false"),
                 "slow writer must exhaust the async flush budget: {}", log_tail(&log));
         }
-        // Print the phase and LSP summary lines as diagnostics, not latency
-        // assertions: runner scheduling can outlast a shutdown deadline.
+        // Print phase and LSP summary lines. The bound below uses the LSP
+        // phase's own elapsed value, never the outer process-exit observation.
         for line in log
             .lines()
             .filter(|line| line.contains("subc exit phase=") || line.contains("lsp shutdown_all:"))
@@ -745,6 +754,25 @@ fn drain_with_live_lsp_servers_and_writer(
             summaries.len(),
             1,
             "expected one shutdown summary; {}",
+            log_tail(&log)
+        );
+
+        let summary_field = |field: &str| {
+            summaries[0]
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix(field))
+                .and_then(|value| value.parse::<u128>().ok())
+                .unwrap_or_else(|| panic!("missing {field} in shutdown summary: {}", summaries[0]))
+        };
+        let servers = summary_field("servers=");
+        assert!(servers >= 3, "shared-deadline proof needs at least three shutdowns: {}", summaries[0]);
+        let lsp_elapsed_ms = summary_field("elapsed_ms=");
+        let lsp_ceiling_ms = 2 * aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET.as_millis();
+        // Measure AFT's phase, not the parent thread's wakeup or process exit.
+        // Two shared budgets tolerate overshoot but not N sequential budgets.
+        assert!(
+            lsp_elapsed_ms < lsp_ceiling_ms,
+            "LSP shutdown took {lsp_elapsed_ms} ms for {servers} servers; expected less than two shared budgets ({lsp_ceiling_ms} ms): {}",
             log_tail(&log)
         );
 
