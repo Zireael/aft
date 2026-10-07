@@ -60,6 +60,9 @@ fn fetch(plan: &Value) -> Value {
     json!({"op":"tool.catalog","preset":"worker","params":plan["tool_items"][0]["params"],"composition":plan["composition"]})
 }
 
+// Remote routing runs only on Unix; the plan fixtures carry Unix sibling paths,
+// which a Windows decode rightly rejects as not absolute.
+#[cfg(unix)]
 #[test]
 fn exec_remote_catalog_freezes_verbatim_plan_and_isolates_scope_epoch_and_session() {
     let root = tempfile::tempdir().unwrap();
@@ -238,6 +241,8 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
         .contains("remote_exec"));
 }
 
+// Remote dispatch runs only on Unix.
+#[cfg(unix)]
 #[tokio::test]
 async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
     let daemon = crate::exec_remote::wire_tests::daemon(
