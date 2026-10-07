@@ -5,9 +5,45 @@ import {
   _resetSubagentCacheForTest,
   _setSubagentClockForTest,
   FAILED_LOOKUP_RETRY_MS,
-  LOOKUP_TIMEOUT_MS,
   resolveIsSubagent,
 } from "../shared/subagent-detect.js";
+
+let timeoutFixtureId = 0;
+
+// Each timeout fixture owns its cache and clock, including when stress cases
+// overlap. A gated host cannot finish merely because the runner was slow.
+async function assertLookupReturnsBeforeHost(kind: "v1" | "v2") {
+  const fixture = await import(
+    `../shared/subagent-detect.js?timeout-fixture=${timeoutFixtureId++}`
+  );
+  fixture._setSubagentClockForTest(() => 1_000_000);
+  let calls = 0;
+  let completed = false;
+  let release: (() => void) | undefined;
+  const hostLookup = async () => {
+    calls += 1;
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    completed = true;
+    return { id: "ses_timeout", parentID: "ses_parent" };
+  };
+  const client =
+    kind === "v2"
+      ? { location: { directory: "/cwd" }, session: { get: () => Effect.promise(hostLookup) } }
+      : { session: { get: async () => ({ data: await hostLookup() }) } };
+  try {
+    expect(await fixture.resolveIsSubagent(client, "ses_timeout", "/cwd")).toBe(false);
+    expect(calls).toBe(1);
+    expect(completed).toBe(false);
+    // A timeout caches a provisional answer rather than starting another
+    // unresolved host lookup. Freeze only the cache clock, not the timer.
+    expect(await fixture.resolveIsSubagent(client, "ses_timeout", "/cwd")).toBe(false);
+    expect(calls).toBe(1);
+  } finally {
+    release?.();
+  }
+}
 
 afterEach(() => {
   _resetSubagentCacheForTest();
@@ -234,14 +270,8 @@ describe("subagent-detect", () => {
     });
 
     test("an OpenCode 2 lookup that never answers is abandoned after the timeout", async () => {
-      const context = {
-        location: { directory: "/cwd" },
-        session: { get: () => Effect.never },
-      };
-      const started = performance.now();
-      expect(await resolveIsSubagent(context, "ses_v2_hang", "/cwd")).toBe(false);
-      expect(performance.now() - started).toBeLessThan(LOOKUP_TIMEOUT_MS + 500);
-    });
+      await assertLookupReturnsBeforeHost("v2");
+    }, 30_000);
   });
 
   test("concurrent first calls share one host lookup", async () => {
@@ -267,25 +297,9 @@ describe("subagent-detect", () => {
     expect(calls).toBe(1);
   });
 
-  test("a host lookup that never answers lets the call proceed as primary within the timeout", async () => {
-    let calls = 0;
-    const client = {
-      session: {
-        get: (_input: { path: { id: string } }) => {
-          calls += 1;
-          return new Promise<never>(() => {});
-        },
-      },
-    };
-    const started = performance.now();
-    expect(await resolveIsSubagent(client, "ses_hang", "/cwd")).toBe(false);
-    const elapsed = performance.now() - started;
-    expect(elapsed).toBeGreaterThanOrEqual(LOOKUP_TIMEOUT_MS - 50);
-    expect(elapsed).toBeLessThan(LOOKUP_TIMEOUT_MS + 500);
-    // The timeout counts as a failure: no new lookup inside the retry window.
-    expect(await resolveIsSubagent(client, "ses_hang", "/cwd")).toBe(false);
-    expect(calls).toBe(1);
-  });
+  test("a host lookup that never answers lets the call proceed before the host completes", async () => {
+    await assertLookupReturnsBeforeHost("v1");
+  }, 30_000);
 
   test("caches negative result (primary session) so repeat calls are O(1)", async () => {
     let calls = 0;

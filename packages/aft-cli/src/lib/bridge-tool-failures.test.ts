@@ -137,7 +137,10 @@ describe("doctor --issue body integration", () => {
 
   test("tool failures section is included in assembled body and survives cap helper", () => {
     const section = formatRecentAftToolFailuresSection(aggregateBridgeToolFailures(FIXTURE_LOG));
-    const raw = sanitizeContent(makeIssueBodyWithToolFailures(section, 5000));
+    // Exercise the actual cap with a modest oversized fixture; sanitizing a
+    // megabyte adds unrelated CPU work to this assembly contract on CI.
+    const raw = sanitizeContent(makeIssueBodyWithToolFailures(section, 500));
+    expect(Buffer.byteLength(raw, "utf8")).toBeGreaterThan(MAX_GITHUB_BODY_BYTES);
     const capped = capBodyToGithubLimit(raw);
 
     expect(capped).toContain("### Recent AFT tool failures");

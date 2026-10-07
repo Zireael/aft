@@ -21,9 +21,10 @@ Assertions exposing a product race must not be weakened to hide that race.
 Twelve log downloads failed with transient HTTP/stream errors. Consequently
 this is a lower bound, not a claim that missing logs contained no flakes.
 Full-run `--log` downloads hit gh's missing-job-log request limit; narrowing
-to named jobs recovered passing test evidence. Next-run candidates are
-separated below rather than treating an unchanged test file as proof that
-its production dependencies were unchanged.
+to named jobs recovered passing test evidence. Next-run candidates are not promoted to confirmed flakes merely because their
+test file was unchanged. The initial correlation found 43 such failure/pass
+pairs (25 names); none of the different-SHA pairs also had unchanged Rust/TS
+production dependencies. Same-SHA test execution is the evidence used here.
 
 ## Confirmed same-SHA flakes
 
@@ -37,7 +38,7 @@ its production dependencies were unchanged.
 | `bash_token_count_test::bash_completed_frame_compressed_tokens_reflect_compression` | macOS | 3 | 09-30 21:38 | `expected compressed token count 613 to be lower than original 613`. Output/compression snapshot race, not a latency assertion. | [36097850252](https://github.com/cortexkit/aft/actions/runs/36097850252/attempts/1), [36706127153](https://github.com/cortexkit/aft/actions/runs/36706127153/attempts/1), [36780704669](https://github.com/cortexkit/aft/actions/runs/36780704669/attempts/1) → 2 |
 | `callgraph_test::callgraph_rust_use_imported_short_callers_resolve` | Linux | 1 | 10-03 20:16 | `timed out after 60s waiting for response line from aft stdout (child still running)`. Product/maintenance liveness. | [37150941148](https://github.com/cortexkit/aft/actions/runs/37150941148/attempts/1) → 2 |
 | `doctor --issue body integration > tool failures section is included in assembled body and survives cap helper` | macOS | 1 | 10-03 05:11 | `timed out after 5000ms`. Cold imports/default Bun timeout. | [37098997194](https://github.com/cortexkit/aft/actions/runs/37098997194/attempts/1) → 2 |
-| `e2e semantic search tool > aft_search degrades to a lexical fallback when semantic is disabled` | Linux, opencode-ndjson | 1 | 09-29 01:38 | E2E fallback assertion failed; same-SHA rerun passed. Requires product/fixture investigation, not a relaxed deadline. | [36508835945](https://github.com/cortexkit/aft/actions/runs/36508835945/attempts/1) → 2 |
+| `e2e semantic search tool > aft_search degrades to a lexical fallback when semantic is disabled` | Linux, opencode-ndjson | 1 | 09-29 01:38 | Expected `src/lib.rs:1 [lexical match]`; got `Found 0 results.\nSearch status: partial/incomplete.`. Cold lexical readiness/coverage. | [36508835945](https://github.com/cortexkit/aft/actions/runs/36508835945/attempts/1) → 2 |
 | `effective_path_cache_test::valid_cache_skips_sleeping_shell_and_returns_ping_quickly` | Linux | 1 | 09-24 14:24 | `served PATH "" does not include cached entry /cached/login/bin`. Child fixture/startup ordering. | [36012527382](https://github.com/cortexkit/aft/actions/runs/36012527382/attempts/1) → 2 |
 | `inspect_command_test::scoped_rust_inspect_drops_a_fixed_compiler_error_with_real_rust_analyzer` | Linux | 1 | 10-01 00:26 | `control: the first check reports the error` failed. Real-server diagnostics generation/readiness. | [36796192789](https://github.com/cortexkit/aft/actions/runs/36796192789/attempts/1) → 2 |
 | `inspect_command_test::scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_rust_analyzer` | Linux | 1 | 10-05 15:13 | `rust-analyzer's own error for the removed field is missing`. Real-server edit/check ordering. | [37331104560](https://github.com/cortexkit/aft/actions/runs/37331104560/attempts/1) → 2 |
@@ -49,7 +50,7 @@ its production dependencies were unchanged.
 | `shared_db_contention_test::status_answers_within_a_second_while_another_process_holds_the_write_lock` | Windows | 2 | 10-03 21:30 | `status exceeded 1s while aft.db was write-locked: [1.1683217s]`. Sampling-window/latency assertion. | [36626746920](https://github.com/cortexkit/aft/actions/runs/36626746920/attempts/1), [37155371550](https://github.com/cortexkit/aft/actions/runs/37155371550/attempts/1) → 2 |
 | `standalone_search_deferred_test::standalone_inspect_preserves_partial_results_when_rust_keeps_indexing` | Windows | 1 | 10-06 06:09 | Expected partial inspect state but response reported success. Slow LSP producer readiness. | [37422176496](https://github.com/cortexkit/aft/actions/runs/37422176496/attempts/1) → 2 |
 | `status_bar_text_test::standalone_status_bar_trails_text_on_change_and_not_on_unchanged_result` | Windows | 2 | 09-25 03:02 | `aft_inspect failed`, `dead_code ... callgraph_unavailable`. Background maintenance/readiness. | [36077367695](https://github.com/cortexkit/aft/actions/runs/36077367695/attempts/1), [36088716976](https://github.com/cortexkit/aft/actions/runs/36088716976/attempts/1) → 2 |
-| `subc transport parity sweep > server-rendered text matches NDJSON for representative tool calls` | Linux, opencode-subc | 1 | 09-30 13:48 | Parity assertion failed; same-SHA rerun passed. Product/fixture ordering. | [36724403748](https://github.com/cortexkit/aft/actions/runs/36724403748/attempts/1) → 2 |
+| `subc transport parity sweep > server-rendered text matches NDJSON for representative tool calls` | Linux, opencode-subc | 1 | 09-30 13:48 | `grep` text differed only by `1 indexed file(s) were not on disk ... index is out of date`. Fixture self-indexing/readiness. | [36724403748](https://github.com/cortexkit/aft/actions/runs/36724403748/attempts/1) → 2 |
 | `subc_bridge_test::subc_bridge_goodbye_cancels_queued_read_before_same_root_rebind` | Windows | 1 | 10-01 07:39 | `subc mode exits cleanly: ConnectionLost`. Transport teardown. | [36831632794](https://github.com/cortexkit/aft/actions/runs/36831632794/attempts/1) → 2 |
 | `subc_bridge_test::subc_bridge_health_check_returns_root_status_report` | Windows | 1 | 09-20 19:34 | `connection teardown must cancel queued root maintenance`. Queue teardown ordering. | [35532736043](https://github.com/cortexkit/aft/actions/runs/35532736043/attempts/1) → 2 |
 | `subc_bridge_test::subc_bridge_l3_coalesces_already_bound_route_burst` | Linux | 1 | 09-22 02:19 | `subc mode exits cleanly: ConnectionLost`. Transport teardown. | [35679021255](https://github.com/cortexkit/aft/actions/runs/35679021255/attempts/1) → 2 |
@@ -241,3 +242,60 @@ remain. All channels/roots are owned by the individual test.
   (not CPU hogs). Output: `both shutdown tests and locked-status test passed
   20/20 with four concurrent contenders`; **1 helper passed, 0 failed** in
   63.62 s. The restored real binary and final test sources were reverified.
+
+### Batch: TypeScript lookup and issue-body fixtures
+
+- V1/V2 timeout cases each own a dynamically imported cache/clock instance.
+  The host cannot complete until the test releases it. Assert the primary
+  fallback, an actually started but incomplete host lookup, and cached timeout
+  behavior; the timer remains real. Remove ±50/500 ms elapsed assertions and
+  use a 30 s per-case hang ceiling. The V1 test name explicitly changes from
+  `within the timeout` to `before the host completes` to disclose the new
+  ordering contract.
+- The issue-body assembly fixture is 500 lines instead of 5000. It explicitly
+  proves **96,952 uncapped bytes > 60,000 byte limit**, so reducing unrelated
+  sanitization work does not remove cap coverage. Its original capped-size
+  and retained-tool-failure assertions remain.
+- Mutations: removing the host/deadline race failed exactly the V2 abandonment
+  test in one run and the V1 fallback test in another, each at its 30 s hang
+  ceiling. The three selected shared-lookup controls passed in each run.
+  Bypassing the body cap failed only the assembly test (`Expected <= 60000;
+  Received 96952`); aggregate-count control passed. Deltas: lookup source
+  +2/-1; cap fixture +2/-1. Both restored working diffs were empty.
+- Lookup stress: removed helper, **20/20 each**, four concurrent lanes, output
+  `V1 and V2 timeout fixtures each passed 20/20 with four concurrent contenders`;
+  **1 helper passed**, 200 expectations. Final lookup suite: **19 passed**,
+  45 expectations.
+- CLI stress: `bun run --cwd packages/aft-cli test:unit --test-name-pattern
+  'doctor --issue body integration|capBodyToGithubLimit|aggregateBridgeToolFailures'
+  --rerun-each 20 --concurrent --max-concurrency 4`: **280 passed, 0 failed**,
+  740 expectations (14 tests × 20; repeats are not retries). Final-source
+  suite: **14 passed**, 37 expectations.
+- `bun run --cwd packages/opencode-plugin typecheck` and
+  `bun run --cwd packages/aft-cli typecheck`: passed, TypeScript 5.9.3.
+  `bun run lint`: **Checked 695 files**, passed, Biome 2.4.7. An initial import
+  wrapping formatting error was corrected before the final gates. Bun 1.4.2.
+  All local TS runs clear `AFT_STORAGE_DIR` and use disposable HOME/XDG dirs.
+- Scoped `aft_inspect` was PARTIAL (no analyzed files/callgraph view in this
+  worktree); it is not a clean diagnostic proof. Package tsc gates above are
+  the authoritative verification.
+
+### Delivery boundary and Windows gate
+
+The reviewer approved delivery of these **11 verified test fixes** rather
+than loosening assertions exposing unresolved product races. The remaining
+confirmed flakes are dispositioned below for separate targeted work. No
+ranking-fence file, package manifest/lockfile, generated schema, or production
+behavior was changed. Native Rust checks ran remotely on ck-motor after the
+Mac compile-slot stall; the remote service owns its own concurrency budget.
+
+The requested local command (with `CARGO_BUILD_JOBS=4` and isolated HOME/XDG,
+no `AFT_STORAGE_DIR`):
+
+`CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= RUSTFLAGS="-D warnings -A deprecated"
+cargo check --target x86_64-pc-windows-gnu --tests -p agent-file-tools`
+
+**Passed**, `Finished dev profile ... in 4m 23s` (rustc/cargo 1.99.0). This
+compiles all Windows test targets; it does not prove Windows runtime behavior.
+Native Windows verification is left to CI; the reviewer's Windows VM is down
+for maintenance and was not used.
