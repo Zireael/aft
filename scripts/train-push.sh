@@ -47,7 +47,9 @@
 #
 # Usage:
 #   scripts/train-push.sh <train-name>
-#   scripts/train-push.sh <train-name> --land
+#   scripts/train-push.sh <train-name> --on <parent-train>
+#   scripts/train-push.sh <train-name> --land [--on <parent-train>]
+#   scripts/train-push.sh <train-name> --restack [--on <parent-train>]
 #   scripts/train-push.sh <train-name> -- <local smoke command...>
 #
 # The optional smoke is the targeted slice the diff touches (the one or two
@@ -57,7 +59,33 @@
 # A red train leaves origin/train/<train-name> in place: fix, commit, and run
 # this script again with the same name to update the branch and re-run CI.
 #
-# If main moves while CI runs, the train is re-queued automatically: rebase onto
+# STACKED TRAINS START CI TOGETHER. Build each child on its parent's pushed
+# train tip, in a separate worktree, and pass --on <parent-train>. Without --on,
+# the nearest unlanded origin/train/* tip strictly below HEAD is detected (an
+# ambiguous tip asks for --on). The child pushes immediately, watches its own
+# run, then waits up to an hour for its exact parent base to appear on main.
+# TRAIN_PUSH_PARENT_ATTEMPTS (360) and TRAIN_PUSH_PARENT_SLEEP (10 seconds) bound
+# that wait. A green child never authorizes landing its still-unlanded parent.
+# When the base is on main and main is an ancestor of the tested child sha, the
+# child fast-forwards without a rebase or another CI run. This works at any depth.
+#
+# A red, changed, or deleted parent blocks the child, preserving its own CI
+# result. Fix and repush the parent, then --restack the child: only the child's
+# commits are rebased onto the current parent tip, or main if the parent ref has
+# gone. It repushes and waits for fresh CI on the new sha. Merge-carrying children
+# refuse automatic restacking for the same reason they refuse automatic requeue.
+# The parent name and exact base are recorded atomically in the shared git dir;
+# recovery (--land or same-sha repush) reads that record even after the parent
+# branch is deleted. Restack from the same clone; other clones have no record of
+# a vanished or rewritten parent and must reconstruct the stack by hand.
+# One train per worktree and one process per train name are still enforced.
+#
+# Search-quality descriptors keep their existing CI gate: the class is derived
+# from the merge-base with main, NOT from the parent tip. A stacked child must
+# describe the whole pending diff (parents included) against main. The workflow
+# already uses that base; stacking does not narrow it or waive descriptor checks.
+#
+# If main moves while an unstacked train's CI runs, it is re-queued: rebase onto
 # the new origin/main, re-push the branch, watch a fresh run - up to 3 rounds.
 # The re-queue is for a moved branch ONLY. A red run is never retried: the same
 # tree on a new base is red for the same reason, and version/lock skew in
@@ -84,7 +112,8 @@
 # Exit codes:
 #   0  landed on the default branch
 #   1  CI red (or a push that reported success without moving origin)
-#   2  precondition refusal, bad usage, failed smoke, or no CI run resolved
+#   2  precondition refusal, bad usage, failed smoke, no CI run resolved, or a
+#      blocked stack (red/changed/abandoned parent, or parent wait limit)
 #   3  the default branch kept moving through 3 re-queue rounds, or the rebase
 #      conflicted
 #   4  CI is green, but landing failed; re-run with --land to finish without
@@ -204,7 +233,7 @@ refuse() {
 # Arguments
 # ---------------------------------------------------------------------------
 if [ "$#" -eq 0 ]; then
-  refuse "no train name given (usage: scripts/train-push.sh <train-name> [--land | -- <smoke command>])"
+  refuse "no train name given (usage: scripts/train-push.sh <train-name> [--on <parent-train>] [--land | --restack | -- <smoke command>])"
 fi
 
 train_name="$1"
@@ -214,23 +243,38 @@ case "$train_name" in
 esac
 
 land_only=0
+restack=0
+parent_arg=""
 smoke_given=0
 smoke_cmd=()
-if [ "$#" -gt 0 ]; then
-  if [ "$1" = "--land" ]; then
-    land_only=1
-    shift
-    [ "$#" -eq 0 ] || refuse "--land does not accept a smoke command"
-  elif [ "$1" = "--" ]; then
-    shift
-    if [ "$#" -eq 0 ]; then
-      refuse "-- given without a smoke command"
-    fi
-    smoke_given=1
-    smoke_cmd=("$@")
-  else
-    refuse "unexpected argument '$1' (use --land, or put the smoke command after a bare --)"
-  fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --land) land_only=1; shift ;;
+    --restack) restack=1; shift ;;
+    --on)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || refuse "--on needs a parent train name"
+      [ -z "$parent_arg" ] || refuse "--on given more than once"
+      parent_arg="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      [ "$#" -gt 0 ] || refuse "-- given without a smoke command"
+      smoke_given=1
+      smoke_cmd=("$@")
+      break
+      ;;
+    *) refuse "unexpected argument '$1' (use --on, --restack, --land, or put the smoke command after a bare --)" ;;
+  esac
+done
+[ "$land_only" -eq 0 ] || {
+  [ "$restack" -eq 0 ] || refuse "--land and --restack are mutually exclusive"
+  [ "$smoke_given" -eq 0 ] || refuse "--land does not accept a smoke command"
+}
+if [ -n "$parent_arg" ]; then
+  case "$parent_arg" in -*) refuse "parent train name must not look like a flag" ;; esac
+  git -C "$REPO" check-ref-format "refs/heads/train/$parent_arg" || refuse "unusable parent train name '$parent_arg'"
+  [ "$parent_arg" != "$train_name" ] || refuse "a train cannot be its own parent"
 fi
 
 train_ref="train/$train_name"
@@ -241,13 +285,11 @@ if ! git -C "$REPO" check-ref-format "refs/heads/$train_ref"; then
   refuse "'$train_name' is not a usable branch name component"
 fi
 
-# REFUSE A CONCURRENT TRAIN. Two trains overlap the moment one is backgrounded and
-# another started - which is exactly what an operator wants to do, because a train
-# takes minutes and waiting is dull. They are not concurrent-safe: each resolves
-# HEAD and moves refs on one remote, so the second can land the first's commits,
-# or find main already where it meant to put it and report a failure over a
-# landing that succeeded. That false failure is the mild outcome; the dangerous
-# one is a train landing a sha its CI never tested.
+# REFUSE CONCURRENT USE OF ONE WORKTREE OR ONE TRAIN NAME. Stacked trains can
+# overlap safely in separate worktrees: each owns its HEAD, its CI run, and its
+# leased remote train ref. Two processes in one worktree still race rebases and
+# resolve-HEAD; two using the same name race pushes and recovery. Atomic locks
+# cover both resources, before any network work.
 #
 # A remote train/* ref is NOT the signal: a ref outlives its process (a red CI
 # leaves the ref as the repush target, and the same train name is re-run round
@@ -269,18 +311,19 @@ fi
 # worktree's (.git/worktrees/<name>): in-progress operations (MERGE_HEAD,
 # rebase-merge/) live there and are per-worktree. `git_common_dir` is the
 # repository's own .git, shared by every worktree: anything that is one fact
-# per repository (the train lock, the watch heartbeat, the trigger proof,
+# per repository (the train-name lock, stack record, watch heartbeat, trigger proof,
 # hooks) must live there, or each fresh worktree re-proves the trigger, two
 # worktrees can push the same train at once, and the repo's pre-push hook is
 # looked for in a directory that never has one.
 git_dir="$(git -C "$REPO" rev-parse --absolute-git-dir 2>/dev/null)"
 git_common_dir="$(cd "$REPO" && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)"
 [ -n "$git_common_dir" ] || git_common_dir="$git_dir"
-train_lock_dir="$git_common_dir/train-push-locks"
+train_key="$(printf '%s' "$train_name" | git -C "$REPO" hash-object --stdin)"
+train_lock_dir="$git_dir/train-push-locks"
+train_name_lock_dir="$git_common_dir/train-push-locks/by-name-$train_key"
 watch_name="${train_name//\//-}"
 watch_heartbeat="$git_common_dir/train-push-$watch_name.watch"
-mkdir -p "$train_lock_dir" 2>/dev/null || true
-train_lock_held="$train_lock_dir/held"
+mkdir -p "$train_lock_dir" "$train_name_lock_dir" 2>/dev/null || true
 
 # ACQUIRE BEFORE ANY NETWORK WORK, AND ACQUIRE ATOMICALLY. A scan-then-write
 # guard with a `git ls-remote` between the scan and the write admitted two
@@ -306,6 +349,8 @@ train_lock_process_start() {
 # Computed before taking the lock so the owner write right after mkdir stays a
 # single write, keeping the window where the lock has no readable owner short.
 train_lock_my_start="$(train_lock_process_start "$$")"
+for train_lock_held in "$train_lock_dir/held" "$train_name_lock_dir/held"; do
+train_lock_attempts=0
 while true; do
   if mkdir "$train_lock_held" 2>/dev/null; then
     printf '%s %s\n%s\n' "$$" "$train_name" "$train_lock_my_start" > "$train_lock_held/owner"
@@ -376,18 +421,21 @@ while true; do
     refuse "could not acquire the train lock after clearing a stale owner; try again"
   fi
 done
+done
 
-# Leftover refs do not refuse - no process drives them, so they cannot race this
+# Remote refs outlive their processes. Some are pending parents, not leftovers;
+# list them for the operator, never delete one just because no local pid owns it.
+# A ref alone cannot race this
 # train. They are listed with the delete composed, because the operator reaching
 # this line is usually mid-CI-failure and composing `--delete train/<name>` by
 # hand next to several refs is where the wrong one gets deleted.
 stale_refs=$(git -C "$REPO" ls-remote --heads "$remote" 'train/*' 2>/dev/null | wc -l | tr -d ' ')
 if [ "${stale_refs:-0}" -gt 0 ]; then
-  printf 'train-push: %s train ref(s) on %s with no live train here:\n' \
+  printf 'train-push: %s train ref(s) on %s (pending or leftover):\n' \
     "$stale_refs" "$remote" >&2
   git -C "$REPO" ls-remote --heads "$remote" 'train/*' 2>/dev/null |
     sed "s|.*refs/heads/|    git push $remote --delete |" >&2
-  printf '  (proceeding: a ref without a process cannot race this train)\n' >&2
+  printf '  (proceeding: a ref alone cannot race this train; do not delete a pending parent)\n' >&2
 fi
 
 # Operator tooling runs on the upstream gh; the shim is only for agent commands.
@@ -422,10 +470,10 @@ resolve_default_branch() {
 }
 
 resolve_ci_run() {
-  local sha="$1"
+  local sha="$1" branch="${2:-$train_ref}"
   "$OPERATOR_GH" run list --repo "$repo_slug" --workflow "$tests_workflow_name" \
     --event "${WATCH_CI_EVENT:-push}" --limit 40 --json databaseId,headSha,headBranch \
-    --jq ".[] | select(.headSha==\"$sha\" and .headBranch==\"$train_ref\") | .databaseId" 2>/dev/null | head -1
+    --jq ".[] | select(.headSha==\"$sha\" and .headBranch==\"$branch\") | .databaseId" 2>/dev/null | head -1
 }
 
 ci_run_attempt() {
@@ -589,6 +637,152 @@ refuse_non_fast_forward() {
   refuse "$sha is not a fast-forward of $remote/$default_branch; rebase and re-run: scripts/train-push.sh $train_name"
 }
 
+# Stack identity survives a parent ref deletion or rewrite and is shared by
+# linked worktrees. It is data, never sourced as shell code. Hashing the train
+# name avoids both path traversal and collisions such as a/b versus a-b.
+stack_dir="$git_common_dir/train-push-stacks"
+stack_record="$stack_dir/$train_key"
+parent_name=""
+parent_base=""
+
+save_stack() {
+  if [ -z "$parent_name" ]; then
+    rm -f "$stack_record"
+    return
+  fi
+  mkdir -p "$stack_dir"
+  printf '%s\n%s\n' "$parent_name" "$parent_base" > "$stack_record.tmp.$$"
+  mv "$stack_record.tmp.$$" "$stack_record"
+}
+
+resolve_stack() {
+  local sha="$1" saved_name="" saved_base="" tip ref distance nearest=""
+  local best_distance="" ambiguous=0
+  if [ -f "$stack_record" ]; then
+    { IFS= read -r saved_name; IFS= read -r saved_base; } < "$stack_record" ||
+      refuse "unreadable stack record $stack_record"
+    git -C "$REPO" check-ref-format "refs/heads/train/$saved_name" >/dev/null ||
+      refuse "invalid parent in stack record $stack_record"
+    git -C "$REPO" merge-base --is-ancestor "$saved_base" "$sha" ||
+      refuse "recorded base $saved_base is not an ancestor of this train; reconstruct the stack by hand"
+    parent_name="$saved_name"
+    parent_base="$saved_base"
+    if [ -n "$parent_arg" ] && [ "$parent_arg" != "$saved_name" ]; then
+      [ "$restack" -eq 1 ] || refuse "recorded parent is $saved_name; changing it to $parent_arg needs --restack"
+    fi
+    return
+  fi
+  [ "$restack" -eq 0 ] || refuse "--restack needs a recorded stack base; reconstruct the stack by hand"
+  if [ -n "$parent_arg" ]; then
+    parent_name="$parent_arg"
+    parent_base="$(git -C "$REPO" rev-parse --verify -q "refs/remotes/$remote/train/$parent_name" || true)"
+    [ -n "$parent_base" ] || refuse "no $remote/train/$parent_name; push the parent first"
+    [ "$parent_base" != "$sha" ] && git -C "$REPO" merge-base --is-ancestor "$parent_base" "$sha" ||
+      refuse "parent $parent_name tip $parent_base is not strictly below the child; restack by hand first"
+    return
+  fi
+  # Choose the closest proper ancestor, not merely the first branch printed.
+  # That makes N+2 depend on N+1 instead of accidentally depending only on N.
+  while read -r ref tip; do
+    [ "$ref" != "refs/remotes/$remote/$train_ref" ] || continue
+    [ "$tip" != "$sha" ] || continue
+    git -C "$REPO" merge-base --is-ancestor "$tip" "$remote_default" && continue
+    git -C "$REPO" merge-base --is-ancestor "$tip" "$sha" || continue
+    distance="$(git -C "$REPO" rev-list --count "$tip..$sha")"
+    if [ -z "$best_distance" ] || [ "$distance" -lt "$best_distance" ]; then
+      nearest="$ref"; parent_base="$tip"; best_distance="$distance"; ambiguous=0
+    elif [ "$distance" -eq "$best_distance" ]; then
+      ambiguous=1
+    fi
+  done < <(git -C "$REPO" for-each-ref --format='%(refname) %(objectname)' "refs/remotes/$remote/train/")
+  [ "$ambiguous" -eq 0 ] || refuse "ambiguous parent train tips; name the parent with --on"
+  if [ -n "$nearest" ]; then
+    parent_name="${nearest#refs/remotes/"$remote"/train/}"
+    say "detected parent $parent_name at $parent_base"
+  fi
+}
+
+refuse_stack() {
+  refuse "$1; base $parent_base is not landable on $remote/$default_branch; restack $train_name with: scripts/train-push.sh $train_name --restack"
+}
+
+wait_for_parent() {
+  local sha="$1" run_url="$2" main_sha tip rid verdict status conclusion bad
+  local attempts="${TRAIN_PUSH_PARENT_ATTEMPTS:-360}" wait_seconds="${TRAIN_PUSH_PARENT_SLEEP:-10}" parent_poll
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || refuse "TRAIN_PUSH_PARENT_ATTEMPTS must be a positive integer"
+  for ((parent_poll=1; parent_poll<=attempts; parent_poll++)); do
+    git -C "$REPO" fetch -q --prune "$remote" ||
+      landing_failed "fetch while waiting for parent $parent_name failed" "$sha" "$run_url"
+    main_sha="$(git -C "$REPO" rev-parse "$remote_default")"
+    # A child run covers parent+child, but cannot authorize landing the parent
+    # itself. Its exact base must already have arrived on the default branch.
+    if git -C "$REPO" merge-base --is-ancestor "$parent_base" "$remote_default"; then
+      git -C "$REPO" merge-base --is-ancestor "$remote_default" "$sha" ||
+        refuse_stack "parent $parent_name landed at a different sha, or $remote/$default_branch moved beyond the tested stack"
+      say "parent $parent_name base $parent_base is on $remote/$default_branch; spending the child's own green without rerunning CI"
+      return
+    fi
+    tip="$(git -C "$REPO" rev-parse --verify -q "refs/remotes/$remote/train/$parent_name" || true)"
+    [ -n "$tip" ] || refuse_stack "parent $parent_name is abandoned or landed at a different sha"
+    [ "$tip" = "$parent_base" ] || refuse_stack "parent $parent_name changed to $tip"
+    rid="$(resolve_ci_run "$parent_base" "train/$parent_name" || true)"
+    if [ -n "$rid" ]; then
+      verdict="$("$OPERATOR_GH" run view "$rid" --repo "$repo_slug" --json status,conclusion \
+        --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+      IFS=$'\t' read -r status conclusion <<< "$verdict"
+      bad="$("$OPERATOR_GH" run view "$rid" --repo "$repo_slug" --json jobs \
+        --jq '[.jobs[] | select(.conclusion=="failure") | .name] | join("; ")' 2>/dev/null || true)"
+      if { [ -n "$bad" ] && [ "$bad" != null ]; } ||
+        { [ "$status" = completed ] && [ "$conclusion" != success ]; }; then
+        refuse "parent $parent_name is red; fix and repush it, then restack $train_name (own CI green: $run_url; scripts/train-push.sh $train_name --restack)"
+      fi
+    fi
+    if [ "$parent_poll" -eq 1 ]; then
+      say "waiting for parent $parent_name to land exactly at $parent_base (currently $remote/$default_branch=$main_sha; bounded to $attempts polls, ${wait_seconds}s apart; own CI green: $run_url)"
+    fi
+    [ "$parent_poll" -eq "$attempts" ] || sleep "$wait_seconds"
+  done
+  refuse "parent $parent_name has not landed base $parent_base before the wait limit; own CI green: $run_url; resume: scripts/train-push.sh $train_name --land"
+}
+
+# watch-ci also reports fail-fast job failures. A watch returning zero is not
+# sufficient by itself: only a completed success for this exact sha AND branch
+# authorizes landing, including after a rerun attempt.
+require_ci_success() {
+  local sha="$1" rid verdict
+  rid="$(resolve_ci_run "$sha")"
+  [ -n "$rid" ] || refuse "no CI run resolved for tested $remote/$train_ref at $sha"
+  verdict="$("$OPERATOR_GH" run view "$rid" --repo "$repo_slug" --json status,conclusion \
+    --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+  [ "$verdict" = $'completed\tsuccess' ] || refuse "CI run $rid for $sha did not conclude success; not landing"
+}
+
+restack_child() {
+  local target target_name old_base="$parent_base" merges before="$head_sha"
+  target_name="${parent_arg:-$parent_name}"
+  target="$(git -C "$REPO" rev-parse --verify -q "refs/remotes/$remote/train/$target_name" || true)"
+  if [ -z "$target" ]; then
+    target="$(git -C "$REPO" rev-parse "$remote_default")"
+    target_name=""
+  fi
+  git -C "$REPO" merge-base --is-ancestor "$remote_default" "$target" ||
+    refuse "restack target is not based on $remote/$default_branch; restack its parent first"
+  [ "$target" != "$before" ] && ! git -C "$REPO" merge-base --is-ancestor "$before" "$target" ||
+    refuse "cannot restack onto a train that already contains this child"
+  merges="$(git -C "$REPO" rev-list --merges "$old_base..$head_sha")"
+  [ -z "$merges" ] || refuse "child carries merge commit(s); not rebasing because merge-only resolutions would be lost; restack by hand"
+  say "restacking $train_name: replay only $old_base..$head_sha onto $target"
+  if ! git -C "$REPO" rebase --onto "$target" "$old_base"; then
+    git -C "$REPO" rebase --abort >/dev/null 2>&1 || true
+    refuse "restack conflicted; rebase aborted (was $before); resolve by hand and repush"
+  fi
+  head_sha="$(git -C "$REPO" rev-parse HEAD)"
+  [ "$head_sha" != "$before" ] || refuse "restack did not change the sha; resume with scripts/train-push.sh $train_name (same-sha CI recovery)"
+  parent_name="$target_name"
+  parent_base="$target"
+  save_stack
+}
+
 land_verified_sha() {
   local sha="$1"
   local run_url="$2"
@@ -596,6 +790,9 @@ land_verified_sha() {
   require_repo_after_green "$sha" "$run_url"
   git -C "$REPO" fetch -q "$remote" "$default_branch" ||
     landing_failed "git fetch $remote $default_branch failed" "$sha" "$run_url"
+  if [ -n "$parent_name" ]; then
+    wait_for_parent "$sha" "$run_url"
+  fi
   if ! git -C "$REPO" merge-base --is-ancestor "$remote_default" "$sha"; then
     refuse_non_fast_forward "$sha"
   fi
@@ -647,11 +844,18 @@ if git -C "$REPO" rev-parse --verify -q "refs/remotes/$remote/$train_ref" >/dev/
   train_remote_sha="$(git -C "$REPO" rev-parse "refs/remotes/$remote/$train_ref")"
 fi
 
+stack_sha="$head_sha"
+[ "$land_only" -eq 0 ] || stack_sha="${train_remote_sha:-$head_sha}"
+resolve_stack "$stack_sha"
+if [ -n "$parent_name" ]; then
+  say "stacked on parent $parent_name at base $parent_base"
+fi
+
 recover_existing=0
 if [ "$land_only" -eq 1 ]; then
   [ -n "$train_remote_sha" ] || refuse "--land needs an existing $remote/$train_ref"
   recover_existing=1
-elif [ -n "$train_remote_sha" ] && [ "$train_remote_sha" = "$head_sha" ]; then
+elif [ "$restack" -eq 0 ] && [ -n "$train_remote_sha" ] && [ "$train_remote_sha" = "$head_sha" ]; then
   recover_existing=1
 fi
 
@@ -701,7 +905,10 @@ if [ "$recover_existing" -eq 1 ]; then
     fi
   fi
 
+  require_ci_success "$verified_sha"
+  save_stack
   [ -n "$run_url" ] || run_url="(run url not reported)"
+  say "CI green: $run_url"
   if [ -n "$heartbeat_dead_note" ]; then
     say "$heartbeat_dead_note; landing its verified sha $verified_sha"
   fi
@@ -950,6 +1157,10 @@ if [ -n "$(git -C "$REPO" status --porcelain)" ]; then
   refuse "working tree is not clean (commit or stash before pushing a train)"
 fi
 
+if [ "$restack" -eq 1 ]; then
+  restack_child
+fi
+
 # A train must not add local dependency paths that escape the repository. CI
 # runs the same check, and this catches the problem before spending a push run.
 # The checker ships beside this script; a repository that copied only
@@ -961,9 +1172,10 @@ if ! python3 "$REPO/scripts/check-path-deps.py"; then
   refuse "dependency path resolves outside the repository"
 fi
 
-# A local main behind origin/main means the train was built on a stale base:
-# CI would test it green and the land would still be refused in step 5.
-if git -C "$REPO" rev-parse --verify -q refs/heads/"$default_branch" >/dev/null; then
+# A local main behind origin/main means an unstacked train was built on a stale
+# base. A stacked worktree instead names its exact parent base, and --restack
+# just replayed onto a fetched base; neither needs the idle local main moved.
+if [ -z "$parent_name" ] && [ "$restack" -eq 0 ] && git -C "$REPO" rev-parse --verify -q refs/heads/"$default_branch" >/dev/null; then
   if ! git -C "$REPO" merge-base --is-ancestor "$remote_default" "refs/heads/$default_branch"; then
     refuse "local $default_branch is behind $remote/$default_branch (git merge --ff-only $remote/$default_branch first)"
   fi
@@ -1113,6 +1325,7 @@ verified_sha=""
 # ref to have been refreshed along the way.
 
 push_train() {
+  save_stack
   if [ -z "$train_remote_sha" ]; then
     # Create with a plain push: a mistyped train name must not be able to
     # clobber a branch that already exists.
@@ -1241,8 +1454,14 @@ while true; do
     exit 2
   fi
 
+  require_ci_success "$head_sha"
   verified_sha="$head_sha"
   say "CI green: $run_url"
+
+  if [ -n "$parent_name" ]; then
+    wait_for_parent "$verified_sha" "$run_url"
+    break
+  fi
 
   # Re-check right before the push, not just at the start of the script.
   require_repo_after_green "$head_sha" "$run_url"
@@ -1283,6 +1502,11 @@ if [ "$verified_sha" != "$head_sha" ]; then
     "$head_sha" "$run_url"
 fi
 
+# A final stack check covers a default-branch move after the parent wait. The
+# push itself stays non-force, so a concurrent divergent landing is refused.
+if [ -n "$parent_name" ]; then
+  wait_for_parent "$verified_sha" "$run_url"
+fi
 say "landing $head_sha on $remote/$default_branch"
 set +e
 git -C "$REPO" push "$remote" "$head_sha:refs/heads/$default_branch" 2>&1 | tee "$push_log"

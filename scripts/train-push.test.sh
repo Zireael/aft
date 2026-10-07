@@ -61,6 +61,9 @@ cat > "$BIN_DIR/gh" <<'STUB'
 set -u
 STATE="${TRAIN_PUSH_TEST_STATE:?gh stub needs TRAIN_PUSH_TEST_STATE}"
 printf '%s\n' "$*" >> "$STATE/gh-calls"
+if [ -d "$STATE/runs" ]; then
+  exec python3 "$(dirname "$0")/stack-gh.py" "$@"
+fi
 
 # A rerun changes the attempt number without changing the run id. The state
 # transition is controllable so recovery tests can prove they watched the new
@@ -168,7 +171,11 @@ case "$json" in
     if [ -f "$STATE/capture_heartbeat" ] && [ -n "${WATCH_CI_HEARTBEAT:-}" ] && [ -f "$WATCH_CI_HEARTBEAT" ]; then
       cp "$WATCH_CI_HEARTBEAT" "$STATE/heartbeat-snapshot"
     fi
-    cat "$STATE/watch_status" 2>/dev/null || echo "completed"
+    watch_status="$(cat "$STATE/watch_status" 2>/dev/null || echo completed)"
+    # Both queries describe one run. Once the watch sees completion, a later
+    # status+conclusion lookup must not keep returning the old running status.
+    printf '%s\n' "$watch_status" > "$STATE/recorded_status"
+    printf '%s\n' "$watch_status"
     ;;
   jobs)
     case "$jq_arg" in
@@ -210,6 +217,7 @@ write_tests_workflow() {
   } > "$work/.github/workflows/tests.yml"
 }
 
+checks=0
 failures=0
 fail() {
   printf 'train-push.test.sh: FAIL — %s\n' "$1" >&2
@@ -218,7 +226,7 @@ fail() {
   fi
   failures=$((failures + 1))
 }
-ok() { printf 'train-push.test.sh: ok — %s\n' "$1"; }
+ok() { checks=$((checks + 1)); printf 'train-push.test.sh: ok — %s\n' "$1"; }
 
 # Build a fixture: a bare repo playing origin, a work clone holding the train,
 # and a second clone that stands in for whoever else pushes to main.
@@ -309,7 +317,10 @@ run_train() {
       OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
       TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
       WATCH_CI_RESOLVE_ATTEMPTS=1 \
-      WATCH_CI_RESOLVE_SLEEP=0 \
+       WATCH_CI_RESOLVE_SLEEP=0 \
+       WATCH_CI_POLL_SLEEP=0.02 \
+       TRAIN_PUSH_PARENT_ATTEMPTS="${TRAIN_PUSH_TEST_PARENT_ATTEMPTS:-200}" \
+       TRAIN_PUSH_PARENT_SLEEP=0.02 \
       TRAIN_PUSH_PROBE_ATTEMPTS=2 \
       TRAIN_PUSH_PROBE_SLEEP=0 \
       "$TRAIN_PUSH" "$@" 2>&1
@@ -401,6 +412,387 @@ if [ "${TRAIN_PUSH_TEST_CASE:-}" = "same-sha-failed-rerun-message" ]; then
   echo "train-push.test.sh: isolated same-sha failed rerun passed"
   exit 0
 fi
+
+# A push creates an independent, initially running CI record for that exact sha
+# and branch. Only the test driver completes it; gh cannot invent a green run.
+# Repushing a new sha creates another run, just as the real push workflow does.
+cat > "$BIN_DIR/stack-gh.py" <<'PY'
+import json, os, pathlib, re, sys
+state = pathlib.Path(os.environ['TRAIN_PUSH_TEST_STATE'])
+args = sys.argv[1:]
+def option(name):
+    return args[args.index(name) + 1] if name in args else ''
+field, query = option('--json'), option('--jq')
+runs = [json.loads(p.read_text()) for p in (state / 'runs').glob('*.json')]
+if args[:2] == ['run', 'rerun']:
+    (state / 'reruns').write_text('unexpected rerun\n')
+    sys.exit(1)
+if args[:2] == ['run', 'list']:
+    sha = re.search(r'headSha=="([0-9a-f]+)"', query).group(1)
+    branch = re.search(r'headBranch=="([^"]+)"', query).group(1)
+    matches = [r for r in runs if r['sha'] == sha and r['branch'] == branch]
+    if matches:
+        print(max(matches, key=lambda r: r['id'])['id'])
+    sys.exit(0)
+if args[:2] != ['run', 'view']:
+    sys.exit('unexpected fake CI query: ' + repr(args))
+run = next(r for r in runs if str(r['id']) == args[2])
+if field == 'url':
+    print('https://github.com/example/repo/actions/runs/' + str(run['id']))
+elif field == 'status,conclusion':
+    print(run['status'] + '\t' + run['conclusion'])
+elif field in ('status', 'conclusion'):
+    print(run[field])
+elif field == 'jobs':
+    if run['conclusion'] == 'failure':
+        print('Unit|9001')
+elif field == 'attempt':
+    print(1)
+else:
+    sys.exit('unexpected fake CI field: ' + field)
+PY
+
+new_stack_fixture() {
+  local dir
+  dir="$(new_fixture "$1")"
+  mkdir -p "$dir/ci-state/runs"
+  cat > "$dir/origin.git/hooks/post-receive" <<HOOK
+#!/usr/bin/env python3
+import json, pathlib, sys
+state = pathlib.Path('$dir/ci-state')
+for line in sys.stdin:
+    old, sha, ref = line.split()
+    if ref == 'refs/heads/$DEFAULT_BRANCH':
+        with (state / 'landings').open('a') as f:
+            f.write(sha + '\\n')
+    if not ref.startswith('refs/heads/train/') or set(sha) == {'0'}:
+        continue
+    rid = len(list((state / 'runs').glob('*.json'))) + 5000
+    run = dict(id=rid, sha=sha, branch=ref[len('refs/heads/'):], status='in_progress', conclusion='')
+    path = state / 'runs' / (str(rid) + '.json')
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(run))
+    tmp.replace(path)
+HOOK
+  chmod +x "$dir/origin.git/hooks/post-receive"
+  printf '%s\n' "$dir"
+}
+
+stack_worktree() {
+  git -C "$1/work" worktree add -qb "$2" "$1/$2" "$3"
+}
+
+stack_commit() {
+  echo "$2" > "$1/$2.txt"
+  git -C "$1" add "$2.txt"
+  git -C "$1" commit -qm "$2"
+}
+
+complete_stack_ci() {
+  python3 - "$1/ci-state" "$2" "$3" <<'PY'
+import json, pathlib, sys
+state, branch, conclusion = sys.argv[1:]
+runs = [p for p in pathlib.Path(state, 'runs').glob('*.json')
+        if json.loads(p.read_text())['branch'] == 'train/' + branch]
+assert runs, 'cannot complete a run that a push has not started'
+path = max(runs, key=lambda p: json.loads(p.read_text())['id'])
+run = json.loads(path.read_text())
+run.update(status='completed', conclusion=conclusion)
+tmp = path.with_suffix('.tmp')
+tmp.write_text(json.dumps(run))
+tmp.replace(path)
+PY
+}
+
+# Background only inside the harness: the driver has useful work (completing
+# independent runs) before joining every train. A bounded poll prevents a broken
+# train from leaving this suite hanging forever.
+start_stack_train() {
+  local dir="$1" worktree="$2" name="$3"
+  shift 3
+  (
+    TRAIN_PUSH_TEST_CWD="$dir/$worktree" run_train "$dir" "$name" "$@"
+    printf '%s\n' "$LAST_OUT" > "$dir/$name.out"
+    printf '%s\n' "$LAST_RC" > "$dir/$name.rc"
+  ) &
+  STACK_PID=$!
+}
+
+wait_stack_push() {
+  local i
+  for i in $(seq 1 100); do
+    [ -n "$(origin_ref "$1" "refs/heads/train/$2")" ] &&
+      [ -n "$(python3 - "$1/ci-state/runs" "$2" <<'PY'
+import json, pathlib, sys
+print('yes' if any(json.loads(p.read_text())['branch'] == 'train/' + sys.argv[2]
+                   for p in pathlib.Path(sys.argv[1]).glob('*.json')) else '')
+PY
+)" ] && return 0
+    [ -f "$1/$2.rc" ] && break
+    sleep 0.02
+  done
+  LAST_OUT="$(cat "$1/$2.out" 2>/dev/null || true)"
+  fail "stack fixture $2 never pushed and started CI"
+  return 1
+}
+
+join_stack_train() {
+  wait "$2" || true
+  LAST_OUT="$(cat "$1/$3.out")"
+  LAST_RC="$(cat "$1/$3.rc")"
+}
+
+stack_child_fixture() {
+  local dir base
+  dir="$(new_stack_fixture "$1")"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  stack_worktree "$dir" parent "$base"
+  stack_commit "$dir/parent" parent
+  git -C "$dir/parent" push -q origin HEAD:refs/heads/train/parent
+  stack_worktree "$dir" child "$(git -C "$dir/parent" rev-parse HEAD)"
+  stack_commit "$dir/child" child
+  printf '%s\n' "$dir"
+}
+
+test_stack_base_not_on_main() {
+  local dir pid base
+  dir="$(stack_child_fixture stack-base)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" = 2 ] && [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ] &&
+    [[ "$LAST_OUT" == *"waiting for parent parent"* ]] && [[ "$LAST_OUT" == *"wait limit"* ]]; then
+    ok "stacked child cannot land before its base is on main"
+  else
+    fail "stacked child cannot land before its base is on main"
+  fi
+}
+
+test_stack_parent_red() {
+  local dir pid base
+  dir="$(stack_child_fixture stack-red)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  complete_stack_ci "$dir" parent failure
+  start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"CI green:"* ]] &&
+    [[ "$LAST_OUT" == *"parent parent is red; fix and repush it, then restack child"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ]; then
+    ok "parent red blocks a green stacked child with the restack remedy"
+  else
+    fail "parent red blocks a green stacked child with the restack remedy"
+  fi
+}
+
+test_stack_changed_parent() {
+  local dir pid old_parent new_parent old_child child_sha
+  dir="$(stack_child_fixture stack-changed)"
+  old_parent="$(git -C "$dir/parent" rev-parse HEAD)"
+  old_child="$(git -C "$dir/child" rev-parse HEAD)"
+  # Record the child's original stack, then finish its own run while its parent
+  # is still running. The timeout is recoverable; CI keeps the green result.
+  TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+  stack_commit "$dir/parent" parent-fix
+  new_parent="$(git -C "$dir/parent" rev-parse HEAD)"
+  git -C "$dir/parent" push -q origin HEAD:refs/heads/train/parent
+  complete_stack_ci "$dir" parent success
+  TRAIN_PUSH_TEST_CWD="$dir/parent" run_train "$dir" parent --land
+  expect_rc 0 "repushed parent lands its new green sha"
+  TRAIN_PUSH_TEST_CWD="$dir/child" run_train "$dir" child --land
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"--restack"* ]] &&
+    [[ "$LAST_OUT" == *"base $old_parent"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$new_parent" ]; then
+    ok "a parent landed at a different sha refuses the child's old green"
+  else
+    fail "a parent landed at a different sha refuses the child's old green"
+  fi
+  # Restack removes the old parent range, replays only child commits, and must
+  # push a new sha with a fresh run instead of spending the previous green.
+  rm -f "$dir/child.rc" "$dir/child.out"
+  start_stack_train "$dir" child child --restack
+  pid="$STACK_PID"
+  for _ in $(seq 1 100); do
+    child_sha="$(origin_ref "$dir" refs/heads/train/child)"
+    [ "$child_sha" != "$old_child" ] &&
+      [ "$(python3 - "$dir/ci-state/runs" <<'PY'
+import json, pathlib, sys
+print(sum(json.loads(p.read_text())['branch'] == 'train/child' for p in pathlib.Path(sys.argv[1]).glob('*.json')))
+PY
+)" = 2 ] && break
+    [ -f "$dir/child.rc" ] && ! kill -0 "$pid" 2>/dev/null && break
+    sleep 0.02
+  done
+  complete_stack_ci "$dir" child success
+  join_stack_train "$dir" "$pid" child
+  expect_rc 0 "restack repushes, retests, and lands on the parent's new sha"
+  [ "$(git -C "$dir/child" rev-list --count "$new_parent..HEAD")" = 1 ] ||
+    fail "restack replayed parent commits instead of only the child"
+  [ -f "$dir/child/parent-fix.txt" ] || fail "restack lost the parent's fix"
+}
+
+test_stack_chain() {
+  local dir base p1 p2 p3 s1 s2 s3
+  dir="$(new_stack_fixture stack-chain)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  stack_worktree "$dir" parent "$base"
+  stack_commit "$dir/parent" parent
+  s1="$(git -C "$dir/parent" rev-parse HEAD)"
+  start_stack_train "$dir" parent parent; p1="$STACK_PID"
+  if ! wait_stack_push "$dir" parent; then join_stack_train "$dir" "$p1" parent; return; fi
+  stack_worktree "$dir" child "$s1"
+  stack_commit "$dir/child" child
+  s2="$(git -C "$dir/child" rev-parse HEAD)"
+  # No --on here: detect the nearest pending train tip as the parent.
+  start_stack_train "$dir" child child; p2="$STACK_PID"
+  if ! wait_stack_push "$dir" child; then
+    complete_stack_ci "$dir" parent success
+    join_stack_train "$dir" "$p1" parent; join_stack_train "$dir" "$p2" child; return
+  fi
+  stack_worktree "$dir" grandchild "$s2"
+  stack_commit "$dir/grandchild" grandchild
+  s3="$(git -C "$dir/grandchild" rev-parse HEAD)"
+  start_stack_train "$dir" grandchild grandchild; p3="$STACK_PID"
+  if wait_stack_push "$dir" grandchild; then complete_stack_ci "$dir" grandchild success; fi
+  complete_stack_ci "$dir" child success
+  # Green descendants cannot land while their parent is running. Wait until
+  # the child has actually reached the landing guard (not just the CI watch).
+  for _ in $(seq 1 100); do
+    grep -q 'headBranch=="train/parent"' "$dir/ci-state/gh-calls" && break
+    sleep 0.02
+  done
+  if [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ] &&
+    kill -0 "$p1" && kill -0 "$p2" && kill -0 "$p3"; then
+    ok "stacked child waits while parent CI runs; all three CI runs started in parallel"
+  else
+    fail "stacked child waits while parent CI runs; all three CI runs started in parallel"
+  fi
+  complete_stack_ci "$dir" parent success
+  join_stack_train "$dir" "$p1" parent; expect_rc 0 "stack chain parent lands"
+  join_stack_train "$dir" "$p2" child; expect_rc 0 "stacked child lands without a rerun after parent lands"
+  expect_out "waiting for parent parent" "stacked child reports its bounded parent wait"
+  expect_no_out "round 2" "stacked child spends its original green without requeue"
+  join_stack_train "$dir" "$p3" grandchild; expect_rc 0 "three-deep grandchild lands"
+  expect_out "detected parent child at $s2" "auto-detection chooses the nearest pending train in a three-deep chain"
+  if [ "$(cat "$dir/ci-state/landings")" = "$(printf '%s\n' "$s1" "$s2" "$s3")" ] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$s3" ] &&
+    [ "$(python3 - "$dir/ci-state/runs" <<'PY'
+import pathlib, sys
+print(len(list(pathlib.Path(sys.argv[1]).glob('*.json'))))
+PY
+)" = 3 ] &&
+    [ ! -s "$dir/ci-state/reruns" ]; then
+    ok "three-deep chain lands in order at the exact tested shas with one CI run each"
+  else
+    fail "three-deep chain lands in order at the exact tested shas with one CI run each"
+  fi
+}
+
+test_stack_abandoned_parent() {
+  local dir pid base old_child
+  dir="$(stack_child_fixture stack-abandoned)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  old_child="$(git -C "$dir/child" rev-parse HEAD)"
+  TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+  git -C "$dir/parent" push -q origin --delete train/parent
+  TRAIN_PUSH_TEST_CWD="$dir/child" run_train "$dir" child --land
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"parent parent is abandoned"* ]] &&
+    [[ "$LAST_OUT" == *"--restack"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ]; then
+    ok "an abandoned parent blocks the child's recorded green"
+  else
+    fail "an abandoned parent blocks the child's recorded green"
+  fi
+  rm -f "$dir/child.rc" "$dir/child.out"
+  start_stack_train "$dir" child child --restack
+  pid="$STACK_PID"
+  for _ in $(seq 1 100); do
+    [ "$(origin_ref "$dir" refs/heads/train/child)" != "$old_child" ] && break
+    [ -f "$dir/child.rc" ] && break
+    sleep 0.02
+  done
+  complete_stack_ci "$dir" child success
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" = 0 ] && [ "$(git -C "$dir/child" rev-list --count "$base..HEAD")" = 1 ] &&
+    [ ! -f "$dir/child/parent.txt" ] && [ -f "$dir/child/child.txt" ]; then
+    ok "restacking an abandoned parent onto main removes only the parent range and retests"
+  else
+    fail "restacking an abandoned parent onto main removes only the parent range and retests"
+  fi
+}
+
+test_stack_name_lock() {
+  local dir pid base
+  dir="$(new_stack_fixture stack-name-lock)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  stack_worktree "$dir" parent "$base"
+  stack_commit "$dir/parent" parent
+  start_stack_train "$dir" parent parent
+  pid="$STACK_PID"
+  if ! wait_stack_push "$dir" parent; then join_stack_train "$dir" "$pid" parent; return; fi
+  stack_worktree "$dir" duplicate "$(git -C "$dir/parent" rev-parse HEAD)"
+  TRAIN_PUSH_TEST_CWD="$dir/duplicate" run_train "$dir" parent
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"train parent is RUNNING as pid"* ]]; then
+    ok "one train name cannot be driven concurrently from different worktrees"
+  else
+    fail "one train name cannot be driven concurrently from different worktrees"
+  fi
+  complete_stack_ci "$dir" parent success
+  join_stack_train "$dir" "$pid" parent
+  expect_rc 0 "the original train retains its name lock and lands"
+}
+
+test_ci_conclusion_guard() {
+  local dir base
+  dir="$(new_fixture ci-conclusion)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  add_train_commit "$dir/work" ci-conclusion
+  # watch-ci's all-jobs-passed fallback can return zero for this non-success
+  # summary. The landing contract still requires the run to conclude success.
+  echo cancelled > "$dir/ci-state/conclusion"
+  run_train "$dir" ci-conclusion
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"did not conclude success; not landing"* ]] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ]; then
+    ok "a non-success run summary cannot authorize landing even if the watcher returns zero"
+  else
+    fail "a non-success run summary cannot authorize landing even if the watcher returns zero"
+  fi
+}
+
+run_stack_tests() {
+  test_stack_base_not_on_main
+  test_stack_parent_red
+  test_stack_changed_parent
+  test_stack_abandoned_parent
+  test_stack_name_lock
+  test_stack_chain
+  test_ci_conclusion_guard
+}
+case "${TRAIN_PUSH_TEST_CASE:-}" in
+  stack-base) test_stack_base_not_on_main ;;
+  stack-red) test_stack_parent_red ;;
+  stack-changed) test_stack_changed_parent ;;
+  stack-chain) test_stack_chain ;;
+  stack-abandoned) test_stack_abandoned_parent ;;
+  stack-name-lock) test_stack_name_lock ;;
+  ci-conclusion) test_ci_conclusion_guard ;;
+  stacked) run_stack_tests ;;
+esac
+if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ]; then
+  [ "$failures" = 0 ] || exit 1
+  echo "train-push.test.sh: stacked cases passed ($checks checks)"
+  exit 0
+fi
+run_stack_tests
 
 # --- refusal: no train name ------------------------------------------------
 dir="$(new_fixture no-path-checker)"
@@ -1848,4 +2240,4 @@ if [ "$failures" -ne 0 ]; then
   printf 'train-push.test.sh: %s check(s) failed\n' "$failures" >&2
   exit 1
 fi
-echo "train-push.test.sh: passed"
+echo "train-push.test.sh: passed ($checks checks)"
