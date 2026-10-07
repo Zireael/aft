@@ -6260,6 +6260,15 @@ fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
             response["summary"]["diagnostics"]["errors"], 1,
             "{response:#}"
         );
+        if result.is_none() {
+            // The production library persists certified checks on a detached
+            // writer. Observe the successful control's record before using it
+            // as the baseline for the unsuccessful run.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while records() == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         assert_eq!(
             records(),
             1,
