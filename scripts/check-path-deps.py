@@ -40,6 +40,20 @@ def short_error(result: subprocess.CompletedProcess[str]) -> str:
     return text[:400] or f"command exited {result.returncode} without a diagnostic"
 
 
+def cargo_env() -> dict[str, str]:
+    """Cargo's environment without a compiler wrapper.
+
+    Reading metadata only asks rustc for its version, and a configured wrapper
+    such as sccache may not be installed yet where this gate runs (CI runs it
+    before the build cache is set up), which makes cargo fail before reading
+    any manifest.
+    """
+    env = dict(os.environ)
+    for name in ("RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"):
+        env[name] = ""
+    return env
+
+
 def cargo_workspace_root(manifest: Path) -> tuple[Path | None, str | None]:
     command = [
         "cargo",
@@ -49,7 +63,9 @@ def cargo_workspace_root(manifest: Path) -> tuple[Path | None, str | None]:
         str(manifest),
     ]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=False, env=cargo_env()
+        )
     except OSError as error:
         return None, str(error)
     if result.returncode:
@@ -73,7 +89,9 @@ def cargo_metadata(manifest: Path) -> tuple[dict[str, Any] | None, str | None]:
         str(manifest),
     ]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=False, env=cargo_env()
+        )
     except OSError as error:
         return None, str(error)
 
@@ -82,7 +100,9 @@ def cargo_metadata(manifest: Path) -> tuple[dict[str, Any] | None, str | None]:
     if result.returncode and os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
         online_command = [part for part in command if part != "--offline"]
         try:
-            result = subprocess.run(online_command, capture_output=True, text=True, check=False)
+            result = subprocess.run(
+                online_command, capture_output=True, text=True, check=False, env=cargo_env()
+            )
         except OSError as error:
             return None, str(error)
     if result.returncode:
@@ -257,7 +277,9 @@ def _prepare_lock(root: Path) -> str | None:
         str(root / "Cargo.toml"),
     ]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=False, env=cargo_env()
+        )
     except OSError as error:
         return str(error)
     if result.returncode:
