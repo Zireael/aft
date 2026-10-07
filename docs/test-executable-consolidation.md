@@ -123,3 +123,59 @@ harness is another target). That is a much smaller opportunity than the 65
 removed harnesses. Consider it only if post-fold measurements still identify
 fake-server first execution as a material bottleneck; a shared cache would need
 its own invalidation, compatibility and concurrency design.
+
+## Native Windows pre-push slice
+
+Run `scripts/windows-gate.sh` **before** `scripts/train-push.sh` to catch native
+Windows x64/MSVC failures without waiting for a train. This is an operator smoke,
+not a replacement for three-platform CI; train-push behavior is unchanged.
+Python 3, Git, OpenSSH and the provisioned Windows builder must be available.
+The VM budget is four vCPUs / 16 GiB: both Cargo jobs and test threads stay at four.
+
+```sh
+scripts/windows-gate.sh --plan                     # inspect origin/main..HEAD
+scripts/windows-gate.sh --base origin/main         # run touched Rust slices
+scripts/windows-gate.sh --full                     # lib + integration
+scripts/windows-gate.sh --filter bash_background::persistence
+scripts/windows-gate.sh --timeout-minutes 30 --full # default cap: 60 minutes
+scripts/windows-gate.sh --status                   # C: free space, target size, lock
+```
+
+`AFT_WINDOWS_GATE_SSH_CONFIG` overrides
+`~/Work/Projects/CortexKit/prefrontal/script/windows-vm/ssh-config`. Connections
+use its `windows-build-vm` alias and current operator key; strict host-key checking
+is always on. VM ownership, start/stop and snapshot procedures live in prefrontal's
+`docs/runbooks/windows-build-vm.md`. The gate does not change those services.
+
+The printed plan uses committed `git diff --name-only <base>..HEAD` (not the
+working tree). Source files select their top-level lib module; integration files
+select their named module in the integration harness. Cargo manifests/lockfiles,
+build scripts, lib/context/config, executor and db changes broaden to the whole
+lib suite. Other touched test harnesses and the aft binary are selected too.
+`--filter` overrides the diff with an ad-hoc lib slice; with `--full` it filters
+both lib and integration. Empty slices fail rather than silently reporting green.
+A diff with no Rust changes explicitly selects nothing; use an override to run.
+Every run first executes the production storage/config isolation test.
+
+Only a Git bundle of the exact HEAD and its history reaches the product checkout;
+uncommitted/untracked product files are never sent. The gate's PowerShell control
+helper is transferred separately, not compiled as product source. A verified
+ancestor already in the locked guest checkout permits an incremental bundle;
+first use or snapshot rollback automatically uses full history. The guest fetches
+and checks out the specified SHA detached in `C:\build\aft\repo`, keeping Cargo's
+`C:\build\aft\target` and toolchain/dependency caches warm. The x64 VS dev shell
+is sourced for each remote command; provisioning and vm-smoke are never modified.
+
+A guest-side exclusive lock names its holder, start and cap. Busy runs refuse;
+expired abandoned locks are reclaimed, never a still-held lock. The supervisor
+bounds transfer/build/tests, kills the complete process tree on timeout/cancel,
+and uses a kill-on-close Windows Job Object to cover supervisor/SSH death. Fresh
+HOME/USERPROFILE/APPDATA/LOCALAPPDATA, XDG and temp directories are created per
+run under `C:\build\aft\runs`; ambient AFT storage/config overrides and injected
+Git config are removed. Test fixture Git identity is disposable. Cleanup deletes
+run data after stopping descendants, leaving repo and target warm. Abandoned
+run directories are reclaimed on a later run. Output streams live and repeats
+libtest failing names, panic blocks and compilation/setup failures at the end.
+
+Local control checks: `python3 scripts/lib/test_windows_gate.py`,
+`bash -n scripts/windows-gate.sh`, `shellcheck -S warning scripts/windows-gate.sh`.
