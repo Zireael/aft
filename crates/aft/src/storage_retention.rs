@@ -276,7 +276,7 @@ fn missing_and_old(binding: &Binding, now: u64) -> bool {
 
 pub(crate) fn missing_root_due(storage: &Path, root: &Path, last_bind_ms: u64) -> bool {
     let root = crate::root_cache::canonical_root(root);
-    let scope = crate::path_identity::project_scope_key(&root);
+    let scope = missing_root_scope_key(&root);
     match read_json::<Binding>(&storage.join(format!("retention/roots/{scope}.json"))) {
         Ok(mut binding) => {
             binding.last_bound_ms = binding.last_bound_ms.max(last_bind_ms);
@@ -291,6 +291,34 @@ pub(crate) fn missing_root_due(storage: &Path, root: &Path, last_bind_ms: u64) -
             },
             crate::pins::now_ms(),
         ),
+    }
+}
+
+// A missing checkout still needs the identity spelling used when it was bound.
+// In particular, Windows fs::canonicalize returns a verbatim (\\?\) path while
+// ProjectRootId uses its normalized identity spelling. The lexical fallback for
+// a now-missing verbatim path otherwise hashes a different key and misses the
+// durable binding. Resolve an existing ancestor through the same identity API,
+// then append the missing components without trying to canonicalize them.
+fn missing_root_scope_key(root: &Path) -> String {
+    let mut ancestor = root;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(identity) = crate::path_identity::ProjectRootId::from_path(ancestor) {
+            let mut normalized = identity.into_path_buf();
+            for component in missing.iter().rev() {
+                normalized.push(component);
+            }
+            return crate::path_identity::project_scope_key(&normalized);
+        }
+        let Some(component) = ancestor.file_name() else {
+            return crate::path_identity::project_scope_key(root);
+        };
+        missing.push(component.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return crate::path_identity::project_scope_key(root);
+        };
+        ancestor = parent;
     }
 }
 
@@ -956,6 +984,18 @@ mod storage_retention_tests {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("payload.bin"), b"rebuildable").unwrap();
         path
+    }
+
+    #[test]
+    fn missing_root_retention_finds_the_identity_recorded_while_present() {
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(&root).unwrap();
+        let missing = crate::root_cache::canonical_root(&root);
+        assert_eq!(missing_root_scope_key(&missing), scope);
+        assert!(
+            missing_root_due(temp.path(), &root, 0),
+            "old missing root lost its durable binding: root={root:?} missing={missing:?} scope={scope}"
+        );
     }
 
     #[test]
