@@ -59,8 +59,12 @@ thread_local! {
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteLaunch {
     pub params: crate::exec_remote::FrozenParams,
+    // Remote dispatch runs only on Unix; Windows carries the policy but never dials.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub connection_file: Option<PathBuf>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub harness: String,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub session: String,
 }
 

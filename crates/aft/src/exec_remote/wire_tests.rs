@@ -11,6 +11,8 @@ pub(crate) fn id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
 }
 
+// Most scripts drive the Unix-only remote bash tests.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(crate) enum Script {
     Lost,
