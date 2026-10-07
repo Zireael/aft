@@ -1451,7 +1451,7 @@ async fn old_shape_prefix_routing_survives_the_runon_kill_switch_and_runon_works
             plain.data["task_id"].as_str().unwrap(),
         )
         .await;
-        assert_eq!(done.info.status, BgTaskStatus::Completed);
+        assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
         assert_eq!(
             exec_runs(&daemon).len(),
             1,
@@ -1469,7 +1469,7 @@ async fn old_shape_prefix_routing_survives_the_runon_kill_switch_and_runon_works
                 whole.data["task_id"].as_str().unwrap(),
             )
             .await;
-            assert_eq!(done.info.status, BgTaskStatus::Completed);
+            assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
             assert_eq!(exec_runs(&daemon).len(), 2);
         } else {
             assert!(!whole.success);
