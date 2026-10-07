@@ -297,6 +297,10 @@ async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
     let (bash_tx, mut bash_rx) = mpsc::channel(8);
     let (touch_tx, _touch_rx) = mpsc::channel(8);
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+    let deferred_tx = DeferredResponseSender {
+        entries: deferred_tx,
+        wake: crate::response_finalize::DeferredResponseWake::default(),
+    };
     handle_tool_call(
         &writer,
         &call,
@@ -406,6 +410,7 @@ async fn exec_remote_module_loop_captures_its_authenticated_daemon_endpoint() {
         1024 * 1024,
         None,
         dir.path(),
+        None,
     );
     let (result, _) = tokio::join!(module_task, peer_task);
     result.unwrap();

@@ -287,6 +287,18 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "bash_background/remote.rs",
+        enclosing_item: "append_executor_environment_disclosure",
+        location_or_primitive: "executor environment name preview min(10)",
+        reason: "supplemental execution note names at most ten filtered environment variables and explicitly counts the rest with +N more; the complete executor report remains in persisted task metadata, not a paginated tool-result list",
+    },
+    ExclusionEntry {
+        file: "db/remote_exec.rs",
+        enclosing_item: "sweep",
+        location_or_primitive: "MAX_FROZEN_POLICIES / POLICY_SWEEP_BATCH SQL LIMIT",
+        reason: "internal policy-retention maintenance scans bounded pages and persists its rotation cursor; it does not produce an agent-visible list or change an active scope's policy identity",
+    },
+    ExclusionEntry {
         file: "url_fetch.rs",
         enclosing_item: "hash_url",
         location_or_primitive: "URL cache hash prefix",

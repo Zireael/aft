@@ -17,8 +17,11 @@ The JCS digest is `7ee77dd3db1fb24f5c4bf7af02ba1c8af39c9d5ecfcbb55dcf68f62954705
 All three copied files were checked against their matching entries in that
 commit's `test-vectors/exec-remote-v1/SHA256SUMS`; the JCS was also checked
 against `accepted.sha256`. These are the only newly vendored protocol files.
-Older protocol outcomes/replies are read from the one locked published types
-package, not duplicated here. The core policy/plans above retain their separate
+Older protocol outcomes/replies remain embedded in
+`tests/fixtures/exec-remote/published-v0.2.0.json`, so unit tests do not run Cargo
+or depend on its registry cache. All 26 outcomes and 16 replies, including their
+original digests, were checked byte-for-byte against the locked published 0.2.1
+package and are unchanged. The core policy/plans above retain their separate
 519c93ee4a5e provenance; they are not the earlier motor-protocol corpus.
 
 The matching upstream `SHA256SUMS` entries are:
