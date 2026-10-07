@@ -181,3 +181,26 @@ fn stage_card_runs_the_floor_gate_before_staging_the_card() {
         "a refused card must stop stage-card"
     );
 }
+
+/// Test-launched candidate probes must not borrow the production executable name.
+#[test]
+fn stage_card_executes_candidates_under_ckdev_names() {
+    let root = repo_root();
+    let script = fs::read_to_string(root.join("scripts/stage-card.sh")).unwrap();
+    let signature = fs::read_to_string(root.join("scripts/lib/ck-aft-signature.sh")).unwrap();
+
+    assert!(
+        script.contains(r#"TMP="$(mktemp "$STAGING/ckdev-aft.tmp.XXXXXX")""#),
+        "the candidate that receives the format probe must have a developer name"
+    );
+    assert!(
+        script.contains(r#"VERSION_BINARY="$(mktemp "$STAGING/ckdev-aft.version.XXXXXX")""#)
+            && script.contains(r#"VERSION="$("$VERSION_BINARY" --version"#),
+        "the staged card version probe must execute a ckdev copy"
+    );
+    assert!(
+        signature.contains(r#"cp "$binary" "$work/ckdev-aft""#)
+            && signature.contains(r#""$work/ckdev-aft" warmup"#),
+        "the ONNX smoke test must execute a ckdev copy"
+    );
+}

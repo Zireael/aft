@@ -1,6 +1,16 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { appendFileSync, constants } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 
@@ -223,9 +233,22 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   };
 
   let daemon: ChildProcessWithoutNullStreams | null = null;
+  let testExecutableDir: string | null = null;
+  let testDaemonPath: string;
   try {
-    daemon = await spawnReadyDaemon(prepared.subcCorePath, daemonDirs);
+    // Keep the executable in the cache tree so the orphan sweep can still
+    // identify and reap it if the test runner exits before cleanup.
+    await mkdir(FETCHED_SUBC_CORE_CACHE_ROOT, { recursive: true });
+    testExecutableDir = await mkdtemp(join(FETCHED_SUBC_CORE_CACHE_ROOT, ".rig-"));
+    testDaemonPath = join(
+      testExecutableDir,
+      `ckdev-subc${process.platform === "win32" ? ".exe" : ""}`,
+    );
+    await copyFile(prepared.subcCorePath, testDaemonPath);
+    if (process.platform !== "win32") await chmod(testDaemonPath, 0o755);
+    daemon = await spawnReadyDaemon(testDaemonPath, daemonDirs);
   } catch (err) {
+    if (testExecutableDir) await safeRemoveDir(testExecutableDir);
     await safeRemoveDir(tempDir);
     throw err;
   }
@@ -266,13 +289,14 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
     restartDaemon: async () => {
       if (cleaned) throw new Error("subc rig already cleaned up");
       await stopDaemon(daemon);
-      daemon = await spawnReadyDaemon(prepared.subcCorePath, daemonDirs);
+      daemon = await spawnReadyDaemon(testDaemonPath, daemonDirs);
     },
     cleanup: async () => {
       if (cleaned) return;
       cleaned = true;
       await stopDaemon(daemon);
       await safeRemoveDir(tempDir);
+      if (testExecutableDir) await safeRemoveDir(testExecutableDir);
     },
   };
 }
@@ -733,9 +757,8 @@ async function findAftModuleProcess(
  *
  * A process qualifies only when both hold:
  *   - its executable lives under `cacheRoot` (the fetched test-binary cache).
- *     The name `ck-subc` is deliberately NOT part of the test: the production
- *     supervisor and other checkouts' supervisors share that name, and only the
- *     cache path distinguishes a daemon this test rig fetched and started.
+ *     The sweep does not match the `ckdev-subc` basename; the cache path and
+ *     ownership record distinguish daemons started by this rig.
  *   - its recorded runner is gone (including reuse of the runner pid). The
  *     parent may be a child subreaper rather than pid 1 on Linux. Only older
  *     daemons without ownership records use parent pid 1 as a fallback.

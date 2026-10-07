@@ -127,7 +127,8 @@ describe.skipIf(POSIX_ONLY)("subc rig orphan daemon sweep", () => {
     test(scenario.name, async () => {
       const sleepBinary = await resolveSleepBinary();
       const cacheRoot = await mkdtemp(join(tmpdir(), "subc-rig-sweep-cache-"));
-      const fakeDaemon = join(cacheRoot, "ck-subc");
+      const fakeDaemon = join(cacheRoot, "ckdev-subc");
+      expect(fakeDaemon.split(/[\\/]/).at(-1)).toBe("ckdev-subc");
       // Execute a symlink so macOS preserves the platform binary's signature.
       await symlink(sleepBinary, fakeDaemon);
       let planted: PlantedProcess | undefined;

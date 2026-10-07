@@ -118,7 +118,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 mkdir -p "$STAGING"
-TMP="$(mktemp "$STAGING/ck-aft.tmp.XXXXXX")"
+TMP="$(mktemp "$STAGING/ckdev-aft.tmp.XXXXXX")"
 cp "$BIN" "$TMP"
 chmod 755 "$TMP"
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -185,7 +185,11 @@ mv "$TMP" "$STAGING/$CARD"
 # line plus a UTC stamp; the gate treats it as inert if absent.
 printf '%s  %s  %s\n' "$HASH" "$CARD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STAGING/ck-aft.current"
 
-VERSION="$("$STAGING/$CARD" --version 2>/dev/null | head -1)"
+VERSION_BINARY="$(mktemp "$STAGING/ckdev-aft.version.XXXXXX")"
+cp "$STAGING/$CARD" "$VERSION_BINARY"
+chmod 755 "$VERSION_BINARY"
+VERSION="$("$VERSION_BINARY" --version 2>/dev/null | head -1)"
+rm -f "$VERSION_BINARY"
 echo "==> card: $STAGING/$CARD"
 echo "    sha256: $HASH"
 echo "    self-report: $VERSION (source $SHA)"
