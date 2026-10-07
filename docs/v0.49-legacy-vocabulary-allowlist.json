@@ -2555,6 +2555,116 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 421,
+      "column": 51,
+      "token": "filePath",
+      "text": "let body = json!({\"name\":\"read\",\"arguments\":{\"filePath\":\"input.txt\"},\"call_key\":\"replay\"});",
+      "location": "line 421, column 51",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 439,
+      "column": 48,
+      "token": "filePath",
+      "text": "json!({\"name\":\"read\",\"arguments\":{\"filePath\":\"missing.txt\"},\"call_key\":\"replay\"}),",
+      "location": "line 439, column 48",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 448,
+      "column": 48,
+      "token": "filePath",
+      "text": "json!({\"name\":\"read\",\"arguments\":{\"filePath\":\"input.txt\"}}),",
+      "location": "line 448, column 48",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 459,
+      "column": 52,
+      "token": "filePath",
+      "text": "json!({\"name\":\"read\",\"arguments\":{\"filePath\":\"input.txt\"},\"call_key\":\"legacy\"}),",
+      "location": "line 459, column 52",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 511,
+      "column": 51,
+      "token": "filePath",
+      "text": "let body = json!({\"name\":\"read\",\"arguments\":{\"filePath\":\"input.txt\"},\"call_key\":\"scoped\"});",
+      "location": "line 511, column 51",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 551,
+      "column": 54,
+      "token": "filePath",
+      "text": "let missing = json!({\"name\":\"read\",\"arguments\":{\"filePath\":\"missing.txt\"}});",
+      "location": "line 551, column 54",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 610,
+      "column": 48,
+      "token": "filePath",
+      "text": "json!({\"name\":\"read\",\"arguments\":{\"filePath\":\"input.txt\"},\"call_key\":\"seed\"}),",
+      "location": "line 610, column 48",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 631,
+      "column": 44,
+      "token": "filePath",
+      "text": "json!({\"name\":\"read\",\"arguments\":{\"filePath\":\"input.txt\"},\"call_key\":\"blocked-read\"}),",
+      "location": "line 631, column 44",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 646,
+      "column": 48,
+      "token": "filePath",
+      "text": "json!({\"name\":\"read\",\"arguments\":{\"filePath\":\"input.txt\"}}),",
+      "location": "line 646, column 48",
+      "ordinal": 2,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance.rs",
+      "line": 1323,
+      "column": 74,
+      "token": "filePath",
+      "text": "let read_body = json!({\"name\":\"read\",\"schema_pin\":null,\"arguments\":{\"filePath\":\"missing.txt\"}});",
+      "location": "line 1323, column 74",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "docs/design/opencode-v2-plugin-playbook.md",
       "line": 75,
       "column": 15,
