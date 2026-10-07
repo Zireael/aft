@@ -360,9 +360,17 @@ impl PauseAt {
     }
 
     fn wait_until_reached(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut state = self.state.lock().unwrap();
         while !state.reached {
-            state = self.changed.wait(state).unwrap();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let (next, _) = self.changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(
+                state.reached || std::time::Instant::now() < deadline,
+                "sweep never reached {:?}; the sweep may have retained the member before removal",
+                self.step
+            );
         }
     }
 
@@ -403,6 +411,11 @@ fn an_owner_pin_taken_while_removal_is_pending_keeps_the_member() {
     // The first sweep only counts the missing root.
     let first = sweep_family(&registry, None, COLLECT_ALL, None).unwrap();
     assert!(first.deregistered.is_empty(), "{first:?}");
+    assert_eq!(
+        first.missing_root_retained,
+        ["scope-gone"],
+        "the first pass must count the missing root before waiting for RemovalPending: {first:?}"
+    );
 
     // The second sweep would remove the member; the owner pins meanwhile.
     let pause = PauseAt::new(SweepStep::RemovalPending);
