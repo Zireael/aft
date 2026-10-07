@@ -6640,24 +6640,24 @@ mod deferred_terminal_tests {
             });
         });
         let manager = crate::inspect::InspectManager::new();
-        // The phase wait takes half the budget left after the reserve (450 ms
-        // here), so the budget assertion below tolerates up to 450 ms of
-        // scheduling overshoot. A 120 ms budget left only 40 ms, which a loaded
-        // macOS runner exceeded.
+        // Deadline selection is deterministic; the assertion must not measure
+        // how soon a loaded runner schedules this thread after the wait.
         let deadline =
-            InspectRequestDeadline::new(Duration::from_millis(1_000), Duration::from_millis(100));
+            InspectRequestDeadline::new(Duration::from_secs(30), Duration::from_millis(100));
+        assert_eq!(
+            deadline.terminal_at - deadline.work_at,
+            Duration::from_millis(100),
+            "deadline selection reserves terminal-response budget"
+        );
+        let phase_deadline = deadline.phase_deadline(Duration::from_millis(150));
         let outcome = receive_tier2_completion_until(
             rx,
             &manager,
             InspectCategory::DeadCode,
-            deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP),
+            phase_deadline,
             Some(deadline),
         )
         .expect("deadline produces an honest failure");
-        assert!(
-            deadline.has_work_budget(),
-            "the phase wait must leave budget for other categories and verification"
-        );
         assert!(matches!(
             outcome,
             JobOutcome::Failed { message } if message.contains("inspect_phase_timeout")

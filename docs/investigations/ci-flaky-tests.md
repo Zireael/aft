@@ -133,3 +133,40 @@ The first Mac baseline compile queued behind other worktrees for 30 minutes
 and was terminated before tests ran. Subsequent native checks use the remote
 Linux build service per the task reviewer's direction; Windows compilation
 remains the named local cross-check.
+
+### Batch: Rust inspect deadline mechanisms
+
+- The ignoring producer now waits for a release signal, not a 250 ms sleep.
+  The test checks permit release while that producer cannot have completed;
+  its root and limiter are per invocation. Positive waits have a 30 s hang
+  ceiling.
+- The cooperative test now asserts observed cancellation, the deadline-owned
+  timeout outcome and an empty permit census, not `< 250 ms` elapsed time.
+  Its name changed from `returns_within_grace` to `observes_cancellation` to
+  disclose that this is a mechanism contract, not a latency SLA.
+- The shared-request test checks the reserved terminal budget structurally
+  and the named phase-timeout outcome while its producer is still gated. It
+  no longer asserts remaining wall-clock budget after scheduler wakeup.
+- Remote Linux gate: `cargo test -p agent-file-tools --lib --
+  tier2_deadline_tests shared_request_deadline_returns_a_named_tier2_terminal_before_slow_work
+  --test-threads 4`: **3 passed, 0 failed**.
+- Mutation: withholding the permit from the deadline controller failed only
+  `tier2_pass_deadline_releases_limiter_while_ignoring_stub_still_runs` with
+  `deadline did not release limiter slot`; both other tests passed.
+- Mutation: completing without cancellation failed only
+  `tier2_pass_deadline_cooperative_stub_observes_cancellation` with
+  `deadline must own the cancellation request`; both other tests passed.
+- Mutation: sending Fresh before releasing the slow producer failed only
+  `shared_request_deadline_returns_a_named_tier2_terminal_before_slow_work`
+  with the `inspect_phase_timeout` outcome assertion; both other tests passed.
+- Each control used staged live files and had a non-empty `git diff --stat`
+  during the mutation and an empty one after `git checkout --` plus `touch`.
+- Stress: temporary test-side helpers ran **each of the three changed tests
+  20 times, with four concurrent contenders** (four lanes × five iterations).
+  Output: `both tier2 deadline tests passed 20/20 with four concurrent
+  contenders`; `shared-request deadline test passed 20/20 with four concurrent
+  contenders`. **2 helper tests passed, 0 failed**. Helpers were removed and
+  the final-source 3-test gate passed again. No retries or synthetic CPU load.
+- `cargo fmt --all -- --check`: exit 0, rustfmt 1.10.0-stable. Compiler baseline
+  is rustc 1.99.0 / cargo 1.99.0; the remote commands reported `ran remotely on
+  ck-motor`.
