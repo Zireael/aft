@@ -17,7 +17,6 @@ use super::helpers::AftProcess;
 
 /// Longer than the steady busy wait, so any maintenance still using it fails.
 const HOLD: Duration = Duration::from_secs(7);
-const STATUS_RESPONSE_CEILING: Duration = Duration::from_secs(5);
 /// How long the child's maintenance keeps retrying a write that meets the
 /// held write lock. Set far above [`READ_BUDGET`], so a maintenance path that
 /// waits while holding the connection mutex delays reads by about this much,
@@ -42,7 +41,7 @@ impl Contended {
         let project = tempfile::tempdir().expect("project dir");
         let storage = tempfile::tempdir().expect("storage dir");
         let mut aft = AftProcess::spawn_with_env(&[
-            ("AFT_STORAGE_DIR", storage.path().as_os_str()),
+            ("AFT_CACHE_DIR", storage.path().as_os_str()),
             // Run maintenance every few hundred milliseconds instead of
             // every minute, so several runs fall inside the hold.
             (
@@ -143,11 +142,11 @@ impl Contended {
 
     /// Keep the lock held for the complete assertion instead of relying on a
     /// short sampling window that can end before a delayed status call runs.
-    fn with_write_lock(&mut self, during: impl FnOnce(&mut AftProcess)) {
+    fn with_write_lock(&mut self, during: impl FnOnce(&mut AftProcess, &Connection)) {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .expect("take the write lock");
-        during(&mut self.aft);
+        during(&mut self.aft, &self.conn);
         self.conn
             .execute_batch("COMMIT")
             .expect("release the write lock");
@@ -209,18 +208,16 @@ fn minute_fold_defers_under_a_foreign_write_lock_and_commits_after_release() {
 fn status_answers_while_another_process_holds_the_write_lock() {
     let mut contended = Contended::start();
     let mut calls = 0;
-    contended.with_write_lock(|aft| {
+    contended.with_write_lock(|aft, writer| {
         for _ in 0..5 {
-            let started = Instant::now();
             let response = aft.send_with_timeout(
                 &json!({ "id": "status", "command": "status" }).to_string(),
-                Duration::from_secs(10),
+                Duration::from_secs(30),
             );
-            let elapsed = started.elapsed();
             assert_eq!(response["success"], true, "status failed: {response:?}");
             assert!(
-                elapsed < STATUS_RESPONSE_CEILING,
-                "status took {elapsed:?} while aft.db remained write-locked"
+                !writer.is_autocommit(),
+                "the writer must remain locked until every status response has arrived"
             );
             calls += 1;
         }

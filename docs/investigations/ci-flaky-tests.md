@@ -194,3 +194,50 @@ remain. All channels/roots are owned by the individual test.
   no retries. Output: `each saturated push test passed 20/20 with four
   concurrent contenders`. **1 helper passed, 0 failed**; it was removed and
   the final 2-test gate passed. Rust formatting passed again.
+
+### Batch: shutdown and database lock fixtures
+
+- The held-write-lock status test no longer samples request latencies. Five
+  successful responses must arrive while its transaction is still open;
+  `is_autocommit()` checks that ordering after each response. The response
+  wait is a 30 s hang ceiling. Child storage uses an isolated cache root, not
+  `AFT_STORAGE_DIR`; the existing spawn helper supplies disposable HOME/XDG.
+- Shutdown now asserts one admitted **1500 ms** LSP phase, one server summary,
+  the durable terminal marker, existing phase-event overlap and no surviving
+  child PIDs. Numeric elapsed comparisons (2 s and budget+150 ms) are removed;
+  elapsed logging remains diagnostic. PID disappearance is condition-polled
+  with a 30 s ceiling.
+- Initial remote fixture failure: `InsecureParentDirectory { ... mode: 509 }`
+  (0775). Connection directories now explicitly use 0700, independent of the
+  runner umask; the real connection security checks are not weakened.
+- Native fixture build: `cargo build -p agent-file-tools --bin aft --features
+  test-timing-hooks`, Finished. Final focused integration gate: **3 passed**.
+  Affected `subc_detach_test` and `shared_db_contention_test` suites: **14 passed,
+  0 failed**, `--test-threads 4`. The existing synthetic `CpuHog` test was
+  excluded at invocation (`--skip
+  subc_drain_exit_stays_bounded_when_lsp_servers_ignore_sigterm_under_load`)
+  because the load rule forbids synthetic busy-loop stress. No source ignore
+  was added.
+- Mutations, all staged first and restored with an empty working diff:
+  - COMMIT before status requests: only the held-lock status test failed,
+    `the writer must remain locked until every status response has arrived`;
+    both shutdown tests passed. Delta: shared DB fixture, +2.
+  - LSP admission budget 1500 → 1400 in the **actual rebuilt binary**: only
+    `subc_drain_exits_with_many_live_lsp_servers_in_one_deadline` failed,
+    `all servers must be admitted under one 1500 ms shutdown budget`; status
+    passed. Delta: LSP manager, +2/-1. A first 3000 ms control was rejected by
+    the pre-existing compile-time exit-budget assertion before tests ran.
+  - Joining index flush before LSP shutdown in the **actual rebuilt binary**:
+    only `subc_drain_with_slow_writer_persists_terminal_line` failed,
+    `index flush and LSP shutdown intervals did not intersect`; status and
+    the other shutdown test passed. Delta: subc module, +3.
+  - Connection fixture mode 0775: only the many-server shutdown test failed
+    with `InsecureParentDirectory ... mode: 509`; status passed. Delta:
+    connection fixture, +2/-1. A 0755 control passed: the connection-file
+    contract forbids group write, not group read/traversal. This non-red
+    boundary control is reported rather than misrepresented as a proof.
+- Stress: a removed test-side helper ran **all three named tests 20/20**,
+  four lanes × five iterations, with real concurrent module/fake-server work
+  (not CPU hogs). Output: `both shutdown tests and locked-status test passed
+  20/20 with four concurrent contenders`; **1 helper passed, 0 failed** in
+  63.62 s. The restored real binary and final test sources were reverified.
