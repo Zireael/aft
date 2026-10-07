@@ -17,6 +17,8 @@ import uuid
 
 ROOT = "C:/build/aft"
 READY = "AFT_WINDOWS_GATE_READY "
+MAINTENANCE_EXIT = 75
+MAINTENANCE_LOCK = "C:/build/maintenance.lock"
 DEV_SHELL = "$ProgressPreference='SilentlyContinue'; . C:\\build\\provision\\dev-shell.ps1; "
 
 
@@ -129,16 +131,30 @@ def stream_output(process, lines, events):
     events.put(None)
 
 
+def prepare_command(remote):
+    # Refuse before uploading or reserving anything in the VM's build directory.
+    return ("$ErrorActionPreference='Stop'; if (Test-Path '" + MAINTENANCE_LOCK
+            + "') { Write-Output 'VM in maintenance (" + MAINTENANCE_LOCK + ")'; exit "
+            + str(MAINTENANCE_EXIT) + " }; New-Item -ItemType Directory -Force -Path '"
+            + remote + "' | Out-Null")
+
+
+def failure_exit_code(returncode):
+    return MAINTENANCE_EXIT if returncode == MAINTENANCE_EXIT else 1
+
+
 def run_gate(guest, sha, base, jobs, cap):
     run_id = uuid.uuid4().hex
     remote = ROOT + "/runs/" + run_id
     holder = socket.gethostname() + ":" + str(os.getpid()) + ":" + sha[:12]
     helper = Path(__file__).with_name("windows-gate.ps1")
     process = None
+    remote_created = False
     lines = []
     start = time.monotonic()
     try:
-        guest.run("$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Force -Path '" + remote + "' | Out-Null")
+        guest.run(prepare_command(remote))
+        remote_created = True
         guest.copy(helper, remote + "/gate.ps1")
         process = subprocess.Popen(guest.command("& '" + remote + "/gate.ps1' -Mode Supervisor -RunId '" + run_id
                                   + "' -CapSeconds " + str(cap) + " -Holder '" + holder.replace("'", "''") + "'; exit $LASTEXITCODE"),
@@ -189,11 +205,13 @@ def run_gate(guest, sha, base, jobs, cap):
         try:
             cleanup = Guest(Path(guest.options[1]), time.monotonic() + 30)
             # The supervisor owns cleanup once launched; never remove a live run.
-            cleanup.run("if ((Test-Path '" + remote + "') -and -not (Test-Path '" + ROOT + "/gate.lock')) { Remove-Item -Recurse -Force '" + remote + "' }")
+            if remote_created:
+                cleanup.run("if ((Test-Path '" + remote + "') -and -not (Test-Path '" + ROOT + "/gate.lock')) { Remove-Item -Recurse -Force '" + remote + "' }")
         except (subprocess.SubprocessError, OSError):
             print("Remote cleanup unavailable; guest cap/next run will reclaim abandoned run directories.", file=sys.stderr)
-        print("\nWindows failure summary:\n" + failure_summary(lines) if not (process is not None and
-              gate_exit_code(process.returncode, lines) == 0) else "\nWindows gate passed.", flush=True)
+        if remote_created:
+            print("\nWindows failure summary:\n" + failure_summary(lines) if not (process is not None and
+                  gate_exit_code(process.returncode, lines) == 0) else "\nWindows gate passed.", flush=True)
         print("Windows gate wall time: {:.2f}s".format(time.monotonic() - start), flush=True)
 
 
@@ -215,6 +233,7 @@ def main():
         guest.run("$ErrorActionPreference='Stop'; $disk=Get-PSDrive C; Write-Output ('C: free {0:N2} GiB' -f ($disk.Free/1GB)); "
                   "$size=(Get-ChildItem '" + ROOT + "/target' -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum; "
                   "Write-Output ('Target {0}: {1:N2} GiB' -f '" + ROOT + "/target', ($size/1GB)); "
+                  "if (Test-Path '" + MAINTENANCE_LOCK + "') { Write-Output 'VM in maintenance' }; "
                   "if (Test-Path '" + ROOT + "/gate.lock') { Get-Content '" + ROOT + "/gate.lock' }")
         return 0
     os.chdir(git("rev-parse", "--show-toplevel"))
@@ -244,6 +263,10 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except subprocess.CalledProcessError as error:
+        label = "VM in maintenance" if error.returncode == MAINTENANCE_EXIT else "WINDOWS GATE FAILED"
+        print(label + ": " + str(error), file=sys.stderr)
+        sys.exit(failure_exit_code(error.returncode))
     except (subprocess.SubprocessError, OSError, RuntimeError, queue.Empty) as error:
         print("WINDOWS GATE FAILED: " + str(error), file=sys.stderr)
         sys.exit(1)

@@ -166,7 +166,16 @@ and checks out the specified SHA detached in `C:\build\aft\repo`, keeping Cargo'
 `C:\build\aft\target` and toolchain/dependency caches warm. The x64 VS dev shell
 is sourced for each remote command; provisioning and vm-smoke are never modified.
 
-A guest-side exclusive lock names its holder, start and cap. Busy runs refuse;
+A guest-side exclusive lock names its holder, start and cap. Before creating run
+data or taking that lock, the gate checks `C:\build\maintenance.lock` and refuses
+with **VM in maintenance**, exit **75** (test/setup failures use exit 1). The
+supervisor rechecks before acquiring its lock; it never creates or removes the
+maintenance marker. The VM owner can place that marker, let any existing gate
+finish, then maintain/reboot/snapshot the guest. `--status` is read-only and also
+reports the marker. Local tests inspect the actual encoded remote command and
+fake its exit 75; no marker is created on the real guest by these checks.
+
+Busy runs refuse;
 expired abandoned locks are reclaimed, never a still-held lock. The supervisor
 bounds transfer/build/tests, kills the complete process tree on timeout/cancel,
 and uses a kill-on-close Windows Job Object to cover supervisor/SSH death. Fresh

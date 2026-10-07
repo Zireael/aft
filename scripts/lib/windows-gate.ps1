@@ -13,6 +13,12 @@ $Root = 'C:\build\aft'
 $Repo = Join-Path $Root 'repo'
 $Run = Join-Path $Root "runs\$RunId"
 $LockPath = Join-Path $Root 'gate.lock'
+# Maintenance ownership is independent of this gate. Existing workers may finish,
+# but new supervisors must refuse before reserving the checkout or cargo target.
+if ($Mode -eq 'Supervisor' -and (Test-Path 'C:\build\maintenance.lock')) {
+    Write-Output 'VM in maintenance (C:\build\maintenance.lock)'
+    exit 75
+}
 
 function Invoke-Native([string]$Program, [string[]]$Arguments) {
     # Windows PowerShell wraps native stderr as ErrorRecords. Exit codes, not

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Local, network-free checks for the Windows gate's plan and failure summary."""
+import base64
 import importlib.util
 from pathlib import Path
+import subprocess
 import unittest
 
 spec = importlib.util.spec_from_file_location("windows_gate", Path(__file__).with_name("windows-gate.py"))
@@ -74,6 +76,31 @@ class WindowsGateTests(unittest.TestCase):
         self.assertEqual(gate.gate_exit_code(0, ["test result: ok. 10 passed;"]), 1)
         self.assertEqual(gate.gate_exit_code(1, ["GATE PASSED"]), 1)
         self.assertEqual(gate.gate_exit_code(0, ["GATE PASSED"]), 0)
+
+    def test_maintenance_probe_precedes_remote_directory_creation(self):
+        guest = gate.Guest(Path("/unused/ssh-config"), 0)
+        command = guest.command(gate.prepare_command("C:/build/aft/runs/local-proof"))
+        script = base64.b64decode(command[-1].split()[-1]).decode("utf-16le")
+        self.assertIn("if (Test-Path 'C:/build/maintenance.lock')", script)
+        self.assertIn("Write-Output 'VM in maintenance (C:/build/maintenance.lock)'; exit 75", script)
+        self.assertLess(script.index("exit 75"), script.index("New-Item"))
+        self.assertIn("StrictHostKeyChecking=yes", command)
+
+    def test_maintenance_exit_is_distinct_and_does_not_upload(self):
+        class MaintenanceGuest:
+            options = ["-F", "/unused/ssh-config"]
+            calls = []
+
+            def run(self, code):
+                self.calls.append(code)
+                raise subprocess.CalledProcessError(75, "local fake maintenance refusal")
+
+        guest = MaintenanceGuest()
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            gate.run_gate(guest, "0" * 40, "1" * 40, [], 60)
+        self.assertEqual(len(guest.calls), 1)
+        self.assertEqual(gate.failure_exit_code(caught.exception.returncode), 75)
+        self.assertEqual(gate.failure_exit_code(1), 1)
 
     def test_non_rust_diff_is_explicitly_empty(self):
         self.assertEqual(gate.select_tests(["docs/test-executable-consolidation.md", "scripts/train-push.sh"]), [])
