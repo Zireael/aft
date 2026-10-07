@@ -170,3 +170,27 @@ remains the named local cross-check.
 - `cargo fmt --all -- --check`: exit 0, rustfmt 1.10.0-stable. Compiler baseline
   is rustc 1.99.0 / cargo 1.99.0; the remote commands reported `ran remotely on
   ck-motor`.
+
+### Batch: saturated subc push queues
+
+Both `< 50 ms` assertions now observe a producer's return signal **before
+any consumer drains the full queue**, with a 30 s hang ceiling. The original
+reliable-bypass, overflow coalescing, dropped-frame and queue-content assertions
+remain. All channels/roots are owned by the individual test.
+
+- Remote final-source gate (both named tests, `--lib`, `--test-threads 4`):
+  **2 passed, 0 failed**.
+- Replacing overflow coalescing with a blocking send failed only
+  `progress_sender_keeps_reliable_off_saturated_lossy_funnel_without_blocking`:
+  `sender returned with saturated lossy queue still undrained: Timeout`.
+  The fan-out test passed.
+- Replacing writer try-enqueue with a blocking send failed only
+  `fan_out_lossy_push_frame_drops_when_writer_is_full_without_blocking`:
+  `fan-out returned with full writer queue still undrained: Timeout`.
+  The progress-sender test passed.
+- Staged-state mutation diffs were respectively `1 file, +2/-1` and
+  `1 file, +5/-7`; each restore had an empty working diff.
+- Temporary stress helper: **20/20 per test**, four lanes × five iterations,
+  no retries. Output: `each saturated push test passed 20/20 with four
+  concurrent contenders`. **1 helper passed, 0 failed**; it was removed and
+  the final 2-test gate passed. Rust formatting passed again.
