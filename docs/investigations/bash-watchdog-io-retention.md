@@ -98,10 +98,12 @@ No `alfonso:bg_*`, `alfonso:sidekick-*`, or `ses_*` occur in this specific cohor
 These are predominantly fixture-like patterns, not evidence of old OpenCode
 masons. Session patterns alone cannot prove historical consumption or a live
 OpenCode notification failure. The source does prove a transport-independent
-gap: notification-enabled terminal watch/status replies did not acknowledge
+gap: notification-enabled terminal watch replies did not acknowledge
 completion. Foreground no-notify tasks already acknowledge at terminal
 publication. The new reply seam consumes terminal results only for their
-originating session; internal status polling and foreign observations do not.
+originating session; read-only `bash_status` snapshots and foreign observations
+do not. A terminal status poll leaves the completion available for a later
+notification or explicit drain, even if rendering enqueues it after the poll.
 A stale rendering snapshot is also fenced against re-enqueuing after that ack.
 
 ## Why folders accumulated, and the repairs

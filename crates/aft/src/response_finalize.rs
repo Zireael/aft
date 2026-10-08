@@ -162,16 +162,16 @@ pub fn finalize_tool_response(
     enforce_reply_ceiling(attach_command, text);
 }
 
-/// Only agent-visible terminal replies consume a completion. Internal status
-/// polls do not pass this seam; reading another session's task cannot consume
-/// its durable result. Foreground, watch and status share it across transports.
+/// Foreground and watch replies consume terminal results for their originating
+/// session. `bash_status` is a read-only snapshot, even when terminal: polling
+/// it must leave the completion available for a later notification or drain.
 fn acknowledge_terminal_bash_reply(
     response: &Response,
     ctx: &AppContext,
     session_id: &str,
     command: &str,
 ) {
-    if !response.success || !matches!(command, "bash" | "bash_watch" | "bash_status") {
+    if !response.success || !matches!(command, "bash" | "bash_watch") {
         return;
     }
     if !response

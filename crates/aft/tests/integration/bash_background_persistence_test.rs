@@ -3146,7 +3146,7 @@ fn background_bash_uses_bash_syntax_when_available() {
 }
 
 #[test]
-fn terminal_status_reply_consumes_result_but_metadata_observation_does_not() {
+fn terminal_status_preserves_completion_until_explicit_acknowledges() {
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
@@ -3161,22 +3161,42 @@ fn terminal_status_reply_consumes_result_but_metadata_observation_does_not() {
     assert_eq!(reply["status"], "completed");
     assert_eq!(
         read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
-        true
+        false
     );
-    assert!(drain(&mut aft, SESSION)["bg_completions"]
-        .as_array()
-        .unwrap()
-        .is_empty());
     assert!(aft.shutdown().success());
     let mut restarted = AftProcess::spawn();
     configure_background(&mut restarted, project.path(), storage.path(), SESSION);
-    assert!(drain(&mut restarted, SESSION)["bg_completions"]
-        .as_array()
-        .unwrap()
-        .is_empty());
     assert_eq!(
         status(&mut restarted, SESSION, &task_id)["status"],
         "completed"
     );
+    let pending = drain(&mut restarted, SESSION);
+    assert_eq!(
+        pending["bg_completions"].as_array().unwrap().len(),
+        1,
+        "{pending}"
+    );
+    assert_eq!(pending["bg_completions"][0]["task_id"], task_id);
+    let collected_reply = ack(&mut restarted, SESSION, &task_id);
+    assert_eq!(collected_reply["success"], true, "{collected_reply}");
+    assert_eq!(
+        read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
+        true
+    );
+    assert!(drain(&mut restarted, SESSION)["bg_completions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert!(restarted.shutdown().success());
+    let mut collected = AftProcess::spawn();
+    configure_background(&mut collected, project.path(), storage.path(), SESSION);
+    assert!(drain(&mut collected, SESSION)["bg_completions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        status(&mut collected, SESSION, &task_id)["status"],
+        "completed"
+    );
+    assert!(collected.shutdown().success());
 }

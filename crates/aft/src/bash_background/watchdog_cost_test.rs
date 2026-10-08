@@ -242,6 +242,101 @@ fn watchdog_cost_scheduler_does_not_own_idle_registries() {
 }
 
 #[test]
+fn watchdog_cost_status_poll_preserves_session_completion_delivery() {
+    let storage = tempfile::tempdir().unwrap();
+    for tool_response in [false, true] {
+        for queued_before_poll in [false, true] {
+            let ctx = crate::context::AppContext::new(
+                crate::context::default_language_provider_factory(),
+                crate::config::Config::default(),
+            );
+            let registry = ctx.bash_background();
+            let (metadata, paths) = fixture(storage.path(), "origin", false, 0);
+            registry
+                .insert_rehydrated_task(metadata.clone(), paths.clone(), true)
+                .unwrap();
+            if queued_before_poll {
+                registry.enqueue_completion_from_parts(&metadata, None, Some(&paths), false, None);
+            }
+            let data = serde_json::json!({"task_id": paths.task_id, "status": "completed", "exit_code": 0, "output_preview": "done"});
+            let mut status = crate::protocol::Response::success("status", data.clone());
+            if tool_response {
+                crate::response_finalize::finalize_tool_response(
+                    &mut status,
+                    &mut String::new(),
+                    &ctx,
+                    "origin",
+                    "bash_status",
+                    true,
+                );
+            } else {
+                crate::response_finalize::finalize_response_with_bg_completions(
+                    &mut status,
+                    &ctx,
+                    "origin",
+                    "bash_status",
+                    true,
+                );
+            }
+            assert!(status.data.get("bg_completions").is_none());
+            assert!(
+                !read_task_at(&resolve_task_layout(&paths.session_dir, &paths.task_id).unwrap())
+                    .unwrap()
+                    .completion_delivered,
+                "a read-only terminal status poll acknowledged an undelivered completion"
+            );
+            let retention = Duration::from_secs(24 * 60 * 60);
+            let cleanup_at = Instant::now() + retention + Duration::from_secs(1);
+            registry.cleanup_finished_at(retention, cleanup_at);
+            assert!(paths.json.exists(), "cleanup removed an undelivered result");
+            // Terminal rendering can enqueue after a status snapshot is returned.
+            if !queued_before_poll {
+                registry.enqueue_completion_from_parts(&metadata, None, Some(&paths), false, None);
+            }
+            let mut foreign = crate::protocol::Response::success("foreign", serde_json::json!({}));
+            crate::response_finalize::finalize_response_with_bg_completions(
+                &mut foreign,
+                &ctx,
+                "other",
+                "echo",
+                true,
+            );
+            assert!(foreign.data.get("bg_completions").is_none());
+            let mut origin = crate::protocol::Response::success("origin", serde_json::json!({}));
+            crate::response_finalize::finalize_response_with_bg_completions(
+                &mut origin,
+                &ctx,
+                "origin",
+                "echo",
+                true,
+            );
+            assert_eq!(origin.data["bg_completions"][0]["task_id"], paths.task_id);
+            let mut watch = crate::protocol::Response::success("watch", data);
+            crate::response_finalize::finalize_response_with_bg_completions(
+                &mut watch,
+                &ctx,
+                "origin",
+                "bash_watch",
+                true,
+            );
+            assert!(registry
+                .drain_completions_for_session(Some("origin"))
+                .is_empty());
+            assert!(
+                read_task_at(&resolve_task_layout(&paths.session_dir, &paths.task_id).unwrap())
+                    .unwrap()
+                    .completion_delivered
+            );
+            registry.cleanup_finished_at(retention, cleanup_at);
+            assert!(
+                !paths.dir.exists(),
+                "cleanup retained a collected result past 24 hours"
+            );
+        }
+    }
+}
+
+#[test]
 fn watchdog_cost_terminal_reply_acknowledges_only_originating_session() {
     let storage = tempfile::tempdir().unwrap();
     let ctx = crate::context::AppContext::new(
@@ -258,7 +353,7 @@ fn watchdog_cost_terminal_reply_acknowledges_only_originating_session() {
         },
     ] {
         registry.set_harness(harness);
-        for command in ["bash_watch", "bash_status", "bash"] {
+        for command in ["bash_watch", "bash"] {
             let (metadata, paths) = fixture(storage.path(), "origin", false, 0);
             registry
                 .insert_rehydrated_task(metadata, paths.clone(), true)
@@ -497,8 +592,8 @@ fn watchdog_cost_terminal_reply_ack_fences_a_late_completion_snapshot() {
         .insert_rehydrated_task(snapshot.clone(), paths.clone(), true)
         .unwrap();
     registry.ack_terminal_result_for_session(&paths.task_id, "session");
-    // Rendering may finish after the caller has already received terminal
-    // status. Its pre-ack snapshot must not restore a notification afterward.
+    // Rendering may finish after the caller has already received a terminal
+    // watch reply. Its pre-ack snapshot must not restore a notification afterward.
     registry.enqueue_completion_from_parts(&snapshot, None, Some(&paths), false, None);
     assert!(
         registry.drain_completions().is_empty(),
