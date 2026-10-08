@@ -18,6 +18,12 @@ pub(crate) const BUDGET: Duration = Duration::from_secs(2);
 // include dependencies is a one-time cost; later requests reuse the ledger and
 // retain the much smaller serving budget.
 const INITIAL_CAPTURE_BUDGET: Duration = Duration::from_secs(15);
+// Filesystem timestamps can round a write down to a tick before the wall-clock
+// instant at which it actually happened. Two seconds covers coarse timestamp
+// resolution as well as sub-second Unix clock ticks. Inputs inside that window
+// cannot certify a check's starting state: skip persistence rather than reuse
+// diagnostics for bytes the compiler may never have read.
+const CHECK_BEGIN_TIMESTAMP_MARGIN: Duration = Duration::from_secs(2);
 // Worktree churn must not turn completed compiler checks into an unbounded disk cache.
 const MAX_RECORDS: usize = 64;
 const RECORD_SCAN_LIMIT: usize = 1024;
@@ -327,6 +333,10 @@ pub(crate) fn fingerprint(
     // or directory may have changed since the reader observed that event.
     began: Option<SystemTime>,
 ) -> Option<Fingerprint> {
+    let latest_safe_time = match began {
+        Some(begin) => Some(begin.checked_sub(CHECK_BEGIN_TIMESTAMP_MARGIN)?),
+        None => None,
+    };
     let mut files = BTreeMap::new();
     let mut report = WalkReport {
         root,
@@ -349,11 +359,11 @@ pub(crate) fn fingerprint(
     while let Some(directory) = pending.pop() {
         report.last = directory.clone();
         expired(deadline)?;
-        if began.is_some_and(|begin| {
+        if latest_safe_time.is_some_and(|cutoff| {
             fs::metadata(&directory)
                 .ok()
                 .and_then(|m| m.modified().ok())
-                .is_none_or(|time| time > begin)
+                .is_none_or(|time| time >= cutoff)
         }) {
             return None;
         }
@@ -434,7 +444,9 @@ pub(crate) fn fingerprint(
             return None;
         }
         if metadata.is_dir() {
-            if began.is_some_and(|begin| metadata.modified().ok().is_none_or(|time| time > begin)) {
+            if latest_safe_time
+                .is_some_and(|cutoff| metadata.modified().ok().is_none_or(|time| time >= cutoff))
+            {
                 return None;
             }
             let mut entries = fs::read_dir(path).ok()?;
@@ -451,15 +463,15 @@ pub(crate) fn fingerprint(
             return None;
         }
         let mut current = stamp(&fs::metadata(&path).ok()?)?;
-        if let Some(begin) = began {
-            let begin = begin.duration_since(UNIX_EPOCH).ok()?.as_nanos();
-            if current.modified > begin {
+        if let Some(cutoff) = latest_safe_time {
+            let cutoff = cutoff.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+            if current.modified >= cutoff {
                 return None;
             }
             #[cfg(unix)]
             if current
                 .changed
-                .is_none_or(|(s, ns)| s < 0 || (s as u128 * 1_000_000_000 + ns as u128) > begin)
+                .is_none_or(|(s, ns)| s < 0 || (s as u128 * 1_000_000_000 + ns as u128) >= cutoff)
             {
                 return None;
             }
@@ -2115,6 +2127,13 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn begin_after_fixture_inputs() -> SystemTime {
+        // Simulate a check starting after the fixture's freshly written inputs
+        // are unambiguously old, without sleeping or relying on scheduler time.
+        SystemTime::now() + Duration::from_secs(3)
+    }
+
+    #[cfg(unix)]
     fn live_fixture() -> (tempfile::TempDir, CompletedRustCheck) {
         use std::os::unix::fs::PermissionsExt;
         let (temp, mut cache) = fixture();
@@ -2126,6 +2145,12 @@ mod tests {
             .runtime
             .env
             .insert("RUSTC".into(), compiler.to_string_lossy().into_owned());
+        // The fixture writes its own build-script output here; an inherited
+        // Cargo target directory must not redirect that input discovery.
+        cache.runtime.env.insert(
+            "CARGO_TARGET_DIR".into(),
+            cache.root.join("target").to_string_lossy().into_owned(),
+        );
         cache.runtime.launch_env = Some(cache.runtime.effective_env().unwrap());
         write(
             &cache.root,
@@ -2134,7 +2159,7 @@ mod tests {
         );
         cache.saved = None;
         fs::remove_file(&cache.path).unwrap();
-        cache.begin(SystemTime::now());
+        cache.begin(begin_after_fixture_inputs());
         assert!(
             cache.pending.is_some(),
             "control: the check has known inputs"
@@ -2166,7 +2191,7 @@ mod tests {
         fs::write(&analyzer, "#!/bin/sh\nprintf 'analyzer 1\\n'\n").unwrap();
         fs::set_permissions(&analyzer, fs::Permissions::from_mode(0o755)).unwrap();
         cache.runtime.binary = analyzer.clone();
-        cache.begin(SystemTime::now());
+        cache.begin(begin_after_fixture_inputs());
         cache.finished = true;
         cache.complete();
         assert!(cache.validated(Instant::now() + BUDGET).is_some());
@@ -2204,11 +2229,24 @@ mod tests {
     fn check_beginning_before_last_edit_is_not_saved() {
         let (_temp, mut cache) = live_fixture();
         let before = fs::read(&cache.path).unwrap();
-        let began = SystemTime::now();
+        let began = begin_after_fixture_inputs();
         write(
             &cache.root,
             "member/src/lib.rs",
             "pub fn after_begin() {}\n",
+        );
+        // Model a post-begin edit whose coarse filesystem clock rounded its
+        // mtime to before the begin event. Pin the ambiguity explicitly so the
+        // test does not depend on which clock tick a fast write lands in.
+        let edited = cache.root.join("member/src/lib.rs");
+        let ambiguous_mtime = began - Duration::from_secs(1);
+        fs::File::open(&edited)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(ambiguous_mtime))
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&edited).unwrap().modified().unwrap(),
+            ambiguous_mtime
         );
         cache.begin(began);
         cache.finished = true;
@@ -2224,13 +2262,18 @@ mod tests {
     fn end_of_run_input_revalidation_refuses_changed_inputs() {
         let (_temp, mut cache) = live_fixture();
         let before = fs::read(&cache.path).unwrap();
-        cache.begin(SystemTime::now());
+        let began = begin_after_fixture_inputs();
+        cache.begin(began);
         assert!(cache.pending.is_some());
         write(
             &cache.root,
             "member/src/lib.rs",
             "pub fn during_check() {}\n",
         );
+        fs::File::open(cache.root.join("member/src/lib.rs"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(began + Duration::from_secs(1)))
+            .unwrap();
         cache.reports.insert(
             cache.root.join("member/src/lib.rs"),
             vec![StoredDiagnostic {

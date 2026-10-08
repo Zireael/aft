@@ -6250,7 +6250,10 @@ fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
         // Default fake startup is already quiescent; its check therefore begins
         // after workspace load. The warming variant settles only on didOpen,
         // which would leave a second compiler run owed after its first run.
-        ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "100");
+        // The successful control must begin after its freshly created inputs
+        // are outside the completed-check timestamp ambiguity window.
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "3000");
         if let Some(message) = result {
             ctx.lsp()
                 .set_extra_env("AFT_FAKE_LSP_CHECK_END_MESSAGE", message);
