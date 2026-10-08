@@ -2530,6 +2530,17 @@ fn subc_bridge_status_bar_returns_when_the_reader_goes_stale() {
 }
 
 #[test]
+fn subc_bridge_status_bar_survives_busy_diagnostics_without_losing_text() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_status_bar_survives_busy_diagnostics_without_losing_text",
+        Duration::from_secs(30),
+        fleet_consumer_env,
+        drive_busy_status_counts_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_session_scoped_bg_completion_and_push_isolation() {
     run_subc_bridge_test(
         "subc_bridge_session_scoped_bg_completion_and_push_isolation",
@@ -7736,8 +7747,13 @@ impl FakeStatusHolder {
             } }),
         )
         .await;
-        // Let the module record the ack before the next tool call reads it.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Discovery runs serially after publish completion. Seeing its next
+        // catalog request proves the module recorded the ack; a sleep after
+        // writing the reply cannot establish that on a busy runner.
+        let catalog =
+            read_raw_inventory_frame(&mut self.consumer_stream, "catalog after ack").await;
+        assert_eq!(frame_operation(&catalog).as_deref(), Some("catalog.list"));
+        reply_to(&mut self.consumer_stream, &catalog, holder_catalog()).await;
     }
 }
 
@@ -7846,11 +7862,18 @@ async fn agent_text_after_counts(
             && frame.header.channel == 1
             && frame.header.corr == corr
         {
-            let plugin_text = tool_response_json(&frame)["text"]
+            let response = tool_response_json(&frame);
+            assert_eq!(response["success"], true, "status-count call: {response:?}");
+            assert_eq!(response["case"], "status_bar");
+            let plugin_text = response["text"]
                 .as_str()
                 .expect("structured text")
                 .to_string();
             assert_eq!(plugin_text, tool_result_text(&frame));
+            assert!(
+                plugin_text.contains("\"case\":\"status_bar\""),
+                "echo body must remain rendered: {plugin_text:?}"
+            );
             return plugin_text;
         }
     }
@@ -7869,6 +7892,34 @@ fn assert_bar(text: &str, dead_code: u64, context: &str) {
     );
 }
 
+/// Finalization skips a busy diagnostics manager without consuming the bar's
+/// change gate. Wait for a later tool-result signal to render the seeded counts,
+/// rather than assuming RouteBindAck makes every count snapshot available.
+async fn assert_eventual_bar(
+    stream: &mut tokio::net::TcpStream,
+    mut corr: u64,
+    dead_code: u64,
+    context: &str,
+) {
+    let mut last_text = String::new();
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            last_text = agent_text_after_counts(stream, corr, dead_code).await;
+            if last_text.contains("[AFT ") {
+                assert_bar(&last_text, dead_code, context);
+                break;
+            }
+            corr += 1;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "{context}: seeded counts never rendered a status bar: {last_text:?}"
+    );
+}
+
 fn assert_no_bar(text: &str, context: &str) {
     assert!(
         !text.contains("[AFT "),
@@ -7882,23 +7933,26 @@ const PAST_PUBLISH_CADENCE: Duration = Duration::from_millis(2_700);
 
 async fn drive_live_holder_without_reader_daemon(input: FakeDaemonInput) {
     let mut stream = open_status_bar_module(&input).await;
-    let text = agent_text_after_counts(&mut stream, 80, 21).await;
-    assert_bar(&text, 21, "before any holder route");
+    assert_eventual_bar(&mut stream, 80_000, 21, "before any holder route").await;
 
     let mut holder =
         FakeStatusHolder::accept(&input.listener, &input.key, &input.daemon_id, &input.root1).await;
     holder.ack_next_publish(None).await;
 
     // The route to the holder is live, but nothing reads the scope.
-    let text = agent_text_after_counts(&mut stream, 81, 22).await;
-    assert_bar(&text, 22, "live holder route without a reader");
+    assert_eventual_bar(
+        &mut stream,
+        81_000,
+        22,
+        "live holder route without a reader",
+    )
+    .await;
     send_connection_goodbye(&mut stream).await;
 }
 
 async fn drive_recent_reader_daemon(input: FakeDaemonInput) {
     let mut stream = open_status_bar_module(&input).await;
-    let text = agent_text_after_counts(&mut stream, 80, 21).await;
-    assert_bar(&text, 21, "before any holder route");
+    assert_eventual_bar(&mut stream, 80_000, 21, "before any holder route").await;
 
     let mut holder =
         FakeStatusHolder::accept(&input.listener, &input.key, &input.daemon_id, &input.root1).await;
@@ -7912,8 +7966,7 @@ async fn drive_recent_reader_daemon(input: FakeDaemonInput) {
 async fn drive_reader_goes_stale_daemon(input: FakeDaemonInput) {
     let mut stream = open_status_bar_module(&input).await;
     let started = Instant::now();
-    let text = agent_text_after_counts(&mut stream, 80, 21).await;
-    assert_bar(&text, 21, "before any holder route");
+    assert_eventual_bar(&mut stream, 80_000, 21, "before any holder route").await;
 
     let mut holder =
         FakeStatusHolder::accept(&input.listener, &input.key, &input.daemon_id, &input.root1).await;
@@ -7929,8 +7982,28 @@ async fn drive_reader_goes_stale_daemon(input: FakeDaemonInput) {
     holder.ack_next_publish(Some(15_000)).await;
 
     // Counts are unchanged since the hidden bar, yet the agent never saw D22.
-    let text = agent_text_after_counts(&mut stream, 83, 22).await;
-    assert_bar(&text, 22, "reader stale past the window");
+    assert_eventual_bar(&mut stream, 83_000, 22, "reader stale past the window").await;
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_busy_status_counts_daemon(input: FakeDaemonInput) {
+    let mut stream = open_status_bar_module(&input).await;
+    let root_id = ProjectRootId::from_path(&input.root1).expect("bound root id");
+    let ctx = input
+        .executor
+        .actor_context(&root_id)
+        .expect("bound context");
+
+    // Hold the same manager a diagnostics producer uses until the response is
+    // received. This forces the contention window without scheduler timing.
+    let held = ctx.lsp();
+    let text = agent_text_after_counts(&mut stream, 79, 21).await;
+    assert_no_bar(&text, "busy diagnostics skip counts, not the rendered body");
+    drop(held);
+
+    // The skipped result must not swallow D21's change: unchanged counts become
+    // visible once a later result can take the diagnostics snapshot.
+    assert_eventual_bar(&mut stream, 80_000, 21, "diagnostics manager released").await;
     send_connection_goodbye(&mut stream).await;
 }
 
