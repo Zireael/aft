@@ -8826,6 +8826,8 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "sol"
                 | "scss"
                 | "vue"
+                | "yaml"
+                | "yml"
                 | "pas"
                 | "pp"
                 | "dpr"
@@ -8850,7 +8852,8 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "gsh"
                 | "gradle"
                 | "m"
-                | "mm",
+                | "mm"
+                | "toml",
         )
     )
 }

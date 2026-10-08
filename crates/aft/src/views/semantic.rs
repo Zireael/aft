@@ -2102,30 +2102,6 @@ mod tests {
         assert_canonical_blob(&b, &source.replace("input + 149\n", "input * 149\n"));
     }
 
-    #[test]
-    fn semantic_data_files_are_excluded_from_views_and_legacy() {
-        for path in ["mutations.toml", "config.yaml", "config.yml"] {
-            let relative = RelPath::new(path.as_bytes().to_vec()).unwrap();
-            assert!(!applies_to(&relative), "views admitted {path}");
-            assert!(
-                !crate::semantic_index::is_semantic_indexed_extension(Path::new(path)),
-                "legacy admitted {path}"
-            );
-            assert!(crate::semantic_index::chunk_view_file(
-                Path::new("."),
-                Path::new(path),
-                b"[table]\nkey = 1\n",
-                EmbedTextCaps::default()
-            )
-            .unwrap()
-            .is_none());
-            assert!(
-                crate::parser::detect_language(Path::new(path)).is_some(),
-                "parser support must remain"
-            );
-        }
-    }
-
     type Row = (String, String, u32, u32);
 
     fn rows(root: &Path, results: &[SemanticResult]) -> Vec<Row> {

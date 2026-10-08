@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Chunk-level embedding reuse for views: embeddings are keyed on the chunk text without line numbers and reused across files, versions and worktrees; vectors are stored as compact binary. The only fenced path is crates/aft/src/semantic_index.rs (visibility changes plus a rows-based embed entry point); the embedded text and resulting vectors are unchanged, so all 93 real-query rows must stay byte-identical. The TOML/YAML exclusion from the same delivery is left out of this train because it changes the candidate pool."
+}
