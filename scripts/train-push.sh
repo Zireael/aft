@@ -337,13 +337,35 @@ while true; do
     refuse "a train is already running on this machine; wait for it"
   fi
 
-  # Stale owner. Claim the removal with a rename, not an rm: two processes
-  # finding the same stale owner would both delete and both acquire, and the
-  # second delete would take the first one's fresh lock. rename(2) of the
-  # directory to an unused name fails ENOENT for whoever arrives second, so
-  # exactly one recovers; the loser loops and meets the winner's live lock.
-  if mv "$train_lock_held" "$train_lock_held.stale.$$" 2>/dev/null; then
-    rm -rf "$train_lock_held.stale.$$" 2>/dev/null || true
+  # Stale owner. Recovery is serialized by a second mkdir lock, `reap`. A
+  # rename alone was not enough: two trains reading the same stale owner both
+  # renamed `held`, and the second rename took the first one's FRESH lock
+  # (created by its mkdir after its own rename), so both trains proceeded.
+  # Inside `reap`, `held` cannot change hands: a fresh mkdir fails while it
+  # exists and every other remover is waiting on `reap`. So re-reading the
+  # owner there and finding the same stale record proves the removal is safe.
+  train_lock_reap="$train_lock_dir/reap"
+  if [ -n "${TRAIN_PUSH_TEST_LOCK_RACE_HOOK:-}" ]; then
+    "$TRAIN_PUSH_TEST_LOCK_RACE_HOOK"
+  fi
+  if mkdir "$train_lock_reap" 2>/dev/null; then
+    printf '%s\n%s\n' "$$" "$train_lock_my_start" > "$train_lock_reap/owner"
+    if [ "$(awk 'NR==1{print $1}' "$train_lock_held/owner" 2>/dev/null || true)" = "$owner_pid" ] &&
+      [ "$(awk 'NR==2' "$train_lock_held/owner" 2>/dev/null || true)" = "$owner_start" ]; then
+      rm -rf "$train_lock_held" 2>/dev/null || true
+    fi
+    rm -rf "$train_lock_reap" 2>/dev/null || true
+  else
+    reaper_pid="$(awk 'NR==1' "$train_lock_reap/owner" 2>/dev/null || true)"
+    reaper_start="$(awk 'NR==2' "$train_lock_reap/owner" 2>/dev/null || true)"
+    if [ -z "$reaper_pid" ] || ! kill -0 "$reaper_pid" 2>/dev/null ||
+      [ "$(train_lock_process_start "$reaper_pid")" != "$reaper_start" ]; then
+      # A reaper holds `reap` for a few milliseconds. One that is gone left
+      # it behind; removing it here would reopen the race, so fail closed.
+      printf 'train-push: a stale-lock recovery was interrupted.\n' >&2
+      printf '  if you are sure no train is running:  rm -rf %s %s\n' "$train_lock_reap" "$train_lock_held" >&2
+      refuse "train lock recovery left behind; refusing rather than racing it"
+    fi
   fi
 
   train_lock_attempts=$((train_lock_attempts + 1))

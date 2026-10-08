@@ -1723,6 +1723,32 @@ case "$(owner_line "$dir")" in
   *" stale") ok "the stale owner was replaced by this train" ;;
   *) fail "the owner file is neither the stale owner nor this train" ;;
 esac
+# test_a_stale_owner_recovered_by_another_train_is_not_dispossessed: two trains
+# read the same stale owner; the other one recovers first and takes a fresh,
+# live lock. This train must meet that live lock and refuse, never remove it.
+dir="$(new_fixture stale-race)"
+add_train_commit "$dir/work" "stale-race"
+plant_owner "$dir" 2147483000 gone
+sleep 60 &
+winner=$!
+winner_start="$(process_start "$winner")"
+cat > "$dir/race-hook.sh" <<HOOK
+#!/usr/bin/env bash
+held="$(lock_held "$dir")"
+rm -rf "\$held"
+mkdir "\$held"
+printf '%s %s\n%s\n' "$winner" winner "$winner_start" > "\$held/owner"
+HOOK
+chmod +x "$dir/race-hook.sh"
+TRAIN_PUSH_TEST_LOCK_RACE_HOOK="$dir/race-hook.sh" run_train "$dir" stale-race
+kill "$winner" 2>/dev/null || true
+expect_rc 2 "a train that lost the stale-lock recovery race refuses"
+case "$(owner_line "$dir")" in
+  *" winner") ok "the winner's fresh lock survived the losing recoverer" ;;
+  *) fail "the losing recoverer took the winner's fresh lock" ;;
+esac
+[ -z "$(origin_ref "$dir" refs/heads/train/stale-race)" ] ||
+  fail "the losing recoverer pushed a train ref"
 # test_a_recycled_pid_is_stale: the recorded pid is alive but is a different
 # process (its start time differs), as when macOS reuses a finished train's pid.
 dir="$(new_fixture recycled-pid)"
