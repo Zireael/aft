@@ -737,6 +737,18 @@ pub struct Tier2HealthSnapshot {
     pub next_refresh_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_paths: Option<usize>,
+    /// Categories whose last build failed, with the failure reason, that
+    /// automatic refreshes skip until their retry pause ends.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub retry_paused: Vec<Tier2RetryPausedHealthSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Tier2RetryPausedHealthSnapshot {
+    pub category: &'static str,
+    pub reason: String,
+    pub identical_failures: u32,
+    pub retry_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -786,6 +798,7 @@ pub(crate) struct RootHealthSummary {
     tier2_stale_since_ms: Option<u64>,
     tier2_next_refresh_at_ms: Option<u64>,
     tier2_pending_paths: Option<usize>,
+    tier2_retry_paused: Vec<Tier2RetryPausedHealthSnapshot>,
     bash: Option<BgTaskHealthCounts>,
     suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
 }
@@ -803,6 +816,7 @@ impl RootHealthSummary {
             tier2_stale_since_ms: None,
             tier2_next_refresh_at_ms: None,
             tier2_pending_paths: None,
+            tier2_retry_paused: Vec::new(),
             bash: None,
             suspended_domains: Vec::new(),
         }
@@ -873,6 +887,7 @@ impl RootHealthSummary {
                 stale_since_ms: self.tier2_stale_since_ms,
                 next_refresh_at_ms: self.tier2_next_refresh_at_ms,
                 pending_paths: self.tier2_pending_paths,
+                retry_paused: self.tier2_retry_paused,
             }),
             bash: self.bash,
             suspended_domains: self.suspended_domains,
@@ -4096,6 +4111,18 @@ impl AppContext {
             Some(busy) => busy,
             None => return RootHealthSummary::busy(),
         };
+        let tier2_retry_paused = match self.inspect_manager.try_tier2_retry_pauses() {
+            Some(pauses) => pauses
+                .into_iter()
+                .map(|pause| Tier2RetryPausedHealthSnapshot {
+                    category: pause.category.as_str(),
+                    reason: pause.reason,
+                    identical_failures: pause.identical_failures,
+                    retry_at_ms: pause.retry_at_ms,
+                })
+                .collect(),
+            None => return RootHealthSummary::busy(),
+        };
         let bash = match self.bash_background.try_health_counts() {
             Some(counts) => counts,
             None => return RootHealthSummary::busy(),
@@ -4335,6 +4362,7 @@ impl AppContext {
             tier2_stale_since_ms,
             tier2_next_refresh_at_ms,
             tier2_pending_paths,
+            tier2_retry_paused,
             bash: Some(bash),
             suspended_domains,
         }
@@ -8859,6 +8887,15 @@ impl AppContext {
     where
         I: IntoIterator<Item = PathBuf>,
     {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        // A change to a Tier-2 input ends any automatic-retry pause on a
+        // failed category, so a fix is picked up by the next automatic
+        // refresh instead of after the pause.
+        let project_root = self.config().project_root.clone();
+        self.inspect_manager.note_tier2_input_paths_changed(
+            project_root.as_deref(),
+            paths.iter().map(PathBuf::as_path),
+        );
         self.pending_tier2_paths.lock().extend(paths);
     }
 
@@ -8897,6 +8934,8 @@ impl AppContext {
     }
 
     pub fn reset_tier2_refresh_scheduler(&self) {
+        // A configure that changes the Tier-2 work can change its inputs.
+        self.inspect_manager.clear_tier2_retry_pauses();
         let now = Instant::now();
         let cold_ready_at = crate::inspect::tier2_scheduler::process_tier2_cold_start_pacer()
             .lock()
@@ -9110,6 +9149,15 @@ impl AppContext {
                 "tier2 refresh schedule failed for {}: {}",
                 error.category,
                 error.message
+            );
+        }
+        for pause in submission.retry_paused {
+            crate::slog_info!(
+                "tier2 refresh skipped {}: last build failed ({}); identical_failures={}, automatic retries paused until unix_ms={}",
+                pause.category,
+                pause.reason,
+                pause.identical_failures,
+                pause.retry_at_ms
             );
         }
     }

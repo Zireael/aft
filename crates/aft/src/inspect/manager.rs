@@ -245,6 +245,9 @@ pub struct Tier2RunSubmission {
     pub queued_categories: Vec<InspectCategory>,
     pub newly_queued_categories: Vec<InspectCategory>,
     pub deferred_categories: Vec<InspectCategory>,
+    /// Categories not started because their last build failed and the
+    /// automatic-retry pause has not elapsed.
+    pub retry_paused: Vec<Tier2RetryPause>,
     pub errors: Vec<Tier2RunSubmissionError>,
 }
 
@@ -317,6 +320,16 @@ struct BuilderStateEntry {
     first_attempt_unix: u64,
     attempt_count: u64,
     last_failure: Option<String>,
+    /// Consecutive failed attempts whose terminal equals `last_failure`.
+    identical_failures: u32,
+    /// Automatic refreshes skip this category until this instant (and unix
+    /// millisecond), because its last build failed for a reason a rerun with
+    /// the same inputs would only repeat.
+    retry_paused_until: Option<(Instant, u64)>,
+    /// The manager's input-change epoch when the current (or last) attempt
+    /// started. A failure is not paused when inputs changed during the attempt,
+    /// because the build may not have seen that change.
+    input_epoch_at_start: u64,
     suspension: Option<crate::build_breaker::BuildSuspension>,
     progress: String,
 }
@@ -331,6 +344,9 @@ impl BuilderStateEntry {
             first_attempt_unix: now,
             attempt_count: 0,
             last_failure: None,
+            identical_failures: 0,
+            retry_paused_until: None,
+            input_epoch_at_start: 0,
             suspension: None,
             progress: "checking cached analysis".into(),
         }
@@ -357,16 +373,45 @@ impl BuilderStateEntry {
         }
     }
 
-    fn record_failure(&mut self, terminal: String) {
+    /// Record a failed attempt. When `pause_retries` is set, automatic
+    /// refreshes skip the category for a pause that doubles with every
+    /// consecutive failure carrying the same terminal. A watcher-observed
+    /// change to an input ends the pause early (see
+    /// [`InspectManager::note_tier2_input_paths_changed`]); the count of
+    /// identical failures is kept, so a failure that repeats after such a
+    /// change still pauses for longer.
+    fn record_failure(&mut self, terminal: String, pause_retries: bool) {
         self.state = None;
         self.suspension = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
+        self.identical_failures = if self.last_failure.as_deref() == Some(terminal.as_str()) {
+            self.identical_failures.saturating_add(1)
+        } else {
+            1
+        };
         self.last_failure = Some(terminal);
+        self.retry_paused_until = pause_retries.then(|| {
+            let pause =
+                super::tier2_scheduler::tier2_failed_build_retry_backoff(self.identical_failures);
+            (
+                Instant::now() + pause,
+                unix_millis_now().saturating_add(pause.as_millis() as u64),
+            )
+        });
+    }
+
+    /// The unix millisecond automatic retries resume, while a pause is active.
+    fn retry_paused_until_at(&self, now: Instant) -> Option<u64> {
+        self.retry_paused_until
+            .filter(|(until, _)| now < *until)
+            .map(|(_, until_ms)| until_ms)
     }
 
     fn record_suspension(&mut self, suspension: crate::build_breaker::BuildSuspension) {
         self.state = Some(InspectBuilderState::Suspended);
         self.last_failure = None;
+        self.identical_failures = 0;
+        self.retry_paused_until = None;
         self.suspension = Some(suspension);
     }
 
@@ -381,10 +426,18 @@ impl BuilderStateEntry {
             );
         }
         if let Some(terminal) = self.last_failure.as_deref() {
-            return format!(
+            let mut detail = format!(
                 "last attempt failed: {terminal} (attempt {}, first at {})",
                 self.attempt_count, self.first_attempt_unix
             );
+            if let Some(until_ms) = self.retry_paused_until_at(Instant::now()) {
+                detail.push_str(&format!(
+                    "; automatic retries paused until {} after {} identical failure(s)",
+                    until_ms / 1_000,
+                    self.identical_failures
+                ));
+            }
+            return detail;
         }
         match self.state {
             Some(InspectBuilderState::Building) => format!(
@@ -514,6 +567,95 @@ fn builder_failure_terminal(message: &str) -> String {
     }
 }
 
+/// Whether a failed attempt should pause automatic retries of its category.
+///
+/// Failures that say nothing about the category's inputs are excluded: the
+/// work was stopped or never got its turn (cancellation, admission limits,
+/// a worker that exited early), or it waited on another plane that becomes
+/// ready on its own (the call graph dead code needs). Everything else, such
+/// as a file the scanner cannot read or a pass that timed out, would only
+/// repeat on the same inputs, so automatic refreshes stop rerunning it on
+/// every refresh.
+fn failure_pauses_automatic_retries(outcome: &JobOutcome) -> bool {
+    const NOT_INPUT_DETERMINED: &[&str] = &[
+        "callgraph_unavailable",
+        "tier2 dead_code aggregate did not complete",
+        "tier2 pass cancelled",
+        "admission was cancelled",
+        "limiter slot deadline",
+        "cold build concurrency limit",
+        "exited without publishing a result",
+        "lock poisoned",
+    ];
+    match outcome {
+        JobOutcome::Failed { message } => !NOT_INPUT_DETERMINED
+            .iter()
+            .any(|marker| message.contains(marker)),
+        JobOutcome::Fresh { .. } | JobOutcome::Stale { .. } | JobOutcome::Pending { .. } => false,
+    }
+}
+
+/// An automatic-retry pause on a Tier-2 category whose last build failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier2RetryPause {
+    pub category: InspectCategory,
+    /// First line of the failure, as health and the builder detail show it.
+    pub reason: String,
+    /// Consecutive failures with this same reason.
+    pub identical_failures: u32,
+    /// Unix millisecond at which automatic refreshes may retry.
+    pub retry_at_ms: u64,
+}
+
+/// Ignore files whose edits change which files the Tier-2 scope walk yields.
+const TIER2_SCOPE_IGNORE_FILE_NAMES: &[&str] = &[".gitignore", ".aftignore", ".ignore"];
+
+/// Whether a changed path could be a Tier-2 input: a file the project scope
+/// walk can include (judged from the path alone, see
+/// [`crate::callgraph::walk_could_include`]) or an ignore file that reshapes
+/// that walk. Absolute paths outside the project root are not inputs.
+fn path_may_be_tier2_input(
+    project_root: Option<&Path>,
+    canonical_root: Option<&Path>,
+    path: &Path,
+) -> bool {
+    let relative = if path.is_absolute() {
+        let Some(relative) = [project_root, canonical_root]
+            .into_iter()
+            .flatten()
+            .find_map(|root| path.strip_prefix(root).ok())
+        else {
+            return false;
+        };
+        relative
+    } else {
+        path
+    };
+    if relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| TIER2_SCOPE_IGNORE_FILE_NAMES.contains(&name))
+    {
+        return true;
+    }
+    crate::callgraph::walk_could_include(&relative.to_string_lossy())
+}
+
+fn retry_pause_from_states(
+    states: &HashMap<JobKey, BuilderStateEntry>,
+    category: InspectCategory,
+    now: Instant,
+) -> Option<Tier2RetryPause> {
+    let entry = states.get(&JobKey::for_project_category(category))?;
+    let retry_at_ms = entry.retry_paused_until_at(now)?;
+    Some(Tier2RetryPause {
+        category,
+        reason: entry.last_failure.clone().unwrap_or_default(),
+        identical_failures: entry.identical_failures,
+        retry_at_ms,
+    })
+}
+
 fn callgraph_store_ready_for_dead_code(callgraph_dir: PathBuf, project_root: PathBuf) -> bool {
     match CallGraphStore::open_readonly(callgraph_dir, project_root) {
         Ok(Some(store)) => store
@@ -593,6 +735,10 @@ pub struct InspectManager {
     /// both surfaces treat a category as busy when it has an entry here, and
     /// fall back to the waiter map if the registry is empty.
     builder_states: Mutex<HashMap<JobKey, BuilderStateEntry>>,
+    /// Advances whenever a watcher-observed change could alter the Tier-2
+    /// inputs (a file the scope walk can include, an ignore file, a rescan or
+    /// a config change). Compared against each attempt's start epoch.
+    tier2_input_epoch: AtomicU64,
     completed_build_durations: Mutex<HashMap<InspectCategory, Duration>>,
     checkout_view_verification: Mutex<Option<CheckoutViewVerification>>,
     automatic_tier2_refresh_allowed: AtomicBool,
@@ -702,6 +848,7 @@ impl InspectManager {
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
             builder_states: Mutex::new(HashMap::new()),
+            tier2_input_epoch: AtomicU64::new(0),
             completed_build_durations: Mutex::new(HashMap::new()),
             checkout_view_verification: Mutex::new(None),
             automatic_tier2_refresh_allowed: AtomicBool::new(true),
@@ -807,10 +954,18 @@ impl InspectManager {
 
     fn set_builder_state(&self, key: &JobKey, state: InspectBuilderState) {
         if let Ok(mut states) = self.builder_states.lock() {
+            let epoch = self.tier2_input_epoch.load(Ordering::SeqCst);
             if let Some(entry) = states.get_mut(key) {
+                // Only a new attempt takes the epoch; a state change within
+                // one attempt (queued, then building) keeps its start epoch.
+                if !entry.is_in_flight() {
+                    entry.input_epoch_at_start = epoch;
+                }
                 entry.begin_attempt(state);
             } else {
-                states.insert(key.clone(), BuilderStateEntry::new(state));
+                let mut entry = BuilderStateEntry::new(state);
+                entry.input_epoch_at_start = epoch;
+                states.insert(key.clone(), entry);
             }
         }
     }
@@ -840,11 +995,16 @@ impl InspectManager {
                 states.remove(key);
             }
             BuilderAttemptTerminal::Failed(terminal) => {
+                let epoch = self.tier2_input_epoch.load(Ordering::SeqCst);
+                let pause_retries = failure_pauses_automatic_retries(outcome);
                 if let Some(entry) = states.get_mut(key) {
-                    entry.record_failure(terminal);
+                    // Inputs changed while this attempt ran: it may not have
+                    // seen the change, so the next refresh should try again.
+                    let inputs_unchanged = entry.input_epoch_at_start == epoch;
+                    entry.record_failure(terminal, pause_retries && inputs_unchanged);
                 } else {
                     let mut entry = BuilderStateEntry::new(InspectBuilderState::Building);
-                    entry.record_failure(terminal);
+                    entry.record_failure(terminal, pause_retries);
                     states.insert(key.clone(), entry);
                 }
             }
@@ -923,6 +1083,87 @@ impl InspectManager {
 
     pub(crate) fn tier2_builder_state_detail(&self, category: InspectCategory) -> String {
         self.tier2_builder_state_detail_at(category, unix_millis_now())
+    }
+
+    /// The automatic-retry pause on `category`, if its last build failed and
+    /// the pause has not elapsed. An explicit `aft_inspect` is not subject to
+    /// it; only automatic (watcher, idle and maintenance) refreshes are.
+    pub fn tier2_retry_pause(&self, category: InspectCategory) -> Option<Tier2RetryPause> {
+        let states = self
+            .builder_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retry_pause_from_states(&states, category, Instant::now())
+    }
+
+    /// Record watcher-observed (or agent-written) changes. When any of
+    /// `paths` could be a Tier-2 input, every automatic-retry pause ends, so
+    /// the next automatic refresh rebuilds a failed category instead of
+    /// waiting out its pause: the change may be the fix. Paths the scope walk
+    /// can never include (unsupported file types, hidden or always-excluded
+    /// directories, paths outside the root) leave pauses in place.
+    ///
+    /// All Tier-2 categories walk the same project scope, so an input of one
+    /// is an input of all. Returns true when the change counted as an input
+    /// change.
+    pub fn note_tier2_input_paths_changed<'a>(
+        &self,
+        project_root: Option<&Path>,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> bool {
+        let mut states = self
+            .builder_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Nothing to end and no attempt that could miss the change: skip the
+        // per-path work on the watcher drain's hot path.
+        if !states
+            .values()
+            .any(|entry| entry.retry_paused_until.is_some() || entry.is_in_flight())
+        {
+            return false;
+        }
+        let canonical_root = project_root.map(crate::inspect::job::canonicalize_normalized);
+        let affects_inputs = paths
+            .into_iter()
+            .any(|path| path_may_be_tier2_input(project_root, canonical_root.as_deref(), path));
+        if affects_inputs {
+            self.end_tier2_retry_pauses_locked(&mut states);
+        }
+        affects_inputs
+    }
+
+    /// End every automatic-retry pause because the Tier-2 inputs may have
+    /// changed in a way no single path names: a watcher rescan, an ignore-rule
+    /// change, or a config change.
+    pub fn clear_tier2_retry_pauses(&self) {
+        let mut states = self
+            .builder_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.end_tier2_retry_pauses_locked(&mut states);
+    }
+
+    fn end_tier2_retry_pauses_locked(&self, states: &mut HashMap<JobKey, BuilderStateEntry>) {
+        self.tier2_input_epoch.fetch_add(1, Ordering::SeqCst);
+        for entry in states.values_mut() {
+            entry.retry_paused_until = None;
+        }
+    }
+
+    /// Every active automatic-retry pause, for health. `None` when the
+    /// registry is busy, so a health poll never waits on a build.
+    pub(crate) fn try_tier2_retry_pauses(&self) -> Option<Vec<Tier2RetryPause>> {
+        let states = self.builder_states.try_lock().ok()?;
+        let now = Instant::now();
+        Some(
+            InspectCategory::active()
+                .iter()
+                .copied()
+                .filter(|category| category.is_tier2())
+                .filter_map(|category| retry_pause_from_states(&states, category, now))
+                .collect(),
+        )
     }
 
     fn record_build_progress(&self, key: &JobKey, progress: impl Into<String>) {
@@ -1431,6 +1672,9 @@ impl InspectManager {
         if !self.automatic_tier2_refresh_allowed() {
             return Ok(None);
         }
+        if self.tier2_retry_pause(category).is_some() {
+            return Ok(None);
+        }
         self.automatic_tier2_schedule_count
             .fetch_add(1, Ordering::SeqCst);
 
@@ -1527,6 +1771,19 @@ impl InspectManager {
             return submission;
         }
         if !self.automatic_tier2_refresh_allowed() {
+            return submission;
+        }
+        // A category whose last build failed is not rebuilt by every
+        // automatic refresh: it waits out its retry pause. An explicit
+        // `aft_inspect` takes the blocking path and is not held back.
+        requested.retain(|category| match self.tier2_retry_pause(*category) {
+            Some(pause) => {
+                submission.retry_paused.push(pause);
+                false
+            }
+            None => true,
+        });
+        if requested.is_empty() {
             return submission;
         }
         self.automatic_tier2_schedule_count
@@ -6240,6 +6497,36 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
                 filter_values_for_scope(rows, scope);
             }
         }
+        // Files the scanner could not read at all (complexity and duplicates
+        // name them with a total in `skipped_files_count`) are scoped the same
+        // way, and the category is complete in a scope none of them touches.
+        if object.contains_key("skipped_files_count") {
+            let remaining = object
+                .get_mut("skipped_files")
+                .and_then(Value::as_array_mut)
+                .map(|rows| {
+                    filter_values_for_scope(rows, scope);
+                    let remaining = rows.len();
+                    // Scoped rollups name every skipped file so this filter
+                    // sees them all; name at most the usual number here.
+                    rows.truncate(super::scanners::source_text::SKIPPED_FILES_LIMIT);
+                    remaining
+                })
+                .unwrap_or(0);
+            if remaining == 0 {
+                object.remove("skipped_files");
+                object.remove("skipped_files_count");
+                let parse_errors_remain = object
+                    .get("parse_errors")
+                    .and_then(Value::as_array)
+                    .is_some_and(|rows| !rows.is_empty());
+                if !parse_errors_remain {
+                    object.insert("complete".to_string(), Value::Bool(true));
+                }
+            } else {
+                object.insert("skipped_files_count".to_string(), json!(remaining));
+            }
+        }
     }
 
     payload
@@ -10698,5 +10985,346 @@ mod tier2_deadline_tests {
         assert!(timed_out, "deadline must own the cancellation request");
         assert_eq!(value, "cancelled");
         assert!(limiter.census().holders.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tier2_unreadable_source_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::inspect::scanners::source_text::{source_read_count_for_debug, NOT_VALID_UTF8};
+    use crate::parser::SymbolCache;
+    use std::sync::RwLock;
+
+    /// Eleven decisions: one complexity hotspot, and a block long enough to
+    /// be reported as a duplicate when it appears twice.
+    fn complex_function(name: &str) -> String {
+        let mut source = format!("export function {name}(a: number): number {{\n");
+        for index in 1..=10 {
+            source.push_str(&format!(
+                "  if (a > {index}) {{\n    return {index};\n  }}\n"
+            ));
+        }
+        source.push_str("  return 0;\n}\n");
+        source
+    }
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, InspectSnapshot) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::create_dir_all(root.join("data")).expect("data dir");
+        std::fs::write(root.join("src/good.ts"), complex_function("decide")).expect("good");
+        std::fs::write(root.join("src/copy.ts"), complex_function("choose")).expect("copy");
+        // GBK-encoded bytes: valid JSON grammar, not valid UTF-8.
+        std::fs::write(root.join("data/bad.json"), b"{\"k\":\"\xb9\xe6\xce\"}").expect("bad json");
+        // An analyzable source with the same GBK bytes in a string literal.
+        std::fs::write(
+            root.join("src/bad.ts"),
+            b"export const label = \"\xb9\xe6\xce\";\n",
+        )
+        .expect("bad ts");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let snapshot = InspectSnapshot::new_with_capabilities(
+            root.clone(),
+            root.join(".aft-cache").join("inspect"),
+            Arc::new(Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            }),
+            Arc::new(RwLock::new(SymbolCache::new())),
+            true,
+            true,
+        );
+        (dir, root, snapshot)
+    }
+
+    fn aggregate(
+        manager: &InspectManager,
+        snapshot: &InspectSnapshot,
+        category: InspectCategory,
+    ) -> Value {
+        manager
+            .tier2_run_with_reuse_result(snapshot.clone(), category, None)
+            .outcome
+            .unwrap_or_else(|message| panic!("{category} build failed: {message}"))
+            .aggregate
+    }
+
+    #[test]
+    fn non_utf8_source_is_a_named_skip_reused_until_it_changes_then_included() {
+        let (_dir, root, snapshot) = fixture();
+        let bad_ts = root.join("src/bad.ts");
+        let bad_json = root.join("data/bad.json");
+        let manager = InspectManager::new();
+        let named_skip = json!([{ "file": "src/bad.ts", "reason": NOT_VALID_UTF8 }]);
+
+        let complexity = aggregate(&manager, &snapshot, InspectCategory::Complexity);
+        assert_eq!(complexity["complete"], json!(false), "{complexity}");
+        assert_eq!(complexity["skipped_files"], named_skip, "{complexity}");
+        assert_eq!(complexity["skipped_files_count"], json!(1));
+        assert_eq!(complexity["count"], json!(2), "{complexity}");
+        assert!(complexity["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["file"] == "src/good.ts")));
+
+        let duplicates = aggregate(&manager, &snapshot, InspectCategory::Duplicates);
+        assert_eq!(duplicates["complete"], json!(false), "{duplicates}");
+        assert_eq!(duplicates["skipped_files"], named_skip, "{duplicates}");
+        assert_eq!(duplicates["skipped_files_count"], json!(1));
+        assert!(
+            duplicates["count"].as_u64().is_some_and(|count| count >= 1),
+            "the two valid files still produce a duplicate group: {duplicates}"
+        );
+
+        assert_eq!(
+            source_read_count_for_debug(&bad_json),
+            0,
+            "neither scanner analyzes JSON, so the GBK data file is never read as source"
+        );
+        assert_eq!(source_read_count_for_debug(&bad_ts), 2);
+
+        // Unchanged inputs: the cached skip is reused and the file is not
+        // read again.
+        let complexity_again = aggregate(&manager, &snapshot, InspectCategory::Complexity);
+        let duplicates_again = aggregate(&manager, &snapshot, InspectCategory::Duplicates);
+        assert_eq!(complexity_again, complexity);
+        assert_eq!(duplicates_again, duplicates);
+        assert_eq!(source_read_count_for_debug(&bad_ts), 2);
+
+        // The file becomes valid UTF-8 (a different size, so it is stale).
+        std::fs::write(&bad_ts, "export const label = \"\u{89c4}\u{8303}\";\n")
+            .expect("transcode bad ts");
+        let complexity_fixed = aggregate(&manager, &snapshot, InspectCategory::Complexity);
+        let duplicates_fixed = aggregate(&manager, &snapshot, InspectCategory::Duplicates);
+        for fixed in [&complexity_fixed, &duplicates_fixed] {
+            assert!(fixed.get("skipped_files").is_none(), "{fixed}");
+            assert!(fixed.get("skipped_files_count").is_none(), "{fixed}");
+        }
+        assert_eq!(
+            complexity_fixed["complete"],
+            json!(true),
+            "{complexity_fixed}"
+        );
+        assert_eq!(source_read_count_for_debug(&bad_ts), 4);
+    }
+
+    #[test]
+    fn scoped_payload_drops_skips_outside_the_scope() {
+        let payload = json!({
+            "count": 0,
+            "items": [],
+            "complete": false,
+            "skipped_files": [{ "file": "src/bad.ts", "reason": NOT_VALID_UTF8 }],
+            "skipped_files_count": 1,
+        });
+        let root = tempfile::tempdir().expect("root");
+        let elsewhere = filter_payload_for_scope(
+            payload.clone(),
+            &JobScope::from_roots(root.path().to_path_buf(), vec![root.path().join("lib")]),
+        );
+        assert!(elsewhere.get("skipped_files").is_none(), "{elsewhere}");
+        assert_eq!(elsewhere["complete"], json!(true), "{elsewhere}");
+
+        let touching = filter_payload_for_scope(
+            payload,
+            &JobScope::from_roots(root.path().to_path_buf(), vec![root.path().join("src")]),
+        );
+        assert_eq!(touching["skipped_files_count"], json!(1), "{touching}");
+        assert_eq!(touching["complete"], json!(false), "{touching}");
+    }
+
+    #[test]
+    fn failure_pause_skips_only_input_determined_failures() {
+        let failed = |message: &str| JobOutcome::Failed {
+            message: message.to_string(),
+        };
+        assert!(failure_pauses_automatic_retries(&failed(
+            "complexity incremental scan failed: read failed for /p/a.ts: Permission denied"
+        )));
+        assert!(failure_pauses_automatic_retries(&failed(
+            "tier2 pass timed out after 600000ms and was cancelled"
+        )));
+        for transient in [
+            "callgraph_unavailable",
+            "tier2 pass cancelled before incremental scan",
+            "explicit inspect Tier-2 cold-build admission was cancelled",
+            "serial Tier-2 run stopped after the limiter slot deadline",
+            "tier2 reuse worker exited without publishing a result",
+        ] {
+            assert!(
+                !failure_pauses_automatic_retries(&failed(transient)),
+                "{transient}"
+            );
+        }
+        assert!(!failure_pauses_automatic_retries(&JobOutcome::Fresh {
+            payload: json!({ "callgraph_available": false }),
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_build_is_not_rerun_by_automatic_refresh_until_its_pause_ends() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, root, snapshot) = fixture();
+        // A source the scanner cannot read keeps failing the build (that
+        // contract is unchanged); it stands in for any failure that a rerun
+        // on the same inputs would only repeat.
+        let locked = root.join("src/locked.ts");
+        std::fs::write(&locked, "export const locked = 1;\n").expect("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        if std::fs::read(&locked).is_ok() {
+            // Running as a user that ignores file modes; nothing can fail.
+            return;
+        }
+        let manager = Arc::new(InspectManager::new());
+        manager.set_cold_build_limiter(cold_build_limiter::test_limiter(1));
+        let wait_idle = |manager: &InspectManager| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while manager.tier2_any_in_flight() {
+                assert!(Instant::now() < deadline, "background build did not finish");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        let first = manager.submit_tier2_run_with_reuse_serial_background(
+            snapshot.clone(),
+            vec![InspectCategory::Complexity],
+        );
+        assert_eq!(
+            first.newly_queued_categories,
+            vec![InspectCategory::Complexity]
+        );
+        wait_idle(&manager);
+        assert_eq!(manager.reuse_start_count_for_test(), 1);
+        let pause = manager
+            .tier2_retry_pause(InspectCategory::Complexity)
+            .expect("a failed build pauses automatic retries");
+        assert!(pause.reason.contains("failed"), "{pause:?}");
+        assert_eq!(pause.identical_failures, 1);
+        assert!(manager
+            .tier2_builder_state_detail(InspectCategory::Complexity)
+            .contains("automatic retries paused until"));
+        assert_eq!(
+            manager.try_tier2_retry_pauses(),
+            Some(vec![pause.clone()]),
+            "health lists the paused category with its failure reason"
+        );
+
+        // The next automatic refresh, inputs unchanged, does not rerun it.
+        let second = manager.submit_tier2_run_with_reuse_serial_background(
+            snapshot.clone(),
+            vec![InspectCategory::Complexity],
+        );
+        assert!(second.newly_queued_categories.is_empty(), "{second:?}");
+        assert_eq!(second.retry_paused, vec![pause.clone()]);
+        wait_idle(&manager);
+        assert_eq!(
+            manager.reuse_start_count_for_test(),
+            1,
+            "a paused category must not start another build"
+        );
+
+        // Changes the scope walk can never include leave the pause in place.
+        let out_of_scope = [
+            root.join("node_modules/dep/index.ts"),
+            root.join(".git/index"),
+            root.join("notes.unknown-ext"),
+            PathBuf::from("/elsewhere/outside/src/lib.ts"),
+        ];
+        assert!(!manager.note_tier2_input_paths_changed(
+            Some(&root),
+            out_of_scope.iter().map(PathBuf::as_path),
+        ));
+        let third = manager.submit_tier2_run_with_reuse_serial_background(
+            snapshot.clone(),
+            vec![InspectCategory::Complexity],
+        );
+        assert!(third.newly_queued_categories.is_empty(), "{third:?}");
+        assert_eq!(third.retry_paused, vec![pause.clone()]);
+        assert_eq!(manager.reuse_start_count_for_test(), 1);
+
+        // A change to an in-scope file ends the pause: the very next automatic
+        // refresh rebuilds without waiting it out.
+        assert!(manager
+            .note_tier2_input_paths_changed(Some(&root), [root.join("src/good.ts").as_path()],));
+        assert!(manager
+            .tier2_retry_pause(InspectCategory::Complexity)
+            .is_none());
+        let fourth = manager.submit_tier2_run_with_reuse_serial_background(
+            snapshot.clone(),
+            vec![InspectCategory::Complexity],
+        );
+        assert_eq!(
+            fourth.newly_queued_categories,
+            vec![InspectCategory::Complexity]
+        );
+        wait_idle(&manager);
+        assert_eq!(manager.reuse_start_count_for_test(), 2);
+        // The cause was not fixed, so it fails again with the same reason and
+        // the pause doubles.
+        let repeat = manager
+            .tier2_retry_pause(InspectCategory::Complexity)
+            .expect("the repeated failure pauses again");
+        assert_eq!(repeat.identical_failures, 2);
+        assert!(repeat.retry_at_ms >= pause.retry_at_ms + 10 * 60 * 1_000);
+
+        // The explicit `aft_inspect` path (the blocking run the inspect command
+        // uses) is not held back by the pause, even with no change observed,
+        // and its success clears the pause.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+        assert!(manager
+            .tier2_retry_pause(InspectCategory::Complexity)
+            .is_some());
+        let explicit = manager.tier2_run_with_reuse_blocking(
+            snapshot,
+            InspectCategory::Complexity,
+            JobScope::for_project(root),
+        );
+        assert!(explicit.payload().is_some(), "{explicit:?}");
+        assert_eq!(manager.reuse_start_count_for_test(), 3);
+        assert!(manager
+            .tier2_retry_pause(InspectCategory::Complexity)
+            .is_none());
+    }
+
+    #[test]
+    fn input_change_during_a_failing_attempt_does_not_pause_it() {
+        let manager = InspectManager::new();
+        let root = PathBuf::from("/project");
+        let key = JobKey::for_project_category(InspectCategory::Complexity);
+        let failed = JobOutcome::Failed {
+            message: "complexity incremental scan failed: read failed for /project/a.ts"
+                .to_string(),
+        };
+        let attempt = |change: Option<&str>| {
+            manager
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key.clone())
+                .or_default();
+            manager.record_flight_start(&key);
+            if let Some(change) = change {
+                assert!(manager.note_tier2_input_paths_changed(Some(&root), [Path::new(change)],));
+            }
+            manager.finish_tier2_flight(&key, failed.clone());
+        };
+
+        // The build may not have seen a fix made while it ran, so its failure
+        // must not hold the next automatic refresh back.
+        attempt(Some("/project/src/a.ts"));
+        assert!(manager
+            .tier2_retry_pause(InspectCategory::Complexity)
+            .is_none());
+
+        attempt(None);
+        assert!(manager
+            .tier2_retry_pause(InspectCategory::Complexity)
+            .is_some());
     }
 }

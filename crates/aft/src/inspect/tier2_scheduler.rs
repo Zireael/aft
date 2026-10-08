@@ -28,6 +28,30 @@ pub const TIER2_COLD_START_SPACING: Duration = Duration::from_secs(3);
 /// first refresh. A burst larger than `MAX_SPREAD / SPACING` roots shares the
 /// last slot rather than delaying later roots' first refresh without limit.
 pub const TIER2_COLD_START_MAX_SPREAD: Duration = Duration::from_secs(5 * 60);
+/// First pause before an automatic refresh retries a Tier-2 category whose
+/// last build failed.
+///
+/// A failed category build stores nothing, so every automatic refresh used to
+/// rerun the whole build from scratch and fail again for the same reason (one
+/// field report: seven identical failures in 77 minutes, each costing 6-11 s
+/// of CPU). Automatic refreshes now skip a failed category until its pause
+/// elapses. An explicit `aft_inspect` is not held back by the pause.
+pub const TIER2_FAILED_BUILD_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
+/// Longest pause between automatic retries of a category that keeps failing
+/// with the same reason.
+pub const TIER2_FAILED_BUILD_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// Pause before the next automatic retry of a Tier-2 category build after
+/// `identical_failures` consecutive failures with the same reason (at least
+/// 1). The pause doubles with each repeat, up to
+/// [`TIER2_FAILED_BUILD_RETRY_BACKOFF_MAX`]; a failure with a new reason
+/// starts again at [`TIER2_FAILED_BUILD_RETRY_BACKOFF`].
+pub fn tier2_failed_build_retry_backoff(identical_failures: u32) -> Duration {
+    let doublings = identical_failures.saturating_sub(1).min(16);
+    TIER2_FAILED_BUILD_RETRY_BACKOFF
+        .saturating_mul(1u32 << doublings)
+        .min(TIER2_FAILED_BUILD_RETRY_BACKOFF_MAX)
+}
 
 /// Hands out first-refresh times for roots configured close together, so
 /// their cold-cache Tier-2 refreshes start one at a time instead of at once.
@@ -505,6 +529,35 @@ mod tests {
             callgraph_cold_build_active: true,
             ..Tier2ExternalGates::default()
         }
+    }
+
+    #[test]
+    fn failed_build_retry_backoff_doubles_per_identical_failure_up_to_the_cap() {
+        assert!(TIER2_FAILED_BUILD_RETRY_BACKOFF > TIER2_REFRESH_MIN_INTERVAL);
+        assert_eq!(
+            tier2_failed_build_retry_backoff(0),
+            TIER2_FAILED_BUILD_RETRY_BACKOFF
+        );
+        assert_eq!(
+            tier2_failed_build_retry_backoff(1),
+            TIER2_FAILED_BUILD_RETRY_BACKOFF
+        );
+        assert_eq!(
+            tier2_failed_build_retry_backoff(2),
+            TIER2_FAILED_BUILD_RETRY_BACKOFF * 2
+        );
+        assert_eq!(
+            tier2_failed_build_retry_backoff(3),
+            TIER2_FAILED_BUILD_RETRY_BACKOFF * 4
+        );
+        assert_eq!(
+            tier2_failed_build_retry_backoff(50),
+            TIER2_FAILED_BUILD_RETRY_BACKOFF_MAX
+        );
+        assert_eq!(
+            tier2_failed_build_retry_backoff(u32::MAX),
+            TIER2_FAILED_BUILD_RETRY_BACKOFF_MAX
+        );
     }
 
     #[test]

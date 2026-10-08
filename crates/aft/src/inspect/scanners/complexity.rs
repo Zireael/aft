@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -8,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tree_sitter::Node;
 
+use super::source_text::{read_source_text, write_skipped_files, SourceText, NOT_VALID_UTF8};
 use crate::cache_freshness::{self, FileFreshness};
 use crate::inspect::{
     FileContribution, InspectCategory, InspectJob, InspectResult, InspectScanSuccess,
@@ -36,6 +36,10 @@ struct ComplexityContribution {
     parse_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language_skipped: Option<String>,
+    /// Set when the file could not be analyzed at all (its bytes are not
+    /// valid UTF-8). The aggregate names it in `skipped_files`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skipped_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -329,7 +333,8 @@ pub fn run_complexity_scan(job: &InspectJob) -> InspectResult {
         .map(|path| scan_file(&job.project_root, path))
         .collect::<Result<Vec<_>, _>>();
     let scans = match scans {
-        Ok(scans) => scans,
+        // A file that vanished mid-scan yields no scan, as if it was deleted.
+        Ok(scans) => scans.into_iter().flatten().collect::<Vec<_>>(),
         Err(message) => return InspectResult::failed(job, message, started.elapsed()),
     };
 
@@ -364,17 +369,53 @@ pub(crate) fn aggregate_complexity_contributions_with_limit(
     aggregate_contributions(project_root, &scans, drill_down_limit)
 }
 
-fn scan_file(project_root: &Path, path: &Path) -> Result<FileComplexityScan, String> {
-    let freshness = cache_freshness::collect(path)
-        .map_err(|error| format!("freshness failed for {}: {error}", path.display()))?;
-    let source = fs::read_to_string(path)
-        .map_err(|error| format!("read failed for {}: {error}", path.display()))?;
-    let contribution = scan_source(project_root, path, &source);
-    Ok(FileComplexityScan {
+/// Scan one scope file. `Ok(None)` means the file vanished between the walk
+/// and this scan and is treated as deleted. A file that is not valid UTF-8 is
+/// a per-file skip; other read failures keep failing the scan as before.
+fn scan_file(project_root: &Path, path: &Path) -> Result<Option<FileComplexityScan>, String> {
+    let freshness = match cache_freshness::collect(path) {
+        Ok(freshness) => freshness,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("freshness failed for {}: {error}", path.display())),
+    };
+    // Only languages with a complexity table are read: a data or document
+    // file (JSON, YAML, Markdown, ...) can never contribute, so its bytes,
+    // whatever their encoding, are never opened as source.
+    let analyzable =
+        detect_language(path).is_some_and(|language| language_spec(language).is_some());
+    let contribution = if analyzable {
+        match read_source_text(path) {
+            Ok(SourceText::Text(source)) => scan_source(project_root, path, &source),
+            Ok(SourceText::NotUtf8) => unreadable_contribution(project_root, path, NOT_VALID_UTF8),
+            Ok(SourceText::Vanished) => return Ok(None),
+            Err(error) => return Err(format!("read failed for {}: {error}", path.display())),
+        }
+    } else {
+        // `scan_source` reports the language as skipped before it looks at
+        // the source text, so no text is needed here.
+        scan_source(project_root, path, "")
+    };
+    Ok(Some(FileComplexityScan {
         path: path.to_path_buf(),
         freshness,
         contribution,
-    })
+    }))
+}
+
+fn unreadable_contribution(
+    project_root: &Path,
+    path: &Path,
+    reason: &str,
+) -> ComplexityContribution {
+    ComplexityContribution {
+        file: display_path(project_root, path),
+        language: detect_language(path)
+            .map(|language| crate::inspect::job::language_name(language).to_string()),
+        functions: Vec::new(),
+        parse_error: None,
+        language_skipped: None,
+        skipped_reason: Some(reason.to_string()),
+    }
 }
 
 fn scan_source(project_root: &Path, path: &Path, source: &str) -> ComplexityContribution {
@@ -395,6 +436,7 @@ fn scan_source(project_root: &Path, path: &Path, source: &str) -> ComplexityCont
                 functions: Vec::new(),
                 parse_error: Some("tree-sitter parse contains syntax errors".to_string()),
                 language_skipped: None,
+                skipped_reason: None,
             };
         }
         Err(error) => {
@@ -404,6 +446,7 @@ fn scan_source(project_root: &Path, path: &Path, source: &str) -> ComplexityCont
                 functions: Vec::new(),
                 parse_error: Some(error.to_string()),
                 language_skipped: None,
+                skipped_reason: None,
             };
         }
     };
@@ -420,6 +463,7 @@ fn scan_source(project_root: &Path, path: &Path, source: &str) -> ComplexityCont
         functions,
         parse_error: None,
         language_skipped: None,
+        skipped_reason: None,
     }
 }
 
@@ -430,6 +474,7 @@ fn skipped_contribution(file: String, language: &str) -> ComplexityContribution 
         functions: Vec::new(),
         parse_error: None,
         language_skipped: Some(language.to_string()),
+        skipped_reason: None,
     }
 }
 
@@ -561,8 +606,12 @@ fn aggregate_contributions(
 ) -> Value {
     let mut hotspots = Vec::new();
     let mut parse_errors = Vec::new();
+    let mut skipped_files = Vec::new();
     let mut languages_skipped = BTreeSet::new();
     for contribution in contributions {
+        if let Some(reason) = &contribution.skipped_reason {
+            skipped_files.push((contribution.file.clone(), reason.clone()));
+        }
         if let Some(error) = &contribution.parse_error {
             parse_errors.push(json!({ "file": contribution.file, "message": error }));
         }
@@ -618,6 +667,7 @@ fn aggregate_contributions(
     if !parse_errors.is_empty() {
         aggregate["parse_errors"] = Value::Array(parse_errors);
     }
+    write_skipped_files(&mut aggregate, skipped_files, drill_down_limit);
     aggregate
 }
 
@@ -853,6 +903,75 @@ mod tests {
         assert_eq!(aggregate["count"], 0);
         assert!(aggregate["items"].as_array().is_some_and(Vec::is_empty));
         assert_eq!(aggregate["languages_skipped"], json!(["pascal"]));
+    }
+
+    #[test]
+    fn non_utf8_source_is_a_named_skip_and_non_utf8_data_file_is_never_read() {
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        // GBK bytes: valid JSON grammar, invalid UTF-8.
+        let bad_json = root.join("data/bad.json");
+        let bad_ts = root.join("src/bad.ts");
+        let good_ts = root.join("src/good.ts");
+        fs::create_dir_all(root.join("data")).expect("data dir");
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::write(&bad_json, b"{\"k\":\"\xb9\xe6\xce\"}").expect("write bad json");
+        fs::write(&bad_ts, b"export const k = \"\xb9\xe6\xce\";\n").expect("write bad ts");
+        fs::write(
+            &good_ts,
+            "export function f(a: boolean) { return a ? 1 : 0; }\n",
+        )
+        .expect("write good ts");
+
+        let json_scan = scan_file(root, &bad_json)
+            .expect("data file scan succeeds")
+            .expect("data file exists");
+        assert_eq!(
+            json_scan.contribution.language_skipped.as_deref(),
+            Some("json")
+        );
+        assert!(json_scan.contribution.skipped_reason.is_none());
+        assert_eq!(
+            super::super::source_text::source_read_count_for_debug(&bad_json),
+            0,
+            "complexity has no table for JSON, so it must never read its bytes"
+        );
+
+        let bad_scan = scan_file(root, &bad_ts)
+            .expect("a non-UTF-8 source must not fail the scan")
+            .expect("source exists");
+        assert_eq!(
+            bad_scan.contribution.skipped_reason.as_deref(),
+            Some(NOT_VALID_UTF8)
+        );
+        assert!(bad_scan.contribution.functions.is_empty());
+        let good_scan = scan_file(root, &good_ts)
+            .expect("good scan")
+            .expect("good exists");
+        assert_eq!(good_scan.contribution.functions.len(), 1);
+
+        let aggregate = aggregate_contributions(
+            root,
+            &[
+                json_scan.contribution,
+                bad_scan.contribution,
+                good_scan.contribution,
+            ],
+            Some(100),
+        );
+        assert_eq!(aggregate["complete"], json!(false));
+        assert_eq!(
+            aggregate["skipped_files"],
+            json!([{ "file": "src/bad.ts", "reason": NOT_VALID_UTF8 }])
+        );
+        assert_eq!(aggregate["skipped_files_count"], json!(1));
+
+        assert!(
+            scan_file(root, &root.join("src/vanished.ts"))
+                .expect("a vanished file is not a failure")
+                .is_none(),
+            "a file removed after the walk is treated as deleted"
+        );
     }
 
     fn test_contribution(

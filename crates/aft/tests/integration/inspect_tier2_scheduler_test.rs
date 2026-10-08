@@ -673,3 +673,154 @@ fn quiet_watcher_drain_dispatches_a_refresh_that_came_due_in_the_silence() {
         "a dispatched refresh clears the deadline until the min interval elapses"
     );
 }
+
+/// A failed Tier-2 build pauses automatic refreshes of its category, but a
+/// change to an input file ends the pause so a fix is picked up by the next
+/// automatic refresh. A change the scope walk can never include does not, and
+/// an explicit `aft_inspect` is never held back by the pause.
+#[cfg(unix)]
+#[test]
+fn failed_tier2_build_pause_ends_on_in_scope_change_and_never_blocks_inspect() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function unused() { return 1; }\n",
+    );
+    let ctx = configured_context(&root);
+    let manager = ctx.inspect_manager();
+    // An unreadable source fails the complexity build on every attempt until
+    // it is fixed, standing in for any cause the user has to repair.
+    let locked = write_file(&root, "src/locked.ts", "export const locked = 1;\n");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    if fs::read(&locked).is_ok() {
+        // Running as a user that ignores file modes; nothing can fail.
+        return;
+    }
+    let wait_idle = || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while manager.tier2_any_in_flight() {
+            assert!(Instant::now() < deadline, "background build did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let paused = |response: &Value| {
+        response["skipped_categories"]
+            .as_array()
+            .is_some_and(|skipped| {
+                skipped.iter().any(|entry| {
+                    entry["category"] == "complexity" && entry["reason"] == "last_build_failed"
+                })
+            })
+    };
+
+    let first = enqueue_tier2_run(&ctx, &["complexity"]);
+    assert_eq!(
+        first["queued_categories"],
+        json!(["complexity"]),
+        "{first:#}"
+    );
+    wait_idle();
+    let starts_after_failure = manager.reuse_start_count_for_test();
+    assert!(
+        manager
+            .tier2_retry_pause(InspectCategory::Complexity)
+            .is_some(),
+        "the failed build pauses automatic retries"
+    );
+
+    // Unchanged inputs: the next automatic run is skipped, naming the failure.
+    let unchanged = enqueue_tier2_run(&ctx, &["complexity"]);
+    assert!(paused(&unchanged), "{unchanged:#}");
+
+    // A change outside the walked scope does not end the pause.
+    ctx.add_pending_tier2_paths([
+        root.join("node_modules/dep/index.ts"),
+        root.join(".aft-test-storage/state.json"),
+    ]);
+    let out_of_scope = enqueue_tier2_run(&ctx, &["complexity"]);
+    assert!(paused(&out_of_scope), "{out_of_scope:#}");
+    assert_eq!(manager.reuse_start_count_for_test(), starts_after_failure);
+
+    // The user fixes the file; the watcher reports it through the real drain;
+    // the next automatic run rebuilds without waiting for the pause to elapse.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded::<WatcherDispatchEvent>();
+    *ctx.watcher_rx().lock() = Some(watcher_rx);
+    let drain_all = || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+            assert!(Instant::now() < deadline, "watcher drain did not settle");
+        }
+    };
+    watcher_tx
+        .send(WatcherDispatchEvent::Paths(vec![locked.clone()]))
+        .expect("send watcher change");
+    drain_all();
+    let in_scope = enqueue_tier2_run(&ctx, &["complexity"]);
+    assert_eq!(
+        in_scope["queued_categories"],
+        json!(["complexity"]),
+        "{in_scope:#}"
+    );
+    wait_idle();
+    assert_eq!(
+        manager.reuse_start_count_for_test(),
+        starts_after_failure + 1
+    );
+    assert!(manager
+        .tier2_retry_pause(InspectCategory::Complexity)
+        .is_none());
+
+    // Break it again (new content, so the cached result is stale) and pause
+    // it, then fix it WITHOUT a watcher report: an explicit aft_inspect still
+    // computes complexity despite the pause.
+    fs::write(&locked, "export const locked = 22;\n").expect("edit locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    ctx.add_pending_tier2_paths([locked.clone()]);
+    let broken = enqueue_tier2_run(&ctx, &["complexity"]);
+    assert_eq!(
+        broken["queued_categories"],
+        json!(["complexity"]),
+        "{broken:#}"
+    );
+    wait_idle();
+    assert!(manager
+        .tier2_retry_pause(InspectCategory::Complexity)
+        .is_some());
+    // A watcher rescan drops the individual paths, so it ends the pause too.
+    watcher_tx
+        .send(WatcherDispatchEvent::RescanRequired(
+            aft::watcher_filter::RescanReason::Unknown,
+        ))
+        .expect("send rescan");
+    drain_all();
+    assert!(manager
+        .tier2_retry_pause(InspectCategory::Complexity)
+        .is_none());
+    let rebroken = enqueue_tier2_run(&ctx, &["complexity"]);
+    assert_eq!(
+        rebroken["queued_categories"],
+        json!(["complexity"]),
+        "{rebroken:#}"
+    );
+    wait_idle();
+    assert!(manager
+        .tier2_retry_pause(InspectCategory::Complexity)
+        .is_some());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    let response = inspect(&ctx);
+    assert_eq!(response["success"], true, "{response:#}");
+    assert!(
+        response["summary"]["complexity"]["count"].is_number(),
+        "explicit inspect must compute complexity while the automatic retry is paused: {response:#}"
+    );
+    assert!(
+        manager
+            .tier2_retry_pause(InspectCategory::Complexity)
+            .is_none(),
+        "the explicit run's success clears the pause"
+    );
+}

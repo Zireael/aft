@@ -1848,17 +1848,34 @@ fn compact_inspect_reason(reason: &str) -> String {
 
 fn incomplete_analysis_reason(value: &Value) -> String {
     let mut reasons = Vec::new();
-    for (key, cause) in [
-        ("parse_errors", "could not be parsed"),
-        ("skipped_files", "could not be analyzed"),
-    ] {
-        if let Some(files) = value
-            .get(key)
-            .and_then(Value::as_array)
-            .filter(|files| !files.is_empty())
-        {
-            let label = if files.len() == 1 { "file" } else { "files" };
-            reasons.push(format!("{} {label} {cause}", files.len()));
+    if let Some(files) = value
+        .get("parse_errors")
+        .and_then(Value::as_array)
+        .filter(|files| !files.is_empty())
+    {
+        let label = if files.len() == 1 { "file" } else { "files" };
+        reasons.push(format!("{} {label} could not be parsed", files.len()));
+    }
+    if let Some(files) = value
+        .get("skipped_files")
+        .and_then(Value::as_array)
+        .filter(|files| !files.is_empty())
+    {
+        // Complexity and duplicates cap their list and carry the full total
+        // in `skipped_files_count`; their line says how many files were
+        // skipped and why. Other categories keep their own wording.
+        let total = value.get("skipped_files_count").and_then(Value::as_u64);
+        let count = total.unwrap_or(files.len() as u64);
+        let label = if count == 1 { "file" } else { "files" };
+        let mut causes = files
+            .iter()
+            .map(|file| file.get("reason").and_then(Value::as_str));
+        let first = causes.next().flatten();
+        let shared_cause = first.filter(|first| causes.all(|cause| cause == Some(*first)));
+        match (total, shared_cause) {
+            (Some(_), Some(cause)) => reasons.push(format!("{count} {label} skipped ({cause})")),
+            (Some(_), None) => reasons.push(format!("{count} {label} skipped")),
+            (None, _) => reasons.push(format!("{count} {label} could not be analyzed")),
         }
     }
     if !reasons.is_empty() {
@@ -2165,15 +2182,30 @@ pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response 
             })
         })
         .collect::<Vec<_>>();
+    let mut data = serde_json::json!({
+        "queued_categories": queued.clone(),
+        "in_flight_categories": queued,
+        "errors": errors,
+    });
+    if !submission.retry_paused.is_empty() {
+        data["skipped_categories"] = Value::Array(
+            submission
+                .retry_paused
+                .iter()
+                .map(|pause| {
+                    serde_json::json!({
+                        "category": pause.category.as_str(),
+                        "reason": "last_build_failed",
+                        "last_failure": pause.reason,
+                        "identical_failures": pause.identical_failures,
+                        "retry_at_ms": pause.retry_at_ms,
+                    })
+                })
+                .collect(),
+        );
+    }
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "queued_categories": queued.clone(),
-            "in_flight_categories": queued,
-            "errors": errors,
-        }),
-    )
+    Response::success(&req.id, data)
 }
 
 trait ResponseIdExt {
@@ -2699,7 +2731,12 @@ fn build_inspect_payload(
                 gap["categories"] = serde_json::json!([category.as_str()]);
                 gap
             }));
-            for key in ["parse_errors", "skipped_files", "building"] {
+            for key in [
+                "parse_errors",
+                "skipped_files",
+                "skipped_files_count",
+                "building",
+            ] {
                 if let Some(value) = payload.get(key) {
                     category_summary[key] = value.clone();
                 }
@@ -4436,6 +4473,42 @@ fn empty_array(value: &Value) -> bool {
 
 fn invalid_request(id: &str, message: String) -> Response {
     Response::error(id, "invalid_request", message)
+}
+
+#[cfg(test)]
+mod incomplete_reason_tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_file_skips_say_how_many_and_why_in_one_line() {
+        let capped = serde_json::json!({
+            "complete": false,
+            "skipped_files": [{ "file": "src/a.ts", "reason": "not valid UTF-8" }],
+            "skipped_files_count": 37,
+        });
+        assert_eq!(
+            incomplete_analysis_reason(&capped),
+            "37 files skipped (not valid UTF-8)"
+        );
+        let one = serde_json::json!({
+            "complete": false,
+            "skipped_files": [{ "file": "src/a.ts", "reason": "not valid UTF-8" }],
+            "skipped_files_count": 1,
+        });
+        assert_eq!(
+            incomplete_analysis_reason(&one),
+            "1 file skipped (not valid UTF-8)"
+        );
+        // Categories without a total keep their existing wording.
+        let legacy = serde_json::json!({
+            "complete": false,
+            "skipped_files": [{ "file": "/elsewhere/a.ts", "reason": "outside_project_root" }],
+        });
+        assert_eq!(
+            incomplete_analysis_reason(&legacy),
+            "1 file could not be analyzed"
+        );
+    }
 }
 
 #[cfg(test)]

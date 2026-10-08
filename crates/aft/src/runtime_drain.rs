@@ -3254,6 +3254,9 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     crate::lsp::typescript_project::clear_typescript_selection();
                     state.rescan_required = true;
                     state.rescan_reason = reason;
+                    // The individual changes are gone, so any Tier-2 input
+                    // may have changed: end automatic-retry pauses.
+                    ctx.inspect_manager().clear_tier2_retry_pauses();
                     state.pending_paths.clear();
                     state.phase = WatcherDrainPhase::Collect;
                     state.semantic_refresh_paths.clear();
@@ -3275,6 +3278,11 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                             .unwrap_or(crate::context::IgnoreRuleChange::Full {
                                 scopes: Vec::new(),
                             });
+                        // Changed ignore rules change which files the Tier-2
+                        // scope walk yields: end automatic-retry pauses.
+                        if !matches!(change, crate::context::IgnoreRuleChange::Unchanged) {
+                            ctx.inspect_manager().clear_tier2_retry_pauses();
+                        }
                         match change {
                             crate::context::IgnoreRuleChange::Unchanged => {}
                             crate::context::IgnoreRuleChange::AddOnly {
