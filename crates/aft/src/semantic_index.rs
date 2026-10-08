@@ -4281,22 +4281,12 @@ pub struct SemanticResult {
     pub source: &'static str,
 }
 
-fn shared_relative_path(project_root: &Path, path: &Path) -> Option<PathBuf> {
-    let relative = cache_relative_path(project_root, path)?;
-    // The portable disk spelling uses '/'. Rebuild components only on Windows
-    // so joining an in-memory base matches native paths recorded by the private
-    // index; persistence still goes through cache_relative_path unchanged.
-    #[cfg(windows)]
-    let relative = relative.components().collect();
-    Some(relative)
-}
-
 fn relativize_semantic_map<T>(
     project_root: &Path,
     map: HashMap<PathBuf, T>,
 ) -> Option<HashMap<PathBuf, T>> {
     map.into_iter()
-        .map(|(path, value)| shared_relative_path(project_root, &path).map(|path| (path, value)))
+        .map(|(path, value)| cache_relative_path(project_root, &path).map(|path| (path, value)))
         .collect()
 }
 
@@ -4620,7 +4610,7 @@ impl SemanticIndex {
         // root hands the index back intact instead of leaving a half-moved
         // one behind. Only the path strings are copied here; the vectors move.
         let root = self.project_root.clone();
-        let relative = |path: &Path| shared_relative_path(&root, path);
+        let relative = |path: &Path| cache_relative_path(&root, path);
         let Some(entry_files) = self
             .entries
             .iter()
@@ -12528,7 +12518,10 @@ Connection: close
         let root = test_project_root();
         let mut index = SemanticIndex::new(root.clone(), 2);
         for ordinal in 0..8_000 {
-            let file = root.join(format!("src/file_{}.rs", ordinal % 200));
+            // The production walker constructs native paths component by
+            // component. A slash-containing join would create mixed separators
+            // in this private fixture on Windows, unlike the shared-base paths.
+            let file = root.join("src").join(format!("file_{}.rs", ordinal % 200));
             add_invalidation_fixture_entry(&mut index, file, ordinal);
         }
         let query = [1.0, 0.5];
