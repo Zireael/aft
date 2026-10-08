@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const debugMock = mock(() => {});
@@ -175,7 +175,16 @@ describe("auto-update-checker/checker", () => {
 
   describe("getCachedVersion and updatePinnedVersion", () => {
     test("reads cached version from OpenCode's scoped package cache layout", async () => {
-      const packagePath = `${homedir()}/.cache/opencode/packages/@cortexkit/aft-opencode@latest/node_modules/@cortexkit/aft-opencode/package.json`;
+      // Resolve the root the way the checker does: OpenCode's cache follows
+      // XDG_CACHE_HOME, which the isolated test environment sets.
+      const { cacheDir } = await import("../../hooks/auto-update-checker/constants.js");
+      const packagePath = join(
+        cacheDir(),
+        "@cortexkit/aft-opencode@latest",
+        "node_modules",
+        "@cortexkit/aft-opencode",
+        "package.json",
+      );
       const existsSpy = spyOn(fs, "existsSync").mockImplementation(
         (p: fs.PathLike) => String(p) === packagePath,
       );
