@@ -1352,12 +1352,23 @@ mod storage_retention_tests {
                 }}),
             )
             .unwrap();
+            // Use a real exited PID: Windows tasklist rejects u32::MAX, which
+            // correctly leaves that synthetic owner's liveness unknown.
+            let mut command = std::process::Command::new("git");
+            crate::test_env::apply_hermetic_git_env(&mut command);
+            let mut child = command
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let owner_pid = child.id();
+            assert!(child.wait().unwrap().success());
             crate::artifact_owner::write_synthetic_manifest_for_test(
                 temp.path(),
                 &root,
                 &scope,
                 &scope,
-                u32::MAX,
+                owner_pid,
                 last_bound + 1000,
             );
         }
