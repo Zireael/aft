@@ -208,12 +208,24 @@ fn prepare_media_read(
     path: &Path,
     byte_size: u64,
     media: SniffedMedia,
+    capture_source: bool,
+    captured_source: &mut Option<CapturedRead>,
 ) -> PreparedPathRead {
     if byte_size > MAX_FILE_READ_BYTES {
         return PreparedPathRead::Response(media_file_too_large_response(&req.id, byte_size));
     }
 
-    let raw_bytes = match fs::read(path) {
+    // Hashline tag publication needs source bytes and metadata, even to explain
+    // why binary content cannot receive line tags. Capture them within the
+    // filesystem deadline instead of reopening the file after a slow decode.
+    let source = capture_source
+        .then(|| crate::hashline::snapshot::read_source(path).ok())
+        .flatten();
+    let bytes = match source.as_ref().filter(|source| source.has_complete_bytes()) {
+        Some(source) => Ok(source.bytes().to_vec()),
+        None => fs::read(path),
+    };
+    let raw_bytes = match bytes {
         Ok(bytes) => bytes,
         Err(e) => {
             return PreparedPathRead::Response(Response::error(
@@ -223,6 +235,12 @@ fn prepare_media_read(
             ));
         }
     };
+    if let Some(source) = source {
+        *captured_source = Some(CapturedRead {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
     PreparedPathRead::Media { raw_bytes, media }
 }
 
@@ -1489,7 +1507,14 @@ fn handle_read_path(
         }
     };
     if let Some(media) = sniff_media(&magic) {
-        return prepare_media_read(req, path, metadata.len(), media);
+        return prepare_media_read(
+            req,
+            path,
+            metadata.len(),
+            media,
+            capture_source,
+            captured_source,
+        );
     }
 
     PreparedPathRead::Response(handle_text_or_binary_read(
@@ -2483,6 +2508,7 @@ mod tests {
                     .effective
             );
         }
+        crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.set(0));
         let budget = crate::bounded_io::Budget::after(Duration::from_secs(1));
         // Simulate slow decoding without adding CPU load. Filesystem access must
         // finish within its budget, but image processing has a separate timeout.
@@ -2498,6 +2524,16 @@ mod tests {
         let attachment = first_attachment(&response.data);
         assert_eq!(attachment["kind"], "image");
         assert_eq!(decoded_attachment_bytes(attachment), bytes);
+        if hashline {
+            assert!(response.data["hashline_tag_unavailable_reason"]
+                .as_str()
+                .unwrap()
+                .contains("binary"));
+            assert_eq!(
+                crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.get()),
+                1
+            );
+        }
     }
 
     #[test]
