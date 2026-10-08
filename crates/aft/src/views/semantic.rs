@@ -1762,9 +1762,12 @@ mod tests {
 
     fn assert_canonical_blob(checkout: &Checkout, source: &str) {
         let producer = checkout.plane.semantic_producer();
+        // A full build chunks walker paths in the host's native form. Keep the
+        // reference independent of the view's path conversion, including on Windows.
+        let relative = Path::new("src").join("large.rs");
         let chunks = crate::semantic_index::chunk_view_file(
             &checkout.root,
-            Path::new("src/large.rs"),
+            &relative,
             source.as_bytes(),
             producer.caps,
         )
