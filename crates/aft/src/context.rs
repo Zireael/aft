@@ -5855,6 +5855,14 @@ impl AppContext {
         }
         publish(&mut slot);
         drop(slot);
+        // Database recovery can be the only event on a refused route. Queue its
+        // current status after releasing the open slot. Transport roots register
+        // their Arc; do not build a synchronous snapshot here for library callers
+        // that may still hold the process-shared connection or App slot.
+        let context = self.status_emitter.context.lock().unwrap().clone();
+        if context.strong_count() > 0 {
+            self.status_emitter.signal_context(context);
+        }
         true
     }
 
@@ -5961,7 +5969,7 @@ impl AppContext {
         // Some library callers enter this gate without transport admission.
         // They get the same bounded reopen as standalone and daemon calls,
         // never the bind's longer deferred initialization retry loop.
-        if self.database_runtime_state.load(Ordering::Acquire) == 3
+        if matches!(self.database_runtime_state.load(Ordering::Acquire), 3 | 5)
             && self.claim_database_runtime_retry(command)
         {
             self.retry_database_runtime();
@@ -15416,6 +15424,221 @@ mod shared_db_tests {
     fn make_database_retry_due(ctx: &AppContext) {
         ctx.database_runtime_failure.lock().retry_at =
             Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    fn resident_database_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+        let storage = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let ctx = AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "resident-recovery".into(),
+        );
+        crate::database_open::run_staged_open(
+            &ctx,
+            crate::database_open::DatabaseOpenRunner::ConfigureTail,
+            true,
+        );
+        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 2);
+        (storage, root, ctx)
+    }
+
+    // A separate process, not a second fd in this process, changes the live
+    // fixture while the App retains its SQLite handle and WAL locks.
+    fn change_schema_in_child(path: &Path, version: u32) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "context::shared_db_tests::repaired_resident_database_rechecks_schema_and_pushes_recovered_status",
+                "--nocapture",
+            ])
+            .env("AFT_TEST_SCHEMA_REPAIR_PATH", path)
+            .env("AFT_TEST_SCHEMA_REPAIR_VERSION", version.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "schema repair child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    fn assert_database_status(ctx: &AppContext, refused: bool) {
+        let status = ctx.build_status_snapshot();
+        let reasons = status["degraded_reasons"].as_array().unwrap();
+        assert_eq!(
+            reasons
+                .iter()
+                .any(|reason| reason == "storage_requires_newer_reader:aft.db"),
+            refused,
+            "unexpected database degraded reasons: {reasons:?}"
+        );
+        assert_eq!(
+            status["storage_refusals"].as_array().unwrap().len(),
+            usize::from(refused)
+        );
+    }
+
+    #[test]
+    fn repaired_resident_database_rechecks_schema_and_pushes_recovered_status() {
+        if let Some(path) = std::env::var_os("AFT_TEST_SCHEMA_REPAIR_PATH") {
+            crate::test_storage::assert_database(Path::new(&path));
+            let version: u32 = std::env::var("AFT_TEST_SCHEMA_REPAIR_VERSION")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            conn.execute("UPDATE schema_version SET version = ?1", [version])
+                .unwrap();
+            conn.execute_batch("COMMIT").unwrap();
+            return;
+        }
+        let (storage, _root, owner) = resident_database_context();
+        let resident = owner.db().unwrap();
+        let path = storage.path().join("aft.db");
+        change_schema_in_child(&path, crate::db::CURRENT_SCHEMA_VERSION + 1);
+        let affected_root = tempdir().unwrap();
+        let ctx = Arc::new(AppContext::from_app(
+            owner.app(),
+            Config {
+                project_root: Some(affected_root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.set_degraded_reasons(vec!["artifact_owner_read_only".into()]);
+        ctx.set_canonical_cache_root(affected_root.path().to_path_buf());
+        ctx.begin_database_runtime(
+            affected_root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "affected-route".into(),
+        );
+        let peeks = crate::db::schema_peek_count_for_test();
+        crate::database_open::run_staged_open(
+            &ctx,
+            crate::database_open::DatabaseOpenRunner::ConfigureTail,
+            true,
+        );
+        assert!(persistence_call(&ctx).is_some());
+        assert_database_status(&ctx, true);
+
+        change_schema_in_child(&path, crate::db::CURRENT_SCHEMA_VERSION);
+        // Expire the real two-second backoff deterministically without sleeping.
+        assert_eq!(
+            ctx.database_runtime_failure.lock().backoff,
+            Duration::from_secs(2)
+        );
+        make_database_retry_due(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctx.bind_status_context();
+        ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            let _ = tx.send(frame);
+        }))));
+        assert!(
+            persistence_call(&ctx).is_none(),
+            "repaired schema remained refused"
+        );
+        assert_database_status(&ctx, false);
+        assert!(Arc::ptr_eq(&resident, &ctx.db().unwrap()));
+        assert_eq!(
+            crate::db::schema_peek_count_for_test(),
+            peeks,
+            "recovery opened a second descriptor"
+        );
+        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "persist", "command": "db_set_host_state",
+            "params": {"key": "recovered", "value": "resident"}
+        }))
+        .unwrap();
+        assert!(crate::commands::state::handle_db_set_host_state(&request, &ctx).success);
+        assert_eq!(
+            crate::db::state::get_host_state(&resident.lock().unwrap(), "recovered").unwrap(),
+            Some("resident".into())
+        );
+        let frame = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("recovery must push status_changed without another index event");
+        let crate::protocol::PushFrame::StatusChanged(status) = frame else {
+            panic!("unexpected frame: {frame:?}")
+        };
+        assert!(!status.snapshot["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "storage_requires_newer_reader:aft.db"));
+        assert!(status.snapshot["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "artifact_owner_read_only"));
+    }
+
+    #[test]
+    fn resident_database_busy_retry_preserves_refusal_until_schema_is_rechecked() {
+        let (storage, _root, ctx) = resident_database_context();
+        let resident = ctx.db().unwrap();
+        let path = storage.path().join("aft.db");
+        change_schema_in_child(&path, crate::db::CURRENT_SCHEMA_VERSION + 1);
+        ctx.finish_database_runtime_error("recheck schema".into(), false);
+        make_database_retry_due(&ctx);
+        assert!(persistence_call(&ctx).is_some());
+        assert_database_status(&ctx, true);
+        let peeks = crate::db::schema_peek_count_for_test();
+        let held = resident.lock().unwrap();
+        make_database_retry_due(&ctx);
+        let response = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+        assert!(response["message"]
+            .as_str()
+            .unwrap()
+            .contains("process-shared database connection is in use"));
+        drop(held);
+        assert_database_status(&ctx, true);
+        change_schema_in_child(&path, crate::db::CURRENT_SCHEMA_VERSION);
+        assert!(
+            persistence_call(&ctx).is_none(),
+            "busy refusal stayed latched after releasing the connection"
+        );
+        assert_database_status(&ctx, false);
+        assert!(Arc::ptr_eq(&resident, &ctx.db().unwrap()));
+        assert_eq!(crate::db::schema_peek_count_for_test(), peeks);
+    }
+
+    #[test]
+    fn resident_database_open_slot_busy_recovers_on_next_call() {
+        let (_storage, _root, ctx) = resident_database_context();
+        let resident = ctx.db().unwrap();
+        let peeks = crate::db::schema_peek_count_for_test();
+        ctx.finish_database_runtime_error("retry open".into(), false);
+        make_database_retry_due(&ctx);
+        let app = ctx.app();
+        let held = app.db.lock();
+        let response = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+        assert!(response["message"]
+            .as_str()
+            .unwrap()
+            .contains("process-shared database connection is in use"));
+        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 5);
+        drop(held);
+        assert!(
+            persistence_call(&ctx).is_none(),
+            "busy refusal stayed latched after releasing the open slot"
+        );
+        assert!(Arc::ptr_eq(&resident, &ctx.db().unwrap()));
+        assert_eq!(crate::db::schema_peek_count_for_test(), peeks);
     }
 
     #[test]

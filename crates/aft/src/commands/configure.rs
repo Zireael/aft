@@ -6087,16 +6087,18 @@ pub(crate) fn open_database_runtime(
     // before a read-write connection, PRAGMA or migration touches it.
     let floor_started = Instant::now();
     let schema = ctx.app().database_schema_version(&db_path, mode);
-    let gate = crate::persisted_format::gate(
-        crate::persisted_format::PersistedStore::AftDb,
-        &db_path,
-        &db_path,
-        schema
-            .as_ref()
-            .ok()
-            .and_then(|(version, _)| *version)
-            .map(u64::from),
-    );
+    // A busy resident handle is not evidence that its schema became readable.
+    // Retain any recorded refusal until a successful version read revalidates
+    // it; in particular never peek through a second fd to bypass contention.
+    let gate = match &schema {
+        Ok((version, _)) => crate::persisted_format::gate(
+            crate::persisted_format::PersistedStore::AftDb,
+            &db_path,
+            &db_path,
+            version.map(u64::from),
+        ),
+        Err(_) => Ok(()),
+    };
     let floor_check = floor_started.elapsed();
     if let Err(refusal) = gate {
         let published = ctx.publish_database_open(epoch, |slot| {
