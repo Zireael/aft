@@ -2462,13 +2462,27 @@ mod tests {
             .contains("too large to inline"));
     }
 
-    #[test]
-    fn image_processing_does_not_consume_filesystem_deadline() {
+    fn image_read_beyond_filesystem_deadline(hashline: bool) {
         let temp = tempfile::tempdir().expect("tempdir");
         let bytes = encode_png(&rgba_image(2, 2, false)).unwrap();
         let path = write_fixture(temp.path(), "small.png", &bytes);
         let ctx = ctx_for(temp.path());
         let req = request(&path, json!({}));
+        if hashline {
+            assert!(
+                ctx.hashline_bindings()
+                    .register(
+                        temp.path(),
+                        req.session().to_string(),
+                        crate::hashline::integration::RegistrationRequest {
+                            configured_enabled: true,
+                            edit_slot_survives: true,
+                            read_slot_survives: true,
+                        },
+                    )
+                    .effective
+            );
+        }
         let budget = crate::bounded_io::Budget::after(Duration::from_secs(1));
         // Simulate slow decoding without adding CPU load. Filesystem access must
         // finish within its budget, but image processing has a separate timeout.
@@ -2484,6 +2498,16 @@ mod tests {
         let attachment = first_attachment(&response.data);
         assert_eq!(attachment["kind"], "image");
         assert_eq!(decoded_attachment_bytes(attachment), bytes);
+    }
+
+    #[test]
+    fn image_processing_does_not_consume_filesystem_deadline() {
+        image_read_beyond_filesystem_deadline(false);
+    }
+
+    #[test]
+    fn registered_image_processing_does_not_consume_filesystem_deadline() {
+        image_read_beyond_filesystem_deadline(true);
     }
 
     /// Render a read response through the agent-facing text formatter, the same
