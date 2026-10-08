@@ -20849,8 +20849,11 @@ mod refresh_worker_tests {
             );
         }
 
+        // A positive wait: two seamed batches (150 ms each) plus real refreshes
+        // can exceed 2 s on a loaded Windows runner. Coalescing is proven by
+        // the call count below, not by how fast the flush returns.
         assert!(flush_callgraph_store_refreshes_with_budget(
-            Duration::from_secs(2)
+            Duration::from_secs(30)
         ));
         assert_eq!(callgraph_refresh_worker_test_counts(&root).0, 2);
         assert!(pending.lock().is_empty());
@@ -20939,8 +20942,9 @@ mod refresh_worker_tests {
         set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, true);
 
         enqueue_callgraph_store_refresh(callgraph_dir.clone(), root.clone(), vec![source], pending);
+        // Positive wait; the outcome is checked by the counts below.
         assert!(flush_callgraph_store_refreshes_with_budget(
-            Duration::from_secs(2)
+            Duration::from_secs(30)
         ));
 
         assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 1));
