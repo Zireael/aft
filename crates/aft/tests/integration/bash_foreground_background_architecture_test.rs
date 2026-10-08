@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{user_config, wait_for_task_metadata, AftProcess};
 
 const SESSION: &str = "bash-arch-session";
 
@@ -78,12 +78,16 @@ fn wait_terminal(aft: &mut AftProcess, task_id: &str) -> Value {
     }
 }
 
-/// `bash_status` can report `completed` before `bash_drain_completions` exposes the
-/// frame (macOS CI flake). Poll drain until the promoted task appears.
-fn wait_terminal_with_drain_completion(aft: &mut AftProcess, task_id: &str) -> Value {
+/// Drain is non-destructive until ack. Observe that lane directly so readiness
+/// polling does not consume the terminal result through bash_status first.
+fn wait_terminal_with_drain_completion(
+    aft: &mut AftProcess,
+    storage: &std::path::Path,
+    task_id: &str,
+) -> Value {
+    wait_for_task_metadata(storage, "opencode", task_id, "completed");
     let started = Instant::now();
     loop {
-        let _terminal = wait_terminal(aft, task_id);
         let drained = drain(aft);
         assert_eq!(drained["success"], true, "drain failed: {drained:?}");
         let completions = drained["bg_completions"].as_array().unwrap();
@@ -207,7 +211,7 @@ fn bash_promote_reenables_completion_delivery() {
         .to_string(),
     );
     assert_eq!(promoted["success"], true, "promote failed: {promoted:?}");
-    let drained = wait_terminal_with_drain_completion(&mut aft, task_id);
+    let drained = wait_terminal_with_drain_completion(&mut aft, storage.path(), task_id);
     let completions = drained["bg_completions"].as_array().unwrap();
     assert_eq!(completions.len(), 1, "drained: {drained:?}");
     assert_eq!(completions[0]["task_id"], task_id);

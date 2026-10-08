@@ -110,3 +110,37 @@ impl Drop for CpuHog {
         }
     }
 }
+
+/// Observe readiness without delivering the result to a protocol session.
+/// A terminal bash_status reply consumes a completion, so replay/reminder
+/// fixtures must instead read the task's atomically published metadata.
+#[cfg(unix)]
+#[allow(dead_code)] // Shared with watcher_integration, which does not use bash fixtures.
+pub fn wait_for_task_metadata(
+    storage: &std::path::Path,
+    harness: &str,
+    task_id: &str,
+    expected: &str,
+) -> serde_json::Value {
+    let root = storage.join(harness).join("bash-tasks");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(sessions) = std::fs::read_dir(&root) {
+            for session in sessions.flatten() {
+                let path = session.path().join(task_id).join("control/metadata.json");
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if metadata["status"] == expected {
+                            return metadata;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "task {task_id} never persisted status {expected}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}

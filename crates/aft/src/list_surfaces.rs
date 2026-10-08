@@ -299,6 +299,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "management health detail, not an agent result list; omitted retention reports are counted exactly and aggregate retention counters remain present",
     },
     ExclusionEntry {
+        file: "bash_background/registry.rs",
+        enclosing_item: "cleanup_finished_at_with, gc_harness_stores",
+        location_or_primitive: "GC_ENTRY_BUDGET maintenance queue and namespace iterator",
+        reason: "internal housekeeping advances bounded round-robin queues and resumable directory iterators; retained work is revisited on later passes, not truncated from an agent-visible list",
+    },
+    ExclusionEntry {
+        file: "bash_background/gc_cursor.rs",
+        enclosing_item: "next_batch",
+        location_or_primitive: "GC_ENTRY_BUDGET directory iterator advancement",
+        reason: "internal persisted-task and quarantine retention scans resume the same iterator next pass; the cap bounds inspection work, not returned records",
+    },
+    ExclusionEntry {
         file: "bash_background/remote.rs",
         enclosing_item: "append_executor_environment_disclosure",
         location_or_primitive: "executor environment name preview min(10)",

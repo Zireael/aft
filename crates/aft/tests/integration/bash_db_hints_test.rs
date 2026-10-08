@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{user_config, wait_for_task_metadata, AftProcess};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,28 @@ fn terminal(aft: &mut AftProcess, task: &str) -> Value {
             return response;
         }
         assert!(Instant::now() < deadline, "{response}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn uncollected_completion(aft: &mut AftProcess, storage: &std::path::Path, task: &str) -> Value {
+    wait_for_task_metadata(storage, "opencode", task, "failed");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let drained =
+            aft.send(&json!({"id":"db-drain", "command":"bash_drain_completions"}).to_string());
+        if let Some(completion) = drained["bg_completions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["task_id"] == task)
+        {
+            return completion.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background completion never became available"
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -81,17 +103,11 @@ fn db_hints_background_completion_keeps_trailer_after_preview_cap() {
     assert_eq!(launched["status"], "running", "{launched}");
     assert!(!launched.to_string().contains("[aft: no column"));
     let task = launched["task_id"].as_str().unwrap();
+    let completion = uncollected_completion(&mut aft, &dir.path().join("storage"), task);
     let response = terminal(&mut aft, task);
     assert_eq!(response["status"], "failed", "{response}");
     let preview = response["output_preview"].as_str().unwrap();
     assert_eq!(preview.matches("[aft: no column").count(), 1, "{preview}");
-    let drained =
-        aft.send(&json!({"id":"db-drain", "command":"bash_drain_completions"}).to_string());
-    let completions = drained["bg_completions"].as_array().unwrap();
-    let completion = completions
-        .iter()
-        .find(|c| c["task_id"] == task)
-        .expect("background completion");
     let preview = completion["output_preview"].as_str().unwrap();
     assert!(preview.contains("tasks: id TEXT, kind TEXT"), "{preview}");
     assert_eq!(preview.matches("[aft: no column").count(), 1, "{preview}");
@@ -111,18 +127,12 @@ fn db_hints_terminal_pty_status_and_completion() {
     );
     assert_eq!(launched["status"], "running", "{launched}");
     let task = launched["task_id"].as_str().unwrap();
+    let completion = uncollected_completion(&mut aft, &dir.path().join("storage"), task);
     let response = terminal(&mut aft, task);
     assert_eq!(response["status"], "failed", "{response}");
     let preview = response["output_preview"].as_str().unwrap();
     assert!(preview.contains("tasks: id TEXT, kind TEXT"), "{preview}");
-    let drained =
-        aft.send(&json!({"id":"db-drain-pty", "command":"bash_drain_completions"}).to_string());
-    let completion = drained["bg_completions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["task_id"] == task)
-        .unwrap();
+
     assert!(
         completion["output_preview"]
             .as_str()

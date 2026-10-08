@@ -213,12 +213,19 @@ impl PinnedDir {
     }
 
     fn modified(&self) -> io::Result<SystemTime> {
+        #[cfg(test)]
+        work_counts::record_stat();
         self.file.metadata()?.modified()
     }
 
     fn same_identity(&self, other: &Self) -> io::Result<bool> {
         #[cfg(unix)]
         {
+            #[cfg(test)]
+            {
+                work_counts::record_stat();
+                work_counts::record_stat();
+            }
             let left = self.file.metadata()?;
             let right = other.file.metadata()?;
             Ok(left.dev() == right.dev() && left.ino() == right.ino())
@@ -340,6 +347,8 @@ impl PinnedDir {
     }
 
     pub fn list_names(&self) -> io::Result<Vec<OsString>> {
+        #[cfg(test)]
+        work_counts::record_open();
         #[cfg(unix)]
         {
             let dot = b".\0";
@@ -1789,6 +1798,8 @@ pub fn read_exit_marker(paths: &TaskPaths) -> io::Result<Option<ExitMarker>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    #[cfg(test)]
+    work_counts::record_marker_read();
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     let content = content.trim();
@@ -1868,6 +1879,9 @@ pub(crate) mod work_counts {
         pub opens: usize,
         pub metadata_reads: usize,
         pub parses: usize,
+        pub marker_reads: usize,
+        pub stats: usize,
+        pub gc_entries: usize,
     }
 
     thread_local! {
@@ -1887,6 +1901,15 @@ pub(crate) mod work_counts {
     }
     pub(crate) fn record_read() {
         record(|counts| counts.metadata_reads += 1);
+    }
+    pub(crate) fn record_marker_read() {
+        record(|counts| counts.marker_reads += 1);
+    }
+    pub(crate) fn record_stat() {
+        record(|counts| counts.stats += 1);
+    }
+    pub(crate) fn record_gc_entry() {
+        record(|counts| counts.gc_entries += 1);
     }
     pub(crate) fn record_parse() {
         record(|counts| counts.parses += 1);
@@ -1912,6 +1935,8 @@ impl ValidatedArtifact {
 
     pub fn len(&self) -> io::Result<u64> {
         validate_regular_handle(&self.file)?;
+        #[cfg(test)]
+        work_counts::record_stat();
         Ok(self.file.metadata()?.len())
     }
 
@@ -2191,6 +2216,8 @@ impl TaskIoHandles {
             io::Error::new(io::ErrorKind::NotFound, "task artifact is not pre-opened")
         })?;
         validate_regular_handle(file)?;
+        #[cfg(test)]
+        work_counts::record_stat();
         Ok(file.metadata()?.len())
     }
 }
@@ -2315,6 +2342,8 @@ fn validate_directory_handle(file: &File) -> io::Result<()> {
     // recursive cleanup may unlink. Junctions must never enter that fallback.
     #[cfg(windows)]
     validate_windows_handle(file, true)?;
+    #[cfg(test)]
+    work_counts::record_stat();
     let metadata = file.metadata()?;
     if !metadata.is_dir() {
         #[cfg(unix)]
@@ -2333,6 +2362,8 @@ fn validate_directory_handle(file: &File) -> io::Result<()> {
 }
 
 fn validate_regular_handle(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    work_counts::record_stat();
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::new(
