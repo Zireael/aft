@@ -775,6 +775,180 @@ test_stack_name_lock_recovery() {
   fi
 }
 
+# Inject the errors Git emits when linked worktrees update shared remote refs.
+# The real fetch still runs on successful attempts; auth/permission failures
+# are separate controls and must never be mistaken for a ref-update race.
+install_fetch_faults() {
+  local dir="$1" real_git
+  real_git="$(command -v git)"
+  mkdir -p "$dir/fixturebin"
+  cat > "$dir/fixturebin/git" <<SHIM
+#!/usr/bin/env bash
+if [ -f "$dir/ci-state/polling" ]; then
+  for arg in "\$@"; do
+    if [ "\$arg" = "refs/heads/train/parent" ]; then
+      case "\$(cat "$dir/ci-state/fetch-fault")" in
+        remote-error) echo 'fatal: Authentication failed for origin' >&2; exit 128 ;;
+        remote-empty) exit 0 ;;
+      esac
+    fi
+  done
+fi
+for arg in "\$@"; do
+  if [ "\$arg" = push ] && [ "\$(cat "$dir/ci-state/fetch-fault")" = recover ] &&
+    [ ! -f "$dir/ci-state/successful-fetches" ]; then
+    touch "$dir/ci-state/pushed-before-fetch-recovery"
+  fi
+  if [ "\$arg" = fetch ]; then
+    count=0
+    [ ! -f "$dir/ci-state/fetch-count" ] || read -r count < "$dir/ci-state/fetch-count"
+    count=\$((count + 1))
+    printf '%s\\n' "\$count" > "$dir/ci-state/fetch-count"
+    mode=\$(cat "$dir/ci-state/fetch-fault")
+    case "\$mode" in
+      recover)
+        if [ "\$count" = 1 ]; then
+          echo "error: cannot lock ref 'refs/remotes/origin/$DEFAULT_BRANCH': is at 1111111111111111111111111111111111111111 but expected 2222222222222222222222222222222222222222" >&2
+          exit 1
+        elif [ "\$count" = 2 ]; then
+          echo "error: cannot lock ref 'refs/remotes/origin/$DEFAULT_BRANCH': Unable to create 'common/refs/remotes/origin/$DEFAULT_BRANCH.lock': File exists." >&2
+          exit 1
+        fi
+        ;;
+      persistent)
+        echo "error: cannot lock ref 'refs/remotes/origin/$DEFAULT_BRANCH': is at 1111111111111111111111111111111111111111 but expected 2222222222222222222222222222222222222222" >&2
+        exit 1
+        ;;
+      permission)
+        echo "error: cannot lock ref 'refs/remotes/origin/$DEFAULT_BRANCH': Unable to create 'common/refs/remotes/origin/$DEFAULT_BRANCH.lock': Permission denied" >&2
+        exit 1
+        ;;
+      transport)
+        echo 'fatal: Authentication failed for origin' >&2
+        exit 128
+        ;;
+      polling)
+        if [ -f "$dir/ci-state/polling" ]; then
+          echo fetched > "$dir/ci-state/fetched-while-polling"
+          echo "error: cannot lock ref 'refs/remotes/origin/$DEFAULT_BRANCH': is at 1111111111111111111111111111111111111111 but expected 2222222222222222222222222222222222222222" >&2
+          exit 1
+        fi
+        ;;
+    esac
+    printf '%s\\n' "\$count" >> "$dir/ci-state/successful-fetches"
+    break
+  fi
+done
+exec "$real_git" "\$@"
+SHIM
+  chmod +x "$dir/fixturebin/git"
+}
+
+test_fetch_race_retry() {
+  local dir
+  dir="$(new_fixture fetch-recovery)"
+  stack_worktree "$dir" child "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  stack_commit "$dir/child" child
+  echo recover > "$dir/ci-state/fetch-fault"
+  install_fetch_faults "$dir"
+  PATH="$dir/fixturebin:$PATH" TRAIN_PUSH_TEST_CWD="$dir/child" run_train "$dir" child
+  if [ "$LAST_RC" = 0 ] && [[ "$LAST_OUT" == *"shared ref update race; retrying"* ]] &&
+    [ "$(head -1 "$dir/ci-state/successful-fetches" 2>/dev/null)" = 3 ] &&
+    [ ! -f "$dir/ci-state/pushed-before-fetch-recovery" ] &&
+    [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$(git -C "$dir/child" rev-parse HEAD)" ]; then
+    ok "a linked-worktree train retries ref-lock and compare-and-swap fetch failures and lands"
+  else
+    fail "a linked-worktree train retries ref-lock and compare-and-swap fetch failures and lands"
+  fi
+}
+
+test_fetch_failure_boundaries() {
+  local dir mode want
+  for mode in persistent permission transport; do
+    dir="$(new_fixture "fetch-$mode")"
+    add_train_commit "$dir/work" "fetch-$mode"
+    echo "$mode" > "$dir/ci-state/fetch-fault"
+    install_fetch_faults "$dir"
+    PATH="$dir/fixturebin:$PATH" run_train "$dir" "fetch-$mode"
+    want=1
+    [ "$mode" != persistent ] || want=5
+    if [ "$LAST_RC" = 2 ] && [ "$(cat "$dir/ci-state/fetch-count")" = "$want" ] &&
+      [ -z "$(origin_ref "$dir" "refs/heads/train/fetch-$mode")" ]; then
+      ok "$mode fetch failures refuse before push after exactly $want attempt(s)"
+    else
+      fail "$mode fetch failures refuse before push after exactly $want attempt(s)"
+    fi
+  done
+}
+
+test_stack_poll_without_fetch() {
+  local dir pid
+  dir="$(stack_child_fixture stack-polling)"
+  echo polling > "$dir/ci-state/fetch-fault"
+  install_fetch_faults "$dir"
+  PATH="$dir/fixturebin:$PATH" TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then
+    touch "$dir/ci-state/polling"
+    complete_stack_ci "$dir" child success
+  fi
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"parent parent has not landed"* ]] &&
+    [ ! -f "$dir/ci-state/fetched-while-polling" ]; then
+    ok "a stacked child polls remote parent refs without fetching shared tracking refs"
+  else
+    fail "a stacked child polls remote parent refs without fetching shared tracking refs"
+  fi
+}
+
+test_stack_unseen_remote_head() {
+  local dir pid old_main new_main=""
+  dir="$(stack_child_fixture stack-unseen-head)"
+  old_main="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then
+    # The peer is a separate clone, so this object is not yet in the linked
+    # worktrees' shared object database when the child starts polling.
+    advance_origin_main "$dir" peer-after-child-push
+    new_main="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+    if git -C "$dir/child" cat-file -e "$new_main^{commit}" 2>/dev/null; then
+      fail "unseen-head fixture unexpectedly already has the peer's commit"
+    fi
+    complete_stack_ci "$dir" child success
+  fi
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"parent parent has not landed"* ]] &&
+    git -C "$dir/child" cat-file -e "$new_main^{commit}" 2>/dev/null &&
+    [ "$(git -C "$dir/child" rev-parse "origin/$DEFAULT_BRANCH")" = "$old_main" ]; then
+    ok "a child downloads an unseen remote head without changing shared tracking refs"
+  else
+    fail "a child downloads an unseen remote head without changing shared tracking refs"
+  fi
+}
+
+test_stack_remote_read_failures() {
+  local dir pid mode
+  for mode in remote-error remote-empty; do
+    dir="$(stack_child_fixture "stack-$mode")"
+    echo "$mode" > "$dir/ci-state/fetch-fault"
+    install_fetch_faults "$dir"
+    PATH="$dir/fixturebin:$PATH" TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 start_stack_train "$dir" child child --on parent
+    pid="$STACK_PID"
+    if wait_stack_push "$dir" child; then
+      touch "$dir/ci-state/polling"
+      complete_stack_ci "$dir" child success
+    fi
+    join_stack_train "$dir" "$pid" child
+    if [ "$LAST_RC" = 4 ] && [[ "$LAST_OUT" == *"CI green, but landing failed"* ]] &&
+      [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$(git -C "$dir/child" rev-parse HEAD~2)" ]; then
+      ok "$mode while reading parent heads fails closed without landing"
+    else
+      fail "$mode while reading parent heads fails closed without landing"
+    fi
+  done
+}
+
 test_ci_conclusion_guard() {
   local dir base
   dir="$(new_fixture ci-conclusion)"
@@ -799,6 +973,11 @@ run_stack_tests() {
   test_stack_abandoned_parent
   test_stack_name_lock
   test_stack_name_lock_recovery
+  test_stack_poll_without_fetch
+  test_stack_unseen_remote_head
+  test_stack_remote_read_failures
+  test_fetch_race_retry
+  test_fetch_failure_boundaries
   test_stack_chain
   test_ci_conclusion_guard
 }
@@ -810,10 +989,15 @@ case "${TRAIN_PUSH_TEST_CASE:-}" in
   stack-abandoned) test_stack_abandoned_parent ;;
   stack-name-lock) test_stack_name_lock ;;
   stack-name-recovery) test_stack_name_lock_recovery ;;
+  stack-polling) test_stack_poll_without_fetch ;;
+  stack-unseen-head) test_stack_unseen_remote_head ;;
+  stack-remote-errors) test_stack_remote_read_failures ;;
+  fetch-retry) test_fetch_race_retry ;;
+  fetch-boundaries) test_fetch_failure_boundaries ;;
   ci-conclusion) test_ci_conclusion_guard ;;
   stacked) run_stack_tests ;;
 esac
-if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ]; then
+if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == fetch-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ]; then
   [ "$failures" = 0 ] || exit 1
   echo "train-push.test.sh: stacked cases passed ($checks checks)"
   exit 0
@@ -1529,7 +1713,7 @@ expect_no_out "Unable to read current working directory" "landing does not ask g
 mutant_dir="$TMP_ROOT/cwd-mutant-scripts"
 cp -R "$SCRIPT_DIR" "$mutant_dir"
 mutant="$mutant_dir/train-push.sh"
-sed 's/git -C "$REPO" fetch -q "$remote" "$default_branch"/git fetch -q "$remote" "$default_branch"/g' "$TRAIN_PUSH" > "$mutant"
+sed 's/fetch_remote -q "$remote" "$default_branch"/git fetch -q "$remote" "$default_branch"/g' "$TRAIN_PUSH" > "$mutant"
 chmod +x "$mutant"
 grep -q '^  git fetch -q "$remote" "$default_branch"' "$mutant" ||
   fail "cwd mutation did not restore a bare post-watch git call"

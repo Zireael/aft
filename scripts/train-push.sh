@@ -229,6 +229,33 @@ refuse() {
   exit 2
 }
 
+# Linked worktrees share refs/remotes even though their HEADs are independent.
+# Git rejects a fetch if another fetch or push changes a tracking ref after
+# its read. Only that compare-and-swap race or an existing ref lock is
+# transient: auth, transport and permission failures still stop immediately.
+fetch_remote() {
+  local output rc attempt delay
+  for attempt in 1 2 3 4 5; do
+    if output="$(git -C "$REPO" fetch "$@" 2>&1)"; then
+      [ -z "$output" ] || printf '%s\n' "$output" >&2
+      return 0
+    else
+      rc=$?
+    fi
+    printf '%s\n' "$output" >&2
+    if [[ "$output" == *"cannot lock ref 'refs/remotes/"* ]] &&
+      { [[ "$output" == *" but expected "* ]] || [[ "$output" == *"File exists"* ]]; }; then
+      [ "$attempt" -lt 5 ] || return "$rc"
+      # Independent processes must not wake up in lockstep on the next try.
+      printf -v delay '0.%03d' "$((50 + RANDOM % 151))"
+      say "git fetch hit a shared ref update race; retrying (attempt $((attempt + 1)) of 5 after ${delay}s)"
+      sleep "$delay" || return "$?"
+    else
+      return "$rc"
+    fi
+  done
+}
+
 # ---------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------
@@ -709,22 +736,38 @@ refuse_stack() {
 }
 
 wait_for_parent() {
-  local sha="$1" run_url="$2" main_sha tip rid verdict status conclusion bad
+  local sha="$1" run_url="$2" main_sha tip rid verdict status conclusion bad refs ref ref_sha
   local attempts="${TRAIN_PUSH_PARENT_ATTEMPTS:-360}" wait_seconds="${TRAIN_PUSH_PARENT_SLEEP:-10}" parent_poll
   [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || refuse "TRAIN_PUSH_PARENT_ATTEMPTS must be a positive integer"
   for ((parent_poll=1; parent_poll<=attempts; parent_poll++)); do
-    git -C "$REPO" fetch -q --prune "$remote" ||
-      landing_failed "fetch while waiting for parent $parent_name failed" "$sha" "$run_url"
-    main_sha="$(git -C "$REPO" rev-parse "$remote_default")"
+    # Read advertised heads without updating shared remote-tracking refs. The
+    # parent and descendants can poll together without contending on ref locks.
+    refs="$(git -C "$REPO" ls-remote --heads "$remote" "refs/heads/$default_branch" "refs/heads/train/$parent_name")" ||
+      landing_failed "could not read remote heads while waiting for parent $parent_name" "$sha" "$run_url"
+    main_sha=""; tip=""
+    while read -r ref_sha ref; do
+      case "$ref" in
+        "refs/heads/$default_branch") main_sha="$ref_sha" ;;
+        "refs/heads/train/$parent_name") tip="$ref_sha" ;;
+      esac
+    done <<< "$refs"
+    [ -n "$main_sha" ] ||
+      landing_failed "remote default branch $default_branch disappeared while waiting for parent $parent_name" "$sha" "$run_url"
+    # A peer may have landed a commit outside this child's history. Download
+    # its advertised object only when needed for ancestry checks, without
+    # changing any tracking ref or a train's FETCH_HEAD.
+    if ! git -C "$REPO" cat-file -e "$main_sha^{commit}" 2>/dev/null; then
+      fetch_remote --no-write-fetch-head --no-tags --refmap= "$remote" "$main_sha" ||
+        landing_failed "could not fetch remote default sha while waiting for parent $parent_name" "$sha" "$run_url"
+    fi
     # A child run covers parent+child, but cannot authorize landing the parent
     # itself. Its exact base must already have arrived on the default branch.
-    if git -C "$REPO" merge-base --is-ancestor "$parent_base" "$remote_default"; then
-      git -C "$REPO" merge-base --is-ancestor "$remote_default" "$sha" ||
+    if git -C "$REPO" merge-base --is-ancestor "$parent_base" "$main_sha"; then
+      git -C "$REPO" merge-base --is-ancestor "$main_sha" "$sha" ||
         refuse_stack "parent $parent_name landed at a different sha, or $remote/$default_branch moved beyond the tested stack"
       say "parent $parent_name base $parent_base is on $remote/$default_branch; spending the child's own green without rerunning CI"
       return
     fi
-    tip="$(git -C "$REPO" rev-parse --verify -q "refs/remotes/$remote/train/$parent_name" || true)"
     [ -n "$tip" ] || refuse_stack "parent $parent_name is abandoned or landed at a different sha"
     [ "$tip" = "$parent_base" ] || refuse_stack "parent $parent_name changed to $tip"
     rid="$(resolve_ci_run "$parent_base" "train/$parent_name" || true)"
@@ -790,7 +833,7 @@ land_verified_sha() {
   local run_url="$2"
 
   require_repo_after_green "$sha" "$run_url"
-  git -C "$REPO" fetch -q "$remote" "$default_branch" ||
+  fetch_remote -q "$remote" "$default_branch" ||
     landing_failed "git fetch $remote $default_branch failed" "$sha" "$run_url"
   if [ -n "$parent_name" ]; then
     wait_for_parent "$sha" "$run_url"
@@ -812,7 +855,7 @@ land_verified_sha() {
     landing_failed "$land_reason" "$sha" "$run_url"
   fi
 
-  git -C "$REPO" fetch -q "$remote" "$default_branch" ||
+  fetch_remote -q "$remote" "$default_branch" ||
     landing_failed "could not verify $remote/$default_branch after push" "$sha" "$run_url"
   if ! git -C "$REPO" merge-base --is-ancestor "$sha" "$remote_default"; then
     landing_failed "push reported success but $sha is not on $remote/$default_branch" "$sha" "$run_url"
@@ -830,7 +873,7 @@ watch_log="$(mktemp "${TMPDIR:-/tmp}/train-push-watch.XXXXXX")"
 push_log="$(mktemp "${TMPDIR:-/tmp}/train-push-push.XXXXXX")"
 trap 'rm -f "$watch_log" "$push_log" "$TRAIN_PUSH_EXEC_COPY"' EXIT
 
-git -C "$REPO" fetch -q --prune "$remote" || refuse "git fetch $remote failed"
+fetch_remote -q --prune "$remote" || refuse "git fetch $remote failed"
 default_branch="$(resolve_default_branch || true)"
 if [ -z "$default_branch" ]; then
   refuse "could not determine $remote's default branch (run: git remote set-head $remote -a)"
@@ -1467,7 +1510,7 @@ while true; do
 
   # Re-check right before the push, not just at the start of the script.
   require_repo_after_green "$head_sha" "$run_url"
-  git -C "$REPO" fetch -q "$remote" "$default_branch" ||
+  fetch_remote -q "$remote" "$default_branch" ||
     landing_failed "git fetch $remote $default_branch failed" "$head_sha" "$run_url"
   if git -C "$REPO" merge-base --is-ancestor "$remote_default" "$head_sha"; then
     break
@@ -1527,7 +1570,7 @@ fi
 
 # Outcome check, not just command check: a push can report success through a
 # wrapper (or fail on auth) while origin never moved.
-git -C "$REPO" fetch -q "$remote" "$default_branch" ||
+fetch_remote -q "$remote" "$default_branch" ||
   landing_failed "could not verify $remote/$default_branch after push" "$head_sha" "$run_url"
 if ! git -C "$REPO" merge-base --is-ancestor "$head_sha" "$remote_default"; then
   landing_failed "push reported success but $head_sha is not on $remote/$default_branch" "$head_sha" "$run_url"
