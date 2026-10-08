@@ -439,7 +439,10 @@ jobs:
   unit-linux-storm:
     name: Release storm (Linux)
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    # The storm runs a release-profile build first. With a cold compiler cache
+    # that build plus the storm takes about 23 minutes on a normal runner, and
+    # a slow runner crossed the old 25-minute cap mid-test.
+    timeout-minutes: 40
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
