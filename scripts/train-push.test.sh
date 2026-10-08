@@ -751,6 +751,30 @@ test_stack_name_lock() {
   expect_rc 0 "the original train retains its name lock and lands"
 }
 
+# Name-lock recovery must be serialized in the shared git directory, not in
+# whichever linked worktree happens to be recovering it. An interrupted reaper
+# is an intentional fail-closed condition; another worktree must not bypass it.
+test_stack_name_lock_recovery() {
+  local dir base key lock
+  dir="$(new_fixture stack-name-recovery)"
+  base="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+  stack_worktree "$dir" child "$base"
+  stack_commit "$dir/child" child
+  key="$(printf '%s' child | git -C "$dir/work" hash-object --stdin)"
+  lock="$dir/work/.git/train-push-locks/by-name-$key"
+  mkdir -p "$lock/held" "$lock/reap"
+  printf '2147483000 gone\n' > "$lock/held/owner"
+  printf '2147483000\n' > "$lock/reap/owner"
+  TRAIN_PUSH_TEST_CWD="$dir/child" run_train "$dir" child
+  if [ "$LAST_RC" = 2 ] && [[ "$LAST_OUT" == *"train lock recovery left behind"* ]] &&
+    [ -f "$lock/reap/owner" ] && [ -f "$lock/held/owner" ] &&
+    [ -z "$(origin_ref "$dir" refs/heads/train/child)" ]; then
+    ok "a linked worktree cannot bypass interrupted shared name-lock recovery"
+  else
+    fail "a linked worktree cannot bypass interrupted shared name-lock recovery"
+  fi
+}
+
 test_ci_conclusion_guard() {
   local dir base
   dir="$(new_fixture ci-conclusion)"
@@ -774,6 +798,7 @@ run_stack_tests() {
   test_stack_changed_parent
   test_stack_abandoned_parent
   test_stack_name_lock
+  test_stack_name_lock_recovery
   test_stack_chain
   test_ci_conclusion_guard
 }
@@ -784,6 +809,7 @@ case "${TRAIN_PUSH_TEST_CASE:-}" in
   stack-chain) test_stack_chain ;;
   stack-abandoned) test_stack_abandoned_parent ;;
   stack-name-lock) test_stack_name_lock ;;
+  stack-name-recovery) test_stack_name_lock_recovery ;;
   ci-conclusion) test_ci_conclusion_guard ;;
   stacked) run_stack_tests ;;
 esac

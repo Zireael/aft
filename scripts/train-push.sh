@@ -392,7 +392,9 @@ while true; do
   # Inside `reap`, `held` cannot change hands: a fresh mkdir fails while it
   # exists and every other remover is waiting on `reap`. So re-reading the
   # owner there and finding the same stale record proves the removal is safe.
-  train_lock_reap="$train_lock_dir/reap"
+  # Both resources have their own recovery mutex. The name lock is shared
+  # across worktrees, so its reaper must be shared across worktrees too.
+  train_lock_reap="${train_lock_held%/held}/reap"
   if [ -n "${TRAIN_PUSH_TEST_LOCK_RACE_HOOK:-}" ]; then
     "$TRAIN_PUSH_TEST_LOCK_RACE_HOOK"
   fi
