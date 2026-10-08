@@ -310,6 +310,8 @@ fn process_image_with_timeout(
     raw_bytes: Vec<u8>,
     kind: ImageKind,
 ) -> Result<ProcessedImage, String> {
+    #[cfg(test)]
+    IMAGE_PROCESSING_DELAY.with(|delay| std::thread::sleep(delay.get()));
     ACTIVE_IMAGE_DECODERS.fetch_update(
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
@@ -1338,6 +1340,7 @@ struct CapturedRead {
 thread_local! {
     static LEGACY_HASHLINE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LEGACY_READ_RENDER_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IMAGE_PROCESSING_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 fn handle_read_local(
@@ -1382,9 +1385,13 @@ fn handle_read_local(
     let owned_req = req.clone();
     #[cfg(test)]
     let legacy = LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
+    #[cfg(test)]
+    let image_delay = IMAGE_PROCESSING_DELAY.with(|delay| delay.get());
     let result = crate::bounded_io::run(path.as_path(), None, move |path| {
         #[cfg(test)]
         LEGACY_HASHLINE_READ.with(|value| value.set(legacy));
+        #[cfg(test)]
+        IMAGE_PROCESSING_DELAY.with(|value| value.set(image_delay));
         let mut captured = None;
         let response = handle_read_path(&owned_req, &path, capture_source, &mut captured);
         #[cfg(test)]
@@ -2417,6 +2424,30 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("too large to inline"));
+    }
+
+    #[test]
+    fn image_processing_does_not_consume_filesystem_deadline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bytes = encode_png(&rgba_image(2, 2, false)).unwrap();
+        let path = write_fixture(temp.path(), "small.png", &bytes);
+        let ctx = ctx_for(temp.path());
+        let req = request(&path, json!({}));
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(1));
+        // Simulate slow decoding without adding CPU load. Filesystem access must
+        // finish within its budget, but image processing has a separate timeout.
+        let response = crate::bounded_io::with_budget(Some(budget), || {
+            let previous = IMAGE_PROCESSING_DELAY
+                .with(|delay| delay.replace(Duration::from_millis(1100)));
+            let response = handle_read(&req, &ctx);
+            IMAGE_PROCESSING_DELAY.with(|delay| delay.set(previous));
+            response
+        });
+
+        assert!(response.success, "{response:?}");
+        let attachment = first_attachment(&response.data);
+        assert_eq!(attachment["kind"], "image");
+        assert_eq!(decoded_attachment_bytes(attachment), bytes);
     }
 
     /// Render a read response through the agent-facing text formatter, the same
