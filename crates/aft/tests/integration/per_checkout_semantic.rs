@@ -7,15 +7,15 @@
 //! bit-equal scores and nothing is shared with the view under test.
 //!
 //! The embed-count tests measure the property this plane exists for: equal
-//! content (same path, bytes and producer) is embedded once per family, across
+//! chunk text (under the same producer) is embedded once per family, across
 //! views and across sessions, and a view of an older branch embeds only content
 //! nobody embedded before.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aft::blob_store::v2::{FamilyPlane, TrigramPolicy};
@@ -50,6 +50,7 @@ fn vector(model: &str, text: &str) -> Vec<f32> {
 struct Model {
     calls: AtomicUsize,
     texts: AtomicUsize,
+    text_counts: Mutex<BTreeMap<String, usize>>,
     delay: Option<Duration>,
 }
 
@@ -60,11 +61,19 @@ impl Model {
         }
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.texts.fetch_add(texts.len(), Ordering::SeqCst);
+        let mut counts = self.text_counts.lock().unwrap();
+        for text in &texts {
+            *counts.entry(text.clone()).or_default() += 1;
+        }
         Ok(texts.iter().map(|text| vector(model, text)).collect())
     }
 
     fn texts(&self) -> usize {
         self.texts.load(Ordering::SeqCst)
+    }
+
+    fn text_counts(&self) -> BTreeMap<String, usize> {
+        self.text_counts.lock().unwrap().clone()
     }
 }
 
@@ -209,22 +218,32 @@ fn rows(root: &Path, results: &[SemanticResult]) -> Vec<Row> {
         .collect()
 }
 
-/// A full cold build of `root`'s walker membership; returns the ranked rows
-/// and the number of texts it embedded.
-fn cold(root: &Path, model: &str, text: &str) -> (Vec<Row>, usize) {
+/// A full cold build, recording the actual chunk texts independently of the
+/// view's reuse decisions. Repeated texts remain in the list for legacy counts.
+fn cold_index(root: &Path, model: &str) -> (SemanticIndex, Vec<String>) {
     let files = ConfiguredMembershipWalker.files(root).unwrap();
-    let mut texts = 0;
+    let mut texts = Vec::new();
     let index = SemanticIndex::build(
         root,
         &files,
         &mut |batch: Vec<String>| {
-            texts += batch.len();
+            texts.extend(batch.iter().cloned());
             Ok(batch.iter().map(|text| vector(model, text)).collect())
         },
         64,
     )
     .unwrap();
-    (rows(root, &index.search(&vector(model, text), 1000)), texts)
+    (index, texts)
+}
+
+/// A full cold build of `root`'s walker membership; returns the ranked rows
+/// and the number of texts it embedded.
+fn cold(root: &Path, model: &str, text: &str) -> (Vec<Row>, usize) {
+    let (index, texts) = cold_index(root, model);
+    (
+        rows(root, &index.search(&vector(model, text), 1000)),
+        texts.len(),
+    )
 }
 
 fn policy() -> TrigramPolicy {
@@ -468,32 +487,64 @@ fn embed_counts_views_and_sessions_share_identical_content() {
             &module(index, "older"),
         );
     }
-    let novel = tempfile::tempdir().unwrap();
-    for index in (0..10).chain(FILES..FILES + 5) {
-        write(
-            novel.path(),
-            &format!("src/module_{index}.rs"),
-            &module(index, "older"),
-        );
-    }
-    let (_, novel_chunks) = cold(novel.path(), "model-a", "load");
-    let (_, older_chunks) = cold(older.path(), "model-a", "load");
+    let (older_index, older_texts) = cold_index(older.path(), "model-a");
+    let older_chunks = older_texts.len();
+    let older_texts = older_texts.into_iter().collect::<BTreeSet<_>>();
     let c = Checkout::open(storage.path(), "older", older.path(), &plane_two);
     let snapshot_c = c.load();
     let before = model.texts();
+    let embedded_before = model.text_counts().into_keys().collect::<BTreeSet<_>>();
+    // Changed files can still contain chunks embedded by the earlier branch.
+    // Only exact chunk texts absent from the model's history need embedding.
+    let unseen = older_texts
+        .difference(&embedded_before)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let novel_chunks = unseen.len();
+    assert!(novel_chunks > 0, "the older branch has no new chunk texts");
+    assert!(
+        older_texts.intersection(&embedded_before).next().is_some(),
+        "the older branch has no previously embedded chunk texts"
+    );
     c.fill(&snapshot_c, &model, "model-a");
     let older_branch = model.texts() - before;
+    let text_counts = model.text_counts();
+    let repeated = text_counts
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .collect::<Vec<_>>();
+    assert!(
+        repeated.is_empty(),
+        "chunk texts were embedded twice across views or sessions: {repeated:?}"
+    );
     assert_eq!(
         older_branch, novel_chunks,
-        "the older branch re-embedded shared content"
+        "the older branch must embed exactly its previously unseen chunk texts"
+    );
+    let embedded_after = text_counts.into_keys().collect::<BTreeSet<_>>();
+    assert_eq!(
+        embedded_after
+            .difference(&embedded_before)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        unseen,
+        "the older branch embedded the wrong chunk texts"
     );
     let folded = c.load();
+    let answer = c.query(&folded, "model-a", "read record");
+    assert!(answer.complete(), "older branch not complete: {answer:?}");
     assert_eq!(
+        answer.results.len(),
+        older_chunks,
+        "every older-branch chunk must have a vector, whether embedded or reused"
+    );
+    assert_eq!(
+        rows(older.path(), &answer.results),
         rows(
             older.path(),
-            &c.query(&folded, "model-a", "read record").results
+            &older_index.search(&vector("model-a", "read record"), 1000)
         ),
-        cold(older.path(), "model-a", "read record").0
+        "older-branch chunk vectors must match an independent cold build"
     );
 
     // The same scenario through one full `SemanticIndex` build per checkout
