@@ -299,6 +299,8 @@ Explicit whole-line `runon` also requires the user-only live safety switch
 `bash.runon_enabled: true` (default false); projects cannot enable it. Turning that switch off
 hides and refuses `runon` without disabling legacy prefix routing.
 
+When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.
+
 Who is offered `runon`:
 
 - OpenCode and Pi sessions on macOS or Linux in subc mode, when the user config sets

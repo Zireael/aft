@@ -22,7 +22,7 @@ export const BASH_RUNON_DESCRIPTION =
 
 /** Guidance served only beside an available remote-run parameter. */
 export const BASH_RUNON_GUIDANCE =
-  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes; keep git, gh, interactive and file-editing commands local.';
+  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.';
 
 export interface BashHostFallbackOptions {
   command: string;

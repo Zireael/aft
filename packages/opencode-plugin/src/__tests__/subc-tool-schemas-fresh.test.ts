@@ -18,7 +18,7 @@ const PRESETS_PATH = path.join(REPO_ROOT, "crates", "aft", "src", "subc_tool_pre
 
 const REMOTE_PATH = path.join(REPO_ROOT, "crates", "aft", "src", "subc_tool_remote_schemas.json");
 const REMOTE_GUIDANCE =
-  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes; keep git, gh, interactive and file-editing commands local.';
+  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.';
 
 const PLACEHOLDER = JSON.stringify({ type: "object" });
 
