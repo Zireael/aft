@@ -29,6 +29,10 @@ pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
     "(No files were found after default directory skips (.git, node_modules, target, etc.); nothing was searched.)";
 
 pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
+    crate::bounded_io::command(req, ctx, handle_grep_inner)
+}
+
+fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|value| value.as_str()) {
         Some(pattern) => pattern,
         None => {
@@ -115,7 +119,8 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(response) => return response,
     };
     let project_root = grep_executor::project_root(ctx);
-    let single_file_scope = scope.roots.len() == 1 && scope.roots[0].search_root.is_file();
+    let single_file_scope = scope.roots.len() == 1
+        && crate::bounded_io::metadata(&scope.roots[0].search_root).is_ok_and(|m| m.is_file());
     let total_started = std::time::Instant::now();
     let search_start = std::time::Instant::now();
     let params = GrepParams {

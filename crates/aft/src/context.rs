@@ -11097,9 +11097,13 @@ impl AppContext {
     fn resolved_path_restriction_root(&self, root: &Path) -> PathBuf {
         let mut memo = self.path_restriction_root_memo.lock();
         if let Some(cached) = memo.as_ref() {
-            if cached.configured_root.as_os_str() == root.as_os_str()
-                && cached.resolved_root.exists()
-            {
+            let root_exists = cached.configured_root.as_os_str() == root.as_os_str()
+                && if crate::bounded_io::current().is_some() {
+                    crate::bounded_io::metadata(&cached.resolved_root).is_ok()
+                } else {
+                    cached.resolved_root.exists()
+                };
+            if root_exists {
                 return cached.resolved_root.clone();
             }
         }
@@ -11112,7 +11116,19 @@ impl AppContext {
         #[cfg(test)]
         self.path_restriction_root_canonicalizations
             .fetch_add(1, Ordering::SeqCst);
-        let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let resolved_root = if crate::bounded_io::current().is_some() {
+            match crate::bounded_io::canonicalize(root) {
+                Ok(root) => root,
+                // The request will return read_blocked; do not cache a lexical
+                // root identity from a timed-out probe for subsequent requests.
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    return root.to_path_buf()
+                }
+                Err(_) => root.to_path_buf(),
+            }
+        } else {
+            std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+        };
         *memo = Some(PathRestrictionRootMemo {
             configured_root: root.to_path_buf(),
             resolved_root: resolved_root.clone(),
@@ -11281,19 +11297,31 @@ impl AppContext {
         // fails (e.g. path does not exist or traverses a broken symlink), inspect
         // every existing component with lstat before falling back lexically so a
         // broken in-root symlink cannot be used to write outside project_root.
-        let resolved = match std::fs::canonicalize(&path_for_resolution) {
-            Ok(resolved) => resolved,
-            Err(_) => {
-                let normalized = normalize_path(&path_for_resolution);
-                reject_escaping_symlink(
-                    req_id,
-                    &path_for_resolution,
-                    &normalized,
-                    &resolved_root,
-                    &raw_root,
-                )?;
-                resolve_with_existing_ancestors(&normalized)
+        let resolve = |req_id: &str, path: &Path, resolved_root: &Path, raw_root: &Path| {
+            match std::fs::canonicalize(path) {
+                Ok(resolved) => Ok(resolved),
+                Err(_) => {
+                    let normalized = normalize_path(path);
+                    reject_escaping_symlink(req_id, path, &normalized, resolved_root, raw_root)?;
+                    Ok(resolve_with_existing_ancestors(&normalized))
+                }
             }
+        };
+        let resolved = if crate::bounded_io::current().is_some() {
+            // Even authorization's symlink/ancestor probes can block on a
+            // remote volume. Keep the work owned and fail closed on timeout;
+            // never fall back to a lexical authorization after a timed-out stat.
+            let id = req_id.to_string();
+            let owned_resolved_root = resolved_root.clone();
+            let owned_raw_root = raw_root.clone();
+            crate::bounded_io::run(&path_for_resolution, None, move |path| {
+                Ok(resolve(&id, &path, &owned_resolved_root, &owned_raw_root))
+            })
+            .map_err(|error| {
+                crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
+            })??
+        } else {
+            resolve(req_id, &path_for_resolution, &resolved_root, &raw_root)?
         };
 
         if !resolved.starts_with(&resolved_root) {

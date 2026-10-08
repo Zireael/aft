@@ -37,6 +37,10 @@ const MAX_DIRECTORY_SECTIONS: usize = 8;
 const MAX_DISPLAY_DIRECTORIES: usize = 6;
 
 pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
+    crate::bounded_io::command(req, ctx, handle_glob_inner)
+}
+
+fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let pattern = match req.params.get("pattern").and_then(|value| value.as_str()) {
         Some(pattern) => pattern,
         None => {
@@ -61,7 +65,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         .project_root
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
-    let project_root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+    let project_root = crate::bounded_io::canonicalize(&project_root).unwrap_or(project_root);
     let search_roots = match req.params.get("path").and_then(|value| value.as_str()) {
         Some(path) => match resolve_path_or_multi(
             path,
@@ -77,7 +81,10 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // Return clear error if the search path doesn't exist
-    if let Some(missing_root) = search_roots.iter().find(|root| !root.exists()) {
+    if let Some(missing_root) = search_roots
+        .iter()
+        .find(|root| crate::bounded_io::metadata(root).is_err())
+    {
         return Response::error(
             &req.id,
             "path_not_found",

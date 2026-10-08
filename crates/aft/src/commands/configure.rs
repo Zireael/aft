@@ -1610,14 +1610,10 @@ fn only_lsp_process_state_changed(previous: &Config, next: &Config) -> bool {
     configs_equal_including_runtime_only_fields(previous, &without_lsp_process_state)
 }
 
-/// The equivalent-configure and attach fast paths skip every probe and load the
-/// full path would run, so they are admissible only while nothing the full path
-/// would re-establish has been lost: the worktree topology memo still holds
-/// under the root's current `.git` marker (a stat, no git spawn), and each
-/// configured artifact plane is resident or already loading, and the watcher is
-/// live. An idle-evicted plane, a loader cleared by an unbind, a stopped
-/// watcher, or a changed `.git` marker takes the full path, which is what
-/// schedules the reload, re-verifies, or re-probes topology.
+/// An equivalent bind may skip topology probes only while the topology memo and
+/// watcher remain live. Missing trigram/semantic artifacts do not change the
+/// root configuration: the bind admits their reload and queues its start after
+/// acknowledgement, without requiring exclusive use beside existing readers.
 fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config) -> bool {
     if ctx.subc_unbound_quiesced() || ctx.database_runtime_failed() {
         return false;
@@ -1632,24 +1628,6 @@ fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config
     if !ctx.watcher_runtime_active() {
         return false;
     }
-    let search_ready = !config.indexes.trigram
-        || ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-        || ctx
-            .search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
-    let semantic_ready = !config.indexes.semantic
-        || ctx
-            .semantic_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-        || ctx.semantic_index_rx().lock().is_some();
     let callgraph_ready = !config.indexes.callgraph
         || ctx
             .callgraph_store()
@@ -1657,7 +1635,7 @@ fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
         || ctx.callgraph_store_rx().lock().is_some();
-    search_ready && semantic_ready && callgraph_ready
+    callgraph_ready
 }
 
 #[cfg(test)]
@@ -3061,7 +3039,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let session_already_bound =
             ctx.has_configure_session_binding(canonical_root, req.session());
         if configs_equal_including_runtime_only_fields(&previous_config, &next_config) {
-            if !session_already_bound && !ctx.configure_maintenance_has_capacity() {
+            let missing = missing_artifact_loads(ctx);
+            let repair_artifacts = missing.search || missing.semantic;
+            if (!session_already_bound || repair_artifacts)
+                && !ctx.configure_maintenance_has_capacity()
+            {
                 return configure_maintenance_backpressure(&req.id);
             }
             if let Some(token) = crate::executor::current_job_cancellation() {
@@ -3082,12 +3064,13 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 edit_slot_survives,
                 &mut configure_warnings,
             );
-            if !session_already_bound {
-                let first_session_bind = ctx.note_configure_session_binding(
-                    canonical_root.clone(),
-                    req.session().to_string(),
-                );
-                debug_assert!(first_session_bind);
+            if !session_already_bound || repair_artifacts {
+                let first_session_bind = !session_already_bound
+                    && ctx.note_configure_session_binding(
+                        canonical_root.clone(),
+                        req.session().to_string(),
+                    );
+                let starts = schedule_missing_artifact_loads(ctx, missing.search, missing.semantic);
                 let storage_root =
                     crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
                 let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
@@ -3100,7 +3083,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     session_id: req.session().to_string(),
                     home_match: ctx.is_home_root(),
                     format_tool_cache_clear_needed: false,
-                    run_bash_replay: true,
+                    run_bash_replay: first_session_bind,
                     configure_database_runtime: false,
                     refresh_project_runtime: false,
                     sync_bash_compress_flag: false,
@@ -3110,16 +3093,18 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     supersede_search_artifact_persistence: false,
                     supersede_callgraph_artifact_persistence: false,
                     supersede_semantic_artifact_persistence: false,
-                    search_artifact_load_start: None,
-                    semantic_artifact_load_start: None,
+                    search_artifact_load_start: starts.0,
+                    semantic_artifact_load_start: starts.1,
                 });
                 if enqueue_result.is_err() {
-                    ctx.forget_configure_session_binding(canonical_root, req.session());
+                    if first_session_bind {
+                        ctx.forget_configure_session_binding(canonical_root, req.session());
+                    }
                     return configure_maintenance_backpressure(&req.id);
                 }
                 slog_debug!(
-                    "equivalent configure registered session {} for generation {}",
-                    req.session(),
+                    "equivalent configure queued session {} replay={} artifact_reload={} for generation {}",
+                    req.session(), first_session_bind, repair_artifacts,
                     ctx.configure_generation()
                 );
             }
@@ -3316,10 +3301,6 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         && ctx.configure_warm_key_matches(&preflight_warm_key)
         && ctx.is_worktree_bridge() == is_worktree_bridge
         && ctx.git_common_dir() == git_common_dir
-        && {
-            let missing = missing_artifact_loads(ctx);
-            !missing.search && !missing.semantic
-        }
     {
         // Equivalent-configure fast path: same commit boundary as the full
         // path — session binding registration is a state mutation. The seal
@@ -3343,7 +3324,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         let needs_session_maintenance =
             !ctx.has_configure_session_binding(&canonical_cache_root, req.session());
-        if needs_session_maintenance && !ctx.configure_maintenance_has_capacity() {
+        let missing = missing_artifact_loads(ctx);
+        let repair_artifacts = missing.search || missing.semantic;
+        if (needs_session_maintenance || repair_artifacts)
+            && !ctx.configure_maintenance_has_capacity()
+        {
             return configure_maintenance_backpressure(&req.id);
         }
         if let Some(token) = crate::executor::current_job_cancellation() {
@@ -3371,7 +3356,8 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         );
         debug_assert!(ctx.has_configure_session_binding(&canonical_cache_root, req.session()));
         let generation = ctx.configure_generation();
-        if first_session_bind {
+        if first_session_bind || repair_artifacts {
+            let starts = schedule_missing_artifact_loads(ctx, missing.search, missing.semantic);
             let storage_root =
                 crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
             let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
@@ -3384,7 +3370,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 session_id: req.session().to_string(),
                 home_match,
                 format_tool_cache_clear_needed: false,
-                run_bash_replay: true,
+                run_bash_replay: first_session_bind,
                 configure_database_runtime: false,
                 refresh_project_runtime: false,
                 sync_bash_compress_flag: false,
@@ -3394,16 +3380,18 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 supersede_search_artifact_persistence: false,
                 supersede_callgraph_artifact_persistence: false,
                 supersede_semantic_artifact_persistence: false,
-                search_artifact_load_start: None,
-                semantic_artifact_load_start: None,
+                search_artifact_load_start: starts.0,
+                semantic_artifact_load_start: starts.1,
             });
             if enqueue_result.is_err() {
-                ctx.forget_configure_session_binding(&canonical_cache_root, req.session());
+                if first_session_bind {
+                    ctx.forget_configure_session_binding(&canonical_cache_root, req.session());
+                }
                 return configure_maintenance_backpressure(&req.id);
             }
             slog_debug!(
-                "equivalent configure registered session {} for generation {}",
-                req.session(),
+                "equivalent configure queued session {} replay={} artifact_reload={} for generation {}",
+                req.session(), first_session_bind, repair_artifacts,
                 generation
             );
         } else {
@@ -7721,6 +7709,115 @@ mod tests {
     fn handle_configure_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         super::handle_configure(req, ctx)
+    }
+
+    fn identical_bind_repairs_evicted_artifact_beside_reader(early_fast_path: bool) {
+        use crate::executor::{Executor, ExecutorConfig, Lane};
+        use crate::path_identity::ProjectRootId;
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config::default(),
+        ));
+        let request = configure_request_with_params(json!({
+            "project_root": project.path(), "storage_dir": storage.path(), "harness": "opencode",
+            "config": [user_tier(json!({"search_index": true, "semantic_search": false, "callgraph_store": false}))],
+        }));
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        if early_fast_path {
+            // Retain the event sender as the fake backend, so its filter thread
+            // stays alive without depending on the OS file watcher service.
+            install_project_watcher_with(&ctx, project.path(), Vec::new(), |_, _, tx| {
+                Ok::<_, &'static str>(tx)
+            });
+            assert!(ctx.watcher_runtime_active());
+        } else {
+            ctx.stop_watcher_runtime();
+        }
+        let generation = ctx.configure_generation();
+        let config = serde_json::to_value(ctx.config().as_ref()).unwrap();
+        let attempts = configure_artifact_load_attempts_for_root_for_test(project.path());
+        *ctx.search_index().write().unwrap() = None;
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        let executor = Executor::with_config(ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 2,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let root = ProjectRootId::from_path(project.path()).unwrap();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let reader = executor.submit(
+            root.clone(),
+            Lane::PureRead,
+            "held-reader".into(),
+            Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Response::success("held-reader", json!({}))
+            }),
+        );
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (bind, _token) = executor.submit_bind_cancellable_async(
+            root,
+            "subc-bind-identical-evicted".into(),
+            Arc::new(move |ctx| handle_configure(&request, ctx)),
+        );
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || tx.send(bind.blocking_recv().unwrap()).unwrap());
+        let beside_reader = rx.recv_timeout(Duration::from_secs(2));
+        // Always release the held reader, even when the regression is present.
+        release_tx.send(()).unwrap();
+        assert!(
+            reader
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .success
+        );
+        waiter.join().unwrap();
+        let response =
+            beside_reader.expect("identical-config artifact repair waited for a root reader");
+        assert!(response.success, "{}", response.data);
+        assert_eq!(
+            ctx.configure_generation(),
+            generation,
+            "artifact repair must not reconfigure the root"
+        );
+        assert_eq!(serde_json::to_value(ctx.config().as_ref()).unwrap(), config);
+        assert!(
+            ctx.search_index_rx().read().unwrap().is_some(),
+            "the missing artifact must be admitted for reload"
+        );
+        assert_eq!(
+            configure_artifact_load_attempts_for_root_for_test(project.path()),
+            attempts,
+            "artifact disk work must wait for post-ack maintenance"
+        );
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert!(configure_artifact_load_attempts_for_root_for_test(project.path()) > attempts);
+        let grep = crate::commands::grep::handle_grep(&grep_request("tracked"), &ctx);
+        assert!(grep.success && grep.data["total_matches"].as_u64().unwrap() > 0);
+        ctx.stop_watcher_runtime();
+    }
+
+    #[test]
+    fn identical_bind_repairs_evicted_artifact_beside_reader_fast_path() {
+        identical_bind_repairs_evicted_artifact_beside_reader(true);
+    }
+
+    #[test]
+    fn identical_bind_repairs_evicted_artifact_beside_reader_preflight_path() {
+        identical_bind_repairs_evicted_artifact_beside_reader(false);
     }
 
     fn symbol_cache_prewarm_test_mutex() -> &'static Mutex<()> {

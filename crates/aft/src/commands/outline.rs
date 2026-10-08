@@ -54,6 +54,10 @@ pub struct OutlineEntry {
 ///
 /// Output is capped at 30KB; if exceeded, truncates with a narrowing hint.
 pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
+    crate::bounded_io::command(req, ctx, handle_outline_inner)
+}
+
+fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     const MAX_OUTPUT_BYTES: usize = 30 * 1024;
 
     if req
@@ -70,7 +74,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
             Ok(path) => path,
             Err(resp) => return resp,
         };
-        if !dir_path.is_dir() {
+        if !crate::bounded_io::metadata(&dir_path).is_ok_and(|m| m.is_dir()) {
             return Response::error(
                 &req.id,
                 "file_not_found",
@@ -191,7 +195,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(path) => path,
         Err(resp) => return resp,
     };
-    if !path.exists() {
+    if crate::bounded_io::metadata(&path).is_err() {
         return Response::error(
             &req.id,
             "file_not_found",
@@ -202,7 +206,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
     if is_http_url(file)
         && crate::parser::detect_language(&path) == Some(crate::parser::LangId::Json)
     {
-        let source = match std::fs::read_to_string(&path) {
+        let source = match crate::bounded_io::read_to_string(&path) {
             Ok(source) => source,
             Err(error) => return Response::error(&req.id, "url_fetch_failed", error.to_string()),
         };
@@ -715,9 +719,10 @@ fn outline_structure_entries(
     }) else {
         return Ok(build_outline_tree(symbols));
     };
-    let source = std::fs::read_to_string(path).map_err(|error| AftError::FileNotFound {
-        path: format!("{}: {error}", path.display()),
-    })?;
+    let source =
+        crate::bounded_io::read_to_string(path).map_err(|error| AftError::FileNotFound {
+            path: format!("{}: {error}", path.display()),
+        })?;
     let (tree, _) = parser.parse_cloned(path)?;
     if collapse_tests && tree.root_node().has_error() {
         return Err(AftError::ParseError {
@@ -759,7 +764,9 @@ fn outline_structure_entries(
             }
             let mut included = base.join(&included_path);
             let mut label_path = PathBuf::from(&included_path);
-            if region.implicit_include && !included.is_file() {
+            if region.implicit_include
+                && !crate::bounded_io::metadata(&included).is_ok_and(|m| m.is_file())
+            {
                 label_path = PathBuf::from(&region.summary.name).join("mod.rs");
                 included = base.join(&label_path);
             }
@@ -1167,13 +1174,13 @@ fn build_outline_gitignore(
 pub(crate) fn git_info_exclude_for_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
     for repository_root in target.ancestors() {
         let git_entry = repository_root.join(".git");
-        let Ok(metadata) = std::fs::metadata(&git_entry) else {
+        let Ok(metadata) = crate::bounded_io::metadata(&git_entry) else {
             continue;
         };
         let git_dir = if metadata.is_dir() {
             git_entry
         } else if metadata.is_file() {
-            let contents = std::fs::read_to_string(&git_entry).ok()?;
+            let contents = crate::bounded_io::read_to_string(&git_entry).ok()?;
             let git_dir = contents.trim().strip_prefix("gitdir:")?.trim();
             let git_dir = PathBuf::from(git_dir);
             if git_dir.is_absolute() {
@@ -1186,7 +1193,7 @@ pub(crate) fn git_info_exclude_for_target(target: &Path) -> Option<(PathBuf, Pat
         };
         let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
         let common_dir = git_dir.join("commondir");
-        let git_common_dir = if let Ok(common) = std::fs::read_to_string(&common_dir) {
+        let git_common_dir = if let Ok(common) = crate::bounded_io::read_to_string(&common_dir) {
             let common = PathBuf::from(common.trim());
             if common.is_absolute() {
                 common
@@ -1233,14 +1240,14 @@ fn handle_outline_files_mode(
             Err(response) => return response,
         };
 
-        if !dir_path.exists() {
+        if crate::bounded_io::metadata(&dir_path).is_err() {
             return Response::error(
                 &req.id,
                 "file_not_found",
                 format!("directory not found: {}", target),
             );
         }
-        if !dir_path.is_dir() {
+        if !crate::bounded_io::metadata(&dir_path).is_ok_and(|m| m.is_dir()) {
             return Response::error(
                 &req.id,
                 "invalid_request",
@@ -1768,7 +1775,7 @@ fn populate_rendered_file_symbols(
             entry.symbols = Some(0);
             continue;
         }
-        let Ok(metadata) = std::fs::metadata(&path) else {
+        let Ok(metadata) = crate::bounded_io::metadata(&path) else {
             entry.symbols = Some(0);
             continue;
         };
@@ -2086,7 +2093,7 @@ fn outline_many_files(
     let mut fallback_parser = FileParser::new();
 
     for (file, path) in files.iter().zip(paths) {
-        if !path.exists() {
+        if crate::bounded_io::metadata(&path).is_err() {
             skipped_files.push(SkippedFile::new(file, "file_not_found"));
             continue;
         }
@@ -2118,9 +2125,10 @@ fn outline_many_files(
                     Ok(mut entries) => {
                         if detect_language(&path) == Some(LangId::Rust) {
                             let parser = batch_parser.as_mut().unwrap_or(&mut fallback_parser);
-                            if let (Ok(source), Ok((tree, _))) =
-                                (std::fs::read_to_string(&path), parser.parse(&path))
-                            {
+                            if let (Ok(source), Ok((tree, _))) = (
+                                crate::bounded_io::read_to_string(&path),
+                                parser.parse(&path),
+                            ) {
                                 add_trait_member_previews(tree.root_node(), &source, &mut entries);
                             }
                         }
@@ -2172,6 +2180,21 @@ fn discover_outline_files_with_options(
     directory: &Path,
     breadth_first: bool,
 ) -> OutlineFileDiscovery {
+    crate::bounded_io::run(directory, None, move |directory| {
+        Ok(discover_outline_files_unbounded(&directory, breadth_first))
+    })
+    .unwrap_or_else(|_| OutlineFileDiscovery {
+        entries_examined: 0,
+        files: Vec::new(),
+        directories: Vec::new(),
+        walk_truncated: true,
+        collection_truncated: true,
+        skipped_foreign_mounts: 0,
+        ignored_entries: 0,
+    })
+}
+
+fn discover_outline_files_unbounded(directory: &Path, breadth_first: bool) -> OutlineFileDiscovery {
     let mut files = Vec::new();
     let mut directories = Vec::new();
     let mut entries_examined = 0;
@@ -2460,7 +2483,7 @@ fn outline_skip_reason(path: &Path, parser: Option<&mut FileParser>) -> Option<&
         return Some("file_not_found");
     }
 
-    let metadata = match std::fs::metadata(path) {
+    let metadata = match crate::bounded_io::metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => return Some("file_not_found"),
     };

@@ -1087,6 +1087,10 @@ pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome 
 /// Returns for binary files:
 ///   `{ binary: true, byte_size }`
 pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
+    crate::bounded_io::command(req, ctx, handle_read_inner)
+}
+
+fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(file) = req.params.get("file").and_then(Value::as_str) {
         if is_github_read_target(file) {
             return handle_github_read(req, ctx, file);
@@ -1372,6 +1376,48 @@ fn handle_read_local(
         };
     }
 
+    // The helper owns only request data and file bytes, never the actor or its
+    // reader hold. Include stat, directory iteration, open, and streaming reads:
+    // any of those can wait in the kernel on a protected or remote volume.
+    let owned_req = req.clone();
+    #[cfg(test)]
+    let legacy = LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
+    let result = crate::bounded_io::run(path.as_path(), None, move |path| {
+        #[cfg(test)]
+        LEGACY_HASHLINE_READ.with(|value| value.set(legacy));
+        let mut captured = None;
+        let response = handle_read_path(&owned_req, &path, capture_source, &mut captured);
+        #[cfg(test)]
+        let observations = (
+            crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.get()),
+            LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.get()),
+        );
+        #[cfg(not(test))]
+        let observations = ();
+        Ok((response, captured, observations))
+    });
+    match result {
+        Ok((response, captured, _observations)) => {
+            #[cfg(test)]
+            {
+                crate::hashline::snapshot::SOURCE_READS
+                    .with(|reads| reads.set(reads.get() + _observations.0));
+                LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.set(bytes.get() + _observations.1));
+            }
+            *captured_source = captured;
+            response
+        }
+        Err(error) => Response::error(&req.id, "read_blocked", error.to_string()),
+    }
+}
+
+fn handle_read_path(
+    req: &RawRequest,
+    path: &Path,
+    capture_source: bool,
+    captured_source: &mut Option<CapturedRead>,
+) -> Response {
+    let file = path.to_string_lossy();
     // Check existence
     if !path.exists() {
         return Response::error(
@@ -1383,10 +1429,10 @@ fn handle_read_local(
 
     // Directory listing
     if path.is_dir() {
-        return handle_directory(req, path.as_path());
+        return handle_directory(req, path);
     }
 
-    let metadata = match fs::metadata(path.as_path()) {
+    let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(e) => {
             return Response::error(
@@ -1397,7 +1443,15 @@ fn handle_read_local(
         }
     };
 
-    let magic = match read_magic(path.as_path()) {
+    if !metadata.is_file() {
+        return Response::error(
+            &req.id,
+            "unsupported_file_type",
+            "read: only regular files and directories can be read",
+        );
+    }
+
+    let magic = match read_magic(path) {
         Ok(magic) => magic,
         Err(e) => {
             return Response::error(
@@ -1408,7 +1462,7 @@ fn handle_read_local(
         }
     };
     if let Some(media) = sniff_media(&magic) {
-        return handle_media_read(req, path.as_path(), metadata.len(), media);
+        return handle_media_read(req, path, metadata.len(), media);
     }
 
     // Parse range parameters. Zero is outside the 1-based domain of every
@@ -1447,7 +1501,7 @@ fn handle_read_local(
     if has_explicit_range {
         return handle_streaming_range_read(
             req,
-            path.as_path(),
+            path,
             metadata.len(),
             start_line,
             explicit_end_line,
@@ -1469,14 +1523,14 @@ fn handle_read_local(
 
     // Read raw bytes for binary detection
     let read_source = capture_source
-        .then(|| crate::hashline::snapshot::read_source(path.as_path()).ok())
+        .then(|| crate::hashline::snapshot::read_source(path).ok())
         .flatten()
         .filter(|source| source.has_complete_bytes());
     let fallback_bytes;
     let raw_bytes = if let Some(source) = &read_source {
         source.bytes()
     } else {
-        fallback_bytes = match fs::read(path.as_path()) {
+        fallback_bytes = match fs::read(path) {
             Ok(b) => b,
             Err(e) => {
                 return Response::error(
@@ -1535,7 +1589,7 @@ fn handle_read_local(
     );
     if let Some(source) = read_source {
         *captured_source = Some(CapturedRead {
-            path: path.as_path().to_path_buf(),
+            path: path.to_path_buf(),
             source,
         });
     }

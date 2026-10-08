@@ -60,6 +60,7 @@ pub(crate) mod bash_db_hints;
 pub mod bash_permissions;
 pub mod bash_rewrite;
 pub mod blob_store;
+pub(crate) mod bounded_io;
 pub mod build_breaker;
 pub mod cache_freshness;
 pub mod callgraph;

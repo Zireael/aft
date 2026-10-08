@@ -15,7 +15,7 @@ use crate::context::AppContext;
 use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
-    build_path_filters, decompose_grep_pattern, read_searchable_text, resolve_search_scope,
+    build_path_filters, decompose_grep_pattern, resolve_search_scope,
     sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc, try_read_with_budget,
     GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult, IndexStatus, PathFilters,
     RegexQuery, WalkBound, INTERACTIVE_ARTIFACT_READ_BUDGET,
@@ -160,7 +160,7 @@ pub fn project_root(ctx: &AppContext) -> PathBuf {
         .project_root
         .clone()
         .unwrap_or_else(|| env::current_dir().unwrap_or_default());
-    std::fs::canonicalize(&project_root).unwrap_or(project_root)
+    crate::bounded_io::canonicalize(&project_root).unwrap_or(project_root)
 }
 
 pub fn resolve_grep_scope(
@@ -172,7 +172,10 @@ pub fn resolve_grep_scope(
     let project_root = project_root(ctx);
     let search_roots = resolve_roots(ctx, paths, &project_root, req_id)?;
 
-    if let Some(missing_root) = search_roots.iter().find(|root| !root.exists()) {
+    if let Some(missing_root) = search_roots
+        .iter()
+        .find(|root| crate::bounded_io::metadata(root).is_err())
+    {
         return Err(Response::error(
             req_id,
             "path_not_found",
@@ -242,7 +245,7 @@ pub(crate) fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Optio
         // An explicitly-named existing file is always in scope (it's searched
         // directly even if gitignored / .aftignored), so don't report it as
         // "no files matched scope".
-        if root.search_root.is_file() {
+        if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
             return Some(true);
         }
         match bounded_scope_has_files(
@@ -287,6 +290,26 @@ fn bounded_scope_has_files(
     filters: &PathFilters,
     ignored_target: bool,
 ) -> Option<bool> {
+    let filters = filters.clone();
+    let filter_root = filter_root.to_path_buf();
+    crate::bounded_io::run(search_root, None, move |search_root| {
+        Ok(scope_has_files_unbounded(
+            &filter_root,
+            &search_root,
+            &filters,
+            ignored_target,
+        ))
+    })
+    .ok()
+    .flatten()
+}
+
+fn scope_has_files_unbounded(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    ignored_target: bool,
+) -> Option<bool> {
     let started = Instant::now();
     let skipped = Arc::new(AtomicUsize::new(0));
     let walker =
@@ -325,6 +348,7 @@ pub(crate) fn execute_profiled(
     scope: &GrepScope,
     params: &GrepParams,
 ) -> (GrepResult, GrepExecutionPhaseTimings) {
+    let _io_scope = crate::bounded_io::enter_if_absent(FALLBACK_WALK_BUDGET);
     let filters = build_path_filters(&params.include, &params.exclude).unwrap_or_default();
     execute_profiled_with_filters(ctx, pattern, scope, params, &filters)
 }
@@ -449,7 +473,7 @@ fn execute_root_profiled(
     // trigram index and the gitignore/.aftignore-aware walk. Matches ripgrep,
     // where naming a file explicitly searches it even when it is gitignored,
     // .aftignored, or not yet indexed. Binary + UTF-8 guards still apply.
-    if root.search_root.is_file() {
+    if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
         if root.use_index {
             crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
         }
@@ -569,9 +593,9 @@ fn execute_root_profiled(
 /// first and then their canonical forms (symlinks, `\\?\` prefixes).
 pub(crate) fn is_same_directory(left: &Path, right: &Path) -> bool {
     left == right
-        || std::fs::canonicalize(left)
+        || crate::bounded_io::canonicalize(left)
             .ok()
-            .zip(std::fs::canonicalize(right).ok())
+            .zip(crate::bounded_io::canonicalize(right).ok())
             .is_some_and(|(left, right)| left == right)
 }
 
@@ -606,6 +630,7 @@ fn grep_explicit_file(
     max_results: usize,
     index_status: IndexStatus,
 ) -> GrepResult {
+    let _io_scope = crate::bounded_io::enter_if_absent(FALLBACK_WALK_BUDGET);
     let total_matches = AtomicUsize::new(0);
     let files_searched = AtomicUsize::new(0);
     let files_with_matches = AtomicUsize::new(0);
@@ -754,7 +779,7 @@ fn fallback_target_walk_builder(
             }
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                return !matches!(
+                let descend = !matches!(
                     name.as_ref(),
                     "node_modules"
                         | "target"
@@ -766,6 +791,7 @@ fn fallback_target_walk_builder(
                         | "dist"
                         | "build"
                 );
+                return descend && crate::bounded_io::probe_directory(entry.path(), None).is_ok();
             }
             !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
         });
@@ -825,6 +851,11 @@ impl TargetIgnoreRules {
 }
 
 pub(crate) fn target_is_ignored(path: &Path) -> bool {
+    crate::bounded_io::run(path, None, |path| Ok(target_is_ignored_unbounded(&path)))
+        .unwrap_or(false)
+}
+
+fn target_is_ignored_unbounded(path: &Path) -> bool {
     let root = path.parent().unwrap_or(path);
     let rules = TargetIgnoreRules::for_root(root);
     for family in [&rules.aft, &rules.plain, &rules.git] {
@@ -843,6 +874,26 @@ pub(crate) fn target_is_ignored(path: &Path) -> bool {
 /// with its immediate on-disk entries, then recurse only through accepted
 /// directories. No ignored directory is opened to count its contents.
 pub(crate) fn diagnose_scope_counts(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    ignored_target: bool,
+) -> Option<ScopeFileCounts> {
+    let filters = filters.clone();
+    let filter_root = filter_root.to_path_buf();
+    crate::bounded_io::run(search_root, None, move |search_root| {
+        Ok(diagnose_scope_counts_unbounded(
+            &filter_root,
+            &search_root,
+            &filters,
+            ignored_target,
+        ))
+    })
+    .ok()
+    .flatten()
+}
+
+fn diagnose_scope_counts_unbounded(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
@@ -1017,6 +1068,38 @@ fn bounded_fallback_walk_files_with_limits_target(
     budget: Duration,
     ignored_target: bool,
 ) -> FallbackWalkOutcome {
+    let filter_root = filter_root.to_path_buf();
+    let filters = filters.clone();
+    crate::bounded_io::run(
+        search_root,
+        Some(Instant::now() + budget),
+        move |search_root| {
+            Ok(walk_files_unbounded(
+                &filter_root,
+                &search_root,
+                &filters,
+                max_files,
+                budget,
+                ignored_target,
+            ))
+        },
+    )
+    .unwrap_or_else(|_| FallbackWalkOutcome {
+        files: Vec::new(),
+        walk_truncated: true,
+        skipped_foreign_mounts: 0,
+        entries_visited: 0,
+    })
+}
+
+fn walk_files_unbounded(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    max_files: usize,
+    budget: Duration,
+    ignored_target: bool,
+) -> FallbackWalkOutcome {
     let filter_root = if filter_root == search_root && search_root.is_file() {
         search_root.parent().unwrap_or(search_root)
     } else {
@@ -1080,6 +1163,56 @@ fn for_each_bounded_fallback_walk_file_with_limits<F>(
 where
     F: FnMut(&PathBuf),
 {
+    let filter_root = filter_root.to_path_buf();
+    let project_root = project_root.to_path_buf();
+    let filters = filters.clone();
+    let cancellation = crate::executor::current_job_cancellation();
+    let walked = crate::bounded_io::run(
+        search_root,
+        Some(Instant::now() + budget),
+        move |search_root| {
+            let mut files = Vec::new();
+            let progress = walk_each_file_unbounded(
+                &filter_root,
+                &search_root,
+                &filters,
+                &project_root,
+                path_exclusion,
+                max_files,
+                budget,
+                &mut |path| files.push(path.clone()),
+                ignored_target,
+                cancellation.as_ref(),
+            );
+            Ok((files, progress))
+        },
+    );
+    match walked {
+        Ok((files, progress)) => {
+            for file in files {
+                on_file(&file);
+            }
+            progress
+        }
+        Err(_) => FallbackWalkProgress {
+            bound: Some(WalkBound::TimeBudget),
+            ..FallbackWalkProgress::default()
+        },
+    }
+}
+
+fn walk_each_file_unbounded<F: FnMut(&PathBuf)>(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    project_root: &Path,
+    path_exclusion: Option<GrepPathExclusion>,
+    max_files: usize,
+    budget: Duration,
+    on_file: &mut F,
+    ignored_target: bool,
+    cancellation: Option<&crate::executor::JobCancellation>,
+) -> FallbackWalkProgress {
     let started = Instant::now();
     let mut files_seen = 0usize;
     let mut counts = ScopeFileCounts::default();
@@ -1093,7 +1226,7 @@ where
 
     for entry in walker.filter_map(|entry| entry.ok()) {
         counts.entries_visited += 1;
-        if crate::executor::current_job_cancelled() {
+        if cancellation.is_some_and(|token| token.cancel_requested_before_commit()) {
             return FallbackWalkProgress {
                 bound: Some(WalkBound::Cancelled),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
@@ -1274,6 +1407,7 @@ fn fallback_grep_with_limits_counted(
     counts: &mut ScopeFileCounts,
     ignored_target: bool,
 ) -> GrepResult {
+    let _io_scope = crate::bounded_io::enter_if_absent(budget);
     let total_matches = AtomicUsize::new(0);
     let files_searched = AtomicUsize::new(0);
     let files_with_matches = AtomicUsize::new(0);
@@ -1286,6 +1420,7 @@ fn fallback_grep_with_limits_counted(
 
     let mut matches = Vec::new();
     let mut batch: Vec<PathBuf> = Vec::with_capacity(256);
+    let io_budget = crate::bounded_io::current();
 
     let flush_batch = |batch: &mut Vec<PathBuf>, matches: &mut Vec<GrepMatch>| {
         if batch.is_empty() {
@@ -1294,35 +1429,39 @@ fn fallback_grep_with_limits_counted(
         let chunk = std::mem::take(batch);
         let partial: Vec<GrepMatch> = chunk
             .par_iter()
-            .filter_map(|file| {
-                if stop_scan.load(Ordering::Relaxed)
-                    || Instant::now() >= scan_deadline
-                    || job_cancellation
-                        .as_ref()
-                        .is_some_and(|token| token.cancel_requested_before_commit())
-                {
-                    return None;
-                }
-                let file_matches = fallback_search_file(
-                    file,
-                    pattern,
-                    max_results,
-                    stop_after,
-                    &total_matches,
-                    &files_searched,
-                    &files_with_matches,
-                    &truncated,
-                    &engine_capped,
-                    job_cancellation.as_ref(),
-                    Some(scan_deadline),
-                );
-                if truncated.load(Ordering::Relaxed)
-                    && total_matches.load(Ordering::Relaxed) >= stop_after
-                {
-                    stop_scan.store(true, Ordering::Relaxed);
-                }
-                (!file_matches.is_empty()).then_some(file_matches)
-            })
+            .map_init(
+                || crate::bounded_io::enter(io_budget.clone()),
+                |_scope, file| {
+                    if stop_scan.load(Ordering::Relaxed)
+                        || Instant::now() >= scan_deadline
+                        || job_cancellation
+                            .as_ref()
+                            .is_some_and(|token| token.cancel_requested_before_commit())
+                    {
+                        return None;
+                    }
+                    let file_matches = fallback_search_file(
+                        file,
+                        pattern,
+                        max_results,
+                        stop_after,
+                        &total_matches,
+                        &files_searched,
+                        &files_with_matches,
+                        &truncated,
+                        &engine_capped,
+                        job_cancellation.as_ref(),
+                        Some(scan_deadline),
+                    );
+                    if truncated.load(Ordering::Relaxed)
+                        && total_matches.load(Ordering::Relaxed) >= stop_after
+                    {
+                        stop_scan.store(true, Ordering::Relaxed);
+                    }
+                    (!file_matches.is_empty()).then_some(file_matches)
+                },
+            )
+            .filter_map(|matches| matches)
             .flatten()
             .collect();
         matches.extend(partial);
@@ -1399,7 +1538,19 @@ fn fallback_search_file(
         return Vec::new();
     }
 
-    let Some(content) = read_searchable_text(file) else {
+    let bytes = match crate::bounded_io::read(file, deadline) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                engine_capped.store(true, Ordering::Relaxed);
+            }
+            return Vec::new();
+        }
+    };
+    if crate::search_index::is_binary_bytes(&bytes) {
+        return Vec::new();
+    }
+    let Ok(content) = String::from_utf8(bytes) else {
         return Vec::new();
     };
     files_searched.fetch_add(1, Ordering::Relaxed);
@@ -1659,6 +1810,156 @@ fn line_details_with_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grep_io_fixture() -> (tempfile::TempDir, AppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for directory in 0..100 {
+            let parent = root.join(format!("directory_{directory:03}"));
+            std::fs::create_dir(&parent).unwrap();
+            for file in 0..100 {
+                std::fs::write(
+                    parent.join(format!("file_{file:03}.rs")),
+                    "pub fn needle() {}\n",
+                )
+                .unwrap();
+            }
+        }
+        let index = crate::search_index::SearchIndex::build_with_limit(&root, 1024 * 1024);
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root),
+                ..crate::config::Config::default()
+            },
+        );
+        *ctx.search_index().write().unwrap() = Some(index);
+        (dir, ctx)
+    }
+
+    fn measured_grep(ctx: &AppContext) -> (Duration, usize, usize) {
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(60));
+        let request = crate::protocol::RawRequest {
+            id: "grep-io-measurement".into(),
+            command: "grep".into(),
+            session_id: None,
+            lsp_hints: None,
+            params: serde_json::json!({"pattern": "needle", "max_results": 10001}),
+        };
+        let started = Instant::now();
+        let response = crate::bounded_io::with_budget(Some(budget.clone()), || {
+            crate::commands::grep::handle_grep(&request, ctx)
+        });
+        let elapsed = started.elapsed();
+        assert!(response.success, "{}", response.data);
+        assert_eq!(
+            response.data["files_searched"], 10_000,
+            "the measurement must actually verify all fixture files"
+        );
+        assert_eq!(response.data["total_matches"], 10_000);
+        let (spawns, round_trips) = budget.measurements();
+        (elapsed, spawns, round_trips)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn ten_thousand_file_grep_uses_directory_probes_not_per_file_helpers() {
+        let (_fixture, ctx) = grep_io_fixture();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let (_, spawns, round_trips) = pool.install(|| measured_grep(&ctx));
+        assert!(spawns > 0, "cold first-access probes must be counted");
+        assert!(spawns <= 132 && round_trips <= 132, "100 directories plus fixed root work, not 10000 files: spawns={spawns} round_trips={round_trips}");
+        *ctx.search_index().write().unwrap() = None;
+        let (_, spawns, round_trips) = pool.install(|| measured_grep(&ctx));
+        assert!(spawns > 0);
+        assert!(spawns <= 132 && round_trips <= 132, "the fallback walk must reuse its bounded helper: spawns={spawns} round_trips={round_trips}");
+    }
+
+    #[test]
+    #[ignore = "manual five-run 10000-file grep wall-time and helper-count measurement"]
+    fn grep_io_10k_measurement() {
+        let (_fixture, ctx) = grep_io_fixture();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for indexed in [true, false] {
+            if !indexed {
+                *ctx.search_index().write().unwrap() = None;
+            }
+            let mut samples = Vec::new();
+            for run in 0..5 {
+                let (elapsed, spawns, round_trips) = pool.install(|| measured_grep(&ctx));
+                println!("grep_io_10k mode={} run={} elapsed_ms={:.3} thread_spawns={} helper_round_trips={}",
+                    if indexed { "indexed" } else { "fallback" }, run + 1, elapsed.as_secs_f64() * 1000.0, spawns, round_trips);
+                samples.push(elapsed);
+            }
+            samples.sort();
+            println!(
+                "grep_io_10k mode={} median_ms={:.3}",
+                if indexed { "indexed" } else { "fallback" },
+                samples[2].as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_scan_deadline_bounds_blocked_file_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocked.txt");
+        std::fs::write(&path, "released\n").unwrap();
+        let fifo = dir.path().join("consent-probe");
+        crate::bounded_io::tests::fifo(&fifo);
+        let probe = crate::bounded_io::tests::block_directory_probe(dir.path(), &fifo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = path.clone();
+        let thread = std::thread::spawn(move || {
+            let total = AtomicUsize::new(0);
+            let searched = AtomicUsize::new(0);
+            let matched = AtomicUsize::new(0);
+            let truncated = AtomicBool::new(false);
+            let capped = AtomicBool::new(false);
+            let matches = fallback_search_file(
+                &input,
+                &literal("released"),
+                100,
+                200,
+                &total,
+                &searched,
+                &matched,
+                &truncated,
+                &capped,
+                None,
+                Some(Instant::now() + Duration::from_millis(80)),
+            );
+            tx.send((
+                matches,
+                searched.load(Ordering::Relaxed),
+                capped.load(Ordering::Relaxed),
+            ))
+            .unwrap();
+        });
+        let before_writer = rx.recv_timeout(Duration::from_millis(800));
+        crate::bounded_io::tests::release_fifo(&fifo);
+        thread.join().unwrap();
+        let (matches, searched, capped) =
+            before_writer.expect("grep checked its scan deadline only after open returned");
+        assert!(matches.is_empty());
+        assert_eq!(
+            probe.fired.load(Ordering::Relaxed),
+            1,
+            "the actual first-access probe must run"
+        );
+        assert_eq!(searched, 0);
+        assert!(
+            capped,
+            "a blocked file is an incomplete search, not a zero-match answer"
+        );
+    }
 
     fn grep_match(file: &Path, line: u32, column: u32) -> GrepMatch {
         GrepMatch {

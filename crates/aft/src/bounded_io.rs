@@ -1,0 +1,750 @@
+//! Bound first access to a protection/filesystem boundary, not every file read.
+//!
+//! A request probes each directory once. Ordinary files in accessible local
+//! directories stay on the caller's hot path. Network/removable/unknown volumes
+//! and symlinks retain per-file isolation. Helpers own no actor or epoch guard.
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::context::AppContext;
+use crate::protocol::{RawRequest, Response};
+
+pub(crate) const IO_BUDGET: Duration = Duration::from_secs(5);
+const MAX_IO_THREADS: usize = 64;
+static NEXT_BUDGET: AtomicU64 = AtomicU64::new(1);
+static HELPERS: LazyLock<Arc<Limiter>> = LazyLock::new(|| Arc::new(Limiter::new(MAX_IO_THREADS)));
+#[cfg(test)]
+#[derive(Default)]
+struct Measurements {
+    spawns: AtomicUsize,
+    round_trips: AtomicUsize,
+}
+
+#[derive(Clone, Debug)]
+struct Failure {
+    code: &'static str,
+    message: String,
+}
+#[derive(Clone)]
+struct ProbeError {
+    kind: io::ErrorKind,
+    message: String,
+}
+impl ProbeError {
+    fn from(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+    fn error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.clone())
+    }
+}
+#[derive(Clone, Copy)]
+struct Access {
+    direct: bool,
+}
+struct Probe {
+    result: Mutex<Option<Result<Access, ProbeError>>>,
+    ready: Condvar,
+}
+#[derive(Clone)]
+pub(crate) struct Budget {
+    id: u64,
+    pub(crate) deadline: Instant,
+    failure: Arc<Mutex<Option<Failure>>>,
+    failed: Arc<AtomicBool>,
+    directories: Arc<Mutex<HashMap<PathBuf, Arc<Probe>>>>,
+    #[cfg(test)]
+    measurements: Arc<Measurements>,
+}
+impl Budget {
+    pub(crate) fn after(duration: Duration) -> Self {
+        Self {
+            id: NEXT_BUDGET.fetch_add(1, Ordering::Relaxed),
+            deadline: Instant::now() + duration,
+            failure: Arc::new(Mutex::new(None)),
+            failed: Arc::new(AtomicBool::new(false)),
+            directories: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            measurements: Arc::new(Measurements::default()),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn measurements(&self) -> (usize, usize) {
+        (
+            self.measurements.spawns.load(Ordering::Relaxed),
+            self.measurements.round_trips.load(Ordering::Relaxed),
+        )
+    }
+}
+thread_local! {
+    static CURRENT: RefCell<Option<Budget>> = const { RefCell::new(None) };
+    // Rayon shares the request's single-flight probes, but does not contend on
+    // that map per file. Its workers remember successful lookups locally.
+    static DIRECTORIES: RefCell<(u64, HashMap<PathBuf, Access>)> = RefCell::new((0, HashMap::new()));
+    static HELPER_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) struct Scope(Option<Budget>);
+impl Drop for Scope {
+    fn drop(&mut self) {
+        CURRENT.with(|current| *current.borrow_mut() = self.0.take());
+    }
+}
+pub(crate) fn current() -> Option<Budget> {
+    CURRENT.with(|current| current.borrow().clone())
+}
+pub(crate) fn enter_if_absent(duration: Duration) -> Scope {
+    let budget = current().unwrap_or_else(|| Budget::after(duration));
+    Scope(CURRENT.with(|current| current.replace(Some(budget))))
+}
+pub(crate) fn with_budget<T>(budget: Option<Budget>, work: impl FnOnce() -> T) -> T {
+    let _scope = enter(budget);
+    work()
+}
+pub(crate) fn enter(budget: Option<Budget>) -> Scope {
+    Scope(CURRENT.with(|current| current.replace(budget)))
+}
+fn deadline(at: Option<Instant>) -> Instant {
+    at.into_iter()
+        .chain(CURRENT.with(|budget| budget.borrow().as_ref().map(|b| b.deadline)))
+        .fold(Instant::now() + IO_BUDGET, Instant::min)
+}
+fn failure(path: &Path, code: &'static str, reason: &str) -> io::Error {
+    let message = format!("{code}: {}: {reason}", path.display());
+    if let Some(budget) = current() {
+        budget
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| Failure {
+                code,
+                message: message.clone(),
+            });
+        budget.failed.store(true, Ordering::Release);
+    }
+    io::Error::new(io::ErrorKind::TimedOut, message)
+}
+fn prior_failure() -> Option<io::Error> {
+    CURRENT.with(|current| {
+        let current = current.borrow();
+        let budget = current.as_ref()?;
+        if !budget.failed.load(Ordering::Acquire) {
+            return None;
+        }
+        let error = budget
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|failure| io::Error::new(io::ErrorKind::TimedOut, failure.message.clone()));
+        error
+    })
+}
+pub(crate) fn command(
+    req: &RawRequest,
+    ctx: &AppContext,
+    work: impl FnOnce(&RawRequest, &AppContext) -> Response,
+) -> Response {
+    let duration = if req.command == "grep" {
+        crate::grep_executor::FALLBACK_WALK_BUDGET
+    } else {
+        IO_BUDGET
+    };
+    let _scope = enter_if_absent(duration);
+    // Probe explicit target roots before canonicalization/stat can cross a
+    // protected location. Files themselves are never opened by this probe.
+    let root = ctx.config().project_root.clone().unwrap_or_default();
+    let mut inputs = Vec::new();
+    for key in ["path", "file", "directory", "target", "files"] {
+        match req.params.get(key) {
+            Some(serde_json::Value::String(path)) => inputs.push(path.as_str()),
+            Some(serde_json::Value::Array(paths)) => {
+                inputs.extend(paths.iter().filter_map(|p| p.as_str()))
+            }
+            _ => {}
+        }
+    }
+    if !root.as_os_str().is_empty() {
+        inputs.push(root.to_str().unwrap_or_default());
+    }
+    inputs.sort_unstable();
+    inputs.dedup();
+    let mut probe_error = None;
+    for input in inputs {
+        if input.starts_with("http://") || input.starts_with("https://") || input.contains("://") {
+            continue;
+        }
+        let path = if Path::new(input).is_absolute() {
+            PathBuf::from(input)
+        } else {
+            root.join(input)
+        };
+        if let Err(error) = probe_target(&path) {
+            // Missing paths still get the handler's normal validation/error.
+            if error.kind() == io::ErrorKind::TimedOut {
+                probe_error = Some(error);
+                break;
+            }
+        }
+    }
+    let response = match probe_error {
+        Some(error) => Response::error(&req.id, "read_deadline_exceeded", error.to_string()),
+        None => work(req, ctx),
+    };
+    let budget = current().expect("command budget installed");
+    let error = budget
+        .failure
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match error {
+        Some(error) => Response::error(&req.id, error.code, error.message),
+        None => response,
+    }
+}
+
+struct Limiter {
+    live: Mutex<usize>,
+    available: Condvar,
+    max: usize,
+}
+impl Limiter {
+    fn new(max: usize) -> Self {
+        Self {
+            live: Mutex::new(0),
+            available: Condvar::new(),
+            max,
+        }
+    }
+    fn acquire(self: &Arc<Self>, at: Instant) -> Option<Permit> {
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        while *live >= self.max {
+            let remaining = at.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            live = self
+                .available
+                .wait_timeout(live, remaining)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        if Instant::now() >= at {
+            return None;
+        }
+        *live += 1;
+        Some(Permit(Arc::clone(self)))
+    }
+}
+struct Permit(Arc<Limiter>);
+impl Drop for Permit {
+    fn drop(&mut self) {
+        *self.0.live.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.available.notify_one();
+    }
+}
+/// Spawn only for boundary probes, whole walks, or reads on risky filesystems.
+/// A stuck call retains its limiter permit, never executor/root ownership.
+pub(crate) fn run<T: Send + 'static>(
+    path: &Path,
+    at: Option<Instant>,
+    work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    run_with_limiter(path, at, Arc::clone(&HELPERS), work)
+}
+fn run_with_limiter<T: Send + 'static>(
+    path: &Path,
+    at: Option<Instant>,
+    limiter: Arc<Limiter>,
+    work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    if let Some(error) = prior_failure() {
+        return Err(error);
+    }
+    let started = Instant::now();
+    let at = deadline(at);
+    if started >= at {
+        return Err(failure(
+            path,
+            "read_deadline_exceeded",
+            "filesystem deadline elapsed before this call started",
+        ));
+    }
+    // A bounded walk already owns an isolated helper. Do not consume another
+    // slot per nested directory probe (or let healthy walks deadlock each
+    // other on admission). Its caller's deadline must be no later than ours.
+    if HELPER_DEADLINE.with(|outer| outer.get().is_some_and(|outer| outer <= at)) {
+        return work(path.to_path_buf());
+    }
+    let Some(permit) = limiter.acquire(at) else {
+        return Err(failure(path, "read_io_queue_timeout", "no filesystem helper slot became available before the deadline; this call did not start"));
+    };
+    let owned = path.to_path_buf();
+    let budget = current();
+    #[cfg(test)]
+    let measurements = budget.as_ref().map(|b| Arc::clone(&b.measurements));
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    #[cfg(test)]
+    if let Some(counts) = &measurements {
+        counts.round_trips.fetch_add(1, Ordering::Relaxed);
+    }
+    std::thread::Builder::new()
+        .name("aft-filesystem-probe".into())
+        .spawn(move || {
+            let _permit = permit;
+            HELPER_DEADLINE.with(|deadline| deadline.set(Some(at)));
+            let result = with_budget(budget, || work(owned));
+            let _ = tx.send(result);
+        })?;
+    #[cfg(test)]
+    if let Some(counts) = &measurements {
+        counts.spawns.fetch_add(1, Ordering::Relaxed);
+    }
+    match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(failure(path, "read_blocked", &format!(
+            "OS access did not finish within {:.3} s; on macOS, check ck-aft access in Privacy & Security, then retry", at.saturating_duration_since(started).as_secs_f64()))),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other("filesystem helper stopped")),
+    }
+}
+fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
+    if let Some(error) = prior_failure() {
+        return Err(error);
+    }
+    let id = CURRENT.with(|current| current.borrow().as_ref().map(|b| b.id));
+    if let Some(access) = DIRECTORIES.with(|dirs| {
+        let dirs = dirs.borrow();
+        (Some(dirs.0) == id)
+            .then(|| dirs.1.get(path).copied())
+            .flatten()
+    }) {
+        return Ok(access);
+    }
+    let budget = current().unwrap_or_else(|| Budget::after(IO_BUDGET));
+    let (probe, owner) = {
+        let mut dirs = budget.directories.lock().unwrap_or_else(|e| e.into_inner());
+        match dirs.entry(path.to_path_buf()) {
+            std::collections::hash_map::Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let probe = Arc::new(Probe {
+                    result: Mutex::new(None),
+                    ready: Condvar::new(),
+                });
+                entry.insert(Arc::clone(&probe));
+                (probe, true)
+            }
+        }
+    };
+    let access = if owner {
+        let result = run(path, at, |path| {
+            #[cfg(all(test, unix))]
+            tests::before_directory_probe(&path)?;
+            // Opening and advancing ReadDir probes consent, not just existence.
+            let mut entries = std::fs::read_dir(&path)?;
+            let _ = entries.next().transpose()?;
+            Ok(Access {
+                direct: local_filesystem(&path)?,
+            })
+        })
+        .map_err(|error| ProbeError::from(&error));
+        *probe.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
+        probe.ready.notify_all();
+        result.map_err(|error| error.error())?
+    } else {
+        let at = deadline(at);
+        let mut result = probe.result.lock().unwrap_or_else(|e| e.into_inner());
+        while result.is_none() {
+            let remaining = at.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(failure(
+                    path,
+                    "read_io_queue_timeout",
+                    "deadline elapsed waiting for this directory's already-running probe",
+                ));
+            }
+            result = probe
+                .ready
+                .wait_timeout(result, remaining)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        result
+            .as_ref()
+            .unwrap()
+            .clone()
+            .map_err(|error| error.error())?
+    };
+    DIRECTORIES.with(|dirs| {
+        let mut dirs = dirs.borrow_mut();
+        if dirs.0 != budget.id {
+            dirs.0 = budget.id;
+            dirs.1.clear();
+        }
+        dirs.1.insert(path.to_path_buf(), access);
+    });
+    Ok(access)
+}
+pub(crate) fn probe_directory(path: &Path, at: Option<Instant>) -> io::Result<()> {
+    directory(path, at).map(|_| ())
+}
+fn parent(path: &Path, at: Option<Instant>) -> io::Result<Access> {
+    directory(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+        at,
+    )
+}
+fn cached_directory(path: &Path) -> Option<Access> {
+    let id = CURRENT.with(|budget| budget.borrow().as_ref().map(|b| b.id))?;
+    DIRECTORIES.with(|dirs| {
+        let dirs = dirs.borrow();
+        (dirs.0 == id).then(|| dirs.1.get(path).copied()).flatten()
+    })
+}
+fn probe_target(path: &Path) -> io::Result<()> {
+    if cached_directory(path).is_some() {
+        return Ok(());
+    }
+    let metadata = if path
+        .parent()
+        .and_then(cached_directory)
+        .is_some_and(|access| access.direct)
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            run(path, None, std::fs::metadata)?
+        } else {
+            metadata
+        }
+    } else {
+        run(path, None, std::fs::metadata)?
+    };
+    if metadata.is_dir() {
+        directory(path, None)?;
+    } else {
+        parent(path, None)?;
+    }
+    Ok(())
+}
+// Only positively identified local filesystems are eligible for direct reads.
+// Network/FUSE/unknown mounts stay bounded per file even after a successful
+// directory probe; a mount that stops responding mid-request cannot park a root.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn local_filesystem(path: &Path) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let resolved = std::fs::canonicalize(path)?;
+        let text = resolved.to_string_lossy();
+        // Local APFS directory access does not guarantee a cloud placeholder's
+        // contents are resident. Hydration may still block on first file read.
+        if text.contains("/Library/Mobile Documents/") || text.contains("/Library/CloudStorage/") {
+            return Ok(false);
+        }
+    }
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    #[cfg(target_os = "macos")]
+    {
+        let name = unsafe { std::ffi::CStr::from_ptr(stat.f_mntonname.as_ptr()) };
+        Ok(
+            stat.f_flags & libc::MNT_LOCAL as u32 != 0
+                && !name.to_bytes().starts_with(b"/Volumes/"),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(matches!(
+            stat.f_type as u64,
+            0xEF53 | 0x58465342 | 0x9123683E | 0x01021994 | 0x794c7630 | 0x2FC12FC1
+        ))
+    }
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn local_filesystem(_: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+pub(crate) fn read(path: &Path, at: Option<Instant>) -> io::Result<Vec<u8>> {
+    if Instant::now() >= deadline(at) {
+        return Err(failure(
+            path,
+            "read_deadline_exceeded",
+            "scan deadline elapsed before file access",
+        ));
+    }
+    let access = parent(path, at)?;
+    if !access.direct {
+        return run(path, at, |path| regular_read(&path, false));
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return run(path, at, |path| regular_read(&path, false));
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    match regular_read(path, true) {
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            run(path, at, |path| regular_read(&path, false))
+        }
+        result => result,
+    }
+}
+fn regular_read(path: &Path, _no_follow: bool) -> io::Result<Vec<u8>> {
+    if !_no_follow && !std::fs::metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    #[cfg(all(test, unix))]
+    tests::before_regular_open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // A file can become a FIFO between admission and open. Never block on that
+    // replacement, and check the opened descriptor before reading any bytes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | if _no_follow { libc::O_NOFOLLOW } else { 0 });
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve(usize::try_from(metadata.len()).map_err(io::Error::other)?)
+        .map_err(io::Error::other)?;
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+pub(crate) fn read_to_string(path: &Path) -> io::Result<String> {
+    String::from_utf8(read(path, None)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    if let Some(error) = prior_failure() {
+        return Err(error);
+    }
+    if cached_directory(path).is_some_and(|access| access.direct) {
+        return std::fs::canonicalize(path);
+    }
+    let access = parent(path, None)?;
+    if access.direct && std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()) {
+        std::fs::canonicalize(path)
+    } else {
+        run(path, None, std::fs::canonicalize)
+    }
+}
+pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
+    let access = parent(path, None)?;
+    if access.direct {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_symlink() {
+            return Ok(metadata);
+        }
+    }
+    run(path, None, std::fs::metadata)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod tests {
+    use super::*;
+    use std::os::unix::fs::OpenOptionsExt;
+    static BLOCKERS: LazyLock<Mutex<HashMap<PathBuf, (PathBuf, Arc<AtomicUsize>)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static FIFO_REPLACEMENTS: LazyLock<
+        Mutex<HashMap<PathBuf, (Arc<AtomicUsize>, std::sync::mpsc::Sender<()>)>>,
+    > = LazyLock::new(|| Mutex::new(HashMap::new()));
+    pub(crate) struct BlockProbe {
+        keys: Vec<PathBuf>,
+        pub(crate) fired: Arc<AtomicUsize>,
+    }
+    impl Drop for BlockProbe {
+        fn drop(&mut self) {
+            let mut blockers = BLOCKERS.lock().unwrap();
+            for key in &self.keys {
+                blockers.remove(key);
+            }
+        }
+    }
+    pub(crate) fn block_directory_probe(directory: &Path, fifo: &Path) -> BlockProbe {
+        let mut keys = vec![
+            directory.to_path_buf(),
+            std::fs::canonicalize(directory).unwrap(),
+        ];
+        keys.dedup();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let mut blockers = BLOCKERS.lock().unwrap();
+        for key in &keys {
+            blockers.insert(key.clone(), (fifo.to_path_buf(), Arc::clone(&fired)));
+        }
+        BlockProbe { keys, fired }
+    }
+    pub(super) fn before_directory_probe(directory: &Path) -> io::Result<()> {
+        let blocker = BLOCKERS.lock().unwrap().get(directory).cloned();
+        if let Some((path, fired)) = blocker {
+            fired.fetch_add(1, Ordering::Relaxed);
+            let _file = std::fs::File::open(path)?;
+        }
+        Ok(())
+    }
+    pub(super) fn before_regular_open(path: &Path) -> io::Result<()> {
+        let fired = FIFO_REPLACEMENTS.lock().unwrap().remove(path);
+        if let Some((fired, reached)) = fired {
+            std::fs::remove_file(path)?;
+            fifo(path);
+            fired.fetch_add(1, Ordering::Relaxed);
+            let _ = reached.send(());
+        }
+        Ok(())
+    }
+    pub(crate) fn fifo(path: &Path) {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    pub(crate) fn release_fifo(path: &Path) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .unwrap();
+        let _ = file.write_all(b"released\n");
+    }
+    #[test]
+    fn blocked_open_returns_before_fifo_writer_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocked");
+        fifo(&path);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = path.clone();
+        let thread = std::thread::spawn(move || {
+            tx.send(run(
+                &input,
+                Some(Instant::now() + Duration::from_millis(80)),
+                std::fs::read,
+            ))
+            .unwrap()
+        });
+        let before_writer = rx.recv_timeout(Duration::from_millis(800));
+        release_fifo(&path);
+        thread.join().unwrap();
+        let error = before_writer
+            .expect("read waited for a FIFO writer instead of its deadline")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("read_blocked"));
+    }
+    #[test]
+    fn saturation_waits_for_a_healthy_helper_instead_of_claiming_blocked_access() {
+        let limiter = Arc::new(Limiter::new(1));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_limiter = Arc::clone(&limiter);
+        let first = std::thread::spawn(move || {
+            run_with_limiter(Path::new("first"), None, first_limiter, move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(1)
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            tx.send(run_with_limiter(Path::new("second"), None, limiter, |_| {
+                Ok(2)
+            }))
+            .unwrap()
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err());
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap(), 1);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(), 2);
+        second.join().unwrap();
+    }
+    #[test]
+    fn saturation_deadline_is_queue_timeout_not_read_blocked() {
+        let limiter = Arc::new(Limiter::new(1));
+        let permit = limiter
+            .acquire(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let work_fired = Arc::clone(&fired);
+        let budget = Budget::after(Duration::from_millis(80));
+        let error = with_budget(Some(budget.clone()), || {
+            run_with_limiter(Path::new("queued"), None, limiter, move |_| {
+                work_fired.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        })
+        .unwrap_err();
+        drop(permit);
+        assert!(error.to_string().contains("read_io_queue_timeout"));
+        assert!(!error.to_string().contains("read_blocked"));
+        assert_eq!(fired.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            budget.failure.lock().unwrap().as_ref().unwrap().code,
+            "read_io_queue_timeout"
+        );
+    }
+    #[test]
+    fn accessible_directory_never_opens_a_fifo_as_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo");
+        fifo(&path);
+        let error = with_budget(Some(Budget::after(IO_BUDGET)), || read(&path, None)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+    #[test]
+    fn fifo_replacement_after_admission_cannot_block_direct_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("regular.txt");
+        std::fs::write(&path, "regular\n").unwrap();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        FIFO_REPLACEMENTS
+            .lock()
+            .unwrap()
+            .insert(path.clone(), (Arc::clone(&fired), reached_tx));
+        let input = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || tx.send(read(&input, None)).unwrap());
+        let reached = reached_rx.recv_timeout(IO_BUDGET + Duration::from_secs(1));
+        let before_writer = rx.recv_timeout(Duration::from_millis(800));
+        if fired.load(Ordering::Relaxed) > 0 {
+            release_fifo(&path);
+        }
+        thread.join().unwrap();
+        reached.expect("the replacement must happen after file admission");
+        let error = before_writer
+            .expect("a FIFO replacement blocked the direct open")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fired.load(Ordering::Relaxed), 1);
+    }
+}

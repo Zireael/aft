@@ -1129,10 +1129,36 @@ impl ReadSource {
 #[cfg(test)]
 thread_local! {
     pub(crate) static SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SOURCE_AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static SOURCE_AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) fn read_source(path: &Path) -> io::Result<ReadSource> {
+    #[cfg(test)]
+    let hook = SOURCE_AFTER_READ.with(|hook| hook.borrow_mut().take());
+    #[cfg(test)]
+    let caller_thread = std::thread::current().id();
+    let (result, _reads) = crate::bounded_io::run(path, None, move |path| {
+        #[cfg(test)]
+        SOURCE_AFTER_READ.with(|slot| *slot.borrow_mut() = hook);
+        let result = read_source_unbounded(&path);
+        #[cfg(test)]
+        let reads = if std::thread::current().id() == caller_thread {
+            // Nested probes can reuse their caller's bounded helper. Its TLS
+            // counter is already updated; transfer only from another thread.
+            0
+        } else {
+            SOURCE_READS.with(|reads| reads.get())
+        };
+        #[cfg(not(test))]
+        let reads = 0usize;
+        Ok((result, reads))
+    })?;
+    #[cfg(test)]
+    SOURCE_READS.with(|reads| reads.set(reads.get() + _reads));
+    result
+}
+
+fn read_source_unbounded(path: &Path) -> io::Result<ReadSource> {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) => {

@@ -3087,6 +3087,7 @@ impl SearchIndexSnapshot {
         max_files: Option<usize>,
         scan_budget: Duration,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
+        let _io_scope = crate::bounded_io::enter_if_absent(scan_budget);
         let matcher = match pattern {
             CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
             CompiledPattern::Regex { compiled, .. } => SearchMatcher::Regex(compiled.clone()),
@@ -3124,6 +3125,7 @@ impl SearchIndexSnapshot {
         let stop_after = max_results.saturating_mul(2);
         let stop_scan = Arc::new(AtomicBool::new(false));
         let deadline = GrepScanDeadline::after(scan_budget);
+        let io_budget = crate::bounded_io::current();
         let verification_claims = AtomicUsize::new(0);
         let claim_verification = || {
             let Some(max_files) = max_files else {
@@ -3136,41 +3138,44 @@ impl SearchIndexSnapshot {
         let mut matches = if candidate_files.len() > 10 {
             candidate_files
                 .par_iter()
-                .map(|file| {
-                    if grep_scan_should_stop(
-                        Some(&stop_scan),
-                        &truncated,
-                        &total_matches,
-                        stop_after,
-                        job_cancellation.as_ref(),
-                        &deadline,
-                    ) {
-                        engine_capped.store(true, Ordering::Relaxed);
-                        return Vec::new();
-                    }
-                    if !claim_verification() {
-                        truncated.store(true, Ordering::Relaxed);
-                        engine_capped.store(true, Ordering::Relaxed);
-                        stop_scan.store(true, Ordering::Relaxed);
-                        return Vec::new();
-                    }
-                    search_candidate_file(
-                        file,
-                        &matcher,
-                        max_results,
-                        stop_after,
-                        &total_matches,
-                        &files_searched,
-                        &files_with_matches,
-                        &bytes_verified,
-                        &truncated,
-                        &engine_capped,
-                        &missing_on_disk,
-                        Some(&stop_scan),
-                        job_cancellation.as_ref(),
-                        &deadline,
-                    )
-                })
+                .map_init(
+                    || crate::bounded_io::enter(io_budget.clone()),
+                    |_scope, file| {
+                        if grep_scan_should_stop(
+                            Some(&stop_scan),
+                            &truncated,
+                            &total_matches,
+                            stop_after,
+                            job_cancellation.as_ref(),
+                            &deadline,
+                        ) {
+                            engine_capped.store(true, Ordering::Relaxed);
+                            return Vec::new();
+                        }
+                        if !claim_verification() {
+                            truncated.store(true, Ordering::Relaxed);
+                            engine_capped.store(true, Ordering::Relaxed);
+                            stop_scan.store(true, Ordering::Relaxed);
+                            return Vec::new();
+                        }
+                        search_candidate_file(
+                            file,
+                            &matcher,
+                            max_results,
+                            stop_after,
+                            &total_matches,
+                            &files_searched,
+                            &files_with_matches,
+                            &bytes_verified,
+                            &truncated,
+                            &engine_capped,
+                            &missing_on_disk,
+                            Some(&stop_scan),
+                            job_cancellation.as_ref(),
+                            &deadline,
+                        )
+                    },
+                )
                 .reduce(Vec::new, |mut left, mut right| {
                     // When concatenating partial match lists from parallel file
                     // searches, simply append the chunks. The stop checks in
@@ -3322,47 +3327,58 @@ impl SearchIndexSnapshot {
         let job_cancellation = crate::executor::current_job_cancellation();
         let started = Instant::now();
         let stopped_early = AtomicBool::new(false);
+        let io_budget = crate::bounded_io::current();
         let files_examined = AtomicUsize::new(0);
         let missing_on_disk = AtomicUsize::new(0);
         let files: Vec<GrepFileMatches> = examined_slice
             .par_iter()
-            .filter_map(|(_, file)| {
-                if started.elapsed() >= limits.budget
-                    || job_cancellation
-                        .as_ref()
-                        .is_some_and(|token| token.cancel_requested_before_commit())
-                {
-                    stopped_early.store(true, Ordering::Relaxed);
-                    return None;
-                }
-                let content = match read_indexed_file_bytes(&file.path) {
-                    Ok(content) => content,
-                    Err(missing) => {
-                        if missing {
-                            missing_on_disk.fetch_add(1, Ordering::Relaxed);
-                        }
-                        files_examined.fetch_add(1, Ordering::Relaxed);
+            .map_init(
+                || crate::bounded_io::enter(io_budget.clone()),
+                |_scope, (_, file)| {
+                    if started.elapsed() >= limits.budget
+                        || job_cancellation
+                            .as_ref()
+                            .is_some_and(|token| token.cancel_requested_before_commit())
+                    {
+                        stopped_early.store(true, Ordering::Relaxed);
                         return None;
                     }
-                };
-                files_examined.fetch_add(1, Ordering::Relaxed);
-                if is_binary_bytes(&content) {
-                    return None;
-                }
-                let (matches, matched_lines) = matching_lines_in_content(
-                    &file.path,
-                    &content,
-                    &matcher,
-                    limits.max_lines_per_file,
-                    keep_past_limit,
-                );
-                (matched_lines > 0).then(|| GrepFileMatches {
-                    path: file.path.clone(),
-                    modified: file.modified,
-                    matches,
-                    matched_lines,
-                })
-            })
+                    let content = match read_indexed_file_bytes(
+                        &file.path,
+                        started.checked_add(limits.budget),
+                    ) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            if error.kind() == std::io::ErrorKind::TimedOut {
+                                stopped_early.store(true, Ordering::Relaxed);
+                            }
+                            if io_error_means_missing_on_disk(&error) {
+                                missing_on_disk.fetch_add(1, Ordering::Relaxed);
+                            }
+                            files_examined.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
+                    };
+                    files_examined.fetch_add(1, Ordering::Relaxed);
+                    if is_binary_bytes(&content) {
+                        return None;
+                    }
+                    let (matches, matched_lines) = matching_lines_in_content(
+                        &file.path,
+                        &content,
+                        &matcher,
+                        limits.max_lines_per_file,
+                        keep_past_limit,
+                    );
+                    (matched_lines > 0).then(|| GrepFileMatches {
+                        path: file.path.clone(),
+                        modified: file.modified,
+                        matches,
+                        matched_lines,
+                    })
+                },
+            )
+            .filter_map(|file| file)
             .collect();
 
         GrepFileCollection {
@@ -3671,10 +3687,14 @@ fn search_candidate_file(
         return Vec::new();
     }
 
-    let content = match read_indexed_file_bytes(&file.path) {
+    let content = match read_indexed_file_bytes(&file.path, deadline.at) {
         Ok(content) => content,
-        Err(missing) => {
-            if missing {
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                deadline.reached.store(true, Ordering::Relaxed);
+                engine_capped.store(true, Ordering::Relaxed);
+            }
+            if io_error_means_missing_on_disk(&error) {
                 missing_on_disk.fetch_add(1, Ordering::Relaxed);
             }
             return Vec::new();
@@ -3890,7 +3910,9 @@ pub(crate) struct GrepScanDeadline {
 impl GrepScanDeadline {
     pub(crate) fn after(budget: Duration) -> Self {
         Self {
-            at: Instant::now().checked_add(budget),
+            at: Instant::now().checked_add(budget).map(|at| {
+                crate::bounded_io::current().map_or(at, |budget| at.min(budget.deadline))
+            }),
             reached: AtomicBool::new(false),
         }
     }
@@ -5774,18 +5796,17 @@ where
 }
 
 pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
+    let bytes = crate::bounded_io::read(path, None).ok()?;
     if is_binary_bytes(&bytes) {
         return None;
     }
     String::from_utf8(bytes).ok()
 }
 
-/// Read an indexed file for grep verification. `Err(true)` means the file is
-/// not on disk in this checkout, so the index entry is stale; `Err(false)` is any
-/// other read failure.
-fn read_indexed_file_bytes(path: &Path) -> Result<Vec<u8>, bool> {
-    fs::read(path).map_err(|error| io_error_means_missing_on_disk(&error))
+/// Read an indexed file for grep verification. Keep the original I/O error so
+/// callers distinguish a missing entry from blocked access or a scan timeout.
+fn read_indexed_file_bytes(path: &Path, deadline: Option<Instant>) -> std::io::Result<Vec<u8>> {
+    crate::bounded_io::read(path, deadline)
 }
 
 /// Whether an I/O error says the path does not exist (including a path whose
@@ -5803,7 +5824,7 @@ fn io_error_means_missing_on_disk(error: &std::io::Error) -> bool {
 pub(crate) fn path_missing_on_disk(path: &Path) -> bool {
     #[cfg(test)]
     audit_record(|work| work.presence_checks += 1);
-    fs::metadata(path).is_err_and(|error| io_error_means_missing_on_disk(&error))
+    crate::bounded_io::metadata(path).is_err_and(|error| io_error_means_missing_on_disk(&error))
 }
 
 /// Extra paths one listing may `stat` beyond its page while replacing entries
@@ -7351,11 +7372,14 @@ fn canonicalize_for_search_membership(path: &Path) -> PathBuf {
     // `fs::canonicalize` yields a Windows verbatim (`\\?\`) path, while the
     // lexical fallback does not, so the two success/failure forms would silently
     // miss each other without this shared non-verbatim normalizer.
-    crate::inspect::job::canonicalize_normalized(path)
+    crate::bounded_io::run(path, None, |path| {
+        Ok(crate::inspect::job::canonicalize_normalized(&path))
+    })
+    .unwrap_or_else(|_| crate::inspect::job::normalize_path(path))
 }
 
 fn canonicalize_or_normalize(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+    crate::bounded_io::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
 
 fn resolve_match_path(project_root: &Path, path: &Path) -> PathBuf {
@@ -7371,7 +7395,7 @@ fn path_modified_time(path: &Path) -> Option<SystemTime> {
     audit_record(|work| work.sort_stats += 1);
     #[cfg(test)]
     cache_freshness::record_metadata_call(path);
-    fs::metadata(path)
+    crate::bounded_io::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
 }
@@ -10462,6 +10486,74 @@ mod tests {
             CompileResult::Ok(compiled) => compiled,
             other => panic!("compile {pattern:?}: {other:?}"),
         }
+    }
+
+    /// A real FIFO open in verification's first-access directory probe stands
+    /// in for consent. Stale FIFO index entries are rejected in a separate test.
+    #[cfg(unix)]
+    #[test]
+    fn indexed_grep_scan_deadline_bounds_blocked_file_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let path = root.join("indexed.txt");
+        fs::write(&path, "needle\n").unwrap();
+        let index = SearchIndex::build_with_limit(&root, 1024 * 1024);
+        let fifo = root.join("consent-probe");
+        crate::bounded_io::tests::fifo(&fifo);
+        let probe = crate::bounded_io::tests::block_directory_probe(&root, &fifo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            tx.send(indexed_grep_with_budget(
+                &index,
+                &root,
+                &compile_grep_pattern("needle", true, false),
+                100,
+                Duration::from_millis(80),
+            ))
+            .unwrap();
+        });
+        let before_writer = rx.recv_timeout(Duration::from_millis(800));
+        crate::bounded_io::tests::release_fifo(&fifo);
+        thread.join().unwrap();
+        let result =
+            before_writer.expect("indexed verification waited in open beyond its scan deadline");
+        assert!(result.matches.is_empty());
+        assert_eq!(
+            probe.fired.load(Ordering::Relaxed),
+            1,
+            "verification's boundary probe must run"
+        );
+        assert_eq!(result.files_searched, 0);
+        assert_eq!(
+            result.missing_on_disk, 0,
+            "blocked access is not a deleted index entry"
+        );
+        assert!(result.scan_deadline_reached);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_grep_never_opens_a_stale_fifo_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let path = root.join("indexed.txt");
+        fs::write(&path, "needle\n").unwrap();
+        let index = SearchIndex::build_with_limit(&root, 1024 * 1024);
+        fs::remove_file(&path).unwrap();
+        crate::bounded_io::tests::fifo(&path);
+        let result = indexed_grep_with_budget(
+            &index,
+            &root,
+            &compile_grep_pattern("needle", true, false),
+            100,
+            Duration::from_millis(800),
+        );
+        assert!(result.matches.is_empty());
+        assert_eq!(result.files_searched, 0);
+        assert!(
+            !result.scan_deadline_reached,
+            "a FIFO is excluded, not opened until a deadline"
+        );
     }
 
     /// Indexed grep over `root` with an explicit scan budget, run on the
