@@ -403,6 +403,16 @@ if [ "${TRAIN_PUSH_TEST_CASE:-}" = "same-sha-failed-rerun-message" ]; then
 fi
 
 # --- refusal: no train name ------------------------------------------------
+dir="$(new_fixture no-path-checker)"
+add_train_commit "$dir/work" "no-path-checker"
+git -C "$dir/work" rm -q scripts/check-path-deps.py
+git -C "$dir/work" commit -qm "drop the path checker"
+run_train "$dir" no-path-checker
+expect_rc 2 "a missing path-dependency checker refuses"
+expect_out "scripts/check-path-deps.py not found" "the refusal names the missing checker"
+expect_no_out "dependency path resolves outside" "a missing checker is not reported as a path verdict"
+
+# --- refusal: no train name ------------------------------------------------
 dir="$(new_fixture usage)"
 run_train "$dir"
 expect_rc 2 "no train name refuses"

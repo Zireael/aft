@@ -3,10 +3,12 @@
 # green. Operator tooling runs through the real GitHub CLI (gh) via watch-ci.sh;
 # the shim is only for AI agent commands.
 #
-# Lifting this into another repository: carry four files together —
-# scripts/train-push.sh, scripts/watch-ci.sh, scripts/lib/operator-gh.sh,
-# scripts/lib/workflow-gates.py — plus `python3`, `git`, and the real `gh` on
-# PATH. Nothing else here assumes this repository's layout: the default branch
+# Lifting this into another repository: carry five files together —
+# scripts/train-push.sh, scripts/watch-ci.sh, scripts/check-path-deps.py,
+# scripts/lib/operator-gh.sh, scripts/lib/workflow-gates.py — plus `python3`,
+# `git`, and the real `gh` on PATH. check-path-deps.py may be replaced by the
+# repository's own check under the same name. Nothing else here assumes this
+# repository's layout: the default branch
 # is read from origin/HEAD, and repo-local preflights run only when their
 # scripts exist (see "Repo-local preflights" below), with the header line
 # naming which ones ran.
@@ -949,6 +951,11 @@ fi
 
 # A train must not add local dependency paths that escape the repository. CI
 # runs the same check, and this catches the problem before spending a push run.
+# The checker ships beside this script; a repository that copied only
+# train-push.sh and watch-ci.sh must be told that, not shown a path verdict.
+if [ ! -f "$REPO/scripts/check-path-deps.py" ]; then
+  refuse "scripts/check-path-deps.py not found: lift it from aft with train-push.sh, or provide your own check under that name"
+fi
 if ! python3 "$REPO/scripts/check-path-deps.py"; then
   refuse "dependency path resolves outside the repository"
 fi
