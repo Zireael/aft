@@ -237,6 +237,12 @@ struct KillSignalGate {
 static KILL_SIGNAL_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
     std::sync::OnceLock::new();
 
+// Park a terminal publisher after it releases the state lock but before it
+// queues the completion. The channel pair is the same as the kill-signal gate.
+#[cfg(test)]
+static TERMINAL_PUBLICATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
+    std::sync::OnceLock::new();
+
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn install_kill_signal_gate_for_test(
@@ -691,6 +697,9 @@ pub(crate) struct BgTask {
     persisted_hard_kill_ms: AtomicU64,
     pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
+    /// Serialize terminal notification routing, including watch safety nets.
+    /// Delivery acknowledgement remains separate so pending results can replay.
+    terminal_notification_routed: Mutex<bool>,
     #[cfg(unix)]
     adopted_exit: Mutex<super::exit_observer::AdoptedExit>,
     pub(crate) state: Mutex<BgTaskState>,
@@ -1519,6 +1528,16 @@ impl BgTaskRegistry {
     }
 
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let gate = TERMINAL_PUBLICATION_GATES
+                .get()
+                .and_then(|gates| gates.lock().unwrap().remove(&task.task_id));
+            if let Some(gate) = gate {
+                let _ = gate.reached.send(());
+                let _ = gate.release.recv_timeout(Duration::from_secs(30));
+            }
+        }
         // When a watchdog pass is publishing this terminal state, record that
         // pass before the completion becomes visible below, so a reader that
         // sees the completion also sees which pass observed it.
@@ -2821,6 +2840,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            terminal_notification_routed: Mutex::new(false),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             kill_settled: std::sync::Condvar::new(),
@@ -3066,6 +3086,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            terminal_notification_routed: Mutex::new(false),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             kill_settled: std::sync::Condvar::new(),
@@ -3299,6 +3320,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            terminal_notification_routed: Mutex::new(false),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             kill_settled: std::sync::Condvar::new(),
@@ -6508,6 +6530,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(persisted_hard_kill_ms),
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.finished_at.map(started_instant_from_unix_millis)),
+            terminal_notification_routed: Mutex::new(false),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             kill_settled: std::sync::Condvar::new(),
@@ -7074,6 +7097,13 @@ impl BgTaskRegistry {
             self.post_terminal_transition(&task, true)?;
         }
         let mut snapshot = self.snapshot_with_terminal_cache(&task, RUNNING_OUTPUT_PREVIEW_BYTES);
+        if snapshot.info.status.is_terminal() {
+            // Another publisher may have set the terminal state without yet
+            // queuing its notification, or deferred it for descendant sampling.
+            // A terminal kill reply must not outrun the session's completion.
+            self.finish_terminal_transition(&task, true)?;
+            self.inner.terminal_transition.notify_waiters();
+        }
         snapshot.kill_signaled = kill_signaled;
         snapshot.kill_reached = kill_reached;
         Ok(snapshot)
@@ -7463,6 +7493,19 @@ impl BgTaskRegistry {
         // real-world bash usage.
         self.record_compression_event_if_applicable(metadata, &token_counts);
 
+        // Kill can finish a transition whose original publisher is still doing
+        // unlocked work. Route once under a separate mutex: queue dedupe alone
+        // cannot protect watches after their in-memory control flags are cleared.
+        let owner = self.task(&metadata.task_id);
+        let mut routed = owner
+            .as_ref()
+            .and_then(|task| task.terminal_notification_routed.lock().ok());
+        if let Some(routed) = routed.as_mut() {
+            if **routed {
+                return;
+            }
+            **routed = true;
+        }
         // A session ack can arrive through another root actor. Reconcile with
         // the shared rows before task-local watch flags decide terminal routing.
         self.sync_memory_watches_from_persistence(&metadata.task_id);
@@ -7489,7 +7532,6 @@ impl BgTaskRegistry {
         // Rendering uses a snapshot taken before the reply may have acked
         // this task. Hold the current state through queue insertion so the ack
         // can fence any late snapshot instead of restoring a notification.
-        let owner = self.task(&metadata.task_id);
         let ack_state = owner.as_ref().and_then(|task| task.state.lock().ok());
         if metadata.completion_delivered
             || ack_state
@@ -13735,6 +13777,113 @@ mod tests {
             "a killed PTY must not wait for its reader's wake"
         );
         release_reader.send(()).expect("release the reader");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_queues_completion_before_return_when_another_publisher_is_paused() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+        let task = registry.task_for_test(&task_id).unwrap();
+        let (kill_reached, release_kill) = install_kill_signal_gate_for_test(&task_id);
+        let killer = {
+            let registry = registry.clone();
+            let task_id = task_id.clone();
+            std::thread::spawn(move || registry.kill(&task_id, "session"))
+        };
+        kill_reached.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let (published_tx, published_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        TERMINAL_PUBLICATION_GATES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(
+                task_id.clone(),
+                KillSignalGate {
+                    reached: published_tx,
+                    release: release_rx,
+                },
+            );
+        // A watchdog marker poll publishes the natural terminal state while
+        // signaling is in flight, then pauses before its completion enqueue.
+        fs::write(&task.paths.exit, "0").unwrap();
+        let publisher = {
+            let registry = registry.clone();
+            let task = Arc::clone(&task);
+            std::thread::spawn(move || registry.poll_task(&task))
+        };
+        published_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            task.state.lock().unwrap().metadata.status,
+            BgTaskStatus::Completed
+        );
+        assert!(completions_for(&registry, &task_id).is_empty());
+
+        release_kill.send(()).unwrap();
+        let snapshot = killer.join().unwrap().unwrap();
+        let first = completions_for(&registry, &task_id);
+        // The already-terminal entry path must also finish delivery without
+        // waiting for the paused publisher or inserting a second completion.
+        let repeated = registry.kill(&task_id, "session").unwrap();
+        let second = completions_for(&registry, &task_id);
+        registry.ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id));
+        release_tx.send(()).unwrap();
+        publisher.join().unwrap().unwrap();
+
+        assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
+        assert_eq!(repeated.info.status, BgTaskStatus::Completed);
+        assert_eq!(
+            first.len(),
+            1,
+            "kill must queue the completion before returning"
+        );
+        assert_eq!(first[0].status, BgTaskStatus::Completed);
+        assert_eq!(
+            second.len(),
+            1,
+            "repeated kill must not duplicate the completion"
+        );
+        assert!(
+            completions_for(&registry, &task_id).is_empty(),
+            "the delayed publisher must not resurrect an acknowledged completion"
+        );
+        registry.kill(&task_id, "session").unwrap();
+        assert!(
+            completions_for(&registry, &task_id).is_empty(),
+            "kill must not resurrect an acknowledged completion"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_repeated_terminal_notification_keeps_watch_routing_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _db, frames) = registry_with_db_and_frames(dir.path());
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+        registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("never-present".into()),
+                true,
+            )
+            .unwrap();
+
+        registry.kill(&task_id, "session").unwrap();
+        registry.kill(&task_id, "session").unwrap();
+        assert!(
+            completions_for(&registry, &task_id).is_empty(),
+            "a watch must not fall through to generic completion on repeated finalization"
+        );
+        let matches = pattern_match_frames(&frames);
+        assert_eq!(matches.len(), 1, "exactly one watch notification");
+        assert_eq!(matches[0].reason, "task_exit");
+        registry.ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id));
+        registry.kill(&task_id, "session").unwrap();
+        assert!(completions_for(&registry, &task_id).is_empty());
+        assert_eq!(pattern_match_frames(&frames).len(), 1);
     }
 
     /// A task can finish on its own while a kill is in flight. If its own
