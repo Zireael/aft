@@ -441,6 +441,14 @@ impl BgTaskRegistry {
         let handles =
             TaskIoHandles::create(&layout, BgMode::Pipes, true).map_err(|e| e.to_string())?;
         write_task_at(&layout, &metadata).map_err(|e| e.to_string())?;
+        // Commit point for a remote task: its record exists, and the remote
+        // worker (which can run the command remotely or fall back to a local
+        // process) starts below. Without this, a startup the reply deadline
+        // had already refused as "not started" could still run here.
+        if let Err(error) = super::super::commit_spawn_receipt(&task_id) {
+            let _ = delete_resolved_task(&layout);
+            return Err(error);
+        }
         self.dual_write_task(&layout.paths, &metadata);
         self.insert_rehydrated_task(metadata, layout.paths, false)?;
         let task = self.task(&task_id).unwrap();

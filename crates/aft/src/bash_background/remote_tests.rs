@@ -890,6 +890,54 @@ async fn exec_remote_bash_continuous_output_cannot_starve_cancel() {
 }
 
 #[tokio::test]
+async fn exec_remote_launch_is_fenced_by_a_refused_startup_receipt() {
+    // The bash reply deadline refused this startup and told the caller the
+    // command was not started; the remote launch must then create nothing:
+    // no registered task, no task record, no remote request or local fallback.
+    let daemon = daemon(Script::Refused, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let receipt = Arc::new(crate::bash_background::SpawnReceipt::new(
+        std::time::Instant::now() + Duration::from_secs(600),
+    ));
+    assert_eq!(
+        receipt.expire(),
+        crate::bash_background::StartupOutcome::Refused
+    );
+    let result = crate::bash_background::with_spawn_receipt(receipt, || {
+        registry.spawn_remote(
+            launch(daemon.connection.clone()),
+            SpawnPlan::Unsandboxed,
+            "printf local-proof > remote-fence-probe",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            dir.path().into(),
+            10,
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+    });
+    let error = result.expect_err("a refused receipt must refuse the remote launch");
+    assert!(error.contains("startup deadline expired"), "{error}");
+    assert!(registry.list(0).is_empty());
+    let (ids, _) = discover_task_ids(&session_tasks_dir(dir.path(), "session")).unwrap_or_default();
+    assert!(
+        ids.is_empty(),
+        "refused remote launch left records: {ids:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!dir.path().join("remote-fence-probe").exists());
+    assert!(
+        daemon.log.lock().unwrap().is_empty(),
+        "no remote request may be sent"
+    );
+}
+
+#[tokio::test]
 async fn exec_remote_bash_deadline_is_not_cancel() {
     let daemon = daemon(Script::Deadline, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();

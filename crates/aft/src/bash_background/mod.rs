@@ -36,6 +36,12 @@ mod slot_limit_tests;
 /// A shell startup has a reply budget even before it has an executor worker.
 /// The short state lock fences process creation against a deadline refusal;
 /// no filesystem operation, process creation, or registry lock runs under it.
+///
+/// The state leaves `Pending` exactly once, under that lock: either the
+/// startup commits (a task record exists and process creation follows, or an
+/// in-process rewrite is about to run) or the reply deadline refuses it. Both
+/// end states are final, so a caller told "refused" can rely on the command
+/// never starting later, and a caller told "committed" gets the task id.
 pub(crate) struct SpawnReceipt {
     state: std::sync::Mutex<SpawnReceiptState>,
     deadline: std::time::Instant,
@@ -47,6 +53,22 @@ enum SpawnReceiptState {
     Pending,
     Refused,
     Committed(String),
+    /// A bash rewrite is executing the command inside this process (for
+    /// example an append turned into a file edit). It has no task id, so the
+    /// only way to learn its outcome is to wait for its reply.
+    CommittedInline,
+}
+
+/// What the reply deadline found when it settled a startup's receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartupOutcome {
+    /// Nothing had committed; the receipt is now refused and the command can
+    /// never start under it.
+    Refused,
+    /// A task record exists and its process is being (or has been) created.
+    Task(String),
+    /// The command is running inside this process as a bash rewrite.
+    Inline,
 }
 
 impl SpawnReceipt {
@@ -56,32 +78,41 @@ impl SpawnReceipt {
             deadline,
         }
     }
-    pub(crate) fn expire(&self) -> Option<String> {
+
+    /// Settles the receipt at the reply deadline. A pending receipt becomes
+    /// refused under the same lock every commit takes, so it is impossible
+    /// for this to return `Refused` and for a commit to succeed afterwards.
+    pub(crate) fn expire(&self) -> StartupOutcome {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &*state {
-            SpawnReceiptState::Committed(id) => Some(id.clone()),
-            _ => {
+            SpawnReceiptState::Committed(id) => StartupOutcome::Task(id.clone()),
+            SpawnReceiptState::CommittedInline => StartupOutcome::Inline,
+            SpawnReceiptState::Pending | SpawnReceiptState::Refused => {
                 *state = SpawnReceiptState::Refused;
-                None
+                StartupOutcome::Refused
             }
         }
     }
 
-    fn commit(&self, task_id: &str) -> Result<(), String> {
+    fn commit(&self, committed: SpawnReceiptState) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if matches!(*state, SpawnReceiptState::Refused)
+        if !matches!(*state, SpawnReceiptState::Pending)
             || std::time::Instant::now() >= self.deadline
         {
-            *state = SpawnReceiptState::Refused;
+            // A second commit on one receipt is a bug; refusing it keeps an
+            // earlier commit's answer intact instead of overwriting it.
+            if matches!(*state, SpawnReceiptState::Pending) {
+                *state = SpawnReceiptState::Refused;
+            }
             return Err("bash startup deadline expired before process creation".into());
         }
-        *state = SpawnReceiptState::Committed(task_id.into());
+        *state = committed;
         Ok(())
     }
 
@@ -134,9 +165,91 @@ pub(crate) fn with_spawn_receipt<T>(
 /// get the task id, including while running-record persistence is blocked.
 pub(crate) fn commit_spawn_receipt(task_id: &str) -> Result<(), String> {
     CURRENT_SPAWN_RECEIPT.with(|slot| match slot.borrow().as_ref() {
-        Some(receipt) => receipt.commit(task_id),
+        Some(receipt) => receipt.commit(SpawnReceiptState::Committed(task_id.into())),
         None => Ok(()),
     })
+}
+
+/// Called by a bash rewrite immediately before it executes the command inside
+/// this process. A rewrite can mutate files (an append becomes an edit), so it
+/// is fenced exactly like process creation: once the deadline has refused the
+/// startup, the rewrite must not run.
+pub(crate) fn commit_spawn_receipt_inline() -> Result<(), String> {
+    CURRENT_SPAWN_RECEIPT.with(|slot| match slot.borrow().as_ref() {
+        Some(receipt) => receipt.commit(SpawnReceiptState::CommittedInline),
+        None => Ok(()),
+    })
+}
+
+#[cfg(test)]
+mod spawn_receipt_tests {
+    use super::{SpawnReceipt, SpawnReceiptState, StartupOutcome};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    fn far_future() -> Instant {
+        Instant::now() + Duration::from_secs(600)
+    }
+
+    fn commit_task(receipt: &SpawnReceipt) -> Result<(), String> {
+        receipt.commit(SpawnReceiptState::Committed("bgb-task".into()))
+    }
+
+    #[test]
+    fn refused_receipt_never_commits_and_committed_receipt_is_never_refused() {
+        let refused = SpawnReceipt::new(far_future());
+        assert_eq!(refused.expire(), StartupOutcome::Refused);
+        assert!(commit_task(&refused).is_err());
+        assert!(refused.commit(SpawnReceiptState::CommittedInline).is_err());
+        assert_eq!(refused.expire(), StartupOutcome::Refused);
+
+        let committed = SpawnReceipt::new(far_future());
+        assert!(commit_task(&committed).is_ok());
+        assert_eq!(committed.expire(), StartupOutcome::Task("bgb-task".into()));
+        // A second commit must not overwrite the first one's answer.
+        assert!(commit_task(&committed).is_err());
+        assert_eq!(committed.expire(), StartupOutcome::Task("bgb-task".into()));
+
+        let inline = SpawnReceipt::new(far_future());
+        assert!(inline.commit(SpawnReceiptState::CommittedInline).is_ok());
+        assert_eq!(inline.expire(), StartupOutcome::Inline);
+    }
+
+    #[test]
+    fn commit_after_the_deadline_is_refused_even_before_the_timer_settles_it() {
+        let receipt = SpawnReceipt::new(Instant::now());
+        assert!(commit_task(&receipt).is_err());
+        assert_eq!(receipt.expire(), StartupOutcome::Refused);
+    }
+
+    #[test]
+    fn racing_commit_and_expire_always_agree() {
+        // Start both sides together many times. Whichever takes the receipt
+        // lock first decides; the two answers must describe the same fact.
+        for _ in 0..2000 {
+            let receipt = Arc::new(SpawnReceipt::new(far_future()));
+            let start = Arc::new(Barrier::new(2));
+            let committer = {
+                let receipt = Arc::clone(&receipt);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    commit_task(&receipt)
+                })
+            };
+            start.wait();
+            let outcome = receipt.expire();
+            let committed = committer.join().unwrap();
+            match outcome {
+                StartupOutcome::Task(id) => {
+                    assert_eq!(id, "bgb-task");
+                    assert!(committed.is_ok());
+                }
+                StartupOutcome::Refused => assert!(committed.is_err()),
+                StartupOutcome::Inline => panic!("no inline commit in this race"),
+            }
+        }
+    }
 }
 
 /// Who started a background task and the key they gave the call, recorded on

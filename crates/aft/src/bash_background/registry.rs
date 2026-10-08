@@ -2735,15 +2735,19 @@ impl BgTaskRegistry {
                 "failed to persist background task metadata: {error}"
             ));
         }
-        self.dual_write_task(&paths, &metadata);
 
         let mut io_handles =
             TaskIoHandles::create(&task_layout, BgMode::Pipes, capture_pipeline_status)
                 .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
+        // Commit point: the starting record and every control/output file
+        // exist; the process is created next. A refused receipt deletes the
+        // record, and the database row is mirrored only after the commit, so
+        // a refused startup leaves no task record anywhere.
         if let Err(error) = super::commit_spawn_receipt(&task_id) {
             let _ = delete_resolved_task(&task_layout);
             return Err(error);
         }
+        self.dual_write_task(&paths, &metadata);
         let child = match spawn_detached_child(
             &spawn_plan,
             command,
@@ -2968,14 +2972,15 @@ impl BgTaskRegistry {
                 "failed to persist background task metadata: {error}"
             ));
         }
-        self.dual_write_task(&paths, &metadata);
         let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pty, false)
             .map_err(|error| format!("failed to pre-open PTY output handles: {error}"))?;
 
+        // Commit point; see `spawn_with_shell`.
         if let Err(error) = super::commit_spawn_receipt(&task_id) {
             let _ = delete_resolved_task(&task_layout);
             return Err(error);
         }
+        self.dual_write_task(&paths, &metadata);
 
         let runtime = match spawn_pty_for_command(
             &spawn_plan,
@@ -3200,14 +3205,15 @@ impl BgTaskRegistry {
                 "failed to persist background task metadata: {error}"
             ));
         }
-        self.dual_write_task(&paths, &metadata);
         let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pipes, false)
             .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
 
+        // Commit point; see the Unix `spawn_with_shell`.
         if let Err(error) = super::commit_spawn_receipt(&task_id) {
             let _ = delete_resolved_task(&task_layout);
             return Err(error);
         }
+        self.dual_write_task(&paths, &metadata);
 
         let child = match spawn_detached_child(
             &spawn_plan,

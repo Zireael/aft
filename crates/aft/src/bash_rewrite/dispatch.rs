@@ -150,6 +150,17 @@ pub fn dispatch_for_request(
                 // Do not turn a handler failure into a native execution. The
                 // handler has already begun and a second execution could
                 // duplicate a mutation such as cat_append.
+                //
+                // A rewrite runs the command in this process, so it passes the
+                // same startup fence as process creation: after the bash reply
+                // deadline has told the caller "not started", it must not run.
+                if let Err(message) = crate::bash_background::commit_spawn_receipt_inline() {
+                    return Some(Response::error(
+                        request_id,
+                        "bash_start_deadline",
+                        format!("{message}; command was not started"),
+                    ));
+                }
                 return Some(rule.execute(&request, ctx));
             }
             crate::bash_rewrite::RewriteDecision::Decline(reason) => {

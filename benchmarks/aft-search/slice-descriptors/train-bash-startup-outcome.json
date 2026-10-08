@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["bash-startup-deadline-outcome"],
+  "note": "Bash startup reply deadline only: a refused startup now says the command was not started (the spawn receipt fences process creation, remote launch and in-process rewrites), a committed one is handed off by task id, and an unresolvable one gets a typed outcome-unknown error. No changed path matches RANKING_FENCE_PREFIXES."
+}

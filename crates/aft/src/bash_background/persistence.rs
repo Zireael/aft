@@ -1365,6 +1365,10 @@ fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io:
     if task.status == BgTaskStatus::Running {
         task_io_fault_for_test(true)?;
     }
+    #[cfg(test)]
+    if task.status == BgTaskStatus::Starting {
+        starting_write_delay_for_test();
+    }
     // Every terminal transition is persisted through here, so this is the one
     // place that retires the task's gh shim ticket on completion, kill,
     // timeout and unknown fate alike. It runs before the write so a failed
@@ -1389,6 +1393,9 @@ pub(crate) enum TaskIoFault {
     LayoutEnospc,
     RunningEnospc,
     RunningDelay(std::time::Duration),
+    /// Delays the starting-record write, which happens before the spawn
+    /// receipt commits, so a test can push that commit past the reply deadline.
+    StartingDelay(std::time::Duration),
 }
 
 #[cfg(test)]
@@ -1420,6 +1427,13 @@ fn task_io_fault_for_test(running: bool) -> io::Result<()> {
         }
         _ => Ok(()),
     })
+}
+
+#[cfg(test)]
+fn starting_write_delay_for_test() {
+    if let Some(TaskIoFault::StartingDelay(delay)) = TASK_IO_FAULT.with(std::cell::Cell::get) {
+        std::thread::sleep(delay);
+    }
 }
 
 #[cfg(test)]

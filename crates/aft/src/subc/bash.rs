@@ -878,16 +878,31 @@ pub(super) fn submit_deferred_bash(
             biased;
             response = &mut spawn_future => response,
             _ = tokio::time::sleep_until(startup_deadline.into()) => {
-                let task_id = receipt.expire();
-                if task_id.is_none() { spawn_cancel.request_cancel(); }
-                let response = match task_id {
-                    Some(task_id) if !server_completion => deadline_handoff_response(&request_id, &task_id, startup_window, worker_session, format_context.bash_watch_available.unwrap_or(worker_session)),
-                    _ => Response::error(&request_id, "bash_start_deadline", startup_refusal_reason(&executor, &root_for_task, admitted.load(Ordering::Relaxed))),
+                // Settling the receipt is the one synchronization point with
+                // the startup job: it takes the receipt lock that every commit
+                // takes, so the outcome read here is final (see `SpawnReceipt`).
+                let outcome = receipt.expire();
+                if outcome == crate::bash_background::StartupOutcome::Refused {
+                    spawn_cancel.request_cancel();
+                }
+                // An in-process rewrite has no task id to hand off, so its
+                // reply is the only way to learn what it did. It is normally a
+                // file read or a small edit; give it a short bounded wait.
+                let settled = if outcome == crate::bash_background::StartupOutcome::Inline {
+                    tokio::time::timeout(INLINE_STARTUP_SETTLE, &mut spawn_future).await.ok()
+                } else {
+                    None
                 };
-                log::warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"));
-                send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task.clone(), request_id.clone(), Some(bash_result_from_response(response, &format_context)), false).await;
-                answered_startup = true;
-                (&mut spawn_future).await
+                match settled {
+                    Some(response) => response,
+                    None => {
+                        let response = startup_deadline_response(&request_id, &outcome, startup_window, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, admitted.load(Ordering::Relaxed));
+                        log::warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"));
+                        send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task.clone(), request_id.clone(), Some(bash_result_from_response(response, &format_context)), false).await;
+                        answered_startup = true;
+                        (&mut spawn_future).await
+                    }
+                }
             }
         };
         let spawn_control = spawn_control_rx.await;
@@ -1065,9 +1080,70 @@ fn deadline_handoff_response(
     )
 }
 
+/// How long the startup reply deadline waits for an in-process bash rewrite
+/// that committed before the deadline. The startup budget is at most 20 s
+/// under the 25 s client transport class, so this keeps the reply inside it.
+const INLINE_STARTUP_SETTLE: Duration = Duration::from_millis(1500);
+
+/// The reply a bash call gets when its startup reply budget expires, built
+/// from the receipt's final state. Every branch answers definitely whether the
+/// command runs: refused means it was not started and never will be; a
+/// committed task is handed off by id; anything else is a typed
+/// outcome-unknown error that says how to find out.
+#[allow(clippy::too_many_arguments)]
+fn startup_deadline_response(
+    request_id: &str,
+    outcome: &crate::bash_background::StartupOutcome,
+    startup_window: u64,
+    server_completion: bool,
+    worker_session: bool,
+    bash_watch_available: bool,
+    executor: &Executor,
+    root: &ProjectRootId,
+    admitted: bool,
+) -> Response {
+    use crate::bash_background::StartupOutcome;
+    match outcome {
+        StartupOutcome::Task(task_id) if !server_completion => deadline_handoff_response(
+            request_id,
+            task_id,
+            startup_window,
+            worker_session,
+            bash_watch_available,
+        ),
+        // A server-owned call is never handed off: once this reply goes out,
+        // its local task is killed (a remote one keeps running). Either way
+        // the command did start, so the caller must not treat it as not run.
+        StartupOutcome::Task(task_id) => Response::error_with_data(
+            request_id,
+            "outcome_unknown_startup_deadline",
+            format!(
+                "bash startup exceeded its reply budget after the command started as task {task_id}; a server-owned call cannot be handed off, so a local task is stopped and may have run partly. Inspect it with bash_status {task_id}; never rerun the command automatically"
+            ),
+            json!({ "task_id": task_id }),
+        ),
+        StartupOutcome::Inline => Response::error(
+            request_id,
+            "outcome_unknown_startup_deadline",
+            format!(
+                "bash startup exceeded its reply budget while the command was running in-process as a rewrite (a file read, search or edit) and it did not finish within {} ms; it may have run, and it has no task id. Check the files it touches before rerunning it",
+                INLINE_STARTUP_SETTLE.as_millis()
+            ),
+        ),
+        StartupOutcome::Refused => Response::error(
+            request_id,
+            "bash_start_deadline",
+            startup_refusal_reason(executor, root, admitted),
+        ),
+    }
+}
+
+/// Only called once the receipt is refused: process creation and in-process
+/// rewrites both commit through that receipt, and a refused receipt never
+/// commits, so every reason here can say the command was not started.
 fn startup_refusal_reason(executor: &Executor, root: &ProjectRootId, admitted: bool) -> String {
     if admitted {
-        return "bash startup exceeded its reply budget during control-file creation or process startup; process creation is refused if it has not committed".into();
+        return "bash startup exceeded its reply budget after executor admission (shell setup or control-file creation), before process creation committed; process creation is now refused, so the command was not started and will not start".into();
     }
     if let Some(writer) = executor
         .try_mutating_lane_snapshots()
@@ -1917,6 +1993,17 @@ mod grant_path_tests {
         arguments: Value,
         received_at: Instant,
     ) -> mpsc::Receiver<BashDeferredCompletion> {
+        deadline_test_call_owned(executor, root, dispatch, arguments, received_at, false)
+    }
+
+    fn deadline_test_call_owned(
+        executor: &Arc<Executor>,
+        root: &ProjectRootId,
+        dispatch: DispatchFn,
+        arguments: Value,
+        received_at: Instant,
+        server_completion: bool,
+    ) -> mpsc::Receiver<BashDeferredCompletion> {
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (tx, rx) = mpsc::channel(8);
         let (touch_tx, _) = mpsc::channel(8);
@@ -1952,7 +2039,7 @@ mod grant_path_tests {
             None,
             false,
             false,
-            false,
+            server_completion,
             super::remote_policy::RemoteSource::None,
             received_at,
         );
@@ -2205,6 +2292,395 @@ mod grant_path_tests {
             ctx.bash_background().task_for_test(task_id).is_some(),
             "receipt must name the actual late-registered task"
         );
+    }
+
+    // --- Startup reply deadline: every reply says definitely whether the
+    // command runs. Process creation commits through the call's spawn
+    // receipt after the starting record and control/output files exist; the
+    // deadline settles the same receipt under its lock. ---
+
+    const DEADLINE_SESSION: &str = "deadline-session";
+
+    struct StartupCall {
+        dir: tempfile::TempDir,
+        ctx: Arc<AppContext>,
+        rx: mpsc::Receiver<BashDeferredCompletion>,
+    }
+
+    fn startup_call(
+        dispatch: DispatchFn,
+        window: u64,
+        command: &str,
+        received_at: Instant,
+        server_completion: bool,
+        rewrite: bool,
+    ) -> StartupCall {
+        let (dir, root) = super::super::test_support::test_root("bash-startup-outcome");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.foreground_wait_window_ms = window;
+            config.project_root = Some(root.as_path().into());
+            config.storage_dir = Some(dir.path().join("storage"));
+            config.sandbox.enabled = false;
+            config.experimental_bash_rewrite = rewrite;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let rx = deadline_test_call_owned(
+            &executor,
+            &root,
+            dispatch,
+            json!({"command": command, "timeout": 60000}),
+            received_at,
+            server_completion,
+        );
+        StartupCall { dir, ctx, rx }
+    }
+
+    async fn first_reply(call: &mut StartupCall, within: Duration) -> BashDeferredCompletion {
+        tokio::time::timeout(within, call.rx.recv())
+            .await
+            .expect("bash must answer within its reply budget")
+            .expect("bash completion channel open")
+    }
+
+    /// Task ids that have a record in the session's task store, on disk.
+    fn task_records_on_disk(ctx: &AppContext) -> Vec<String> {
+        let session_dir = crate::bash_background::persistence::session_tasks_dir(
+            &crate::bash_background::task_storage_dir(ctx),
+            DEADLINE_SESSION,
+        );
+        match crate::bash_background::persistence::discover_task_ids(&session_dir) {
+            Ok((ids, _)) => ids,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("cannot list task records: {error}"),
+        }
+    }
+
+    /// Asserts the call's command never ran and never will: no process side
+    /// effect, no registered task, no task record on disk.
+    fn assert_never_started(call: &StartupCall) {
+        assert!(
+            !call.dir.path().join("started-command").exists(),
+            "a startup reported as not started must never run"
+        );
+        assert!(
+            call.ctx.bash_background().list(0).is_empty(),
+            "a refused startup must not register a task"
+        );
+        assert_eq!(
+            task_records_on_disk(&call.ctx),
+            Vec::<String>::new(),
+            "a refused startup must not leave a task record"
+        );
+    }
+
+    fn assert_not_started_refusal(response: &Response) {
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "bash_start_deadline", "{response:?}");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            message.contains("command was not started"),
+            "a refusal must say definitely that the command did not start: {message}"
+        );
+    }
+
+    async fn wait_for_terminal(
+        ctx: &AppContext,
+        task_id: &str,
+    ) -> crate::bash_background::BgTaskStatus {
+        let give_up = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(snapshot) =
+                ctx.bash_background()
+                    .observed_status(task_id, DEADLINE_SESSION, 0)
+            {
+                if snapshot.info.status.is_terminal() {
+                    return snapshot.info.status;
+                }
+            }
+            assert!(Instant::now() < give_up, "task {task_id} never finished");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn slow_starting_record_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        with_task_io_fault(
+            TaskIoFault::StartingDelay(Duration::from_millis(300)),
+            || running_bash_stub(req, ctx),
+        )
+    }
+
+    fn slow_running_record_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        with_task_io_fault(
+            TaskIoFault::RunningDelay(Duration::from_millis(1200)),
+            || running_bash_stub(req, ctx),
+        )
+    }
+
+    /// The starting-record delay the boundary test is sweeping. Only that
+    /// test reads it, one call at a time.
+    static BOUNDARY_STARTING_DELAY_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    fn boundary_starting_delay_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        let delay = BOUNDARY_STARTING_DELAY_MS.load(Ordering::SeqCst);
+        with_task_io_fault(
+            TaskIoFault::StartingDelay(Duration::from_millis(delay)),
+            || running_bash_stub(req, ctx),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_deadline_during_control_file_write_says_not_started_and_never_starts() {
+        // The starting-record write (before the commit) outlasts the 80 ms
+        // budget, so the deadline refuses the receipt while the job is busy.
+        let mut call = startup_call(
+            slow_starting_record_stub,
+            80,
+            "printf ran > started-command",
+            Instant::now(),
+            false,
+            false,
+        );
+        let done = first_reply(&mut call, Duration::from_millis(480)).await;
+        let response = done.response_for_test();
+        assert_not_started_refusal(&response);
+        assert!(
+            response.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("before process creation committed"),
+            "{response:?}"
+        );
+        // Let the delayed startup job run to the end; it must find the
+        // receipt refused and create nothing.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_never_started(&call);
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(100), call.rx.recv()).await,
+                Ok(Some(_))
+            ),
+            "only one terminal reply"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_deadline_after_commit_hands_off_the_task_and_it_completes() {
+        // The commit lands well inside the 500 ms budget; the running-record
+        // write after process creation then holds the job past the deadline.
+        let mut call = startup_call(
+            slow_running_record_stub,
+            500,
+            "printf ran > started-command",
+            Instant::now(),
+            false,
+            false,
+        );
+        let done = first_reply(&mut call, Duration::from_millis(1000)).await;
+        let response = done.response_for_test();
+        assert!(
+            response.success,
+            "a committed startup must be handed off: {response:?}"
+        );
+        assert_eq!(response.data["status"], "running");
+        let task_id = response.data["task_id"]
+            .as_str()
+            .expect("handoff names the task")
+            .to_string();
+        assert!(
+            response.data["output"].as_str().unwrap().contains(&task_id),
+            "{response:?}"
+        );
+        assert_eq!(
+            wait_for_terminal(&call.ctx, &task_id).await,
+            crate::bash_background::BgTaskStatus::Completed
+        );
+        assert!(call.dir.path().join("started-command").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_deadline_at_the_commit_boundary_is_never_ambiguous() {
+        // Sweep the starting-record delay across the 200 ms budget so the
+        // commit lands just before, at, or just after the deadline. Which
+        // side wins is timing; that the reply matches what happened is not.
+        for delay_ms in [140u64, 170, 185, 200, 215, 230, 260] {
+            BOUNDARY_STARTING_DELAY_MS.store(delay_ms, Ordering::SeqCst);
+            let mut call = startup_call(
+                boundary_starting_delay_stub,
+                200,
+                "printf ran > started-command",
+                Instant::now(),
+                false,
+                false,
+            );
+            let done = first_reply(&mut call, Duration::from_millis(1500)).await;
+            let response = done.response_for_test();
+            eprintln!(
+                "commit-boundary delay {delay_ms} ms: {}",
+                if response.success {
+                    "handed off"
+                } else {
+                    "refused"
+                }
+            );
+            if response.success {
+                let task_id = response.data["task_id"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("delay {delay_ms}: success without a task id"))
+                    .to_string();
+                assert_eq!(
+                    wait_for_terminal(&call.ctx, &task_id).await,
+                    crate::bash_background::BgTaskStatus::Completed,
+                    "delay {delay_ms}"
+                );
+                assert!(
+                    call.dir.path().join("started-command").exists(),
+                    "delay {delay_ms}: handed-off task must have run"
+                );
+            } else {
+                assert_not_started_refusal(&response);
+                tokio::time::sleep(Duration::from_millis(delay_ms + 400)).await;
+                assert_never_started(&call);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_owned_bash_committed_at_deadline_is_outcome_unknown_with_task_id() {
+        // A server-owned call's startup budget is a fixed 20 s; receive it
+        // 19.5 s ago so the deadline falls 500 ms from now, after the commit.
+        let mut call = startup_call(
+            slow_running_record_stub,
+            500,
+            "printf ran > started-command; sleep 3",
+            Instant::now() - Duration::from_millis(19_500),
+            true,
+            false,
+        );
+        let done = first_reply(&mut call, Duration::from_millis(1000)).await;
+        let response = done.response_for_test();
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "outcome_unknown_startup_deadline");
+        let task_id = response.data["task_id"]
+            .as_str()
+            .expect("outcome-unknown names the started task");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("bash_status {task_id}")),
+            "{message}"
+        );
+        assert!(!message.contains("not started"), "{message}");
+    }
+
+    fn slow_rewrite_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        std::thread::sleep(Duration::from_millis(300));
+        crate::bash_rewrite::try_rewrite_for_request(
+            "echo fenced >> notes.txt",
+            &req.id,
+            req.session_id.as_deref(),
+            ctx,
+            &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+        )
+        .expect("the append rewrite accepts this command")
+    }
+
+    fn prompt_rewrite_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        crate::bash_rewrite::try_rewrite_for_request(
+            "echo fenced >> notes.txt",
+            &req.id,
+            req.session_id.as_deref(),
+            ctx,
+            &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+        )
+        .expect("the append rewrite accepts this command")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_process_rewrite_is_fenced_like_process_creation() {
+        // Control: inside the budget the rewrite runs and appends.
+        let mut call = startup_call(
+            prompt_rewrite_stub,
+            2000,
+            "unused",
+            Instant::now(),
+            false,
+            true,
+        );
+        let done = first_reply(&mut call, Duration::from_millis(2500)).await;
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert!(call.dir.path().join("notes.txt").exists());
+
+        // Past the budget the rewrite must not run once the caller was told
+        // the command was not started.
+        let mut call = startup_call(slow_rewrite_stub, 80, "unused", Instant::now(), false, true);
+        let done = first_reply(&mut call, Duration::from_millis(480)).await;
+        let response = done.response_for_test();
+        assert_not_started_refusal(&response);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !call.dir.path().join("notes.txt").exists(),
+            "a refused rewrite must never append"
+        );
+    }
+
+    fn inline_commit_then_sleep_stub(sleep: Duration, req: RawRequest) -> Response {
+        crate::bash_background::commit_spawn_receipt_inline().expect("commit before deadline");
+        std::thread::sleep(sleep);
+        Response::success(req.id, json!({ "output": "inline done" }))
+    }
+
+    fn short_inline_stub(req: RawRequest, _ctx: &AppContext) -> Response {
+        inline_commit_then_sleep_stub(Duration::from_millis(300), req)
+    }
+
+    fn stuck_inline_stub(req: RawRequest, _ctx: &AppContext) -> Response {
+        inline_commit_then_sleep_stub(INLINE_STARTUP_SETTLE + Duration::from_millis(800), req)
+    }
+
+    #[tokio::test]
+    async fn committed_inline_rewrite_answers_with_its_result_or_outcome_unknown() {
+        let mut call = startup_call(
+            short_inline_stub,
+            80,
+            "unused",
+            Instant::now(),
+            false,
+            false,
+        );
+        let done = first_reply(&mut call, Duration::from_millis(1200)).await;
+        let response = done.response_for_test();
+        assert!(
+            response.success,
+            "a settled rewrite returns its own reply: {response:?}"
+        );
+
+        let mut call = startup_call(
+            stuck_inline_stub,
+            80,
+            "unused",
+            Instant::now(),
+            false,
+            false,
+        );
+        let done = first_reply(
+            &mut call,
+            INLINE_STARTUP_SETTLE + Duration::from_millis(500),
+        )
+        .await;
+        let response = done.response_for_test();
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "outcome_unknown_startup_deadline");
     }
 
     #[tokio::test]
