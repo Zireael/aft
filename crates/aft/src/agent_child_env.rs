@@ -267,14 +267,19 @@ bounded_probe() (
   "$@" </dev/null &
   probe_pid=$!
   (
-    sleeper=
-    trap 'if [ -n "$sleeper" ]; then kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; fi; exit 0' TERM
+    # The shell publishes $! when it starts its only background child, before
+    # running a pending trap. Do not copy it to a variable: cancellation can
+    # arrive between starting sleep and assigning that variable. Before sleep
+    # starts, $! is inherited from the enclosing shell and names the probe, not
+    # a child of this watchdog; cancellation then just exits without a timer.
+    trap 'trap "" TERM; if [ "$!" != "$probe_pid" ]; then kill "$!" 2>/dev/null; wait "$!" 2>/dev/null; fi; exit 0' TERM
     sleep 10 &
-    sleeper=$!
-    wait "$sleeper"
+    wait "$!"
     kill -KILL "$probe_pid" 2>/dev/null
   ) </dev/null >/dev/null 2>&1 &
   watchdog_pid=$!
+  # SIGKILL cannot run shell cleanup. If the hook itself is killed externally,
+  # this subshell and its watchdog still finish within the ten-second deadline.
   wait "$probe_pid" 2>/dev/null
   probe_status=$?
   kill "$watchdog_pid" 2>/dev/null || :
@@ -2930,6 +2935,204 @@ mod tests {
                 assert!(status.success());
             }
         }
+    }
+
+    #[cfg(unix)]
+    struct DispatcherProcessFixture {
+        temp: tempfile::TempDir,
+        sessions: Vec<u32>,
+        initial_pids: HashSet<u32>,
+    }
+
+    #[cfg(unix)]
+    fn dispatcher_process_snapshot() -> Vec<(u32, u32, String)> {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,ppid=,pgid=,sess=,stat=,command="])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "ps failed: {output:?}");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let mut columns = line.split_whitespace();
+                let pid = columns.next()?.parse().ok()?;
+                columns.next()?; // Parent PID is retained in the diagnostic line.
+                let pgid = columns.next()?.parse().ok()?;
+                columns.next()?; // macOS reports an opaque session identifier.
+                let state = columns.next()?;
+                // Zombies cannot run or retain a cwd. Their eventual reaping by
+                // init is outside the dispatcher's control after a hook SIGKILL.
+                (!state.starts_with('Z')).then(|| (pid, pgid, line.to_owned()))
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    impl DispatcherProcessFixture {
+        fn new(git_body: &str) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path().join("repo");
+            assert!(Command::new("git")
+                .args(["-c", "core.hooksPath=/dev/null", "init", "--quiet"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success());
+            write_executable(&temp.path().join("git"), git_body);
+            Self {
+                temp,
+                sessions: Vec::new(),
+                initial_pids: dispatcher_process_snapshot()
+                    .into_iter()
+                    .map(|(pid, _, _)| pid)
+                    .collect(),
+            }
+        }
+
+        fn spawn(&mut self, contents: &str) -> std::process::Child {
+            use std::process::Stdio;
+
+            let hook = self.temp.path().join("post-index-change");
+            write_executable(&hook, contents);
+            // Every invocation has a fresh session/process group. POSIX sh does
+            // not enable job control here, so all descendants (including ones
+            // reparented to init) keep this group. This scopes ps to processes
+            // started by the test without relying on command names or PPIDs.
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg(&hook)
+                .current_dir(self.temp.path().join("repo"))
+                .env("AFT_TEST_REPO", self.temp.path().join("repo"))
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        self.temp.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::bash_background::process::start_new_session(&mut command);
+            let child = command.spawn().unwrap();
+            self.sessions.push(child.id());
+            child
+        }
+
+        fn remaining_processes(&self) -> Vec<String> {
+            dispatcher_process_snapshot()
+                .into_iter()
+                .filter(|(pid, pgid, _)| {
+                    !self.initial_pids.contains(pid) && self.sessions.contains(pgid)
+                })
+                .map(|(_, _, line)| line)
+                .collect()
+        }
+
+        fn assert_drained(&self, allowance: Duration) {
+            let deadline = Instant::now() + allowance;
+            loop {
+                let remaining = self.remaining_processes();
+                if remaining.is_empty() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "dispatcher left live descendants (pid ppid pgid sess stat command):\n{}",
+                    remaining.join("\n")
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait(child: &mut std::process::Child, allowance: Duration) -> std::process::ExitStatus {
+            let deadline = Instant::now() + allowance;
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return status;
+                }
+                if Instant::now() >= deadline {
+                    crate::bash_background::process::terminate_process(child);
+                    panic!("dispatcher exceeded {allowance:?}");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DispatcherProcessFixture {
+        fn drop(&mut self) {
+            // A failing orphan assertion must not itself leave test processes.
+            for &session in &self.sessions {
+                unsafe { libc::kill(-(session as libc::pid_t), libc::SIGKILL) };
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_fast_probes_leave_no_orphan_processes() {
+        let mut fixture = DispatcherProcessFixture::new(
+            "#!/bin/sh\ncase $1 in\nrev-parse) printf '%s\\n' \"$AFT_TEST_REPO\";;\nconfig) printf '%s\\n' \"$AFT_TEST_REPO/missing-hooks\";;\nesac\n",
+        );
+        let hook = managed_git_hook_contents("post-index-change");
+        for _ in 0..200 {
+            let mut child = fixture.spawn(&hook);
+            assert!(DispatcherProcessFixture::wait(&mut child, Duration::from_secs(2)).success());
+        }
+        // Force the timer-publication interleaving without synthetic CPU load:
+        // a synchronous, test-only delay preserves $!, but gives the parent
+        // time to cancel before the watchdog's next command. The production
+        // dispatcher above also runs 200 times without any injected delay.
+        let delayed = hook.replace("sleep 10 &", "sleep 10 &\n    /bin/sleep 0.05");
+        assert_ne!(hook, delayed, "test delay must reach the real watchdog");
+        let mut child = fixture.spawn(&delayed);
+        assert!(DispatcherProcessFixture::wait(&mut child, Duration::from_secs(2)).success());
+        fixture.assert_drained(Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_deadline_probe_returns_124_without_orphan_processes() {
+        let mut fixture = DispatcherProcessFixture::new("#!/bin/sh\nexec sleep 600\n");
+        // Exercise the exact generated function independently of probe_value,
+        // whose caller deliberately converts a timeout into hook failure (1).
+        let hook = managed_git_hook_contents("post-index-change");
+        let bounded = hook.split("\nprobe_value()").next().unwrap();
+        let mut child = fixture.spawn(&format!("{bounded}\nbounded_probe git\nexit \"$?\"\n"));
+        assert_eq!(
+            DispatcherProcessFixture::wait(&mut child, Duration::from_secs(12)).code(),
+            Some(124)
+        );
+        fixture.assert_drained(Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_sigkilled_hook_descendants_exit_within_deadline() {
+        let mut fixture = DispatcherProcessFixture::new("#!/bin/sh\nexec sleep 600\n");
+        let mut child = fixture.spawn(&managed_git_hook_contents("post-index-change"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if fixture
+                .remaining_processes()
+                .iter()
+                .any(|line| line.ends_with("sleep 600"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "stalled probe was not reached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Kill only the hook PID, not its session, to model an outside caller
+        // that cannot run a shell trap. The surviving watchdog must still end
+        // the stalled probe and then exit within its original ten-second bound.
+        child.kill().unwrap();
+        assert!(!DispatcherProcessFixture::wait(&mut child, Duration::from_secs(1)).success());
+        fixture.assert_drained(Duration::from_secs(12));
     }
 
     #[cfg(unix)]
