@@ -2350,7 +2350,7 @@ mod tests {
 
         let response = read_response(temp.path(), &path, json!({}));
 
-        assert!(response.success);
+        assert!(response.success, "{response:?}");
         assert_eq!(response.data["attachments"].as_array().unwrap().len(), 0);
         assert!(response.data["attachment_omitted_reason"]
             .as_str()

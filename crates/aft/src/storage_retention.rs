@@ -1362,7 +1362,7 @@ mod storage_retention_tests {
         let history = bindings(temp.path()).unwrap();
         // Each source contributes a scope and an artifact-key copy. Keep all
         // their timestamps, even though they describe the same checkout.
-        assert_eq!(history[&scope].len(), 6);
+        assert_eq!(history[&scope].len(), 6, "scope={scope}, history={history:?}");
         let original: Binding =
             read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
         let mut clocks: Vec<_> = history[&scope]
@@ -1438,7 +1438,8 @@ mod storage_retention_tests {
     #[test]
     fn storage_retention_linked_worktree_unflagged_history_copies_keep_seven_days() {
         let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, true, true);
-        assert_eq!(bindings(temp.path()).unwrap()[&scope].len(), 6);
+        let history = bindings(temp.path()).unwrap();
+        assert_eq!(history[&scope].len(), 6, "scope={scope}, history={history:?}");
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
         assert!(path.exists());
     }
