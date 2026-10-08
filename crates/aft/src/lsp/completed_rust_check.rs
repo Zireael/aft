@@ -2338,7 +2338,10 @@ mod tests {
             cache.validated(Instant::now() + BUDGET).is_some(),
             "control: the saved result is valid"
         );
-        cache.runtime.validation_delay = Duration::from_millis(250);
+        // The injected fingerprint delay is far longer than the bound below, so
+        // a validation that waited for it fails clearly while a loaded runner's
+        // scheduling noise (hundreds of ms) cannot.
+        cache.runtime.validation_delay = Duration::from_secs(5);
         let started = Instant::now();
         assert!(
             cache
@@ -2347,7 +2350,7 @@ mod tests {
             "an incomplete validation served saved diagnostics"
         );
         assert!(
-            started.elapsed() < Duration::from_millis(150),
+            started.elapsed() < Duration::from_secs(2),
             "inspect waited past the validation budget"
         );
     }
