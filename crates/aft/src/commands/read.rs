@@ -2205,6 +2205,7 @@ mod tests {
 
     #[test]
     fn github_read_response_preserves_engine_text_and_attachment_metadata() {
+        let _decoder_guard = image_decoder_test_guard();
         let request = RawRequest {
             id: "github-response".to_string(),
             command: "read".to_string(),
@@ -2294,7 +2295,16 @@ mod tests {
             .as_array()
             .and_then(|attachments| attachments.first())
             .and_then(Value::as_object)
-            .expect("first attachment object")
+            .unwrap_or_else(|| panic!("first attachment object: {data}"))
+    }
+
+    /// Image decoding admits at most `MAX_IMAGE_DECODERS` process-wide. Tests
+    /// that decode images run serially so a parallel test holding the slots
+    /// cannot turn an expected attachment into a capacity omission.
+    fn image_decoder_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn decoded_attachment_bytes(attachment: &serde_json::Map<String, Value>) -> Vec<u8> {
@@ -2327,6 +2337,7 @@ mod tests {
 
     #[test]
     fn media_sniff_supports_images_and_passthrough_for_small_files() {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let small = rgba_image(32, 16, false);
         let fixtures = [
@@ -2371,6 +2382,7 @@ mod tests {
 
     #[test]
     fn media_sniff_happens_before_explicit_range_and_resizes_large_images() {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let large = rgba_image(2048, 512, false);
         let bytes = encode_png(&large).unwrap();
@@ -2391,6 +2403,7 @@ mod tests {
 
     #[test]
     fn resized_webp_reencodes_with_source_mime() {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let large = rgba_image(2048, 512, false);
         let bytes = encode_webp_lossless(&large).unwrap();
@@ -2413,6 +2426,7 @@ mod tests {
 
     #[test]
     fn corrupt_images_are_omitted_with_reason() {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = write_fixture(temp.path(), "corrupt.png", b"\x89PNG\r\n\x1a\nnot a png");
 
@@ -2472,6 +2486,7 @@ mod tests {
 
     #[test]
     fn oversized_image_after_resize_is_omitted_with_reason() {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let noisy = rgba_image(1536, 1536, true);
         let bytes = encode_png(&noisy).unwrap();
@@ -2488,6 +2503,7 @@ mod tests {
     }
 
     fn image_read_beyond_filesystem_deadline(hashline: bool) {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let bytes = encode_png(&rgba_image(2, 2, false)).unwrap();
         let path = write_fixture(temp.path(), "small.png", &bytes);
