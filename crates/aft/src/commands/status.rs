@@ -237,6 +237,19 @@ impl AppContext {
                                         "model": config.semantic.model.as_str(),
                                     })
                                 }
+                                SemanticIndexStatus::Failed(error)
+                                    if crate::semantic_admission::is_not_opened_status(
+                                        error.as_str(),
+                                    ) =>
+                                {
+                                    serde_json::json!({
+                                        "status": crate::semantic_admission::NOT_OPENED_LABEL,
+                                        "state": crate::semantic_admission::NOT_OPENED_LABEL,
+                                        "refreshing_count": 0,
+                                        "backend": config.semantic_backend_label(),
+                                        "model": config.semantic.model.as_str(),
+                                    })
+                                }
                                 SemanticIndexStatus::Failed(error) => serde_json::json!({
                                     "status": "failed",
                                     "state": "failed",

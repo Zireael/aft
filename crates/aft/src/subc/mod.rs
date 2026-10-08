@@ -3063,8 +3063,25 @@ fn remove_route_channel(
     let removed = routes.remove(&channel);
     if let Some(identity) = &removed {
         remove_root_channel(root_channels, &identity.root, channel);
+        release_semantic_opener_if_unrouted(routes, identity);
     }
     removed
+}
+
+/// Keeps semantic admission (see `semantic_admission`) in step with the
+/// installed routes: a session whose last route on a root is gone no longer
+/// holds that root open. Configure records the opening, before the route is
+/// installed, so a bind that never installs must release it here too.
+fn release_semantic_opener_if_unrouted(
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    identity: &RouteIdentity,
+) {
+    let still_routed = routes
+        .values()
+        .any(|route| route.root == identity.root && route.session == identity.session);
+    if !still_routed {
+        crate::semantic_admission::note_closed(&identity.session, identity.root.as_path());
+    }
 }
 
 fn insert_route_channel(
@@ -3073,8 +3090,12 @@ fn insert_route_channel(
     channel: RouteChannel,
     identity: RouteIdentity,
 ) {
+    if crate::semantic_admission::harness_opens_root(&identity.harness) {
+        crate::semantic_admission::note_opened(&identity.session, identity.root.as_path());
+    }
     if let Some(previous) = routes.insert(channel, identity.clone()) {
         remove_root_channel(root_channels, &previous.root, channel);
+        release_semantic_opener_if_unrouted(routes, &previous);
     }
     root_channels
         .entry(identity.root.clone())
@@ -5932,6 +5953,7 @@ async fn handle_route_bind_completion(
             "subc attach: dropping RouteBind completion for non-pending route {}",
             completion.route
         );
+        release_semantic_opener_if_unrouted(routes, &completion.identity);
         rollback_pending_bind_actor(
             executor,
             live_roots,
@@ -5969,6 +5991,7 @@ async fn handle_route_bind_completion(
         metrics.record_bind_ack(pending.started_at.elapsed());
     }
     if pending.cancelled {
+        release_semantic_opener_if_unrouted(routes, &completion.identity);
         rollback_pending_bind_actor(
             executor,
             live_roots,
@@ -6005,6 +6028,7 @@ async fn handle_route_bind_completion(
     };
 
     if let Some((response, fallback)) = failure {
+        release_semantic_opener_if_unrouted(routes, &completion.identity);
         rollback_pending_bind_actor(
             executor,
             live_roots,
@@ -10825,10 +10849,19 @@ pub(crate) mod test_support {
         session_id: &str,
         trust: BindTrust,
     ) -> RouteIdentity {
+        route_identity_with_harness(root, session_id, trust, "opencode")
+    }
+
+    pub(super) fn route_identity_with_harness(
+        root: &ProjectRootId,
+        session_id: &str,
+        trust: BindTrust,
+        harness: &str,
+    ) -> RouteIdentity {
         RouteIdentity(Arc::new(RouteIdentityData {
             root: root.clone(),
             project_root: root.as_path().to_path_buf(),
-            harness: "opencode".to_string(),
+            harness: harness.to_string(),
             session: session_id.to_string(),
             role: tool_provider::RouteRole::Legacy,
             trust,
@@ -14943,6 +14976,66 @@ mod tests {
     /// principal entirely for non-fed harnesses would satisfy both. Pin the
     /// delegation itself: on a normal harness the verdict must still come from
     /// the principal, in both directions.
+    /// Installed routes drive semantic admission: an OpenCode route opens its
+    /// root until the session's last route on it is removed, and a runner
+    /// (sidekick) route never opens one.
+    #[test]
+    fn installed_interactive_routes_open_their_root_until_the_last_one_leaves() {
+        use crate::semantic_admission::{admission, SemanticAdmission};
+        let (_opened_dir, opened) = test_root("semantic-opened-route");
+        let (_sidekick_dir, sidekick) = test_root("semantic-sidekick-route");
+        let mut routes = HashMap::new();
+        let mut root_channels = HashMap::new();
+        let first = route_key(41, 1);
+        let second = route_key(42, 1);
+        let runner = route_key(43, 1);
+        insert_route_channel(
+            &mut routes,
+            &mut root_channels,
+            first,
+            test_support::route_identity(&opened, "ses_semantic_route"),
+        );
+        insert_route_channel(
+            &mut routes,
+            &mut root_channels,
+            second,
+            test_support::route_identity(&opened, "ses_semantic_route"),
+        );
+        insert_route_channel(
+            &mut routes,
+            &mut root_channels,
+            runner,
+            test_support::route_identity_with_harness(
+                &sidekick,
+                "alfonso:sidekick-route",
+                BindTrust::FirstParty,
+                "runner",
+            ),
+        );
+        assert_eq!(
+            admission(opened.as_path(), &[]),
+            SemanticAdmission::InteractiveSession
+        );
+        assert_eq!(
+            admission(sidekick.as_path(), &[]),
+            SemanticAdmission::NotOpened
+        );
+
+        remove_route_channel(&mut routes, &mut root_channels, first);
+        assert_eq!(
+            admission(opened.as_path(), &[]),
+            SemanticAdmission::InteractiveSession,
+            "the session still has a route on the root"
+        );
+        remove_route_channel(&mut routes, &mut root_channels, second);
+        assert_eq!(
+            admission(opened.as_path(), &[]),
+            SemanticAdmission::NotOpened,
+            "the session's last route on the root is gone"
+        );
+        remove_route_channel(&mut routes, &mut root_channels, runner);
+    }
+
     #[test]
     fn trust_for_bind_delegates_to_the_principal_on_ordinary_harnesses() {
         for harness in ["opencode", "pi", "runner", "mcp:claude"] {

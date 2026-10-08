@@ -962,11 +962,16 @@ fn spawn_semantic_refresh_worker(
     limiter: SemanticRefreshLimiter,
     session_id: Option<String>,
     worker_memory: Arc<AtomicU64>,
+    admission: crate::semantic_admission::LiveAdmission,
 ) -> thread::JoinHandle<()> {
     let mut index_memory = SemanticWorkerMemory::new(worker_memory, &index);
     thread::spawn(move || {
         log_ctx::with_session(session_id, || {
             let semantic_blob_store = open_semantic_view_blob_store(view_blob_source);
+            // Work held back while no session had the root open; the first
+            // batch after it is opened again folds it back in.
+            let mut held_paths = BTreeSet::new();
+            let mut held_corpus = false;
             while let Ok(first_request) = request_rx.recv() {
                 let mut paths = BTreeSet::new();
                 let mut corpus_requested = false;
@@ -1030,6 +1035,25 @@ fn spawn_semantic_refresh_worker(
                         || generation_flag.load(Ordering::SeqCst) != generation)
                 {
                     return;
+                }
+
+                // A root that is no longer open in any session keeps the index
+                // it has but embeds nothing more (see `semantic_admission`).
+                if !admission.admits() {
+                    held_corpus |= corpus_requested;
+                    held_paths.extend(std::mem::take(&mut paths));
+                    continue;
+                }
+                if held_corpus {
+                    held_corpus = false;
+                    held_paths.clear();
+                    paths.clear();
+                    corpus_requested = true;
+                } else if !held_paths.is_empty() {
+                    if !corpus_requested {
+                        paths.extend(std::mem::take(&mut held_paths));
+                    }
+                    held_paths.clear();
                 }
 
                 // Corpus catch-up and watcher batches share both the quiet window
@@ -1342,6 +1366,13 @@ pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
     let Some(project_root) = ctx.canonical_cache_root_opt() else {
         return false;
     };
+    let admission = crate::semantic_admission::LiveAdmission::for_root(
+        &project_root,
+        &ctx.config().index.roots,
+    );
+    if !admission.admits() {
+        return false;
+    }
     let Some(index) = ctx
         .semantic_index()
         .write()
@@ -1405,6 +1436,7 @@ pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
         SemanticRefreshLimiter(ctx.cold_build_limiter()),
         log_ctx::current_session(),
         ctx.semantic_worker_bytes(),
+        admission,
     );
     if let Ok(mut slot) = worker_slot.lock() {
         *slot = Some(handle);
@@ -3735,11 +3767,26 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         !equivalent_warm_config && semantic_build_in_progress && !semantic_build_inputs_changed;
     let first_session_bind =
         ctx.note_configure_session_binding(canonical_cache_root.clone(), req.session().to_string());
+    // An interactive session binding this root opens it for semantic indexing
+    // before the artifact scheduling below consults that (see
+    // `semantic_admission`). Route teardown closes it again.
+    if crate::semantic_admission::opens_root(&harness) {
+        crate::semantic_admission::note_opened(req.session(), &canonical_cache_root);
+    }
+    let semantic_admitted =
+        crate::semantic_admission::admission(&canonical_cache_root, &next_config.index.roots)
+            .admits();
     if !equivalent_warm_config {
         ctx.reset_tier2_refresh_scheduler();
         if !semantic_build_adopted {
             ctx.reset_semantic_cold_seed_gate_for_configure();
-            if next_config.indexes.semantic && !ctx.shared_artifacts_read_only() && !home_match {
+            // The cold-seed gate holds Tier-2 work until a semantic build
+            // finishes; a root that will not build must not hold it.
+            if next_config.indexes.semantic
+                && !ctx.shared_artifacts_read_only()
+                && !home_match
+                && semantic_admitted
+            {
                 ctx.schedule_semantic_cold_seed_gate_for_configure();
             }
         }
@@ -4154,11 +4201,33 @@ fn release_callgraph_start_waiters_for_generation_change(
     }
 }
 
+/// Whether this root may build or refresh its own semantic index (see
+/// `semantic_admission`). A root that may not still reads a saved index.
+fn semantic_work_admitted(ctx: &AppContext) -> bool {
+    ctx.canonical_cache_root_opt().is_some_and(|root| {
+        crate::semantic_admission::admission(&root, &ctx.config().index.roots).admits()
+    })
+}
+
+/// Whether the semantic status records that the root is not opened and has
+/// no saved index to read, so there is nothing to load until it is opened.
+fn semantic_status_is_not_opened(ctx: &AppContext) -> bool {
+    matches!(
+        &*ctx
+            .semantic_index_status()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        SemanticIndexStatus::Failed(message)
+            if crate::semantic_admission::is_not_opened_status(message)
+    )
+}
+
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     let config = ctx.config();
     let search_enabled = config.indexes.trigram;
     let semantic_enabled = config.indexes.semantic;
     drop(config);
+    let semantic_admitted = semantic_enabled && semantic_work_admitted(ctx);
 
     let search_index_missing = ctx
         .search_index()
@@ -4195,7 +4264,13 @@ fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
         // A started views-on lane owns semantic search for this root in every
         // state, including a named failure: nothing retries it per query.
         && !ctx.checkout_semantic().active()
-        && (semantic_index_missing || semantic_refresh_missing);
+        && if semantic_admitted {
+            semantic_index_missing || semantic_refresh_missing
+        } else {
+            // A root nobody has open only ever reads a saved index, once; it
+            // never gets a refresh worker.
+            semantic_index_missing && !semantic_status_is_not_opened(ctx)
+        };
 
     ArtifactLoadNeeds {
         search: search_missing,
@@ -4544,7 +4619,15 @@ fn schedule_artifact_loads_admitted(
     let search_index_max_file_size = config.search_index_max_file_size;
     let semantic_config = config.semantic.clone();
     let views_enabled = config.views.enabled;
+    let semantic_live_admission = crate::semantic_admission::LiveAdmission::for_root(
+        &canonical_cache_root,
+        &config.index.roots,
+    );
     drop(config);
+    // A root no session has open never starts a semantic build, a view fill
+    // or a refresh; it takes the read-only arm below, which reads a saved
+    // index if there is one.
+    let semantic_admitted = !load_semantic || semantic_live_admission.admits();
     let semantic_view_blob_source = views_enabled
         .then(|| {
             ctx.view_runtime_snapshot()
@@ -4904,22 +4987,25 @@ fn schedule_artifact_loads_admitted(
     // With views enabled, this checkout's own view serves semantic search
     // (see `views::semantic_runtime`); the legacy index is not built, so
     // identical content in sibling worktrees is embedded once per family.
-    let load_semantic = if load_semantic && views_enabled && semantic_view_work_allowed {
-        semantic_artifact_load_start = Some(start_checkout_semantic_lane(
-            ctx,
-            &canonical_cache_root,
-            &project_key,
-            storage_dir.as_deref(),
-            semantic_config.clone(),
-        ));
-        false
-    } else {
-        load_semantic
-    };
+    let load_semantic =
+        if load_semantic && views_enabled && semantic_view_work_allowed && semantic_admitted {
+            semantic_artifact_load_start = Some(start_checkout_semantic_lane(
+                ctx,
+                &canonical_cache_root,
+                &project_key,
+                storage_dir.as_deref(),
+                semantic_config.clone(),
+            ));
+            false
+        } else {
+            load_semantic
+        };
 
     // The read-only semantic arm has the same bounded-open shape as search and
     // likewise never enters the owner refresh/rebuild path below.
-    if load_semantic && (is_worktree_bridge || ctx.shared_artifacts_read_only()) {
+    if load_semantic
+        && (is_worktree_bridge || ctx.shared_artifacts_read_only() || !semantic_admitted)
+    {
         if ctx
             .semantic_index()
             .read()
@@ -4989,6 +5075,11 @@ fn schedule_artifact_loads_admitted(
                     crate::readonly_artifacts::ReadOnlyArtifact::Cancelled => {
                         SemanticIndexEvent::Failed(
                             "read-only semantic index load was cancelled".to_string(),
+                        )
+                    }
+                    crate::readonly_artifacts::ReadOnlyArtifact::Absent if !semantic_admitted => {
+                        SemanticIndexEvent::Failed(
+                            crate::semantic_admission::NOT_OPENED_STATUS.to_string(),
                         )
                     }
                     crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
@@ -5888,6 +5979,7 @@ fn schedule_artifact_loads_admitted(
                                     )),
                                     log_ctx::current_session(),
                                     Arc::clone(&semantic_worker_memory),
+                                    semantic_live_admission,
                                 );
                                 if let Ok(mut slot) = refresh_worker_slot.lock() {
                                     *slot = Some(worker_handle);
@@ -9442,6 +9534,7 @@ mod tests {
                     super::SemanticRefreshLimiter(crate::cold_build_limiter::test_limiter(1)),
                     None,
                     ctx.semantic_worker_bytes(),
+                    crate::semantic_admission::LiveAdmission::always(),
                 );
                 request_tx.send(SemanticRefreshRequest::Corpus).unwrap();
                 // A normally completed worker must also terminate so a missed
@@ -9546,6 +9639,7 @@ mod tests {
             limiter,
             None,
             ctx.semantic_worker_bytes(),
+            crate::semantic_admission::LiveAdmission::always(),
         );
         (ctx, request_tx, event_rx, worker)
     }
@@ -9963,6 +10057,7 @@ mod tests {
             super::SemanticRefreshLimiter(ctx.cold_build_limiter()),
             None,
             ctx.semantic_worker_bytes(),
+            crate::semantic_admission::LiveAdmission::always(),
         );
         *slot.lock().unwrap() = Some(worker);
 
@@ -11628,6 +11723,476 @@ mod tests {
         );
     }
 
+    /// A semantic configure as a route under `harness` and `session` would send
+    /// it, with optional user-tier `index.roots`.
+    fn configure_semantic_bind(
+        root: &Path,
+        storage: &Path,
+        base_url: &str,
+        harness: &str,
+        session: &str,
+        index_roots: Option<serde_json::Value>,
+    ) -> RawRequest {
+        let mut user = json!({
+            "search_index": false,
+            "semantic_search": true,
+            "callgraph_store": false,
+            "semantic": {
+                "backend": "openai_compatible",
+                "model": "counting-test-embedding",
+                "base_url": base_url,
+                "timeout_ms": 5_000,
+                "max_batch_size": 64,
+                "max_files": 1_000
+            }
+        });
+        if let Some(roots) = index_roots {
+            user["index"] = json!({ "roots": roots });
+        }
+        configure_request_with_session(
+            json!({
+                "project_root": root,
+                "harness": harness,
+                "storage_dir": storage,
+                "config": [user_tier(user)],
+            }),
+            session,
+        )
+    }
+
+    fn semantic_admission_project(parent: &Path) -> PathBuf {
+        let project = parent.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        for index in 0..3 {
+            std::fs::write(
+                project.join("src").join(format!("opened_{index}.rs")),
+                format!("pub fn opened_symbol_{index}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        project
+    }
+
+    /// Run the configure tail and wait until the semantic lane settles on
+    /// "not opened": the read-only arm looked for a saved index, found none,
+    /// and nothing else is loading.
+    fn wait_for_semantic_not_opened(ctx: &AppContext, timeout: Duration) {
+        super::drain_deferred_configure_maintenance(ctx);
+        let deadline = Instant::now() + timeout;
+        loop {
+            crate::runtime_drain::drain_build_completions(ctx);
+            if super::semantic_status_is_not_opened(ctx) && ctx.semantic_index_rx().lock().is_none()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "semantic lane never settled on not opened: {:?}",
+                ctx.semantic_index_status().read().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn total_embedding_requests(server: &CountingEmbeddingServer) -> usize {
+        server
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    #[test]
+    fn sidekick_bind_of_a_fresh_repo_starts_no_embedding() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let project = semantic_admission_project(temp.path());
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        let request = configure_semantic_bind(
+            &project,
+            &storage,
+            &server.base_url,
+            "runner",
+            "alfonso:sidekick-00000000-0000-4001-98dd-383a2dbeca78",
+            None,
+        );
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        wait_for_semantic_not_opened(&ctx, Duration::from_secs(5));
+        // Give a wrongly started build time to reach the backend.
+        std::thread::sleep(Duration::from_millis(300));
+        crate::runtime_drain::drain_build_completions(&ctx);
+
+        assert_eq!(
+            total_embedding_requests(&server),
+            0,
+            "a root no interactive session has open must never reach the embedding backend"
+        );
+        assert!(ctx.semantic_index().read().unwrap().is_none());
+        assert!(ctx.semantic_refresh_sender().is_none());
+        let health = ctx.try_health_snapshot(&project);
+        assert_eq!(
+            health
+                .semantic_index
+                .expect("semantic health component")
+                .status,
+            "off (not opened)"
+        );
+        assert_eq!(
+            ctx.build_status_snapshot()["semantic_index"]["status"],
+            "off (not opened)"
+        );
+    }
+
+    #[test]
+    fn opencode_bind_of_a_fresh_repo_starts_embedding() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let project = semantic_admission_project(temp.path());
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        let request = configure_semantic_bind(
+            &project,
+            &storage,
+            &server.base_url,
+            "opencode",
+            "ses_opencode_fresh_repo",
+            None,
+        );
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        assert!(
+            server.non_probe_input_count() > 0,
+            "an OpenCode session's root is embedded"
+        );
+        crate::semantic_admission::note_closed("ses_opencode_fresh_repo", &project);
+    }
+
+    #[test]
+    fn a_root_opened_after_a_sidekick_bind_starts_its_index() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let project = semantic_admission_project(temp.path());
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        let sidekick = configure_semantic_bind(
+            &project,
+            &storage,
+            &server.base_url,
+            "runner",
+            "alfonso:sidekick-opened-later",
+            None,
+        );
+        assert!(handle_configure_for_test(&sidekick, &ctx).success);
+        wait_for_semantic_not_opened(&ctx, Duration::from_secs(5));
+        assert_eq!(total_embedding_requests(&server), 0);
+
+        let opencode = configure_semantic_bind(
+            &project,
+            &storage,
+            &server.base_url,
+            "opencode",
+            "ses_opened_later",
+            None,
+        );
+        assert!(handle_configure_for_test(&opencode, &ctx).success);
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        assert!(
+            server.non_probe_input_count() > 0,
+            "opening the root later starts its semantic index"
+        );
+        crate::semantic_admission::note_closed("ses_opened_later", &project);
+    }
+
+    /// The search-quality real-query runner configures its evidence tree over
+    /// stdio as `harness: "opencode"` with no session id
+    /// (benchmarks/aft-search/run_real_query.py `configure`). That root must
+    /// stay admitted, or every semantic benchmark row would move.
+    #[test]
+    fn real_query_benchmark_configure_shape_opens_its_root() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let project = semantic_admission_project(temp.path());
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        let request = configure_request_with_params(json!({
+            "project_root": project,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [{
+                "tier": "user",
+                "source": "<aft-search-real-query>",
+                "doc": json!({
+                    "search_index": true,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }).to_string()
+            }],
+        }));
+        assert!(request.session_id.is_none());
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        assert_eq!(
+            crate::semantic_admission::admission(&ctx.canonical_cache_root(), &[]),
+            crate::semantic_admission::SemanticAdmission::InteractiveSession
+        );
+        crate::semantic_admission::note_closed(request.session(), &project);
+    }
+
+    #[test]
+    fn index_roots_entry_selecting_semantic_admits_a_runner_bind() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let clones = temp.path().join("clones");
+        let project = semantic_admission_project(&clones);
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        let request = configure_semantic_bind(
+            &project,
+            &storage,
+            &server.base_url,
+            "runner",
+            "alfonso:sidekick-standing-root",
+            Some(json!([{ "path": clones, "indexes": ["semantic"] }])),
+        );
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        assert!(
+            server.non_probe_input_count() > 0,
+            "a standing root the user listed is embedded whoever binds it"
+        );
+    }
+
+    /// A linked worktree of `main` borrowing the resident semantic base of
+    /// `main`'s context, which was bound under `owner_harness`. Returns the
+    /// worktree's context after a `runner` bind, as a delegated worker binds.
+    fn worker_worktree_bind(
+        owner_harness: &str,
+        owner_session: &str,
+        server: &CountingEmbeddingServer,
+        temp: &Path,
+    ) -> (Arc<AppContext>, Arc<AppContext>, PathBuf) {
+        let storage = temp.join("storage");
+        let main = temp.join("main");
+        init_git_fixture(&main);
+        let worktree = temp.join("worktree");
+        let mut worktree_command = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&main))
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let canonical_main = crate::inspect::job::canonicalize_normalized(&main);
+        let canonical_worktree = crate::inspect::job::canonicalize_normalized(&worktree);
+        let app = App::default_shared();
+        let executor = crate::executor::Executor::new();
+        let owner_ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        ));
+        let owner_root = crate::path_identity::ProjectRootId::from_path(&canonical_main).unwrap();
+        assert!(executor.register_actor(owner_root, Arc::clone(&owner_ctx)));
+        let owner_request = configure_semantic_bind(
+            &canonical_main,
+            &storage,
+            &server.base_url,
+            owner_harness,
+            owner_session,
+            None,
+        );
+        assert!(handle_configure_for_test(&owner_request, &owner_ctx).success);
+        // Install an empty resident base instead of building the main
+        // checkout, so every embedding the backend sees comes from the worktree.
+        owner_ctx.retire_semantic_index_rx("test replaces the configure load");
+        let mut owner_index = SemanticIndex::new(canonical_main.clone(), 3);
+        owner_index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(
+            &owner_ctx.config().semantic,
+            3,
+        ));
+        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
+        owner_ctx.install_semantic_index_rx(ready_rx, owner_ctx.configure_generation());
+        ready_tx
+            .send(crate::context::SemanticIndexEvent::Ready(owner_index))
+            .expect("queue resident semantic index");
+        crate::runtime_drain::drain_semantic_index_events(&owner_ctx);
+
+        let borrower_ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        ));
+        let borrower_root =
+            crate::path_identity::ProjectRootId::from_path(&canonical_worktree).unwrap();
+        assert!(executor.register_actor(borrower_root, Arc::clone(&borrower_ctx)));
+        let borrower_request = configure_semantic_bind(
+            &canonical_worktree,
+            &storage,
+            &server.base_url,
+            "runner",
+            "alfonso:bg_worker_worktree",
+            None,
+        );
+        assert!(handle_configure_for_test(&borrower_request, &borrower_ctx).success);
+        assert_eq!(borrower_ctx.cache_role(), "worktree");
+        (owner_ctx, borrower_ctx, canonical_main)
+    }
+
+    #[test]
+    fn worker_worktree_of_an_opened_repository_embeds() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _quiet_window = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "50");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let (_owner, borrower, main) = worker_worktree_bind(
+            "opencode",
+            "ses_worker_worktree_owner",
+            &server,
+            temp.path(),
+        );
+        let sender = borrower
+            .semantic_refresh_sender()
+            .expect("a worktree of a repository the user has open keeps a refresh worker");
+        // The worker edits a file; the watcher hands it to the refresh worker.
+        let edited = borrower.canonical_cache_root().join("worker_edit.rs");
+        std::fs::write(&edited, "pub fn worker_edit() {}\n").unwrap();
+        sender
+            .send(SemanticRefreshRequest::Files {
+                paths: vec![edited],
+            })
+            .unwrap();
+        assert!(
+            server.wait_for_non_probe_input(Duration::from_secs(10)),
+            "the worker worktree embeds the files its checkout changed"
+        );
+        crate::semantic_admission::note_closed("ses_worker_worktree_owner", &main);
+    }
+
+    #[test]
+    fn worker_worktree_of_a_repository_nobody_opened_embeds_nothing() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let (_owner, borrower, _main) =
+            worker_worktree_bind("runner", "alfonso:sidekick-owner", &server, temp.path());
+        assert!(borrower.semantic_refresh_sender().is_none());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(server.non_probe_input_count(), 0);
+    }
+
+    #[test]
+    fn refresh_worker_holds_edits_while_its_root_is_closed_and_catches_up_on_reopen() {
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let source = root.join("held.rs");
+        std::fs::write(&source, "pub fn held_symbol() {}\n").unwrap();
+        let config = semantic_refresh_test_config(&server.base_url);
+        let index = SemanticIndex::new(root.clone(), 3);
+        let ctx = test_context();
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        crate::semantic_admission::note_opened("ses_refresh_reopen", &root);
+        let worker = super::spawn_semantic_refresh_worker(
+            root.clone(),
+            index,
+            crate::semantic_index::EmbeddingModel::from_config(&config)
+                .expect("construct refresh model"),
+            config.max_batch_size,
+            config.max_files,
+            Duration::from_millis(20),
+            true,
+            None,
+            request_rx,
+            event_tx,
+            ctx.subc_lifecycle_admission(),
+            ctx.configure_generation_flag(),
+            ctx.configure_generation(),
+            super::SemanticRefreshLimiter(crate::cold_build_limiter::test_limiter(1)),
+            None,
+            ctx.semantic_worker_bytes(),
+            crate::semantic_admission::LiveAdmission::for_root(&root, &[]),
+        );
+
+        // The session leaves: an edit is held, not embedded.
+        crate::semantic_admission::note_closed("ses_refresh_reopen", &root);
+        request_tx
+            .send(SemanticRefreshRequest::Files {
+                paths: vec![source.clone()],
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            server.non_probe_input_count(),
+            0,
+            "a root no session has open stops refreshing"
+        );
+
+        // Opened again: the next batch carries the held edit with it.
+        crate::semantic_admission::note_opened("ses_refresh_reopen", &root);
+        let other = root.join("other.rs");
+        std::fs::write(&other, "pub fn other_symbol() {}\n").unwrap();
+        request_tx
+            .send(SemanticRefreshRequest::Files {
+                paths: vec![other.clone()],
+            })
+            .unwrap();
+        assert!(server.wait_for_non_probe_input(Duration::from_secs(10)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let embedded = loop {
+            let inputs = non_probe_inputs(&server);
+            if inputs.iter().any(|text| text.contains("held_symbol"))
+                && inputs.iter().any(|text| text.contains("other_symbol"))
+            {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            embedded,
+            "the held edit is embedded once the root reopens: {:?}",
+            non_probe_inputs(&server)
+        );
+        crate::semantic_admission::note_closed("ses_refresh_reopen", &root);
+        drop(request_tx);
+        drop(event_rx);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn superseded_semantic_build_stops_after_its_current_batch() {
         let _artifact_guard = artifact_owner_test_lock();
@@ -11821,6 +12386,7 @@ mod tests {
             super::SemanticRefreshLimiter(crate::cold_build_limiter::test_limiter(1)),
             None,
             ctx.semantic_worker_bytes(),
+            crate::semantic_admission::LiveAdmission::always(),
         );
 
         std::fs::write(&source, "pub fn unstable_content() -> bool { false }\n")
@@ -12211,6 +12777,9 @@ mod tests {
         let ctx = std::sync::Arc::new(AppContext::from_app(App::default_shared(), config));
         ctx.set_canonical_cache_root(root.path().to_path_buf());
         ctx.set_heavy_root_work_allowed(true);
+        // The fixture stands for a root an interactive session has open; only
+        // such a root starts a semantic view fill (see `semantic_admission`).
+        crate::semantic_admission::note_opened("ses_evicted_view_reload", root.path());
         *ctx.semantic_index().write().unwrap() =
             Some(SemanticIndex::new(root.path().to_path_buf(), 3));
         *ctx.semantic_index_status().write().unwrap() =
@@ -13516,6 +14085,9 @@ mod tests {
             config.indexes.semantic = true;
         });
         ctx.set_canonical_cache_root(root.path().to_path_buf());
+        // The fixture stands for a root an interactive session has open; only
+        // such a root gets a refresh worker back (see `semantic_admission`).
+        crate::semantic_admission::note_opened("ses_refresh_disconnect", root.path());
         set_configure_artifact_post_gate_delay_for_test(500);
         struct DelayReset;
         impl Drop for DelayReset {

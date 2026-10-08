@@ -4218,6 +4218,21 @@ impl AppContext {
                     current_batch: None,
                     total_batches: None,
                 },
+                SemanticIndexStatus::Failed(message)
+                    if crate::semantic_admission::is_not_opened_status(message) =>
+                {
+                    SemanticHealthComponentSnapshot {
+                        status: crate::semantic_admission::NOT_OPENED_LABEL,
+                        reason: None,
+                        since_ms: None,
+                        next_retry_ms: None,
+                        stage: None,
+                        embedded_chunks: None,
+                        total_chunks: None,
+                        current_batch: None,
+                        total_batches: None,
+                    }
+                }
                 SemanticIndexStatus::Failed(_) => SemanticHealthComponentSnapshot {
                     status: "degraded",
                     reason: None,
