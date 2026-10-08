@@ -176,7 +176,10 @@ fn callgraph_ignored_nested_worktree_is_not_indexed_not_symbol_missing() {
             "add",
             "-q",
             "--detach",
-            nested.to_str().unwrap(),
+            // Git for Windows cannot create a worktree through the verbatim
+            // prefix returned by canonicalize. Use the same relative destination
+            // from this checkout without changing the ignored-worktree fixture.
+            ".cortexkit/alfonso/implementation-worktrees/nested",
         ],
     );
     let file = nested.join("packages/core/src/pool-authority.ts");

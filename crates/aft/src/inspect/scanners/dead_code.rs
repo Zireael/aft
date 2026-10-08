@@ -3426,7 +3426,9 @@ fn rust_path_attribute_value(source: &str, node: tree_sitter::Node<'_>) -> Optio
 /// Resolves `.` and `..` segments of a project-relative path textually.
 fn normalize_relative_segments(path: &str) -> String {
     let mut segments: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
+    // Joined PathBufs use backslashes on Windows, but contribution keys always
+    // use forward slashes. Normalize before resolving dot segments.
+    for segment in path.split(['/', '\\']) {
         match segment {
             "" | "." => {}
             ".." => {
@@ -6680,6 +6682,14 @@ mod tests {
         assert!(
             aggregate_has_item(&private, "src/hidden.rs", "exposed"),
             "{private:#}"
+        );
+    }
+
+    #[test]
+    fn rust_public_api_path_override_normalizes_native_separators() {
+        assert_eq!(
+            normalize_relative_segments(r"custom\..\custom\redirected.rs"),
+            "custom/redirected.rs"
         );
     }
 

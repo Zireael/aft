@@ -584,17 +584,22 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     const { h, bash, bridgeCalls } = await pluginHarness({ bash_permissions: true });
     const ask = mockAsk();
 
-    const result = await callPluginBash(bash, h, { command: "git status" }, { ask });
+    // The isolated test home can live inside the repository on Windows. Select
+    // a nonexistent Git directory for this command only: ancestor discovery
+    // cannot turn the intended command failure into a successful status query,
+    // and bridge configuration still sees an ordinary project directory.
+    const command = "git --git-dir=missing-repository status";
+    const result = await callPluginBash(bash, h, { command }, { ask });
 
-    // Real git status fails inside the temp dir (no repo) — exit 128 surfaces
+    // Real git status fails on the missing repository — exit 128 surfaces
     // in the agent-visible output AND in the metadata.
     expect(result.metadata.exit).toBe(128);
     expect(result.output).toContain("[exit code: 128]");
     expect(ask).toHaveBeenCalledTimes(1);
     expect(ask.mock.calls[0][0]).toMatchObject({
       permission: "bash",
-      patterns: ["git status"],
-      always: ["git status *"],
+      patterns: ["git --git-dir=missing-repository status"],
+      always: ["git --git-dir=missing-repository *"],
     });
     expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash", "bash"]);
   });
