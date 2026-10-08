@@ -1395,6 +1395,8 @@ pub(crate) enum TaskIoFault {
     RunningDelay(std::time::Duration),
     /// Delays the starting-record write, which happens before the spawn
     /// receipt commits, so a test can push that commit past the reply deadline.
+    /// Only the Unix startup tests construct it.
+    #[cfg_attr(not(unix), allow(dead_code))]
     StartingDelay(std::time::Duration),
 }
 

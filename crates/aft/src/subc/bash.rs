@@ -2299,8 +2299,12 @@ mod grant_path_tests {
     // receipt after the starting record and control/output files exist; the
     // deadline settles the same receipt under its lock. ---
 
+    #[cfg(unix)]
     const DEADLINE_SESSION: &str = "deadline-session";
 
+    // Only the Unix tests below read `dir` and `ctx`; the in-process rewrite
+    // test that also runs on Windows needs just the reply channel.
+    #[cfg_attr(not(unix), allow(dead_code))]
     struct StartupCall {
         dir: tempfile::TempDir,
         ctx: Arc<AppContext>,
@@ -2345,6 +2349,7 @@ mod grant_path_tests {
     }
 
     /// Task ids that have a record in the session's task store, on disk.
+    #[cfg(unix)]
     fn task_records_on_disk(ctx: &AppContext) -> Vec<String> {
         let session_dir = crate::bash_background::persistence::session_tasks_dir(
             &crate::bash_background::task_storage_dir(ctx),
@@ -2359,6 +2364,7 @@ mod grant_path_tests {
 
     /// Asserts the call's command never ran and never will: no process side
     /// effect, no registered task, no task record on disk.
+    #[cfg(unix)]
     fn assert_never_started(call: &StartupCall) {
         assert!(
             !call.dir.path().join("started-command").exists(),
@@ -2375,6 +2381,7 @@ mod grant_path_tests {
         );
     }
 
+    #[cfg(unix)]
     fn assert_not_started_refusal(response: &Response) {
         assert!(!response.success, "{response:?}");
         assert_eq!(response.data["code"], "bash_start_deadline", "{response:?}");
@@ -2385,6 +2392,7 @@ mod grant_path_tests {
         );
     }
 
+    #[cfg(unix)]
     async fn wait_for_terminal(
         ctx: &AppContext,
         task_id: &str,
@@ -2404,6 +2412,7 @@ mod grant_path_tests {
         }
     }
 
+    #[cfg(unix)]
     fn slow_starting_record_stub(req: RawRequest, ctx: &AppContext) -> Response {
         use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
         with_task_io_fault(
@@ -2412,6 +2421,7 @@ mod grant_path_tests {
         )
     }
 
+    #[cfg(unix)]
     fn slow_running_record_stub(req: RawRequest, ctx: &AppContext) -> Response {
         use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
         with_task_io_fault(
@@ -2422,9 +2432,11 @@ mod grant_path_tests {
 
     /// The starting-record delay the boundary test is sweeping. Only that
     /// test reads it, one call at a time.
+    #[cfg(unix)]
     static BOUNDARY_STARTING_DELAY_MS: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
 
+    #[cfg(unix)]
     fn boundary_starting_delay_stub(req: RawRequest, ctx: &AppContext) -> Response {
         use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
         let delay = BOUNDARY_STARTING_DELAY_MS.load(Ordering::SeqCst);
@@ -2581,6 +2593,7 @@ mod grant_path_tests {
         assert!(!message.contains("not started"), "{message}");
     }
 
+    #[cfg(unix)]
     fn slow_rewrite_stub(req: RawRequest, ctx: &AppContext) -> Response {
         std::thread::sleep(Duration::from_millis(300));
         crate::bash_rewrite::try_rewrite_for_request(
@@ -2593,6 +2606,7 @@ mod grant_path_tests {
         .expect("the append rewrite accepts this command")
     }
 
+    #[cfg(unix)]
     fn prompt_rewrite_stub(req: RawRequest, ctx: &AppContext) -> Response {
         crate::bash_rewrite::try_rewrite_for_request(
             "echo fenced >> notes.txt",
