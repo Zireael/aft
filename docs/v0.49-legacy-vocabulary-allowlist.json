@@ -503,11 +503,11 @@
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 16348,
+      "line": 16441,
       "column": 26,
       "token": "filePath",
       "text": "\"filePath\": fixture.dir.path().join(\"module_0.rs\")",
-      "location": "line 16348, column 26",
+      "location": "line 16441, column 26",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -2028,22 +2028,22 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_detach_test.rs",
-      "line": 226,
+      "line": 244,
       "column": 22,
       "token": "filePath",
       "text": "json!({ \"filePath\": target.to_string_lossy(), \"content\": \"changed\\n\" }),",
-      "location": "line 226, column 22",
+      "location": "line 244, column 22",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "crates/aft/tests/integration/subc_detach_test.rs",
-      "line": 273,
+      "line": 291,
       "column": 36,
       "token": "filePath",
       "text": "json!({ \"op\": \"undo\", \"filePath\": target.to_string_lossy() }),",
-      "location": "line 273, column 36",
+      "location": "line 291, column 36",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
@@ -3745,22 +3745,22 @@
     },
     {
       "path": "packages/aft-cli/src/commands/lsp.ts",
-      "line": 85,
+      "line": 86,
       "column": 3,
       "token": "filePath",
       "text": "filePath: string,",
-      "location": "line 85, column 3",
+      "location": "line 86, column 3",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "packages/aft-cli/src/commands/lsp.ts",
-      "line": 88,
+      "line": 89,
       "column": 45,
       "token": "filePath",
       "text": "const resolvedFile = resolve(fallbackCwd, filePath);",
-      "location": "line 88, column 45",
+      "location": "line 89, column 45",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
