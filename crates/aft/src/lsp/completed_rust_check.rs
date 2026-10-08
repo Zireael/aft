@@ -27,7 +27,9 @@ const CHECK_BEGIN_TIMESTAMP_MARGIN: Duration = Duration::from_secs(2);
 // Worktree churn must not turn completed compiler checks into an unbounded disk cache.
 const MAX_RECORDS: usize = 64;
 const RECORD_SCAN_LIMIT: usize = 1024;
-const RECORD_SCHEMA: u32 = 2;
+// Schema 2 did not fence filesystem timestamp granularity at check begin, so
+// even matching inputs cannot establish that its saved diagnostics are sound.
+const RECORD_SCHEMA: u32 = 3;
 
 fn canonical(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path)
@@ -1985,6 +1987,38 @@ mod tests {
         fs::write(&cache.path, "{\"record\":").unwrap();
         assert!(load().saved.is_none());
     }
+
+    #[test]
+    fn schema_two_record_is_a_cache_miss_and_normal_write_replaces_it() {
+        let (_temp, cache) = fixture();
+        let certified = cache.saved.as_ref().unwrap();
+        let mut old = (**certified).clone();
+        old.schema = 2;
+        write_record(&cache.path, &old).unwrap();
+        let legacy_bytes = fs::read(&cache.path).unwrap();
+
+        // Loading still constructs the completed-check state normally. Only the
+        // cached authority is absent, so the caller runs the compiler instead
+        // of treating an obsolete record as an analyzer or storage failure.
+        let missed = reload(&cache);
+        assert!(
+            missed.saved.is_none(),
+            "schema 2 cannot certify diagnostics"
+        );
+        assert!(valid(&missed).is_none());
+        assert!(missed.pending.is_none());
+        assert_eq!(missed.path, cache.path);
+        assert_eq!(fs::read(&missed.path).unwrap(), legacy_bytes);
+
+        // The regular atomic writer replaces the obsolete record in the same
+        // namespace; no migration or special cleanup path is required.
+        write_record(&missed.path, certified).unwrap();
+        let disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&missed.path).unwrap()).unwrap();
+        assert_eq!(disk["record"]["schema"], 3);
+        assert!(valid(&reload(&missed)).is_some());
+    }
+
     #[test]
     fn fingerprint_deadline_exceeded_refuses_saved_check() {
         let (_temp, cache) = fixture();
