@@ -122,6 +122,105 @@ pub(crate) fn find_project_typescript_package(
     }
 }
 
+/// Whether any `package.json` that can supply TypeScript to the files a
+/// TypeScript server serves declares a `typescript` dependency (of any kind).
+/// Used only after the server reported that it found no TypeScript and AFT
+/// found no installed one, to tell "dependencies not installed" apart from
+/// "nothing here uses TypeScript".
+///
+/// Two places are searched:
+/// - the directories from `source_file` up to `boundary`, the same walk
+///   [`find_project_typescript_package`] makes, so a declaring manifest
+///   above the server root counts;
+/// - every package under `server_root` that this server serves. One server
+///   serves every package below its root that sees the same installed
+///   TypeScript (see [`shared_typescript_server_root`]), so a server whose
+///   root has no TypeScript also serves the packages that have none
+///   installed. A package with its own `node_modules/typescript` has its own
+///   server and is skipped, together with everything under it.
+///
+/// When nothing declares TypeScript, the files are outside every TypeScript
+/// project, for example stray scripts at a workspace root whose packages
+/// each install their own TypeScript. They are never served with a
+/// package's TypeScript: the lookup walks up from a file, never into a
+/// sibling package. An unreadable `package.json` counts as declaring, so an
+/// unparseable manifest never turns into a confident "no project".
+pub(crate) fn typescript_dependency_declared(
+    source_file: &Path,
+    server_root: &Path,
+    boundary: &Path,
+) -> bool {
+    if let Some(mut directory) = source_file.parent() {
+        loop {
+            if package_json_declares_typescript(&directory.join("package.json")) {
+                return true;
+            }
+            if directory == boundary {
+                break;
+            }
+            let Some(parent) = directory.parent() else {
+                break;
+            };
+            if !parent.starts_with(boundary) {
+                break;
+            }
+            directory = parent;
+        }
+    }
+    let walker = ignore::WalkBuilder::new(server_root)
+        .same_file_system(true)
+        .standard_filters(true)
+        .add_custom_ignore_filename(".aftignore")
+        .filter_entry(|entry| {
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if !is_dir {
+                return entry.file_name() == "package.json";
+            }
+            if crate::lsp::roots::skip_in_server_walk(
+                entry.file_name().to_string_lossy().as_ref(),
+                entry.depth(),
+            ) {
+                return false;
+            }
+            // A package with its own TypeScript is served by its own server.
+            entry.depth() == 0
+                || !entry
+                    .path()
+                    .join("node_modules")
+                    .join("typescript")
+                    .join("package.json")
+                    .is_file()
+        })
+        .build();
+    walker.flatten().any(|entry| {
+        entry.file_type().is_some_and(|kind| kind.is_file())
+            && package_json_declares_typescript(entry.path())
+    })
+}
+
+fn package_json_declares_typescript(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        // An unreadable manifest cannot prove the project has no TypeScript;
+        // keep the install advice rather than a confident "no project".
+        return true;
+    };
+    [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ]
+    .iter()
+    .any(|section| {
+        json.get(section)
+            .and_then(|deps| deps.get("typescript"))
+            .is_some()
+    })
+}
+
 /// The project's TypeScript for `source_file`, served from `server_root`.
 ///
 /// The walk is bounded by the configured project root when the file is inside
@@ -645,5 +744,75 @@ mod tests {
             project_typescript_for(&outside, &project, Some(&project)),
             None
         );
+    }
+
+    /// The per-package Bun workspace: every package installs its own
+    /// TypeScript, the root declares none. Root scripts are outside every
+    /// TypeScript project, and a package's declaration is not borrowed for
+    /// them because that package has its own server.
+    #[test]
+    fn root_scripts_of_a_per_package_workspace_declare_no_typescript() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        write(
+            &root.join("package.json"),
+            r#"{"private":true,"workspaces":["packages/*"],"devDependencies":{"@biomejs/biome":"^2.5.1"}}"#,
+        );
+        let script = root.join("scripts").join("build.ts");
+        write(&script, "");
+        let plugin = root.join("packages").join("plugin");
+        write(
+            &plugin.join("package.json"),
+            r#"{"devDependencies":{"typescript":"^5.9.3"}}"#,
+        );
+        write(&plugin.join("tsconfig.json"), "{}");
+        write(
+            &plugin
+                .join("node_modules")
+                .join("typescript")
+                .join("package.json"),
+            r#"{"version":"5.9.3"}"#,
+        );
+        assert!(!typescript_dependency_declared(&script, &root, &root));
+
+        // A package that declares TypeScript but has none installed shares
+        // the root's server (both see no TypeScript), so installing is the
+        // remedy for that server even when its first file is a root script.
+        write(
+            &root.join("packages").join("fresh").join("package.json"),
+            r#"{"dependencies":{"typescript":"5.9.3"}}"#,
+        );
+        assert!(typescript_dependency_declared(&script, &root, &root));
+    }
+
+    #[test]
+    fn a_declaring_or_unreadable_manifest_on_the_walk_counts_as_declared() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let script = root.join("tools").join("gen.ts");
+        write(&script, "");
+        write(&root.join("package.json"), r#"{"name":"plain"}"#);
+        assert!(!typescript_dependency_declared(
+            &script,
+            &root.join("tools"),
+            &root
+        ));
+        // Declared above the server root, inside the project: install helps.
+        write(
+            &root.join("package.json"),
+            r#"{"peerDependencies":{"typescript":"*"}}"#,
+        );
+        assert!(typescript_dependency_declared(
+            &script,
+            &root.join("tools"),
+            &root
+        ));
+        // An unparseable manifest never yields a confident "no project".
+        write(&root.join("package.json"), "{ not json");
+        assert!(typescript_dependency_declared(
+            &script,
+            &root.join("tools"),
+            &root
+        ));
     }
 }
