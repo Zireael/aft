@@ -2828,23 +2828,32 @@ mod tests {
         executor: &Executor,
         app: &App,
         expected: u64,
-    ) {
+    ) -> HealthReport {
         let metrics = DispatchPathMetrics::new();
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             cache.refresh(executor, app);
             let report = build_health_report(cache, executor, &HashMap::new(), &metrics, app);
+            // Both the rollup and the live probe can skip a contended scheduler.
+            // Wait for the roots, not the diagnostic values being asserted, so
+            // a missing diagnostic still fails after a completed refresh.
+            let scheduler_busy = report.detail.as_deref().is_some_and(|detail| {
+                detail.contains(
+                    "executor scheduler state could not be snapshotted without contention",
+                )
+            });
             if report
                 .metrics
                 .as_ref()
                 .and_then(|metrics| metrics["root_count"].as_u64())
                 == Some(expected)
+                && !scheduler_busy
             {
-                return;
+                return report;
             }
             assert!(
                 Instant::now() < deadline,
-                "health cache did not capture {expected} roots"
+                "health cache did not capture {expected} roots without contention: {report:?}"
             );
             std::thread::yield_now();
         }
@@ -3227,14 +3236,7 @@ mod tests {
         assert!(executor.register_actor(root, Arc::clone(&ctx)));
         let cache = HealthRollupCache::new();
         let app = crate::context::App::default_shared();
-        cache.refresh(&executor, &app);
-        let report = build_health_report(
-            &cache,
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &app,
-        );
+        let report = refresh_until_root_count(&cache, &executor, &app, 1);
         let metrics = report.metrics.unwrap();
         let refusals = metrics["bash_task_refusals"].as_array().unwrap();
         assert_eq!(refusals.len(), 1);
@@ -3245,18 +3247,73 @@ mod tests {
         ctx.bash_background()
             .maybe_gc_persisted(&harness_storage)
             .unwrap();
-        cache.refresh(&executor, &app);
-        let report = build_health_report(
-            &cache,
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &app,
-        );
+        let report = refresh_until_root_count(&cache, &executor, &app, 1);
         assert!(report.metrics.unwrap()["bash_task_refusals"]
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn health_unavailable_rollup_reports_degraded_status_and_reason() {
+        let executor = Executor::new();
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        let detail = report.detail.unwrap();
+        assert!(
+            detail.contains("health diagnostic snapshot is being refreshed")
+                || detail.contains(
+                    "executor scheduler state could not be snapshotted without contention"
+                ),
+            "{detail}"
+        );
+
+        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert!(report
+            .detail
+            .unwrap()
+            .contains("executor scheduler state could not be snapshotted without contention"));
+    }
+
+    #[test]
+    fn health_wait_retries_an_unavailable_rollup() {
+        let (dir, root) = test_root("health-contended-rollup");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("storage")),
+                project_root: Some(root.as_path().into()),
+                ..crate::config::Config::default()
+            },
+        ));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, ctx));
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                executor.hold_state_lock_for_test(|| {
+                    locked_tx.send(()).unwrap();
+                    // Keep the first refresh unavailable regardless of scheduling
+                    // speed, then let the polling helper capture the actor.
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while cache.refresh_count_for_test() == 0 {
+                        assert!(Instant::now() < deadline, "health refresh never attempted");
+                        std::thread::yield_now();
+                    }
+                });
+            });
+            locked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            let report = refresh_until_root_count(&cache, &executor, &app, 1);
+            assert_eq!(report.metrics.unwrap()["root_count"], 1);
+            assert!(cache.refresh_count_for_test() >= 2);
+        });
     }
 
     #[test]
