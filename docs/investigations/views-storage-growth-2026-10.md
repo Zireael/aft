@@ -572,3 +572,103 @@ ran its check/build scripts; the package check is authoritative. Windows checkin
 remains unavailable in this remote environment because the MinGW compiler was
 missing in the preceding verification; no Windows pass is claimed. The follow-up
 path diff has no ranking-fence matches and retains the non-ranking descriptor.
+
+## Policy update: recorded linked-worktree bindings use one day
+
+Implementation base: `881a22e3ec5930e7ee6e2820cd61b04a9bbeb4b7`. The historical
+seven-day-only conclusions above describe those earlier commits; their line
+citations refer to their stated bases, not the shifted current source lines.
+
+The product policy now retains a missing **verified linked Git worktree** for
+**24 hours since its last binding clock**, versus **seven days** for main,
+ambiguous, unknown or older/unflagged bindings. No Alfonso/Mason directory name
+is used to classify new bindings. `record_bind` persists `linked_worktree` in
+its existing atomic root-history JSON; missing fields deserialize as `false`.
+`linked_worktree_at_bind` requires a regular `.git` file, its resolved Git dir
+under the resolved common Git dir's `worktrees/`, a common dir outside the
+checkout, and a valid backlink to that checkout's `.git`. Separate main Git
+dirs, submodules without that topology, broken Git metadata and uncertain cases
+do not receive the shorter window. `missing_and_old` selects the age threshold;
+`missing_root_due` uses the same persisted flag for family GC. Unknown-key
+first-observation clocks remain seven days.
+
+The parent explicitly approved a narrow history reconciliation: only when a
+durable root record says `linked_worktree=true`, propagate that classification
+and its recorded mount identity to same-root memo/owner copies lacking the mount
+identity. Otherwise those copies would continue to require seven days, and
+ordinary linked worktrees outside the legacy worker path would lack a mount
+identity. All copies, timestamps, existing recorded mount identities and the
+`every copy must pass` rule are preserved; unflagged/main-root history is not
+changed. Reader/pin/query-marker, lease, residency, mount-device and final
+admission/open-connection checks are unchanged. This is an age-only policy, not
+permission to purge a shared family while another checkout or reader is live.
+
+### Conditional disk impact and existing flag coverage
+
+At **2026-10-08T10:51:24Z**, a new plain-metadata/stat census of the same V1 main
+files found:
+
+| Missing-root history age | Worker-provenance dirs | Derived DBs | Logical bytes | Allocated bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Less than one day | 357 | 75 | 21,262,192,640 | 21,300,609,024 |
+| One to seven days | 973 | 220 | **50,654,351,360** | **50,854,834,176** |
+| At least seven days | 0 | 0 | 0 | 0 |
+
+Another 14 attributed missing-root directories had no generation DB bytes.
+The one-to-seven-day population is the **conditional additional age-eligible
+amount**, if those checkouts had recorded verified linked topology while bound
+and all existing protections permit cleanup. Worker provenance is recoverable
+from root paths; their deleted `.git` metadata is not, so this is not a new
+post-deletion topology inference or a deletion authorization. Actual free-space
+recovery also depends on shared APFS extents. In the earlier 10:04 census the
+same conditional population was **49,851,133,952 logical /
+50,050,637,824 allocated bytes**.
+
+**None of today's old bindings already qualify for the new flag:** all **426**
+durable root records in the 10:51 sample lacked `linked_worktree`; zero had true
+or false explicitly, and zero missing view scopes had `linked_worktree=true`.
+Thus the immediate additional reclamation from deploying this rule over the
+existing unflagged records is **0 bytes**. Already-deleted unflagged checkouts
+cannot be automatically backfilled from nonexistent Git metadata. Future binds
+of existing linked checkouts record the flag (and a fresh last-bind time);
+subsequent deletion can qualify after 24 hours. The one-day policy does not
+retroactively shorten an unknown record's seven-day window.
+
+### Tests and mutation controls
+
+Real temporary Git repositories/worktrees outside the checkout exercise:
+
+- A 25-hour linked binding with memo and owner copies: actual root cache removal,
+  persisted flag, all six history copies and their three distinct clocks retained.
+- A 23-hour linked binding: retained.
+- A 25-hour main checkout: retained.
+- Linked-looking but unflagged durable history plus memo/owner copies: retained.
+- A legacy record without the field: retained at 25 hours, reclaimed after eight
+  days when its existing mount/protection checks permit it.
+- A recent owner clock: every-copy age protection still retains the root.
+- A live reader and a disconnected recorded mount: both still block removal.
+- Ambiguous/broken `.git` files: no linked flag is recorded.
+
+Before the policy change, only
+`storage_retention_linked_worktree_25h_with_history_copies_is_reclaimed` failed in
+the linked-case filter (`removed_roots` 0 instead of 1; three controls passed).
+After implementation, all five linked-case tests passed. Two independent staged
+`NON-VACUITY BREAK` controls then made only that 25-hour reclamation test fail:
+forcing the linked threshold back to seven days (four controls stayed green),
+and suppressing metadata propagation to legacy history copies (the same four
+controls stayed green). Each control captured a nonempty source diff, restored
+with `git checkout -- ... && touch ...`, and captured an empty source diff after
+restoration. No mutant remains, and no live storage was opened through SQLite or
+modified by this implementation or its censuses.
+
+Policy-update final Rust verification on Linux (rustc/cargo 1.99.0,
+rustfmt 1.10.0-stable): formatting and package-with-tests checking passed;
+`cargo test -p agent-file-tools --lib -- storage_retention` passed **35 tests**;
+`cargo test -p agent-file-tools --test integration -- per_checkout_registry`
+passed **16 tests** (one child fixture ignored in the parent run);
+`cargo test -p agent-file-tools --test integration -- pins_gc_test` passed
+**4 tests**. Commands used the Linux guard and isolated HOME/XDG storage.
+Scoped inspection remained partial; the successful package check is authoritative.
+The pre-existing unavailable MinGW compiler still prevents claiming a Windows
+compile pass. The requested post-commit install, bridge build and governed-docs
+alignment results are recorded in the delivery declaration.

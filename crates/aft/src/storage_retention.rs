@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::context::SubcLifecycleAdmission;
 
 pub(crate) const ROOT_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+const LINKED_WORKTREE_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 const INTERVAL: Duration = Duration::from_secs(10 * 60);
 // Startup can warm many checkout views at once. Keep storage-wide V1 blob
 // marking (which must exclude pin admission) off that request-critical lane.
@@ -40,6 +41,8 @@ pub(crate) struct Binding {
     pub last_bound_ms: u64,
     #[serde(default)]
     volume: Option<(PathBuf, u64)>,
+    #[serde(default)]
+    linked_worktree: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -203,6 +206,7 @@ pub(crate) fn record_bind(storage: &Path, root: &Path, artifact_key: &str) -> io
     let scope = crate::path_identity::project_scope_key(&root);
     let binding = Binding {
         volume: volume_anchor(&root),
+        linked_worktree: linked_worktree_at_bind(&root),
         root,
         artifact_key: artifact_key.to_owned(),
         last_bound_ms: crate::pins::now_ms(),
@@ -213,6 +217,36 @@ pub(crate) fn record_bind(storage: &Path, root: &Path, artifact_key: &str) -> io
             .join(format!("{scope}.json")),
         &binding,
     )
+}
+
+/// Only a verified linked-worktree Git layout gets the shorter retention age.
+/// A Git file alone can also describe a submodule or a separate main Git dir.
+fn linked_worktree_at_bind(root: &Path) -> bool {
+    let marker = root.join(".git");
+    if !fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.file_type().is_file()) {
+        return false;
+    }
+    let Some(git_dir) = fs::read_to_string(&marker).ok().and_then(|text| {
+        let path = text.strip_prefix("gitdir:")?.trim();
+        (!path.is_empty())
+            .then(|| fs::canonicalize(root.join(path)).ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    let Some(common) = fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .and_then(|text| fs::canonicalize(git_dir.join(text.trim())).ok())
+    else {
+        return false;
+    };
+    let backlink = fs::read_to_string(git_dir.join("gitdir"))
+        .ok()
+        .and_then(|text| fs::canonicalize(git_dir.join(text.trim())).ok());
+    git_dir.is_dir()
+        && !common.starts_with(root)
+        && git_dir.parent() == Some(common.join("worktrees").as_path())
+        && backlink.as_deref() == Some(marker.as_path())
 }
 
 #[cfg(unix)]
@@ -282,7 +316,12 @@ fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
 }
 
 fn missing_and_old(binding: &Binding, now: u64) -> bool {
-    if now.saturating_sub(binding.last_bound_ms) < ROOT_GRACE_MS {
+    let grace = if binding.linked_worktree {
+        LINKED_WORKTREE_GRACE_MS
+    } else {
+        ROOT_GRACE_MS
+    };
+    if now.saturating_sub(binding.last_bound_ms) < grace {
         return false;
     }
     if !matches!(binding.root.try_exists(), Ok(false)) {
@@ -313,6 +352,7 @@ pub(crate) fn missing_root_due(storage: &Path, root: &Path, last_bind_ms: u64) -
                 artifact_key: String::new(),
                 last_bound_ms: last_bind_ms,
                 volume: None,
+                linked_worktree: false,
             },
             crate::pins::now_ms(),
         ),
@@ -377,6 +417,7 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
         recorded_at_ms: u64,
     }
     let mut result: BTreeMap<String, Vec<Binding>> = BTreeMap::new();
+    let mut linked_roots = HashMap::new();
     let memo = storage.join("cache-keys.json");
     if memo.exists() {
         let memo: BTreeMap<String, Memo> = read_json(&memo)?;
@@ -389,6 +430,7 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
                 artifact_key: entry.key,
                 last_bound_ms: entry.recorded_at_ms,
                 volume: None,
+                linked_worktree: false,
             };
             result
                 .entry(crate::path_identity::project_scope_key(&binding.root))
@@ -409,6 +451,12 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
             continue;
         }
         let binding: Binding = read_json(&entry.path())?;
+        if binding.linked_worktree {
+            linked_roots.insert(
+                crate::root_cache::canonical_root(&binding.root),
+                binding.volume.clone(),
+            );
+        }
         let scope = entry
             .path()
             .file_stem()
@@ -439,6 +487,7 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
             artifact_key: entry.file_name().to_string_lossy().into_owned(),
             last_bound_ms: owner.heartbeat_at_ms,
             volume: None,
+            linked_worktree: false,
         };
         result
             .entry(owner.project_scope_key)
@@ -448,6 +497,21 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
             .entry(binding.artifact_key.clone())
             .or_default()
             .push(binding);
+    }
+    // Memo and owner records retain their own clocks and root protections.
+    // When a durable bind verified linked topology, its mount identity also
+    // identifies same-root legacy copies that did not record either fact.
+    for records in result.values_mut() {
+        for binding in records {
+            if let Some(volume) =
+                linked_roots.get(&crate::root_cache::canonical_root(&binding.root))
+            {
+                binding.linked_worktree = true;
+                if binding.volume.is_none() {
+                    binding.volume = volume.clone();
+                }
+            }
+        }
     }
     Ok(result)
 }
@@ -1215,6 +1279,194 @@ mod storage_retention_tests {
         record_bind(temp.path(), &root, &scope).unwrap();
         fs::remove_dir(root).unwrap();
         let path = cache(temp.path(), "symbols", &scope);
+        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
+        assert!(path.exists());
+    }
+
+    fn deleted_checkout_fixture(
+        linked: bool,
+        hours: u64,
+        legacy: bool,
+        history_copies: bool,
+    ) -> (tempfile::TempDir, PathBuf, String, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        fs::create_dir(&main).unwrap();
+        let git = |args: &[&str]| {
+            let mut command = std::process::Command::new("git");
+            crate::test_env::apply_hermetic_git_env(command.current_dir(&main));
+            let output = command.args(args).output().unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        git(&["init", "--quiet"]);
+        git(&[
+            "-c",
+            "user.name=Retention Tests",
+            "-c",
+            "user.email=retention@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        let root = if linked {
+            let worktree = temp.path().join("linked-checkout");
+            git(&[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                worktree.to_str().unwrap(),
+            ]);
+            worktree
+        } else {
+            main
+        };
+        let root = fs::canonicalize(root).unwrap();
+        let scope = crate::path_identity::project_scope_key(&root);
+        record_bind(temp.path(), &root, &scope).unwrap();
+        let record = temp.path().join(format!("retention/roots/{scope}.json"));
+        let mut binding: serde_json::Value = read_json(&record).unwrap();
+        let last_bound = crate::pins::now_ms() - hours * 60 * 60 * 1000;
+        binding["last_bound_ms"] = last_bound.into();
+        if legacy {
+            binding.as_object_mut().unwrap().remove("linked_worktree");
+        }
+        atomic_json(&record, &binding).unwrap();
+        if history_copies {
+            atomic_json(
+                &temp.path().join("cache-keys.json"),
+                &serde_json::json!({(root.to_string_lossy().as_ref()): {
+                    "key": scope, "recorded_at_ms": last_bound - 1000
+                }}),
+            )
+            .unwrap();
+            crate::artifact_owner::write_synthetic_manifest_for_test(
+                temp.path(),
+                &root,
+                &scope,
+                &scope,
+                u32::MAX,
+                last_bound + 1000,
+            );
+        }
+        let path = cache(temp.path(), "views", &scope);
+        fs::remove_dir_all(&root).unwrap();
+        (temp, root, scope, path)
+    }
+
+    #[test]
+    fn storage_retention_linked_worktree_25h_with_history_copies_is_reclaimed() {
+        let (temp, root, scope, path) = deleted_checkout_fixture(true, 25, false, true);
+        let history = bindings(temp.path()).unwrap();
+        // Each source contributes a scope and an artifact-key copy. Keep all
+        // their timestamps, even though they describe the same checkout.
+        assert_eq!(history[&scope].len(), 6);
+        let original: Binding =
+            read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+        let mut clocks: Vec<_> = history[&scope]
+            .iter()
+            .map(|binding| binding.last_bound_ms)
+            .collect();
+        clocks.sort_unstable();
+        assert_eq!(
+            clocks,
+            vec![
+                original.last_bound_ms - 1000,
+                original.last_bound_ms - 1000,
+                original.last_bound_ms,
+                original.last_bound_ms,
+                original.last_bound_ms + 1000,
+                original.last_bound_ms + 1000,
+            ]
+        );
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(!path.exists());
+        assert!(missing_root_due(temp.path(), &root, 0));
+        let record: serde_json::Value =
+            read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+        assert_eq!(record["linked_worktree"], true);
+    }
+
+    #[test]
+    fn storage_retention_linked_worktree_23h_is_kept() {
+        let (temp, root, _scope, path) = deleted_checkout_fixture(true, 23, false, false);
+        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
+        assert!(path.exists());
+        assert!(!missing_root_due(temp.path(), &root, 0));
+    }
+
+    #[test]
+    fn storage_retention_linked_worktree_recent_owner_clock_still_keeps_root() {
+        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, false, true);
+        let owner = temp
+            .path()
+            .join(format!("artifact-owners/{scope}/owner.json"));
+        let mut metadata: serde_json::Value = read_json(&owner).unwrap();
+        metadata["heartbeat_at_ms"] = (crate::pins::now_ms() - 23 * 60 * 60 * 1000).into();
+        atomic_json(&owner, &metadata).unwrap();
+        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn storage_retention_main_checkout_25h_is_kept() {
+        let (temp, _root, _scope, path) = deleted_checkout_fixture(false, 25, false, false);
+        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn storage_retention_ambiguous_git_file_does_not_record_linked_topology() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        let separate_git = temp.path().join("separate-git");
+        fs::create_dir(&separate_git).unwrap();
+        for target in [separate_git, temp.path().join("missing-git")] {
+            fs::write(root.join(".git"), format!("gitdir: {}\n", target.display())).unwrap();
+            record_bind(temp.path(), &root, "0123456789abcdef").unwrap();
+            let scope = crate::path_identity::project_scope_key(&root);
+            let binding: Binding =
+                read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+            assert!(!binding.linked_worktree);
+        }
+    }
+
+    #[test]
+    fn storage_retention_linked_worktree_unflagged_history_copies_keep_seven_days() {
+        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, true, true);
+        assert_eq!(bindings(temp.path()).unwrap()[&scope].len(), 6);
+        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn storage_retention_legacy_binding_uses_seven_days() {
+        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, true, false);
+        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
+        assert!(path.exists());
+        let record = temp.path().join(format!("retention/roots/{scope}.json"));
+        let mut binding: serde_json::Value = read_json(&record).unwrap();
+        binding["last_bound_ms"] = (crate::pins::now_ms() - 8 * 24 * 60 * 60 * 1000).into();
+        atomic_json(&record, &binding).unwrap();
+        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn storage_retention_linked_worktree_25h_keeps_live_reader_and_mount_checks() {
+        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, false, true);
+        let marker = crate::root_cache::ReadMarker::create(&path, "query").unwrap();
+        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
+        assert!(path.exists());
+        drop(marker);
+        let record = temp.path().join(format!("retention/roots/{scope}.json"));
+        let mut binding: serde_json::Value = read_json(&record).unwrap();
+        binding["volume"] = serde_json::json!([temp.path().join("unmounted"), 42]);
+        atomic_json(&record, &binding).unwrap();
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
         assert!(path.exists());
     }

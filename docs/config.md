@@ -63,6 +63,8 @@ disable requires editing the base list):
 
 On Unix, AFT storage is owner-only (0700 directories and executables, 0600 files), and existing loose storage directories are tightened when opened without walking their contents.
 
+For a missing checkout folder, index retention uses a one-day age window from the last bind when the persisted binding verifies a linked Git worktree, and seven days for main checkouts or older/unknown bindings; reader, pin, lease and mount protections still apply.
+
 Set `AFT_STORAGE_DIR` to place AFT's SQLite databases, WALs, writer leases, and indexes on a local disk when `$HOME` is NFS-mounted (for example on corporate or HPC systems). The variable is process state, not a JSONC configuration key, and an empty value is treated as unset. Relative values are resolved to an absolute path at first read; `~` and `~/...` are expanded using the current user's home directory.
 
 Storage resolution is identical for plugins, standalone binaries, and warmup:
