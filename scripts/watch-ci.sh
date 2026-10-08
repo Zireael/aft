@@ -116,6 +116,28 @@ watch_run_view() {
   fi
 }
 
+# A completed run's verdict is read with queries that must succeed. A gh
+# failure (network, rate limit, auth) answers with empty output, and an empty
+# conclusion or job list would otherwise read as "nothing failed" and land an
+# unverified sha. Retry briefly, then fail closed with exit 3.
+verdict_query() {
+  local run="$1" out attempt
+  shift
+  for attempt in 1 2 3; do
+    if out=$(watch_run_view "$run" --repo "$REPO" "$@" 2>/dev/null) && [ -n "$out" ]; then
+      printf '%s' "$out"
+      return 0
+    fi
+    [ "$attempt" -lt 3 ] && watch_sleep "${WATCH_CI_VERDICT_RETRY_SLEEP:-5}"
+  done
+  return 1
+}
+
+undetermined() {
+  echo "CI_UNDETERMINED run=$RID reason='$1'${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}" >&2
+  exit 3
+}
+
 ARG="${1:-}"
 RID=""
 WATCH_SHA=""
@@ -212,15 +234,28 @@ while true; do
   fi
 
   if [ "$STATUS" = "completed" ]; then
-    CONC=$(watch_run_view "$RID" --repo "$REPO" --json conclusion --jq '.conclusion')
+    if ! CONC=$(verdict_query "$RID" --json conclusion --jq '.conclusion'); then
+      undetermined "could not read the run conclusion"
+    fi
     if [ "$CONC" = "success" ]; then
       echo "CI_DONE run=$RID conclusion=$CONC${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}"
       exit 0
     fi
     # The run's summary conclusion can read non-success while every job
     # passed or was skipped; judge the jobs, which are what main requires.
-    GATING_BAD=$(watch_run_view "$RID" --repo "$REPO" --json jobs \
-      --jq '[.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | .name] | join("; ")')
+    # Only a successful query that lists jobs may conclude "all passed": an
+    # empty answer from a failed or truncated query must not read as green.
+    if ! JOB_COUNT=$(verdict_query "$RID" --json jobs --jq '.jobs | length') \
+      || ! [[ "$JOB_COUNT" =~ ^[0-9]+$ ]] || [ "$JOB_COUNT" -eq 0 ]; then
+      undetermined "could not list the run's jobs (conclusion=$CONC)"
+    fi
+    # The "bad=" prefix keeps a legitimately empty list distinguishable from
+    # a query that printed nothing.
+    if ! GATING_BAD=$(verdict_query "$RID" --json jobs \
+      --jq '"bad=" + ([.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | .name] | join("; "))'); then
+      undetermined "could not read job conclusions (conclusion=$CONC)"
+    fi
+    GATING_BAD="${GATING_BAD#bad=}"
     if [ -z "$GATING_BAD" ]; then
       echo "CI_DONE run=$RID conclusion=$CONC jobs_all_passed=1${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}"
       exit 0

@@ -126,6 +126,14 @@ if [ "${1:-}" = "api" ]; then
   exit 0
 fi
 
+# Fault injection: a field listed in fail_json makes every `run view` query
+# for it exit nonzero with no output, the way gh behaves on a network, rate
+# limit or auth error. The verdict path must fail closed on it.
+if [ "${1:-}" = "run" ] && [ "${2:-}" = "view" ] && [ -f "$STATE/fail_json" ] &&
+  grep -qxF "$json" "$STATE/fail_json"; then
+  exit 1
+fi
+
 case "$json" in
   defaultBranchRef) cat "$STATE/default_branch" ;;
   databaseId,headSha|databaseId,headSha,workflowName|databaseId,headSha,headBranch)
@@ -165,6 +173,8 @@ case "$json" in
   jobs)
     case "$jq_arg" in
       *'.conclusion + "|"'*) cat "$STATE/rerun_jobs" ;;
+      *'| length'*) cat "$STATE/job_count" 2>/dev/null || echo 3 ;;
+      *'"bad=" +'*) printf 'bad=%s\n' "$(sed 's/|.*//' "$STATE/failed_job")" ;;
       *) cat "$STATE/failed_job" ;;
     esac
     ;;
@@ -990,6 +1000,31 @@ else
 fi
 [ ! -e "$dir/work/.git/train-push-green.watch" ] ||
   fail "a clean watcher exit left its heartbeat behind"
+
+# A completed run whose verdict queries fail must not land. gh answers a
+# network, rate-limit or auth error with empty output; reading that as "no
+# failed jobs" fast-forwarded main on an unverified sha.
+dir="$(new_fixture verdict-query-fails)"
+add_train_commit "$dir/work" "verdict-query-fails"
+base_sha="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+echo "failure" > "$dir/ci-state/conclusion"
+printf 'conclusion\njobs\n' > "$dir/ci-state/fail_json"
+WATCH_CI_VERDICT_RETRY_SLEEP=0 run_train "$dir" verdict-query-fails
+expect_rc 2 "a failed verdict query refuses to land"
+expect_out "CI_UNDETERMINED" "a failed verdict query names the undetermined verdict"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base_sha" ] ||
+  fail "a failed verdict query fast-forwarded main"
+
+# A completed run that lists no jobs is not a run in which every job passed.
+dir="$(new_fixture verdict-no-jobs)"
+add_train_commit "$dir/work" "verdict-no-jobs"
+base_sha="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+echo "failure" > "$dir/ci-state/conclusion"
+echo 0 > "$dir/ci-state/job_count"
+WATCH_CI_VERDICT_RETRY_SLEEP=0 run_train "$dir" verdict-no-jobs
+expect_rc 2 "an empty job list refuses to land"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base_sha" ] ||
+  fail "an empty job list fast-forwarded main"
 
 # A completed push run for the same commit on another branch is not proof that
 # the train push started a run. The branch-qualified watch must fail plainly
