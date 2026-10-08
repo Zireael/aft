@@ -178,35 +178,52 @@ fn media_file_too_large_response(id: &str, byte_size: u64) -> Response {
     )
 }
 
-fn handle_media_read(
+enum PreparedPathRead {
+    Response(Response),
+    Media {
+        raw_bytes: Vec<u8>,
+        media: SniffedMedia,
+    },
+}
+
+impl PreparedPathRead {
+    fn into_response(self, id: &str) -> Response {
+        let (raw_bytes, media) = match self {
+            Self::Response(response) => return response,
+            Self::Media { raw_bytes, media } => (raw_bytes, media),
+        };
+        let byte_size = raw_bytes.len();
+        match media {
+            SniffedMedia::Pdf => handle_pdf_media(id, raw_bytes),
+            SniffedMedia::Image(kind) => match process_image_with_timeout(raw_bytes, kind) {
+                Ok(image) => image_attachment_response(id, image),
+                Err(reason) => media_omitted_response(id, byte_size, reason),
+            },
+        }
+    }
+}
+
+fn prepare_media_read(
     req: &RawRequest,
     path: &Path,
     byte_size: u64,
     media: SniffedMedia,
-) -> Response {
+) -> PreparedPathRead {
     if byte_size > MAX_FILE_READ_BYTES {
-        return media_file_too_large_response(&req.id, byte_size);
+        return PreparedPathRead::Response(media_file_too_large_response(&req.id, byte_size));
     }
 
     let raw_bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) => {
-            return Response::error(
+            return PreparedPathRead::Response(Response::error(
                 &req.id,
                 "io_error",
                 format!("read: failed to read file: {}", e),
-            );
+            ));
         }
     };
-    let byte_size = raw_bytes.len();
-
-    match media {
-        SniffedMedia::Pdf => handle_pdf_media(&req.id, raw_bytes),
-        SniffedMedia::Image(kind) => match process_image_with_timeout(raw_bytes, kind) {
-            Ok(image) => image_attachment_response(&req.id, image),
-            Err(reason) => media_omitted_response(&req.id, byte_size, reason),
-        },
-    }
+    PreparedPathRead::Media { raw_bytes, media }
 }
 
 fn handle_pdf_media(id: &str, raw_bytes: Vec<u8>) -> Response {
@@ -1412,7 +1429,10 @@ fn handle_read_local(
                 LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.set(bytes.get() + _observations.1));
             }
             *captured_source = captured;
-            response
+            // Decoding, resizing and base64 encoding are CPU work, not OS access.
+            // Run them after the filesystem helper returns so a slow image uses
+            // the image-processing timeout rather than the filesystem deadline.
+            response.into_response(&req.id)
         }
         Err(error) => Response::error(&req.id, "read_blocked", error.to_string()),
     }
@@ -1423,55 +1443,71 @@ fn handle_read_path(
     path: &Path,
     capture_source: bool,
     captured_source: &mut Option<CapturedRead>,
-) -> Response {
+) -> PreparedPathRead {
     let file = path.to_string_lossy();
     // Check existence
     if !path.exists() {
-        return Response::error(
+        return PreparedPathRead::Response(Response::error(
             &req.id,
             "not_found",
             format!("read: file not found: {}", file),
-        );
+        ));
     }
 
     // Directory listing
     if path.is_dir() {
-        return handle_directory(req, path);
+        return PreparedPathRead::Response(handle_directory(req, path));
     }
 
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(e) => {
-            return Response::error(
+            return PreparedPathRead::Response(Response::error(
                 &req.id,
                 "io_error",
                 format!("read: failed to stat file: {}", e),
-            );
+            ));
         }
     };
 
     if !metadata.is_file() {
-        return Response::error(
+        return PreparedPathRead::Response(Response::error(
             &req.id,
             "unsupported_file_type",
             "read: only regular files and directories can be read",
-        );
+        ));
     }
 
     let magic = match read_magic(path) {
         Ok(magic) => magic,
         Err(e) => {
-            return Response::error(
+            return PreparedPathRead::Response(Response::error(
                 &req.id,
                 "io_error",
                 format!("read: failed to read file header: {}", e),
-            );
+            ));
         }
     };
     if let Some(media) = sniff_media(&magic) {
-        return handle_media_read(req, path, metadata.len(), media);
+        return prepare_media_read(req, path, metadata.len(), media);
     }
 
+    PreparedPathRead::Response(handle_text_or_binary_read(
+        req,
+        path,
+        metadata.len(),
+        capture_source,
+        captured_source,
+    ))
+}
+
+fn handle_text_or_binary_read(
+    req: &RawRequest,
+    path: &Path,
+    file_byte_size: u64,
+    capture_source: bool,
+    captured_source: &mut Option<CapturedRead>,
+) -> Response {
     // Parse range parameters. Zero is outside the 1-based domain of every
     // range field, so a `0` placeholder counts as absent rather than selecting
     // an empty window (a zero limit or end line would read no lines at all).
@@ -1509,20 +1545,20 @@ fn handle_read_path(
         return handle_streaming_range_read(
             req,
             path,
-            metadata.len(),
+            file_byte_size,
             start_line,
             explicit_end_line,
             limit,
         );
     }
 
-    if metadata.len() > MAX_FILE_READ_BYTES {
+    if file_byte_size > MAX_FILE_READ_BYTES {
         return Response::error(
             &req.id,
             "invalid_request",
             format!(
                 "read: file is too large to load at once ({} bytes > {} bytes). Use start_line/end_line to read sections.",
-                metadata.len(),
+                file_byte_size,
                 MAX_FILE_READ_BYTES
             ),
         );
@@ -2357,7 +2393,7 @@ mod tests {
 
         let response = read_response(temp.path(), &path, json!({}));
 
-        assert!(response.success, "{response:?}");
+        assert!(response.success);
         assert_eq!(response.data["attachments"].as_array().unwrap().len(), 0);
         assert!(response.data["attachment_omitted_reason"]
             .as_str()
@@ -2437,8 +2473,8 @@ mod tests {
         // Simulate slow decoding without adding CPU load. Filesystem access must
         // finish within its budget, but image processing has a separate timeout.
         let response = crate::bounded_io::with_budget(Some(budget), || {
-            let previous = IMAGE_PROCESSING_DELAY
-                .with(|delay| delay.replace(Duration::from_millis(1100)));
+            let previous =
+                IMAGE_PROCESSING_DELAY.with(|delay| delay.replace(Duration::from_millis(1100)));
             let response = handle_read(&req, &ctx);
             IMAGE_PROCESSING_DELAY.with(|delay| delay.set(previous));
             response

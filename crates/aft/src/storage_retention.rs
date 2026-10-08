@@ -433,7 +433,7 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
                 linked_worktree: false,
             };
             result
-                .entry(crate::path_identity::project_scope_key(&binding.root))
+                .entry(missing_root_scope_key(&binding.root))
                 .or_default()
                 .push(binding.clone());
             result
@@ -1335,9 +1335,19 @@ mod storage_retention_tests {
         }
         atomic_json(&record, &binding).unwrap();
         if history_copies {
+            // An alias of the surviving parent exercises missing-root identity
+            // lookup on Unix, just as verbatim paths do on Windows.
+            #[cfg(unix)]
+            let memo_root = {
+                let alias = temp.path().join("memo-parent");
+                std::os::unix::fs::symlink(temp.path(), &alias).unwrap();
+                alias.join(root.file_name().unwrap())
+            };
+            #[cfg(not(unix))]
+            let memo_root = root.clone();
             atomic_json(
                 &temp.path().join("cache-keys.json"),
-                &serde_json::json!({(root.to_string_lossy().as_ref()): {
+                &serde_json::json!({(memo_root.to_string_lossy().as_ref()): {
                     "key": scope, "recorded_at_ms": last_bound - 1000
                 }}),
             )
@@ -1362,7 +1372,11 @@ mod storage_retention_tests {
         let history = bindings(temp.path()).unwrap();
         // Each source contributes a scope and an artifact-key copy. Keep all
         // their timestamps, even though they describe the same checkout.
-        assert_eq!(history[&scope].len(), 6, "scope={scope}, history={history:?}");
+        assert_eq!(
+            history[&scope].len(),
+            6,
+            "scope={scope}, history={history:?}"
+        );
         let original: Binding =
             read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
         let mut clocks: Vec<_> = history[&scope]
@@ -1439,7 +1453,11 @@ mod storage_retention_tests {
     fn storage_retention_linked_worktree_unflagged_history_copies_keep_seven_days() {
         let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, true, true);
         let history = bindings(temp.path()).unwrap();
-        assert_eq!(history[&scope].len(), 6, "scope={scope}, history={history:?}");
+        assert_eq!(
+            history[&scope].len(),
+            6,
+            "scope={scope}, history={history:?}"
+        );
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
         assert!(path.exists());
     }
