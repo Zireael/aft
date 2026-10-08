@@ -174,6 +174,7 @@ fn inspect_server(
         "extensions": def.extensions,
         "root_markers": def.root_markers,
         "binary_name": def.binary,
+        "binary_names": def.binary_candidates(),
         "binary_path": binary_path.as_ref().map(|path| path.display().to_string()),
         "binary_source": binary_source,
         "workspace_root": workspace_root.as_ref().map(|path| path.display().to_string()),
@@ -294,6 +295,30 @@ fn normalize_query_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::inspect_server;
+    use crate::config::Config;
+    use crate::lsp::registry::{builtin_servers, ServerKind};
+    use std::path::Path;
+
+    #[test]
+    fn dockerfile_inspection_lists_preferred_and_fallback_binaries() {
+        let server = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Dockerfile)
+            .unwrap();
+        let inspection = inspect_server(
+            &server,
+            None,
+            Path::new("/tmp/app.dockerfile"),
+            &Config::default(),
+        );
+
+        assert_eq!(
+            inspection["binary_names"],
+            serde_json::json!(["docker-language-server", "docker-langserver"])
+        );
+    }
+
     #[test]
     fn top_level_pull_failure_produces_incomplete_gaps() {
         let gaps = super::pull_failure_gaps(&["python".to_string()], "didOpen failed");

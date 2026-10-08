@@ -46,6 +46,7 @@ export interface LspServerInspection {
   extensions: string[];
   root_markers: string[];
   binary_name: string;
+  binary_names?: string[];
   binary_path: string | null;
   binary_source: "path" | "lsp_paths_extra" | "project_node_modules" | "not_found" | string;
   workspace_root: string | null;
@@ -314,14 +315,16 @@ function childDirs(path: string): string[] {
 }
 
 function formatBinary(server: LspServerInspection): string {
+  const names = server.binary_names?.length ? server.binary_names : [server.binary_name];
+  const alternatives = names.length > 1 ? `; candidates: ${names.join(" or ")}` : "";
   if (!server.binary_path) {
     const locations =
       server.kind === "python" || server.kind === "ty"
         ? "workspace virtualenv, node_modules/.bin, lsp_paths_extra, or PATH"
         : "node_modules/.bin, lsp_paths_extra, or PATH";
-    return `${server.binary_name} (NOT FOUND in ${locations})`;
+    return `${names.join(" or ")} (NOT FOUND in ${locations})`;
   }
-  return `${server.binary_path} (found via ${server.binary_source})`;
+  return `${server.binary_path} (found via ${server.binary_source}${alternatives})`;
 }
 
 function formatWorkspaceRoot(server: LspServerInspection): string {

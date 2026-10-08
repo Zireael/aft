@@ -618,7 +618,15 @@ impl DiagnosticsCollection {
         project_root: &Path,
     ) {
         for failure in failures {
-            let mut reason = failure.reason();
+            let mut reason = if failure.server_key.kind == ServerKind::Dockerfile
+                && matches!(
+                    failure.result,
+                    ServerAttemptResult::BinaryNotInstalled { .. }
+                ) {
+                "docker-language-server or docker-langserver is unavailable".to_string()
+            } else {
+                failure.reason()
+            };
             if let Some(hint) = missing_dependency_hint(failure, project_root) {
                 reason.push_str("; ");
                 reason.push_str(&hint);
@@ -1559,6 +1567,9 @@ mod payload_count_tests {
             serde_json::json!(["images/app.dockerfile", "images/base.dockerfile"])
         );
         let reason = gap["reason"].as_str().unwrap();
+        assert!(reason.contains("docker-language-server"), "{reason}");
+        assert!(reason.contains("docker-langserver"), "{reason}");
+        assert!(reason.contains("is unavailable"), "{reason}");
         assert!(
             reason.contains("dockerfile-language-server-nodejs"),
             "{reason}"

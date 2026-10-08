@@ -772,6 +772,11 @@ AFT sets `GIT_OPTIONAL_LOCKS=0` for every language server so Git status calls by
 | gopls | `.go` | `gopls` |
 | bash-language-server | `.sh .bash .zsh` | `bash-language-server` |
 | yaml-language-server | `.yaml .yml` | `yaml-language-server` |
+| Dockerfile Language Server | `.dockerfile` | `docker-language-server start --stdio` (preferred); `docker-langserver --stdio` fallback |
+
+Docker's `docker-language-server` is preferred when available and runs with `start --stdio`.
+The npm `docker-langserver` server remains a fallback; AFT's plugins continue to auto-install
+`dockerfile-language-server-nodejs` when `lsp.auto_install` is enabled.
 
 **TypeScript 7 and later** ship no `tsserver.js`, so `typescript-language-server` cannot
 serve them. When the nearest installed `node_modules/typescript/package.json` reports version

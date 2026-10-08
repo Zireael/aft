@@ -99,6 +99,15 @@ pub fn resolve_server_binary(
     } else {
         config.project_root.as_deref()
     };
+    if server.kind == ServerKind::Dockerfile && server.binary == "docker-langserver" {
+        if let Some(preferred) = resolve_lsp_binary(
+            "docker-language-server",
+            project_root,
+            &config.lsp_paths_extra,
+        ) {
+            return Some(preferred);
+        }
+    }
     resolve_lsp_binary(&server.binary, project_root, &config.lsp_paths_extra)
 }
 
@@ -277,8 +286,32 @@ pub struct ServerDef {
 }
 
 impl ServerDef {
+    /// Return executable names in preference order. Docker's upstream server
+    /// takes precedence over the older npm server, which remains the fallback.
+    pub fn binary_candidates(&self) -> Vec<String> {
+        if self.kind == ServerKind::Dockerfile && self.binary == "docker-langserver" {
+            vec!["docker-language-server".to_string(), self.binary.clone()]
+        } else {
+            vec![self.binary.clone()]
+        }
+    }
+
     /// The standalone Oxlint server uses stdio without the CLI's --lsp flag.
     pub fn spawn_args_for_binary(&self, binary: &Path) -> Vec<String> {
+        if self.kind == ServerKind::Dockerfile
+            && self.binary == "docker-langserver"
+            && matches!(
+                binary.file_name().and_then(|name| name.to_str()),
+                Some(
+                    "docker-language-server"
+                        | "docker-language-server.cmd"
+                        | "docker-language-server.exe"
+                        | "docker-language-server.bat"
+                )
+            )
+        {
+            return vec!["start".to_string(), "--stdio".to_string()];
+        }
         if self.kind == ServerKind::Oxlint
             && self.binary == "oxlint"
             && matches!(
@@ -2266,6 +2299,57 @@ mod tests {
         assert_eq!(
             resolved.as_deref(),
             Some(local_bin.join("pyright-langserver").as_path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dockerfile_server_prefers_docker_language_server_and_falls_back_on_path() {
+        const CHILD_ENV: &str = "AFT_DOCKER_SERVER_PATH_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let server = builtin_servers()
+                .into_iter()
+                .find(|server| server.kind == ServerKind::Dockerfile)
+                .unwrap();
+            let config = Config::default();
+            let preferred = resolve_server_binary(&server, None, &config).unwrap();
+            assert_eq!(
+                preferred.file_name().and_then(|name| name.to_str()),
+                Some("docker-language-server")
+            );
+            assert_eq!(
+                server.spawn_args_for_binary(&preferred),
+                ["start", "--stdio"]
+            );
+
+            std::fs::remove_file(&preferred).unwrap();
+            let fallback = resolve_server_binary(&server, None, &config).unwrap();
+            assert_eq!(
+                fallback.file_name().and_then(|name| name.to_str()),
+                Some("docker-langserver")
+            );
+            assert_eq!(server.spawn_args_for_binary(&fallback), ["--stdio"]);
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        touch_exe(&temp.path().join("docker-language-server"));
+        touch_exe(&temp.path().join("docker-langserver"));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lsp::registry::tests::dockerfile_server_prefers_docker_language_server_and_falls_back_on_path",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("PATH", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
