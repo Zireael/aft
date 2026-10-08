@@ -365,14 +365,12 @@ impl BgTaskRegistry {
         mut env: HashMap<String, String>,
         hard_kill: super::super::HardKill,
         storage_dir: PathBuf,
-        max_running: usize,
+        slot: super::super::TaskSlot,
         notify: bool,
         compressed: bool,
         root: Option<PathBuf>,
     ) -> Result<String, String> {
-        if self.running_count() >= max_running {
-            return Err("background bash task limit exceeded".into());
-        }
+        self.check_background_slot(slot, &session_id)?;
         let layout = match plan.prepared_task() {
             Some(p) => p.resolved_task(),
             None => allocate_task_layout(&storage_dir, &session_id).map_err(|e| e.to_string())?,
@@ -446,6 +444,8 @@ impl BgTaskRegistry {
         self.dual_write_task(&layout.paths, &metadata);
         self.insert_rehydrated_task(metadata, layout.paths, false)?;
         let task = self.task(&task_id).unwrap();
+        task.holds_background_slot
+            .store(slot.holds_slot(), Ordering::SeqCst);
         task.state
             .lock()
             .map_err(|_| "task lock poisoned")?

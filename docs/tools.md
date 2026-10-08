@@ -439,6 +439,19 @@ Foreground bash also starts through the same task flow. Short commands are polle
 output; commands that exceed the foreground wait window are automatically promoted to background
 and return a `taskId`.
 
+**Background task limit** — at most 8 background tasks (`max_background_bash_tasks`) run at once
+per project root, shared by all sessions in it. Local and remote (`runon`) tasks share the same
+slots. Only background tasks count: `background: true` and
+`pty: true` launches, and foreground commands once they are promoted. A background launch at the
+limit is refused with `background_task_limit_exceeded`; the message lists your own session's tasks
+holding slots (task id, age, the first 60 characters of the command, up to 8 rows), counts the slots
+held by other sessions in one line ("N more held by other sessions in this project", with no task ids
+or commands), and says to free a slot by stopping one of your own tasks with `bash_kill` or to wait
+for a task to finish. A foreground command always starts, even at the limit. If it then outlives
+its wait window it is still promoted (it is
+already running, so refusing it would lose its work) and counts from then on, so the count can
+briefly exceed the limit.
+
 **`bash_status`** — read-only snapshot of a background or PTY task's current state and output.
 Never waits. For PTY tasks, `outputMode` selects `screen` (vt100-rendered), `raw` (byte stream),
 or `both`.

@@ -641,7 +641,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().into(),
-                10,
+                crate::bash_background::TaskSlot::Background { max: 10 },
                 true,
                 false,
                 Some(dir.path().into()),

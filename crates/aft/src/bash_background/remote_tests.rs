@@ -87,7 +87,7 @@ fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
             HashMap::from([("BUILD_REMOTE_ENV_TEST".into(), "environment-proof".into())]),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
             dir.into(),
-            10,
+            crate::bash_background::TaskSlot::Background { max: 10 },
             true,
             false,
             Some(dir.into()),
@@ -107,6 +107,98 @@ async fn terminal(registry: &BgTaskRegistry, task: &str) -> BgTaskSnapshot {
     })
     .await
     .expect("fake executor must terminate")
+}
+
+#[tokio::test]
+async fn exec_remote_bash_background_slots_are_shared_with_local_tasks() {
+    use crate::bash_background::{HardKill, TaskSlot};
+
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let local = registry
+        .spawn_with_shell(
+            SpawnPlan::Unsandboxed,
+            "sleep 30 # local-slot-holder",
+            crate::bash_background::BashShell::Bash,
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            HardKill::After(Duration::from_secs(60)),
+            dir.path().into(),
+            1,
+            false,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let remote_spawn = |slot| {
+        let mut launch = launch(daemon.connection.clone());
+        launch.explicit_runon = true;
+        registry.spawn_remote(
+            launch,
+            SpawnPlan::Unsandboxed,
+            "printf remote-slot-proof",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            HardKill::After(Duration::from_secs(60)),
+            dir.path().into(),
+            slot,
+            false,
+            false,
+            Some(dir.path().into()),
+        )
+    };
+    // Remote background work uses the same project-local budget, whereas a
+    // remote foreground call is admitted even when local work fills it.
+    let refusal = remote_spawn(TaskSlot::Background { max: 1 }).unwrap_err();
+    assert!(refusal.contains(&local), "{refusal}");
+    assert!(refusal.contains("local-slot-holder"), "{refusal}");
+    let foreground = remote_spawn(TaskSlot::Foreground).unwrap();
+    registry.kill(&local, "session").unwrap();
+    registry
+        .check_background_slot(TaskSlot::Background { max: 1 }, "session")
+        .expect("a waiting remote foreground command holds no slot");
+    registry.promote(&foreground, "session").unwrap();
+    let refusal = registry
+        .check_background_slot(TaskSlot::Background { max: 1 }, "session")
+        .unwrap_err();
+    assert!(refusal.contains(&foreground), "{refusal}");
+    assert!(refusal.contains("remote-slot-proof"), "{refusal}");
+    // Wait for executor acceptance before cancellation, and leave the async
+    // test runtime free to serve the fake executor's cancel response.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if registry
+                .task(&foreground)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .metadata
+                .remote
+                .as_ref()
+                .unwrap()
+                .job_id
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fake executor must accept the foreground command");
+    let killing = registry.clone();
+    let kill_task = foreground.clone();
+    tokio::task::spawn_blocking(move || killing.kill(&kill_task, "session").unwrap())
+        .await
+        .unwrap();
+    let done = terminal(&registry, &foreground).await;
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
 }
 
 #[tokio::test]
@@ -597,7 +689,7 @@ async fn exec_remote_bash_discloses_only_names_aft_stripped() {
             env,
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
             dir.path().into(),
-            10,
+            crate::bash_background::TaskSlot::Background { max: 10 },
             true,
             false,
             Some(dir.path().into()),

@@ -30,6 +30,9 @@ use std::time::Duration;
 
 pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry, WatchdogPassCause};
 
+#[cfg(all(test, unix))]
+mod slot_limit_tests;
+
 /// A shell startup has a reply budget even before it has an executor worker.
 /// The short state lock fences process creation against a deadline refusal;
 /// no filesystem operation, process creation, or registry lock runs under it.
@@ -486,7 +489,38 @@ impl HardKill {
     }
 }
 
-/// Spawn a bash command in the background. Returns a task_id immediately.
+/// Whether a launch takes one of the project root's background-task slots
+/// (`max_background_bash_tasks`). A project root's registry is shared by every
+/// session working in that root, so the slots are too; another root has its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSlot {
+    /// An ordinary foreground command. It always starts, even when every
+    /// background slot is taken: the cap exists to stop runaway detached work,
+    /// not to block the command an agent is waiting on. It holds no slot while
+    /// its caller waits on it. If it outlives its wait window and is promoted
+    /// to a background task, it is still promoted (it is already running, and
+    /// killing or refusing it then would lose its work) and holds a slot from
+    /// then on, so the number of slot holders can briefly exceed the cap until
+    /// tasks finish.
+    Foreground,
+    /// A launch that runs in the background from the start (`background:
+    /// true`, or a PTY). Refused when `max` background tasks are already
+    /// running in this project root. Local and remote tasks share these slots.
+    Background { max: usize },
+}
+
+impl TaskSlot {
+    /// Whether a task launched this way holds a background slot from the start.
+    pub fn holds_slot(self) -> bool {
+        matches!(self, Self::Background { .. })
+    }
+}
+
+/// Spawn a bash command as a task. Returns a task_id immediately.
+///
+/// `require_background_flag` marks a background launch: it needs the
+/// background feature and takes a background slot. A foreground command
+/// (`false`, and not a PTY) always starts; see [`TaskSlot::Foreground`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     request_id: &str,
@@ -523,6 +557,11 @@ pub(crate) fn spawn(
     });
     let storage_dir = task_storage_dir(ctx);
     let max_running = ctx.config().max_background_bash_tasks;
+    let slot = if require_background_flag || pty {
+        TaskSlot::Background { max: max_running }
+    } else {
+        TaskSlot::Foreground
+    };
     let project_root = ctx
         .config()
         .project_root
@@ -682,7 +721,7 @@ pub(crate) fn spawn(
             env.clone(),
             hard_kill,
             storage_dir.clone(),
-            max_running,
+            slot,
             notify_on_completion,
             compressed,
             project_root.clone(),
@@ -696,6 +735,7 @@ pub(crate) fn spawn(
     let spawn_result = if let Some(result) = remote_result {
         result
     } else if pty {
+        // A PTY always runs in the background, so it always takes a slot.
         ctx.bash_background().spawn_pty_with_shell(
             spawn_plan,
             command,
@@ -714,7 +754,7 @@ pub(crate) fn spawn(
             pty_cols,
         )
     } else {
-        ctx.bash_background().spawn_with_shell(
+        ctx.bash_background().spawn_with_shell_in_slot(
             spawn_plan,
             command,
             shell,
@@ -724,7 +764,7 @@ pub(crate) fn spawn(
             env,
             hard_kill,
             storage_dir,
-            max_running,
+            slot,
             notify_on_completion,
             compressed,
             project_root,

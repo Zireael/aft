@@ -809,7 +809,14 @@ pub struct Config {
     pub experimental_bash_compress: bool,
     /// Enable experimental bash background execution (default: false).
     pub experimental_bash_background: bool,
-    /// Maximum number of background bash tasks allowed to run concurrently (default: 8).
+    /// Maximum number of background bash tasks allowed to run at once in one
+    /// project root, shared by all its sessions (default: 8). Only background
+    /// tasks count, whether local or remote: `background: true` and PTY launches, and foreground
+    /// commands once promoted to the background. A background launch at the
+    /// limit is refused with a list of the caller's own tasks holding slots
+    /// (other sessions' are only counted); a foreground command always starts,
+    /// and one promoted at the limit keeps
+    /// running, so the count can briefly exceed the limit.
     pub max_background_bash_tasks: usize,
     /// Emit reminders for long-running bash tasks (default: true).
     pub bash_long_running_reminder_enabled: bool,

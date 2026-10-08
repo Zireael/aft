@@ -287,6 +287,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "bash_background/registry.rs",
+        enclosing_item: "format_background_slot_refusal",
+        location_or_primitive: "SLOT_REFUSAL_MAX_ROWS / SLOT_REFUSAL_COMMAND_CHARS .take()",
+        reason: "a background-launch error previews at most eight of the caller's slot holders, counts omitted own holders and other sessions' holders, and shortens command labels with an ellipsis; this is actionable refusal context, not a paginated task-result list",
+    },
+    ExclusionEntry {
         file: "subc/health.rs",
         enclosing_item: "budget_health_metrics",
         location_or_primitive: "storage_retention map removal under HEALTH_METRICS_BUDGET_BYTES",

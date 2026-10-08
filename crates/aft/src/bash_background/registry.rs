@@ -665,6 +665,12 @@ pub(crate) struct BgTask {
     pub(crate) paths: TaskPaths,
     artifact_root: PathBuf,
     pub(crate) started: Instant,
+    /// Whether this task holds one of the project root's background slots
+    /// (`max_background_bash_tasks`): true for a background or PTY launch and
+    /// for a task reloaded after a restart, false for a foreground command
+    /// while its caller waits on it. Promotion sets it (see
+    /// [`super::TaskSlot::Foreground`]).
+    holds_background_slot: AtomicBool,
     /// Completion of the PTY reader thread, which owns an output-file handle
     /// independently of `PtyRuntime` while it drains the pseudoterminal. Piped
     /// and replayed tasks have no reader and start complete.
@@ -2567,6 +2573,8 @@ impl BgTaskRegistry {
         )
     }
 
+    /// Spawns a background launch: refused when `max_running` background
+    /// tasks already run in this registry. See [`Self::spawn_with_shell_in_slot`].
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_shell(
@@ -2577,10 +2585,47 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
+        env: HashMap<String, String>,
         hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
+        notify_on_completion: bool,
+        compressed: bool,
+        project_root: Option<PathBuf>,
+    ) -> Result<String, String> {
+        self.spawn_with_shell_in_slot(
+            spawn_plan,
+            command,
+            shell,
+            shell_path,
+            session_id,
+            workdir,
+            env,
+            hard_kill,
+            storage_dir,
+            super::TaskSlot::Background { max: max_running },
+            notify_on_completion,
+            compressed,
+            project_root,
+        )
+    }
+
+    /// Spawns a piped task. A [`super::TaskSlot::Foreground`] command always
+    /// starts; a background launch is refused when its slots are all taken.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_shell_in_slot(
+        &self,
+        spawn_plan: SpawnPlan,
+        command: &str,
+        shell: super::BashShell,
+        shell_path: PathBuf,
+        session_id: String,
+        workdir: PathBuf,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
+        hard_kill: super::HardKill,
+        storage_dir: PathBuf,
+        slot: super::TaskSlot,
         notify_on_completion: bool,
         compressed: bool,
         project_root: Option<PathBuf>,
@@ -2592,15 +2637,11 @@ impl BgTaskRegistry {
         #[cfg(not(target_os = "linux"))]
         let linux_scope = false;
 
-        let running = self.running_count();
-        if running >= max_running {
-            #[cfg(unix)]
+        if let Err(refusal) = self.check_background_slot(slot, &session_id) {
             if let Some(prepared) = spawn_plan.prepared_task() {
                 let _ = delete_resolved_task(&prepared.resolved_task());
             }
-            return Err(format!(
-                "background bash task limit exceeded: {running} running (max {max_running})"
-            ));
+            return Err(refusal);
         }
 
         let timeout_ms = Some(hard_kill.limit().as_millis() as u64);
@@ -2752,6 +2793,7 @@ impl BgTaskRegistry {
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
+            holds_background_slot: AtomicBool::new(slot.holds_slot()),
             hard_kill_renewable: hard_kill.renewable(),
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
@@ -2858,15 +2900,15 @@ impl BgTaskRegistry {
     ) -> Result<String, String> {
         self.start_watchdog();
 
-        let running = self.running_count();
-        if running >= max_running {
+        if let Err(refusal) = self.check_background_slot(
+            super::TaskSlot::Background { max: max_running },
+            &session_id,
+        ) {
             #[cfg(unix)]
             if let Some(prepared) = spawn_plan.prepared_task() {
                 let _ = delete_resolved_task(&prepared.resolved_task());
             }
-            return Err(format!(
-                "background bash task limit exceeded: {running} running (max {max_running})"
-            ));
+            return Err(refusal);
         }
 
         let timeout_ms = Some(hard_kill.limit().as_millis() as u64);
@@ -2987,6 +3029,8 @@ impl BgTaskRegistry {
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
             terminal_reader_done,
+            // A PTY always runs in the background.
+            holds_background_slot: AtomicBool::new(true),
             hard_kill_renewable: hard_kill.renewable(),
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
@@ -3069,6 +3113,8 @@ impl BgTaskRegistry {
         )
     }
 
+    /// Spawns a background launch: refused when `max_running` background
+    /// tasks already run in this registry. See [`Self::spawn_with_shell_in_slot`].
     #[cfg(windows)]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_shell(
@@ -3087,18 +3133,46 @@ impl BgTaskRegistry {
         compressed: bool,
         project_root: Option<PathBuf>,
     ) -> Result<String, String> {
+        self.spawn_with_shell_in_slot(
+            spawn_plan,
+            command,
+            shell,
+            shell_path,
+            session_id,
+            workdir,
+            env,
+            hard_kill,
+            storage_dir,
+            super::TaskSlot::Background { max: max_running },
+            notify_on_completion,
+            compressed,
+            project_root,
+        )
+    }
+
+    /// Spawns a piped task. A [`super::TaskSlot::Foreground`] command always
+    /// starts; a background launch is refused when its slots are all taken.
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_shell_in_slot(
+        &self,
+        spawn_plan: SpawnPlan,
+        command: &str,
+        shell: super::BashShell,
+        shell_path: PathBuf,
+        session_id: String,
+        workdir: PathBuf,
+        env: HashMap<String, String>,
+        hard_kill: super::HardKill,
+        storage_dir: PathBuf,
+        slot: super::TaskSlot,
+        notify_on_completion: bool,
+        compressed: bool,
+        project_root: Option<PathBuf>,
+    ) -> Result<String, String> {
         self.start_watchdog();
 
-        let running = self.running_count();
-        if running >= max_running {
-            #[cfg(unix)]
-            if let Some(prepared) = spawn_plan.prepared_task() {
-                let _ = delete_resolved_task(&prepared.resolved_task());
-            }
-            return Err(format!(
-                "background bash task limit exceeded: {running} running (max {max_running})"
-            ));
-        }
+        self.check_background_slot(slot, &session_id)?;
 
         let timeout_ms = Some(hard_kill.limit().as_millis() as u64);
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
@@ -3181,6 +3255,7 @@ impl BgTaskRegistry {
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
+            holds_background_slot: AtomicBool::new(slot.holds_slot()),
             hard_kill_renewable: hard_kill.renewable(),
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
@@ -5231,6 +5306,11 @@ impl BgTaskRegistry {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
+        // A promoted foreground command now runs in the background, so it
+        // holds a slot from here on, even when every slot was already taken:
+        // it is already running, and refusing or killing it would lose its
+        // work (see `TaskSlot::Foreground`).
+        task.holds_background_slot.store(true, Ordering::SeqCst);
         let terminal_after_promote = {
             let mut db = DeferredDbWrites::new(self, &task);
             let mut state = task
@@ -6202,6 +6282,10 @@ impl BgTaskRegistry {
             artifact_root: canonical_artifact_root(&paths),
             started,
             terminal_reader_done: Arc::new(AtomicBool::new(true)),
+            // A task reloaded after a restart has no caller waiting on it any
+            // more, so it runs as a background task and holds a slot. A remote
+            // launch, which registers through here too, sets its own.
+            holds_background_slot: AtomicBool::new(true),
             hard_kill_renewable: renewable,
             persisted_hard_kill_ms: AtomicU64::new(persisted_hard_kill_ms),
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
@@ -7735,12 +7819,70 @@ impl BgTaskRegistry {
             .count_u64("output_ring_bytes", 0)
     }
 
-    fn running_count(&self) -> usize {
-        self.inner
-            .tasks
-            .lock()
-            .map(|tasks| tasks.values().filter(|task| task.is_running()).count())
-            .unwrap_or(0)
+    /// Checks whether a launch may start: a foreground command always may; a
+    /// background launch may while fewer than `max` tasks hold background
+    /// slots in this registry (one project root, all sessions). The refusal
+    /// lists the caller's own slot holders and how to free one, so the agent
+    /// can act on it without another call. Its first line contains "limit
+    /// exceeded", which `bash_background::spawn` maps to the
+    /// `background_task_limit_exceeded` error code.
+    pub(crate) fn check_background_slot(
+        &self,
+        slot: super::TaskSlot,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let super::TaskSlot::Background { max } = slot else {
+            return Ok(());
+        };
+        let mut holders = self.background_slot_holders(session_id);
+        if holders.own.len() + holders.other_sessions < max {
+            return Ok(());
+        }
+        // Oldest first, since rows beyond the listing limit are only counted.
+        holders
+            .own
+            .sort_by_key(|holder| std::cmp::Reverse(holder.age));
+        Err(format_background_slot_refusal(
+            &holders.own,
+            holders.other_sessions,
+            max,
+        ))
+    }
+
+    /// Running tasks that hold a background slot, split into the caller's own
+    /// (listed in a refusal) and a count of other sessions' (never described:
+    /// a session, possibly an untrusted bind, must not observe another
+    /// session's commands, and cannot kill its tasks anyway). A foreground
+    /// command its caller is still waiting on holds no slot.
+    fn background_slot_holders(&self, session_id: &str) -> SlotHolders {
+        let mut holders = SlotHolders {
+            own: Vec::new(),
+            other_sessions: 0,
+        };
+        let Ok(tasks) = self.inner.tasks.lock() else {
+            return holders;
+        };
+        for task in tasks.values() {
+            if !task.holds_background_slot.load(Ordering::SeqCst) {
+                continue;
+            }
+            let Ok(state) = task.state.lock() else {
+                continue;
+            };
+            if !BgTask::state_is_running(&state) {
+                continue;
+            }
+            if task.session_id == session_id {
+                holders.own.push(BackgroundSlotHolder {
+                    task_id: task.task_id.clone(),
+                    command: state.metadata.command.clone(),
+                    age: task.started.elapsed(),
+                });
+            } else {
+                holders.other_sessions += 1;
+            }
+        }
+        holders
     }
 
     fn start_watchdog(&self) {
@@ -7759,6 +7901,81 @@ impl BgTaskRegistry {
     pub fn task_exit_path(&self, task_id: &str, session_id: &str) -> Option<PathBuf> {
         self.task_for_session(task_id, session_id)
             .map(|task| task.paths.exit.clone())
+    }
+}
+
+/// A caller's running task holding one of a project root's background slots,
+/// as listed in a refusal of that caller's background launch.
+pub(super) struct BackgroundSlotHolder {
+    pub(super) task_id: String,
+    pub(super) command: String,
+    pub(super) age: Duration,
+}
+
+/// The background slots of a project root as one caller may see them.
+struct SlotHolders {
+    own: Vec<BackgroundSlotHolder>,
+    /// Slots held by other sessions' tasks: only counted, never described.
+    other_sessions: usize,
+}
+
+/// Most of the caller's own slot holders a refusal lists; the rest are counted.
+const SLOT_REFUSAL_MAX_ROWS: usize = 8;
+/// Characters of each holder's command a refusal shows.
+const SLOT_REFUSAL_COMMAND_CHARS: usize = 60;
+
+/// The refusal for a background launch when every slot is taken. `own` holds
+/// the caller's own slot holders, oldest first; other sessions' tasks appear
+/// only as a count, with no task id and no command text.
+pub(super) fn format_background_slot_refusal(
+    own: &[BackgroundSlotHolder],
+    other_sessions: usize,
+    max: usize,
+) -> String {
+    let mut message = format!(
+        "background bash task limit exceeded: {} running (max {max}) in this project. Tasks holding the slots:",
+        own.len() + other_sessions
+    );
+    for holder in own.iter().take(SLOT_REFUSAL_MAX_ROWS) {
+        let flat: String = holder
+            .command
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let mut command: String = flat.chars().take(SLOT_REFUSAL_COMMAND_CHARS).collect();
+        if flat.chars().count() > SLOT_REFUSAL_COMMAND_CHARS {
+            command.push('…');
+        }
+        message.push_str(&format!(
+            "\n  {}  running {}  {command}",
+            holder.task_id,
+            format_slot_age(holder.age)
+        ));
+    }
+    if own.len() > SLOT_REFUSAL_MAX_ROWS {
+        message.push_str(&format!(
+            "\n  … and {} more of yours",
+            own.len() - SLOT_REFUSAL_MAX_ROWS
+        ));
+    }
+    if other_sessions > 0 {
+        let more = if own.is_empty() { "" } else { " more" };
+        message.push_str(&format!(
+            "\n  {other_sessions}{more} held by other sessions in this project"
+        ));
+    }
+    message.push_str(
+        "\nTo free a slot, stop one of your own tasks with bash_kill (task ids above), or wait for a task to finish, then retry. A command run without background: true still runs now.",
+    );
+    message
+}
+
+fn format_slot_age(age: Duration) -> String {
+    let secs = age.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
     }
 }
 
