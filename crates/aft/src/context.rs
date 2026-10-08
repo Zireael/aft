@@ -41,6 +41,11 @@ use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThread
 #[path = "gitignore_state.rs"]
 mod gitignore_state;
 pub(crate) use gitignore_state::IgnoreRuleChange;
+// The shared ignore-rule definition every project walker applies; see
+// `apply_project_ignore_rules`.
+pub(crate) use gitignore_state::apply_project_ignore_rules;
+#[cfg(test)]
+pub(crate) use gitignore_state::ignore_rules_fixture;
 
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;

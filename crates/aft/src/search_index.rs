@@ -5715,31 +5715,25 @@ pub(crate) fn project_walk_builder(search_root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
-    builder
-        .same_file_system(true)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                return !matches!(
-                    name.as_ref(),
-                    "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | ".git"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                );
-            }
-            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
-        });
+    builder.same_file_system(true).hidden(false);
+    crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(|entry| {
+        let name = entry.file_name().to_string_lossy();
+        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            return !matches!(
+                name.as_ref(),
+                "node_modules"
+                    | "target"
+                    | "venv"
+                    | ".venv"
+                    | ".git"
+                    | "__pycache__"
+                    | ".tox"
+                    | "dist"
+                    | "build"
+            );
+        }
+        !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+    });
     builder
 }
 
@@ -7227,31 +7221,27 @@ fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
     let mut builder = WalkBuilder::new(root);
     // Nested ignore discovery is a background recursive walk; a disappearing
     // mount must not turn ReadDir::drop's ENXIO into a daemon abort.
-    builder
-        .same_file_system(true)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                return !matches!(
-                    name.as_ref(),
-                    ".git"
-                        | "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                );
-            }
-            true
-        });
+    builder.same_file_system(true).hidden(false);
+    // Same rules as the project walk, so rule files inside ignored trees
+    // (which cannot change what is indexed) are not discovered.
+    crate::context::apply_project_ignore_rules(&mut builder, root).filter_entry(|entry| {
+        let name = entry.file_name().to_string_lossy();
+        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            return !matches!(
+                name.as_ref(),
+                ".git"
+                    | "node_modules"
+                    | "target"
+                    | "venv"
+                    | ".venv"
+                    | "__pycache__"
+                    | ".tox"
+                    | "dist"
+                    | "build"
+            );
+        }
+        true
+    });
 
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         if !entry
@@ -7272,13 +7262,8 @@ fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
 pub(crate) fn count_ignore_rule_discovery_dirs(root: &Path) -> usize {
     let mut dirs = 0usize;
     let mut builder = WalkBuilder::new(root);
-    builder
-        .same_file_system(true)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore");
+    builder.same_file_system(true).hidden(false);
+    crate::context::apply_project_ignore_rules(&mut builder, root);
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         if entry.file_type().map_or(false, |ft| ft.is_dir()) {
             dirs += 1;
@@ -11539,6 +11524,140 @@ mod interactive_artifact_read_budget_tests {
         assert!(
             elapsed < Duration::from_millis(60),
             "contended read exceeded its 20ms budget: {elapsed:?}"
+        );
+    }
+}
+
+/// The search index, its glob, and the project walker it shares with the
+/// semantic collector and views membership apply `.gitignore` files the same
+/// way in a plain folder as in a git repository.
+#[cfg(test)]
+mod project_ignore_rule_tests {
+    use super::*;
+    use crate::context::ignore_rules_fixture as fixture;
+    use std::collections::BTreeSet;
+
+    fn fixture_root(git: bool) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fixture::write(&root, git);
+        (dir, root)
+    }
+
+    fn indexed_needle_files(root: &Path) -> BTreeSet<String> {
+        let index = SearchIndex::build(root);
+        let result = index.grep(fixture::NEEDLE, true, &[], &[], root, 1000);
+        let files = result
+            .matches
+            .iter()
+            .map(|found| found.file.clone())
+            .collect::<Vec<_>>();
+        fixture::relative_set(root, &files)
+    }
+
+    fn indexed_glob_files(root: &Path) -> BTreeSet<String> {
+        let index = SearchIndex::build(root);
+        fixture::relative_set(root, &index.glob("**/*", root))
+    }
+
+    fn walked_files(root: &Path) -> BTreeSet<String> {
+        fixture::relative_set(root, &walk_project_files(root, &PathFilters::default()))
+    }
+
+    #[test]
+    fn non_git_root_index_excludes_top_level_and_nested_gitignored_paths() {
+        let (_dir, root) = fixture_root(false);
+
+        let grepped = indexed_needle_files(&root);
+        fixture::assert_honours_ignore_rules(&grepped, "trigram grep");
+        assert_eq!(
+            grepped.len(),
+            fixture::VISIBLE_SOURCES.len(),
+            "grep must find the needle only in the visible sources: {grepped:?}"
+        );
+        fixture::assert_honours_ignore_rules(&indexed_glob_files(&root), "trigram glob");
+        fixture::assert_honours_ignore_rules(&walked_files(&root), "project walk");
+    }
+
+    #[test]
+    fn non_git_and_git_roots_index_the_identical_file_set() {
+        let (_plain_dir, plain) = fixture_root(false);
+        let (_git_dir, git) = fixture_root(true);
+
+        assert_eq!(walked_files(&plain), walked_files(&git));
+        assert_eq!(indexed_needle_files(&plain), indexed_needle_files(&git));
+        assert_eq!(indexed_glob_files(&plain), indexed_glob_files(&git));
+    }
+
+    /// The project walker as it was built before every walker shared
+    /// `apply_project_ignore_rules`, reproduced independently with the
+    /// crate's default `require_git`, so the comparison below is not two
+    /// calls through the same implementation.
+    fn pre_change_project_walk(root: &Path) -> BTreeSet<String> {
+        let mut builder = WalkBuilder::new(root);
+        builder
+            .same_file_system(true)
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .add_custom_ignore_filename(".aftignore")
+            .filter_entry(|entry| {
+                let name = entry.file_name().to_string_lossy();
+                if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                    return !matches!(
+                        name.as_ref(),
+                        "node_modules"
+                            | "target"
+                            | "venv"
+                            | ".venv"
+                            | ".git"
+                            | "__pycache__"
+                            | ".tox"
+                            | "dist"
+                            | "build"
+                    );
+                }
+                !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+            });
+        let files = builder
+            .build()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .map(|entry| entry.into_path())
+            .collect::<Vec<_>>();
+        fixture::relative_set(root, &files)
+    }
+
+    #[test]
+    fn git_root_index_file_set_is_unchanged_from_the_pre_change_walker() {
+        let (_dir, root) = fixture_root(true);
+        // A nested repository starts its own rule scope in git: the outer
+        // `*.log` rule does not reach inside it. A walker that simply turned
+        // `require_git` off everywhere would drop this file.
+        fs::create_dir_all(root.join("vendor/nested_repo/.git")).unwrap();
+        fs::write(root.join("vendor/nested_repo/kept.log"), fixture::NEEDLE).unwrap();
+        fs::write(root.join("vendor/nested_repo/.gitignore"), "skipped.rs\n").unwrap();
+        fs::write(root.join("vendor/nested_repo/skipped.rs"), fixture::NEEDLE).unwrap();
+        fs::create_dir_all(root.join(".git/info")).unwrap();
+        fs::write(root.join(".git/info/exclude"), "excluded_by_info.rs\n").unwrap();
+        fs::write(root.join("excluded_by_info.rs"), fixture::NEEDLE).unwrap();
+
+        let before = pre_change_project_walk(&root);
+        let after = walked_files(&root);
+        assert_eq!(after, before, "git roots must walk exactly as before");
+        assert!(after.contains("vendor/nested_repo/kept.log"), "{after:?}");
+        assert!(
+            !after.contains("vendor/nested_repo/skipped.rs"),
+            "{after:?}"
+        );
+        assert!(!after.contains("excluded_by_info.rs"), "{after:?}");
+        fixture::assert_honours_ignore_rules(&after, "git project walk");
+
+        assert_eq!(
+            indexed_glob_files(&root),
+            before,
+            "the index must hold the pre-change file set"
         );
     }
 }

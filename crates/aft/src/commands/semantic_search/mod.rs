@@ -6355,13 +6355,9 @@ fn collect_degraded_grep_files(
     // abort the daemon if a disappearing child mount reports ENXIO.
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(project_root).ok();
-    let walker = ignore::WalkBuilder::new(project_root)
-        .same_file_system(true)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
+    let mut builder = ignore::WalkBuilder::new(project_root);
+    builder.same_file_system(true).hidden(false);
+    let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
         .filter_entry({
             let skipped_foreign_mounts = Arc::clone(&skipped_foreign_mounts);
             move |entry| {

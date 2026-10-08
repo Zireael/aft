@@ -925,7 +925,9 @@ For best results in very large trees, point AFT at a specific project subdirecto
 Every AFT walk — trigram index, semantic index, call graph, and `aft_inspect` —
 honors `.gitignore` (including `.git/info/exclude` and nested `.gitignore`
 files) and skips common build directories (`node_modules`, `target`, `dist`,
-`build`, `.venv`, and similar).
+`build`, `.venv`, and similar). In a folder that is not a git repository, AFT
+still applies `.gitignore` files and your global git excludes file
+(`core.excludesFile`); `.git/info/exclude` only exists inside a repository.
 
 AFT also honors an optional **`.aftignore`** file: the same syntax as
 `.gitignore`, hierarchical, and working in non-git projects, layered on top of

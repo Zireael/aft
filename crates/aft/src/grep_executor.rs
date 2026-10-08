@@ -735,13 +735,8 @@ fn fallback_target_walk_builder(
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(search_root).ok();
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
-    builder
-        .same_file_system(true)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
+    builder.same_file_system(true).hidden(false);
+    crate::context::apply_project_ignore_rules(&mut builder, search_root)
         .parents(true)
         .filter_entry(move |entry| {
             if entry.depth() > 0 && entry.file_type().map_or(false, |ft| ft.is_dir()) {
@@ -775,9 +770,10 @@ fn fallback_target_walk_builder(
             !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
         });
     if ignored_target {
-        // Like outline, an explicitly ignored target also honors Git rules in
-        // a standalone (non-Git) directory. The crate never filters depth zero,
-        // but still applies its own precedence and pruning to every descendant.
+        // Like outline, an explicitly ignored target also honors Git rules
+        // without stopping at a nested repository's boundary, even inside a
+        // Git work tree. The crate never filters depth zero, but still applies
+        // its own precedence and pruning to every descendant.
         builder.require_git(false);
     }
     builder
@@ -2083,22 +2079,40 @@ mod tests {
         assert!(actual.contains(&root.join("src/main.rs")));
         assert!(!actual.contains(&root.join("vendor/generated.rs")));
         assert!(!actual.contains(&root.join("src/private.rs")));
-        // Ordinary walks must also retain the crate's pre-existing behavior
-        // outside a Git repository, instead of implicitly enabling Git rules.
+        // Outside a Git repository the same .gitignore rules apply, so the
+        // walk exposes exactly the file set the repository walk did (#403).
+        let in_repository = actual;
         std::fs::remove_dir(root.join(".git")).unwrap();
-        let expected = original
+        let mut actual = fallback_project_walk_builder(root, Arc::new(AtomicUsize::new(0)))
             .build()
             .map(|entry| entry.unwrap().into_path())
             .collect::<Vec<_>>();
-        let actual = fallback_project_walk_builder(root, Arc::new(AtomicUsize::new(0)))
-            .build()
-            .map(|entry| entry.unwrap().into_path())
-            .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
-        assert!(actual.contains(&root.join("vendor/generated.rs")));
+        actual.sort();
+        let mut without_git_dir = in_repository;
+        without_git_dir.sort();
+        assert_eq!(actual, without_git_dir);
+        assert!(!actual.contains(&root.join("vendor/generated.rs")));
         assert!(!actual.contains(&root.join("src/private.rs")));
     }
 
+    fn fallback_walk_set(root: &Path) -> std::collections::BTreeSet<String> {
+        let outcome = bounded_fallback_walk_files(root, root, &PathFilters::default());
+        assert!(!outcome.walk_truncated, "fixture walk must not truncate");
+        crate::context::ignore_rules_fixture::relative_set(root, &outcome.files)
+    }
+
+    #[test]
+    fn fallback_walk_honours_gitignore_in_non_git_root_like_git_root() {
+        use crate::context::ignore_rules_fixture as fixture;
+        let plain_dir = tempfile::tempdir().unwrap();
+        let git_dir = tempfile::tempdir().unwrap();
+        fixture::write(plain_dir.path(), false);
+        fixture::write(git_dir.path(), true);
+
+        let plain = fallback_walk_set(plain_dir.path());
+        fixture::assert_honours_ignore_rules(&plain, "non-git grep/glob fallback walk");
+        assert_eq!(plain, fallback_walk_set(git_dir.path()));
+    }
     #[test]
     fn target_walk_counts_custom_ignores_and_preserves_rule_precedence() {
         let dir = tempfile::tempdir().unwrap();

@@ -15965,6 +15965,24 @@ mod tests {
     }
 
     #[test]
+    fn semantic_collector_honours_gitignore_in_non_git_root_like_git_root() {
+        use crate::context::ignore_rules_fixture as fixture;
+        let plain = tempfile::tempdir().unwrap();
+        let git = tempfile::tempdir().unwrap();
+        fixture::write(plain.path(), false);
+        fixture::write(git.path(), true);
+        let collected = |root: &std::path::Path| {
+            let files = super::walk_semantic_project_files_bounded(root, 1000)
+                .expect("fixture is within the semantic file cap");
+            fixture::relative_set(root, &files)
+        };
+
+        let plain_files = collected(plain.path());
+        fixture::assert_honours_ignore_rules(&plain_files, "non-git semantic collector");
+        assert_eq!(plain_files, collected(git.path()));
+    }
+
+    #[test]
     fn configure_missing_tools_warns_for_explicit_oxfmt_formatter() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = Config {

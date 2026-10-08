@@ -683,6 +683,24 @@ def runtime_evidence_tree(tree: Path) -> Iterator[Path]:
 # a projection of this repository and so has the same relative layout.
 BENCH_IGNORE_RELATIVE = "benchmarks/aft-search/.aftignore"
 
+# First line of the copy's root .aftignore. The evidence copy has no .git, and
+# AFT applies .gitignore files (and the machine's global git excludes file) in
+# folders that are not git repositories too. The benchmark's candidate pool is
+# the tracked tree, including files that were force-added despite matching a
+# .gitignore (plans and reports under .alfonso/, benchmark results), so the root
+# .aftignore re-includes every entry before its own exclusions. An .aftignore
+# outranks .gitignore and the global excludes file, later lines in the same
+# file still win, and the deeper benchmarks/aft-search/.aftignore is consulted
+# first, so every exclusion the benchmark writes still applies.
+#
+# The pattern re-includes only names that do not start with a dot. A
+# re-included entry also bypasses the hidden-file filter, so `!*` would add
+# the hidden directories (.gsd/, .github/, .alfonso/, ...) to walks that skip
+# hidden files, such as the call graph's. Hidden names fall through to the
+# usual rules, and no .gitignore in the pinned tree names a hidden entry
+# itself, so both kinds of walk see exactly the pool they saw before.
+EVIDENCE_POOL_WHITELIST = b"# Pin the pool to the tracked tree; see run_real_query.py.\n![!.]*\n"
+
 
 def _relative_pattern_summary(summary: Any, project_root: Path) -> Any:
     """Rewrite the engine's absolute definition paths relative to the tree.
@@ -736,13 +754,16 @@ def copy_evidence_root_ignore(root: Path) -> Path:
     fixtures' queries; see `evidence-root.aftignore` for why it is excluded.
     The pinned tree has no root `.aftignore` today. If a later pin adds one,
     its entries are kept and this list is appended, so the tree's own
-    exclusions still apply.
+    exclusions still apply. `EVIDENCE_POOL_WHITELIST` goes first so that no
+    `.gitignore` rule removes a tracked file from the pool.
     """
     destination = root / ".aftignore"
     existing = destination.read_bytes() if destination.is_file() else b""
     if existing and not existing.endswith(b"\n"):
         existing += b"\n"
-    destination.write_bytes(existing + EVIDENCE_ROOT_IGNORE_SOURCE.read_bytes())
+    destination.write_bytes(
+        EVIDENCE_POOL_WHITELIST + existing + EVIDENCE_ROOT_IGNORE_SOURCE.read_bytes()
+    )
     return destination
 
 

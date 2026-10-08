@@ -6731,10 +6731,8 @@ pub fn walk_applicable_area(
     for root in &walk_roots[1..] {
         builder.add(root);
     }
-    let walker = builder
-        .same_file_system(true)
-        .standard_filters(true)
-        .add_custom_ignore_filename(".aftignore")
+    builder.same_file_system(true).standard_filters(true);
+    let walker = crate::context::apply_project_ignore_rules(&mut builder, &walk_roots[0])
         .filter_entry(|entry| {
             !crate::lsp::roots::skip_in_server_walk(
                 entry.file_name().to_string_lossy().as_ref(),

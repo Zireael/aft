@@ -1081,13 +1081,9 @@ fn collect_ts_js_files(root: &Path, out: &mut Vec<PathBuf>, source_path: &Path, 
     use ignore::WalkBuilder;
 
     // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-    let walker = WalkBuilder::new(root)
-        .same_file_system(true)
-        .hidden(false) // include .storybook/, .config/, etc. (tracked consumers)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
+    let mut builder = WalkBuilder::new(root);
+    builder.same_file_system(true).hidden(false); // include .storybook/, .config/, etc. (tracked consumers)
+    let walker = crate::context::apply_project_ignore_rules(&mut builder, root)
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 return !matches!(

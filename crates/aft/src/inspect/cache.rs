@@ -2181,13 +2181,9 @@ fn collect_resolver_config_dependency_files(project_root: &Path) -> BTreeSet<Pat
 
 fn walk_resolver_config_files(project_root: &Path) -> BTreeSet<PathBuf> {
     // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-    let walker = ignore::WalkBuilder::new(project_root)
-        .same_file_system(true)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
+    let mut builder = ignore::WalkBuilder::new(project_root);
+    builder.same_file_system(true).hidden(true);
+    let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             if entry

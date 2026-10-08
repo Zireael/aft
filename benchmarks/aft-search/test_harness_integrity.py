@@ -32,6 +32,7 @@ from run import (
     strip_verbatim_prefix,
 )
 from run_real_query import (
+    EVIDENCE_POOL_WHITELIST,
     PLATFORM_UNSUPPORTED_EXIT,
     UnsupportedPlatform,
     assert_reference_platform,
@@ -270,7 +271,10 @@ class AnswerKeyExclusionTests(unittest.TestCase):
                 self.assertTrue(copied.is_file())
                 self.assertEqual(copied.read_bytes(), (HERE / ".aftignore").read_bytes())
                 root_ignore = root / ".aftignore"
-                self.assertEqual(root_ignore.read_bytes(), (HERE / "evidence-root.aftignore").read_bytes())
+                self.assertEqual(
+                    root_ignore.read_bytes(),
+                    EVIDENCE_POOL_WHITELIST + (HERE / "evidence-root.aftignore").read_bytes(),
+                )
             self.assertEqual(evidence_tree_sha256(tree), pinned_digest)
             self.assertFalse((tree / ".aftignore").exists())
 
@@ -289,7 +293,10 @@ class AnswerKeyExclusionTests(unittest.TestCase):
             (tree / ".aftignore").write_text("vendored/", encoding="utf-8")
             with runtime_evidence_tree(tree) as root:
                 merged = (root / ".aftignore").read_bytes()
-            self.assertEqual(merged, b"vendored/\n" + (HERE / "evidence-root.aftignore").read_bytes())
+            self.assertEqual(
+                merged,
+                EVIDENCE_POOL_WHITELIST + b"vendored/\n" + (HERE / "evidence-root.aftignore").read_bytes(),
+            )
 
 
 if __name__ == "__main__":

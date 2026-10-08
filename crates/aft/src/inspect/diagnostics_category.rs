@@ -563,10 +563,9 @@ fn scoped_coverage_candidates(
         }
 
         // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-        let walker = ignore::WalkBuilder::new(&root)
-            .same_file_system(true)
-            .standard_filters(true)
-            .add_custom_ignore_filename(".aftignore")
+        let mut builder = ignore::WalkBuilder::new(&root);
+        builder.same_file_system(true).standard_filters(true);
+        let walker = crate::context::apply_project_ignore_rules(&mut builder, &root)
             .filter_entry(|entry| {
                 !crate::lsp::roots::skip_in_server_walk(
                     entry.file_name().to_string_lossy().as_ref(),
@@ -1735,5 +1734,49 @@ mod environmental_render_tests {
             item["message"].as_str(),
             Some("temporary analyzer result (analyzer warming)")
         );
+    }
+}
+
+/// The tier-2 diagnostics scan enumerates its own candidate files; they must
+/// follow the same ignore rules as the rest of AFT in a plain folder.
+#[cfg(test)]
+mod ignore_rule_candidate_tests {
+    use std::path::Path;
+    use std::sync::{Arc, RwLock};
+
+    use super::scoped_coverage_candidates;
+    use crate::config::Config;
+    use crate::context::ignore_rules_fixture as fixture;
+    use crate::inspect::job::{InspectSnapshot, JobScope};
+    use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
+    use crate::parser::SymbolCache;
+
+    fn candidates(root: &Path) -> std::collections::BTreeSet<String> {
+        let root = crate::inspect::job::canonicalize_normalized(root);
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            root.join(".aft-inspect"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        let files = scoped_coverage_candidates(
+            &snapshot,
+            &JobScope::for_project(root.clone()),
+            &snapshot.config,
+            &mut TsconfigMembershipCache::new(),
+        );
+        fixture::relative_set(&root, &files)
+    }
+
+    #[test]
+    fn diagnostics_candidates_honour_gitignore_in_non_git_root_like_git_root() {
+        let plain = tempfile::tempdir().unwrap();
+        let git = tempfile::tempdir().unwrap();
+        fixture::write(plain.path(), false);
+        fixture::write(git.path(), true);
+
+        let plain_files = candidates(plain.path());
+        fixture::assert_honours_ignore_rules(&plain_files, "non-git diagnostics candidates");
+        assert_eq!(plain_files, candidates(git.path()));
     }
 }

@@ -9006,6 +9006,28 @@ export function bannerUnused() {}
         ]);
     }
 
+    /// Every inspect scan pass starts from `scope_files`, so a gitignored path
+    /// it lists would be scanned by every tier-1 and tier-2 category.
+    #[test]
+    fn inspect_scope_files_honour_gitignore_in_non_git_root_like_git_root() {
+        use crate::context::ignore_rules_fixture as fixture;
+        let plain = tempfile::tempdir().unwrap();
+        let git = tempfile::tempdir().unwrap();
+        fixture::write(plain.path(), false);
+        fixture::write(git.path(), true);
+        let scanned = |root: &Path| {
+            let root = root.to_path_buf();
+            fixture::relative_set(
+                &root,
+                &scope_files(&root, &JobScope::for_project(root.clone())),
+            )
+        };
+
+        let plain_files = scanned(plain.path());
+        fixture::assert_honours_ignore_rules(&plain_files, "non-git inspect scope");
+        assert_eq!(plain_files, scanned(git.path()));
+    }
+
     /// Facts missing at rollup time (files scanned before the call graph was
     /// ready) are filled by scanning those files with the rollup's graph, so a
     /// pass completes instead of failing until some later pass.

@@ -4,6 +4,52 @@ use std::sync::Arc;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
+/// Apply the ignore rules every AFT project traversal honours to `builder`.
+///
+/// This is the one definition the project walkers share (search index build
+/// and refresh, semantic collection, grep/glob fallback, call graph, inspect
+/// scans, views membership, LSP applicability and ignore-file discovery), so
+/// a folder is indexed the same way whether or not it is a git repository:
+///
+/// - `.gitignore` files at the walk root, below it, and in its ancestors;
+/// - `.aftignore` files, layered on top with higher precedence;
+/// - Git's global excludes file (`core.excludesFile`);
+/// - `.git/info/exclude`, which only exists inside a repository.
+///
+/// The `ignore` crate applies the git-family sources only inside a repository
+/// unless `require_git` is off. Inside a git or jj work tree the crate default
+/// is kept, so git roots walk exactly as they always have (including where a
+/// nested repository starts its own rule scope). In a folder that is not a
+/// repository it is switched off so `.gitignore` files and the global excludes
+/// file still apply, matching the shared matcher that filters watcher events
+/// ([`IgnoreInputSnapshot::build_matcher`]), which reads both regardless of
+/// git. `.git/info/exclude` has nothing to contribute there.
+///
+/// Call it after `standard_filters`, which would otherwise reset these flags.
+pub(crate) fn apply_project_ignore_rules<'a>(
+    builder: &'a mut ignore::WalkBuilder,
+    walk_root: &Path,
+) -> &'a mut ignore::WalkBuilder {
+    builder
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .add_custom_ignore_filename(".aftignore")
+        .require_git(is_inside_vcs_work_tree(walk_root))
+}
+
+/// Whether `path` or one of its ancestors holds `.git` (a directory, or the
+/// file a linked worktree or submodule uses) or `.jj`. This is the same test
+/// the `ignore` crate uses to decide that git rules apply, run on the same
+/// canonical ancestors it inspects, so keeping `require_git` on exactly when
+/// this is true leaves the crate's own decision unchanged for git roots.
+fn is_inside_vcs_work_tree(path: &Path) -> bool {
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    absolute
+        .ancestors()
+        .any(|dir| dir.join(".git").exists() || dir.join(".jj").exists())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IgnoreInput {
     path: PathBuf,
@@ -434,6 +480,87 @@ fn matcher_ignores(matcher: Option<&Gitignore>, path: &Path) -> bool {
                 .matched_path_or_any_parents(path, path.is_dir())
                 .is_ignore()
     })
+}
+
+/// A project tree whose `.gitignore` files hide part of it, written either as
+/// a plain folder or as a git work tree, so each project walker can be checked
+/// for the same file set in both.
+#[cfg(test)]
+pub(crate) mod ignore_rules_fixture {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// Text every fixture file carries, so grep can prove which files the
+    /// index holds.
+    pub(crate) const NEEDLE: &str = "ignore_rules_needle";
+
+    /// Source files no ignore rule touches.
+    pub(crate) const VISIBLE_SOURCES: &[&str] =
+        &["src/main.rs", "src/nested/keep.rs", "vendor/other.rs"];
+
+    /// Files hidden by the top-level `.gitignore` (`vendor/deps/`, `*.log`)
+    /// or by the nested `src/nested/.gitignore` (`generated/`).
+    pub(crate) const IGNORED: &[&str] = &[
+        "vendor/deps/lib.rs",
+        "vendor/deps/inner/deep.rs",
+        "trace.log",
+        "src/nested/generated/out.rs",
+    ];
+
+    /// Write the fixture under `root`. With `git`, `root` also gets a `.git`
+    /// directory, which is what makes the `ignore` crate treat it as a
+    /// repository.
+    pub(crate) fn write(root: &Path, git: bool) {
+        let source = format!("fn marker() {{ {NEEDLE}(); }}\n");
+        let mut files = vec![
+            (".gitignore", "vendor/deps/\n*.log\n".to_string()),
+            ("src/nested/.gitignore", "generated/\n".to_string()),
+        ];
+        for relative in VISIBLE_SOURCES.iter().chain(IGNORED) {
+            files.push((relative, source.clone()));
+        }
+        for (relative, content) in files {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        if git {
+            std::fs::create_dir_all(root.join(".git")).unwrap();
+        }
+    }
+
+    /// Root-relative, `/`-separated paths, for comparing walks of the plain
+    /// and the git copy of the fixture.
+    pub(crate) fn relative_set<'a>(
+        root: &Path,
+        paths: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> BTreeSet<String> {
+        paths
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap_or_else(|_| panic!("{} is outside {}", path.display(), root.display()))
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    /// Assert a walk's file set holds every visible source and no ignored file.
+    pub(crate) fn assert_honours_ignore_rules(walked: &BTreeSet<String>, label: &str) {
+        for ignored in IGNORED {
+            assert!(
+                !walked.contains(*ignored),
+                "{label}: {ignored} is excluded by a .gitignore but was walked: {walked:?}"
+            );
+        }
+        for visible in VISIBLE_SOURCES {
+            assert!(
+                walked.contains(*visible),
+                "{label}: {visible} is not ignored but was not walked: {walked:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

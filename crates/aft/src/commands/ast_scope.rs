@@ -241,35 +241,29 @@ fn walk_root(
 
     let mut builder = WalkBuilder::new(&root.path);
     // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-    builder
-        .same_file_system(true)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
-        .filter_entry(|entry| {
-            if entry.depth() == 0 {
-                return true;
-            }
+    builder.same_file_system(true).hidden(true);
+    crate::context::apply_project_ignore_rules(&mut builder, &root.path).filter_entry(|entry| {
+        if entry.depth() == 0 {
+            return true;
+        }
 
-            let name = entry.file_name().to_string_lossy();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                return !matches!(
-                    name.as_ref(),
-                    "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | ".git"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                );
-            }
-            true
-        });
+        let name = entry.file_name().to_string_lossy();
+        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            return !matches!(
+                name.as_ref(),
+                "node_modules"
+                    | "target"
+                    | "venv"
+                    | ".venv"
+                    | ".git"
+                    | "__pycache__"
+                    | ".tox"
+                    | "dist"
+                    | "build"
+            );
+        }
+        true
+    });
 
     if let Some(overrides) = overrides {
         builder.overrides(overrides);
