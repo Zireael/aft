@@ -215,13 +215,7 @@ fn migrate_block(
             .and_then(|lsp| lsp.get("idle_minutes"))
             .is_none()
         {
-            let minutes = value
-                .as_i64()
-                .unwrap_or(i64::from(crate::config::DEFAULT_LSP_IDLE_MINUTES))
-                .clamp(
-                    i64::from(crate::config::MIN_LSP_IDLE_MINUTES),
-                    i64::from(crate::config::MAX_LSP_IDLE_MINUTES),
-                );
+            let minutes = feature_config::retired_lsp_idle_minutes(value);
             doc.set(
                 &path_of(prefix, &["lsp", "idle_minutes"]),
                 &Value::from(minutes),
@@ -539,7 +533,9 @@ fn write_backup(target: &Path, text: &str) -> std::io::Result<PathBuf> {
 /// keeps the previous text in a `<name>.bak-<unix seconds>` file beside it,
 /// and is serialized across processes by a lock file, so only one of several
 /// loaders rewrites the file and reports it. A symlinked file is rewritten at
-/// its target so the link survives. A read-only file, or any failure, leaves
+/// its target so the link survives. A read-only file, a debug build pointed at
+/// the account's own config directory (see
+/// [`crate::production_storage::config_write_refusal`]), or any failure leaves
 /// the file as it was and returns [`UserConfigMigration::NotMigrated`]; the
 /// caller's in-memory translation still applies its current equivalents.
 pub fn auto_migrate_user_config(path: &Path) -> Option<UserConfigMigration> {
@@ -555,6 +551,9 @@ pub fn auto_migrate_user_config(path: &Path) -> Option<UserConfigMigration> {
     };
 
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(reason) = crate::production_storage::config_write_refusal(&target) {
+        return not_migrated(reason, &translation);
+    }
     match std::fs::metadata(&target) {
         Ok(metadata) if metadata.permissions().readonly() => {
             return not_migrated("the file is read-only".to_string(), &translation);

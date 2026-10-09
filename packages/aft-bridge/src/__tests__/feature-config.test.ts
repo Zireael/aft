@@ -116,6 +116,19 @@ describe("feature-config policy", () => {
       "inspect.max_drill_down_items",
       "inspect.tier2_soft_deadline_ms",
     ]);
+    // A whole number written as a float is that number (Rust reads it the
+    // same way); a fraction, or an integer beyond the exactly representable
+    // range, falls back to the default.
+    for (const [text, minutes] of [
+      ["12.0", 12],
+      ["1e3", 1000],
+      ["12.5", 60],
+      ["9007199254740993", 60],
+    ] as const) {
+      const parsed = JSON.parse(`{"idle":{"lsp_ttl_minutes":${text}}}`) as Record<string, unknown>;
+      translateConfigDocument(parsed, "user");
+      expect(parsed, text).toEqual({ lsp: { idle_minutes: minutes } });
+    }
     const nonInteger: Record<string, unknown> = { idle: { lsp_ttl_minutes: "x" } };
     translateConfigDocument(nonInteger, "project");
     expect(nonInteger).toEqual({ lsp: { idle_minutes: 60 } });

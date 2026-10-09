@@ -315,6 +315,37 @@ fn take_nested(map: &mut Map<String, Value>, container: &str, leaf: &str) -> Opt
     Some(value)
 }
 
+/// Largest integer a JSON number keeps exactly in JavaScript
+/// (`Number.MAX_SAFE_INTEGER`).
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+/// The whole number a JSON value spells, the way JavaScript's
+/// `Number.isSafeInteger` reads the parsed value: `12` and `12.0` are both 12,
+/// while `12.5`, non-numbers and integers beyond the exactly representable
+/// range are not whole numbers. Keeps the Rust and TypeScript translations
+/// equal, since JavaScript cannot tell `12.0` from `12`.
+fn safe_whole_number(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return (number.unsigned_abs() <= MAX_SAFE_INTEGER as u64).then_some(number);
+    }
+    let number = value.as_f64()?;
+    (number.is_finite() && number.fract() == 0.0 && number.abs() <= MAX_SAFE_INTEGER as f64)
+        .then_some(number as i64)
+}
+
+/// The `lsp.idle_minutes` value a retired `idle.lsp_ttl_minutes` value
+/// becomes: a whole number clamped to the current range, or the default for
+/// anything else. Shared by load-time translation and `doctor --fix`; mirrors
+/// the TypeScript translation.
+pub fn retired_lsp_idle_minutes(value: &Value) -> i64 {
+    safe_whole_number(value)
+        .unwrap_or(i64::from(crate::config::DEFAULT_LSP_IDLE_MINUTES))
+        .clamp(
+            i64::from(crate::config::MIN_LSP_IDLE_MINUTES),
+            i64::from(crate::config::MAX_LSP_IDLE_MINUTES),
+        )
+}
+
 /// Translate the retired inspect/LSP keys of one block, exactly as
 /// `doctor --fix` rewrites them: `idle.lsp_ttl_minutes` becomes
 /// `lsp.idle_minutes` (clamped to its range) unless that is already set, and
@@ -337,13 +368,7 @@ fn translate_inspect_lsp_paths(
                 "idle.lsp_ttl_minutes is ignored because lsp.idle_minutes is set".to_string(),
             );
         } else {
-            let minutes = value
-                .as_i64()
-                .unwrap_or(i64::from(crate::config::DEFAULT_LSP_IDLE_MINUTES))
-                .clamp(
-                    i64::from(crate::config::MIN_LSP_IDLE_MINUTES),
-                    i64::from(crate::config::MAX_LSP_IDLE_MINUTES),
-                );
+            let minutes = retired_lsp_idle_minutes(&value);
             let lsp = map
                 .entry("lsp".to_string())
                 .or_insert_with(|| Value::Object(Map::new()));
@@ -1181,6 +1206,23 @@ mod tests {
         );
         let (value, _) = translate(json!({"idle": {"lsp_ttl_minutes": "x"}}));
         assert_eq!(value, json!({"lsp": {"idle_minutes": 60}}));
+        // A whole number written as a float is that number, as JavaScript
+        // (and so the TypeScript translation) reads it; anything else is the
+        // default.
+        for (text, minutes) in [
+            ("12.0", 12),
+            ("12", 12),
+            ("1e3", 1000),
+            ("12.5", 60),
+            ("1e20", 60),
+            ("9007199254740993", 60),
+        ] {
+            let doc: Value =
+                serde_json::from_str(&format!(r#"{{"idle": {{"lsp_ttl_minutes": {text}}}}}"#))
+                    .unwrap();
+            let (value, _) = translate(doc);
+            assert_eq!(value, json!({"lsp": {"idle_minutes": minutes}}), "{text}");
+        }
         let (value, out) = translate(json!({
             "idle": {"lsp_ttl_minutes": 10},
             "lsp": {"idle_minutes": "never"}

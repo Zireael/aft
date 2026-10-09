@@ -888,6 +888,13 @@ const CASES: ParityCase[] = [
     user: { lsp: { idle_minutes: 30 } },
     project: { idle: { lsp_ttl_minutes: 10 } },
   },
+  // A whole number written as a float: both languages must read 12.0 as 12.
+  { name: "retired_lsp_ttl_float_user", user: '{ "idle": { "lsp_ttl_minutes": 12.0 } }' },
+  {
+    name: "retired_lsp_ttl_float_project",
+    user: { lsp: { idle_minutes: 30 } },
+    project: '{ "idle": { "lsp_ttl_minutes": 12.0 } }',
+  },
   { name: "retired_soft_deadline_project", project: { inspect: { tier2_soft_deadline_ms: 50 } } },
   { name: "retired_max_items_user", user: { inspect: { max_drill_down_items: 20 } } },
   {

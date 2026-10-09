@@ -284,6 +284,45 @@ pub(crate) fn protected(path: &Path) -> bool {
     protection_status_with(path, account_storage_roots).unwrap_or(true)
 }
 
+/// The account's own CortexKit config directories, derived from the OS
+/// account record like [`account_storage_roots`] and never from HOME, XDG or
+/// USERPROFILE. The user config file AFT reads by default lives under one of
+/// them (`~/.config/cortexkit/aft.jsonc`; on Windows the profile's
+/// `.config` or roaming `AppData` folder).
+pub(crate) fn account_config_roots() -> io::Result<Vec<PathBuf>> {
+    let home = account_home()?;
+    #[cfg(windows)]
+    {
+        Ok(vec![
+            home.join(".config/cortexkit"),
+            home.join("AppData/Roaming/cortexkit"),
+        ])
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(vec![home.join(".config/cortexkit")])
+    }
+}
+
+/// Why this build must not rewrite the config file at `path`, or `None` when
+/// it may. A debug build (a test run, or the `target/debug/aft` a test spawns)
+/// that inherited the operator's real HOME would otherwise rewrite the
+/// operator's own config file when it migrates retired keys. Same policy as
+/// the storage fence: release builds are never refused,
+/// `AFT_ALLOW_PRODUCTION_MIGRATION=1` opts in, and a failed account lookup
+/// refuses.
+pub(crate) fn config_write_refusal(path: &Path) -> Option<String> {
+    match protection_status_with(path, account_config_roots) {
+        Ok(false) => None,
+        Ok(true) => Some(format!(
+            "{CODE}: a dev/test build does not rewrite the account's own config file; set AFT_ALLOW_PRODUCTION_MIGRATION=1 to allow it"
+        )),
+        Err(error) => Some(format!(
+            "{CODE}: a dev/test build could not resolve the account's config directory ({error}), so it does not rewrite config files; set AFT_ALLOW_PRODUCTION_MIGRATION=1 to allow it"
+        )),
+    }
+}
+
 fn protection_status_with(
     path: &Path,
     roots: impl FnOnce() -> io::Result<Vec<PathBuf>>,
@@ -674,6 +713,43 @@ mod tests {
         with_test_account(&root, false, || {
             assert!(refuse_write(&alias.join("uncreated/../aft.db")).is_err());
             assert!(refuse_write(&fixture.path().join("production-sibling/aft.db")).is_ok());
+        });
+    }
+
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    fn unix_account_config_root_ignores_home_and_xdg() {
+        let _env = crate::test_env::process_env_lock();
+        let home = account_home().expect("passwd supplies the effective account home");
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = fixture.path().join("nonexistent-home");
+        let _restore =
+            RestoreEnvironment::replace(&[("HOME", &missing), ("XDG_CONFIG_HOME", &missing)]);
+        let root = home.join(".config/cortexkit");
+        assert_eq!(account_config_roots().unwrap(), vec![root.clone()]);
+        // Only computes the verdict; nothing under the real directory is touched.
+        assert!(config_write_refusal(&root.join("aft.jsonc"))
+            .unwrap()
+            .contains(CODE));
+        assert!(config_write_refusal(&missing.join(".config/cortexkit/aft.jsonc")).is_none());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn config_write_fence_matches_build_debug_assertions() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("aft.jsonc");
+        with_test_account(fixture.path(), false, || {
+            assert_eq!(
+                config_write_refusal(&path).is_some(),
+                cfg!(debug_assertions)
+            );
+        });
+        with_test_account(fixture.path(), true, || {
+            assert!(
+                config_write_refusal(&path).is_none(),
+                "the opt-in allows it"
+            );
         });
     }
 

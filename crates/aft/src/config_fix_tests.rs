@@ -28,6 +28,12 @@ fn inspect_cleanup_doctor_maps_idle_and_drops_inert_keys() {
     .unwrap();
     let value: Value = serde_json::from_str(&migrated.text).unwrap();
     assert_eq!(value["lsp"]["idle_minutes"], "never", "canonical key wins");
+    // A whole number written as a float migrates as that number, matching
+    // the load-time translation in both languages.
+    let migrated =
+        migrate_config_text(r#"{"idle":{"lsp_ttl_minutes":12.0}}"#, FixTier::User).unwrap();
+    let value: Value = serde_json::from_str(&migrated.text).unwrap();
+    assert_eq!(value["lsp"]["idle_minutes"], 12);
 }
 
 fn resolved(doc: &str, tier: &str, harness: Option<&Harness>) -> Value {
@@ -527,4 +533,55 @@ fn a_symlinked_user_file_is_rewritten_at_its_target() {
         .file_type()
         .is_symlink());
     assert!(retired_key_translation(&std::fs::read_to_string(&real).unwrap()).is_none());
+}
+
+/// A debug build (a test run, or the `target/debug/aft` a test spawns) that
+/// inherited the operator's real HOME must not rewrite the operator's own
+/// config file: it translates in memory and says why. The account's config
+/// directory comes from the storage fence's test seam, so this test never
+/// looks at the real one. `AFT_ALLOW_PRODUCTION_MIGRATION=1` opts back in.
+#[cfg(debug_assertions)]
+#[test]
+fn a_debug_build_never_rewrites_a_user_file_in_the_account_config_dir() {
+    let fixture = tempfile::tempdir().unwrap();
+    let config_dir = fixture.path().join("account/.config/cortexkit");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let path = config_dir.join("aft.jsonc");
+    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    let outcome = crate::production_storage::with_test_account(&config_dir, false, || {
+        auto_migrate_user_config(&path)
+    })
+    .expect("reported");
+    let UserConfigMigration::NotMigrated { reason, notice, .. } = &outcome else {
+        panic!("expected no rewrite, got {outcome:?}");
+    };
+    assert!(reason.contains(crate::production_storage::CODE), "{reason}");
+    assert!(
+        reason.contains("AFT_ALLOW_PRODUCTION_MIGRATION=1"),
+        "{reason}"
+    );
+    assert!(
+        notice.contains("applied their current equivalents"),
+        "{notice}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), RETIRED_USER_FILE);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+    );
+    assert_eq!(
+        std::fs::read_dir(&config_dir).unwrap().count(),
+        1,
+        "no backup, lock or temporary file may be created"
+    );
+
+    let opted_in = crate::production_storage::with_test_account(&config_dir, true, || {
+        auto_migrate_user_config(&path)
+    });
+    assert!(
+        matches!(opted_in, Some(UserConfigMigration::Migrated { .. })),
+        "{opted_in:?}"
+    );
 }
