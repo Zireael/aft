@@ -24,9 +24,7 @@ from typing import Any, Iterable
 TIER2_CATEGORIES = {"dead_code", "unused_exports", "duplicates", "cycles"}
 DEFAULT_WORKDIR = Path.home() / "Work" / "OSS" / "AFT_TESTS"
 PROJECT_CONFIG = {
-    "semantic_search": False,
-    "search_index": False,
-    "callgraph_store": True,
+    "indexes": {"semantic": False, "trigram": False, "callgraph": True},
     "inspect": {"enabled": True},
 }
 

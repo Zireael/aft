@@ -161,9 +161,7 @@ def build_fixture(base: Path, env: dict[str, str], filler: int) -> tuple[Path, P
 
 def configure(client: AftClient, root: Path, storage: Path, ram_overlay: bool) -> JsonObject:
     doc = {
-        "search_index": True,
-        "semantic_search": False,
-        "callgraph_store": False,
+        "indexes": {"trigram": True, "semantic": False, "callgraph": False},
         "inspect": {"enabled": False},
         "worktree": {"ram_overlay": ram_overlay},
     }

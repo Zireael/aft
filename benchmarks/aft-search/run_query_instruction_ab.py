@@ -79,9 +79,7 @@ class ProductionAftClient(body_cap.ProductionAftClient):
             "max_files": 20000,
         }
         doc = {
-            "search_index": True,
-            "semantic_search": True,
-            "callgraph_store": False,
+            "indexes": {"trigram": True, "semantic": True, "callgraph": False},
             "semantic": semantic,
         }
         response = self.call(

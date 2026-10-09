@@ -176,9 +176,7 @@ def create_borrow_worktrees(base: Path, owner: Path, file_count: int) -> list[Pa
 def configure_owner(client: AftClient, owner: Path, storage: Path) -> None:
     config_document = json.dumps(
         {
-            "search_index": True,
-            "semantic_search": False,
-            "callgraph_store": False,
+            "indexes": {"trigram": True, "semantic": False, "callgraph": False},
             "inspect": {"enabled": False},
         }
     )

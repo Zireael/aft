@@ -26,7 +26,7 @@ QUERIES = {
         ("validate_path", "function name in Rust source"),
         ("BinaryBridge", "class name in TypeScript"),
         ("fn handle_grep", "specific function"),
-        ("experimental_search_index", "config key across Rust+TS"),
+        ("indexes.trigram", "current config key across Rust+TS"),
     ],
     "codedb": [
         ("readLine", "Zig stdlib function call"),
@@ -54,7 +54,7 @@ class AftClient:
         self.buf = b""
         self.id = 0
         self._send({"id": "cfg", "command": "configure",
-                     "project_root": repo, "experimental_search_index": True})
+                     "project_root": repo, "indexes": {"trigram": True}})
         self._recv()
         time.sleep(min(30, max(2, file_count / 5000)))
         self._send({"id": "ping", "command": "version"})

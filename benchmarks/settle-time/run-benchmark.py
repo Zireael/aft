@@ -583,8 +583,7 @@ def build_summary(
             "search_index_files": search_index.get("files") if isinstance(search_index, dict) else None,
         },
         "config": {
-            "search_index": True,
-            "semantic_search": semantic_enabled,
+            "indexes": {"trigram": True, "semantic": semantic_enabled},
             "semantic_backend": "fastembed" if semantic_enabled else None,
             "tier2_trigger_path": "watcher_configure_warm",
             "settle_cpu_threshold_percent_one_core": float(os.environ.get("AFT_SETTLE_CPU_THRESHOLD", "5")),
@@ -705,8 +704,7 @@ def main() -> int:
                 "project_root": str(clone_path.resolve()),
                 "harness": "opencode",
                 "storage_dir": str(storage_dir.resolve()),
-                "search_index": True,
-                "semantic_search": semantic_enabled,
+                "indexes": {"trigram": True, "semantic": semantic_enabled},
                 "semantic": {
                     "backend": "fastembed",
                     "model": "all-MiniLM-L6-v2",

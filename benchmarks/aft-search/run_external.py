@@ -205,8 +205,7 @@ def build_report(
             "config": {
                 "top_k": TOP_K,
                 "relevance_mode": args.relevance_mode,
-                "experimental_search_index": True,
-                "experimental_semantic_search": True,
+                "indexes": {"trigram": True, "semantic": True},
                 "reranker": False,
             },
         },

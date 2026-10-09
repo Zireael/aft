@@ -42,10 +42,7 @@ class AftBridgeDriver implements EvalDriver {
       { timeoutMs: this.context.readyTimeoutMs, errorPrefix: "[aft-codegraph-bench]" },
       {
         harness: "opencode",
-        search_index: true,
-        semantic_search: true,
-        experimental_search_index: true,
-        experimental_semantic_search: true,
+        indexes: { trigram: true, semantic: true },
       },
     );
     const response = await this.bridge.send(
@@ -53,10 +50,7 @@ class AftBridgeDriver implements EvalDriver {
       {
         project_root: this.context.codebasePath,
         harness: "opencode",
-        search_index: true,
-        semantic_search: true,
-        experimental_search_index: true,
-        experimental_semantic_search: true,
+        indexes: { trigram: true, semantic: true },
       },
       { timeoutMs: this.context.readyTimeoutMs },
     );

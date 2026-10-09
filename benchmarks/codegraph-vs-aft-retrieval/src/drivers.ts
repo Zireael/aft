@@ -62,10 +62,7 @@ class AftRetrievalDriver implements RetrievalDriver {
     const baseConfig: Record<string, unknown> = {
       harness: "opencode",
       storage_dir: storageDir,
-      search_index: true,
-      semantic_search: true,
-      experimental_search_index: true,
-      experimental_semantic_search: true,
+      indexes: { trigram: true, semantic: true },
       restrict_to_project_root: false,
       // Flat semantic: picks the cloud spawn path in the bridge TS.
       ...(semanticFlat ? { semantic: semanticFlat } : {}),

@@ -160,9 +160,7 @@ class AftClient:
                         "tier": "user",
                         "doc": json.dumps(
                             {
-                                "search_index": True,
-                                "semantic_search": False,
-                                "callgraph_store": False,
+                                "indexes": {"trigram": True, "semantic": False, "callgraph": False},
                             }
                         ),
                     }

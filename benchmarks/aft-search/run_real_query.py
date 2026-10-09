@@ -187,9 +187,7 @@ class NdjsonClient:
         if endpoint:
             semantic["base_url"] = endpoint
         doc = bench_rerank.apply_to_config({
-            "search_index": True,
-            "semantic_search": True,
-            "callgraph_store": False,
+            "indexes": {"trigram": True, "semantic": True, "callgraph": False},
             "semantic": semantic,
         })
         response = self.call(
