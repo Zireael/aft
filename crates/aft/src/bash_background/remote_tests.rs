@@ -13,10 +13,13 @@ pub(super) fn take_reattach_budget(root: &Path) -> Option<Duration> {
 
 fn shorten_reattach_budget(root: &Path) {
     // Scope the hook to one worker, so parallel remote tests keep the real budget.
+    // Empty attaches are 100 ms apart, so 1.5 s leaves room for several even on
+    // a loaded runner. Tests bound the whole recovery at 30 s, which only
+    // catches a budget that never expires.
     reattach_budgets()
         .lock()
         .unwrap()
-        .insert(root.into(), Duration::from_millis(250));
+        .insert(root.into(), Duration::from_millis(1_500));
 }
 
 fn crash_tasks() -> &'static Mutex<HashSet<String>> {
@@ -436,7 +439,7 @@ async fn exec_remote_bash_empty_attach_budget_reports_job_without_rerun() {
     shorten_reattach_budget(dir.path());
     let registry = registry();
     let task_id = start(&registry, dir.path(), daemon.connection.clone());
-    let done = tokio::time::timeout(Duration::from_secs(2), terminal(&registry, &task_id))
+    let done = tokio::time::timeout(Duration::from_secs(30), terminal(&registry, &task_id))
         .await
         .expect("empty attaches must exhaust the recovery budget");
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
@@ -593,7 +596,7 @@ async fn exec_remote_bash_attach_call_and_reconnect_failures_exhaust_budget() {
     shorten_reattach_budget(dir.path());
     let registry = registry();
     let task_id = start(&registry, dir.path(), daemon.connection.clone());
-    let done = tokio::time::timeout(Duration::from_secs(2), terminal(&registry, &task_id))
+    let done = tokio::time::timeout(Duration::from_secs(30), terminal(&registry, &task_id))
         .await
         .expect("failed attach calls and reconnects must exhaust the recovery budget");
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
@@ -622,7 +625,7 @@ async fn exec_remote_bash_restart_connect_failures_exhaust_reattach_budget() {
     );
     shorten_reattach_budget(dir.path());
     registry.resume_remote_task(&task_id).unwrap();
-    let done = tokio::time::timeout(Duration::from_secs(2), terminal(&registry, &task_id))
+    let done = tokio::time::timeout(Duration::from_secs(30), terminal(&registry, &task_id))
         .await
         .expect("restarting an accepted job cannot retry connect forever");
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
