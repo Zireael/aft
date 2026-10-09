@@ -194,7 +194,7 @@ fn provider_project_setup_accepts_absent_and_canonical_roots() {
     )
     .unwrap();
     assert_eq!(config["disabled_tools"], json!(["aft_outline"]));
-    assert_eq!(config["callgraph_store"], false);
+    assert_eq!(config["indexes"]["callgraph"], false);
     assert!(canonical.join("project").join(".cortexkit").is_dir());
 }
 
