@@ -160,9 +160,7 @@ fn hermetic_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
     .unwrap();
     // Keep the module light: nothing here needs an index.
     let quiet = json!({
-        "search_index": false,
-        "semantic_search": false,
-        "callgraph_store": false,
+        "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         "disabled_tools": [],
     });
     std::fs::write(

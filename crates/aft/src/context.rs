@@ -12536,9 +12536,7 @@ mod callgraph_store_for_ops_tests {
                 "harness": "opencode",
                 "storage_dir": storage_dir,
                 "config": [user_tier(json!({
-                    "callgraph_store": true,
-                    "search_index": true,
-                    "semantic_search": true,
+                    "indexes": { "trigram": true, "semantic": true, "callgraph": true },
                 }))],
             })),
             &ctx,

@@ -1396,9 +1396,7 @@ mod production {
                 "project_root": root,
                 "storage_dir": storage,
                 "config": crate::helpers::user_config(json!({
-                    "search_index": true,
-                    "semantic_search": true,
-                    "callgraph_store": false,
+                    "indexes": { "trigram": true, "semantic": true, "callgraph": false },
                     "views": { "enabled": views },
                     "semantic": {
                         "backend": "openai_compatible",

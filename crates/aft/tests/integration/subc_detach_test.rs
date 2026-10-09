@@ -647,8 +647,7 @@ fn drain_with_live_lsp_servers_and_writer(
         std::fs::write(
             config_dir.join("aft.jsonc"),
             serde_json::to_vec(&json!({
-                "storage_dir": storage.path(), "search_index": false, "semantic_search": false,
-                "callgraph_store": false
+                "storage_dir": storage.path(), "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))
             .unwrap(),
         )
@@ -848,9 +847,7 @@ pub(super) fn write_user_config(config_home: &Path, storage: &Path) {
         serde_json::to_string(&json!({
             "storage_dir": storage,
             "bash": { "background": true },
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }))
         .expect("serialize user config"),
     )
@@ -1114,9 +1111,7 @@ async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harnes
     std::fs::write(
         &project_cfg,
         serde_json::to_string(&json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }))
         .expect("serialize project config"),
     )

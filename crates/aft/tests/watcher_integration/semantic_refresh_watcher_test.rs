@@ -340,8 +340,7 @@ fn configure_semantic_openai_with_overlay(
             "project_root": root.display().to_string(),
             "storage_dir": storage_dir.display().to_string(),
             "config": user_config(serde_json::json!({
-                "search_index": false,
-                "semantic_search": true,
+                "indexes": { "trigram": false, "semantic": true },
                 "worktree": {
                     "ram_overlay": ram_overlay
                 },

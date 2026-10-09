@@ -92,8 +92,7 @@ fn configure(aft: &mut AftProcess, root: &Path, hashline: bool) {
             "source": root.join(".cortexkit/aft.jsonc"),
             "doc": json!({
                 "edit_mode": "hashline",
-                "search_index": false,
-                "semantic_search": false
+                "indexes": { "trigram": false, "semantic": false }
             })
             .to_string()
         }]);

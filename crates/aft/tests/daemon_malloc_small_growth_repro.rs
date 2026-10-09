@@ -563,7 +563,7 @@ fn parked_semantic_loads_are_unattributed() {
     std::fs::write(
         home.join("config/cortexkit/aft.jsonc"),
         format!(
-            r#"{{"search_index": true, "semantic_search": true,
+            r#"{{"indexes": {{"trigram": true, "semantic": true}},
   "semantic": {{"backend": "openai_compatible", "model": "stub-embedding",
                "base_url": "{base}", "timeout_ms": 60000}},
   "subc": {{"connection_file": "{conn}"}}}}"#,

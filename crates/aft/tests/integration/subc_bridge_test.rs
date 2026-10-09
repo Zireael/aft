@@ -4415,9 +4415,7 @@ async fn drive_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
         "repeat-breaker-bash-session",
         json!({
             "bash": { "rewrite": true },
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;
@@ -5533,9 +5531,7 @@ async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
         10,
         &root1,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_configure_warning": {
                 "message": "route-1-maintenance-warning",
             },
@@ -5565,9 +5561,7 @@ async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
         &root1,
         "session-1",
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_configure_warning": {
                 "message": "session-1-reconfigure-warning",
             },
@@ -5866,7 +5860,7 @@ async fn drive_checkpoint_rebind_daemon(input: FakeDaemonInput) {
     let file = nested.join("pool-authority.test.ts");
     std::fs::write(&file, "checkpoint contents").unwrap();
     let session = "019de471-4fdc-762d-9286-624dfad0b5fe";
-    let doc = json!({ "callgraph_store": false, "search_index": false, "semantic_search": false });
+    let doc = json!({ "indexes": { "trigram": false, "semantic": false, "callgraph": false } });
     send_route_bind_with_harness_session_principal_and_doc(
         &mut stream,
         1,
@@ -6291,9 +6285,7 @@ async fn drive_routebind_nonblocking_daemon(input: FakeDaemonInput) {
         19,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6411,9 +6403,7 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         19,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6552,9 +6542,7 @@ async fn drive_duplicate_routebind_daemon(input: FakeDaemonInput) {
         111,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6588,9 +6576,7 @@ async fn drive_pending_bind_tool_call_daemon(input: FakeDaemonInput) {
         1200,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6624,9 +6610,7 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
         110,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6784,9 +6768,7 @@ async fn drive_cancelled_first_bind_does_not_orphan_later_bind_daemon(input: Fak
         200,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6834,9 +6816,7 @@ async fn drive_bind_deadline_recovery_daemon(input: FakeDaemonInput) {
         300,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6907,9 +6887,7 @@ async fn drive_goodbye_removes_queued_bind_daemon(input: FakeDaemonInput) {
         400,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -7005,9 +6983,7 @@ async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
         &push_burst_root,
         "session-6",
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_configure_status_burst": {
                 "marker": "configure-burst",
                 "count": 16,
@@ -7076,9 +7052,7 @@ async fn drive_lossy_pressure_daemon(input: FakeDaemonInput) {
         &push_burst_root,
         "session-6",
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_configure_status_burst": {
                 "marker": "lossy-pressure",
                 "count": 2048,
@@ -9950,9 +9924,7 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
 
 fn minimal_bind_doc() -> Value {
     json!({
-        "callgraph_store": false,
-        "search_index": false,
-        "semantic_search": false,
+        "indexes": { "trigram": false, "semantic": false, "callgraph": false },
     })
 }
 
@@ -11379,9 +11351,7 @@ async fn drive_failed_new_root_daemon(input: FakeDaemonInput) {
         50,
         &failed_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_configure_status_burst": {
                 "marker": "failed-no-channel",
                 "count": 4,
@@ -11433,9 +11403,7 @@ async fn drive_inspect_dead_code_convergence_daemon(input: FakeDaemonInput) {
         60,
         &callgraph_root,
         json!({
-            "callgraph_store": true,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": true },
         }),
     )
     .await;
@@ -11710,9 +11678,7 @@ async fn drive_pending_bind_health_daemon(input: FakeDaemonInput) {
         110,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "inspect": { "enabled": false },
             "subc_test_slow_configure": true,
         }),
@@ -11905,9 +11871,7 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
         10,
         &root1,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "inspect": { "enabled": false },
         }),
     )
@@ -12052,9 +12016,7 @@ async fn drive_hashline_edit_round_daemon(input: FakeDaemonInput) {
         &root1,
         json!({
             "edit_mode": "hashline",
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;
@@ -12151,9 +12113,7 @@ async fn drive_disabled_tools_daemon(input: FakeDaemonInput) {
     let victim = root1.join("victim.txt");
     std::fs::write(&victim, "keep me\n").expect("write delete target");
     let doc = json!({
-        "callgraph_store": false,
-        "search_index": false,
-        "semantic_search": false,
+        "indexes": { "trigram": false, "semantic": false, "callgraph": false },
     });
     send_route_bind_with_session_and_doc(
         &mut stream,
@@ -12299,9 +12259,7 @@ async fn drive_hashline_bash_cat_daemon(input: FakeDaemonInput) {
         json!({
             "edit_mode": "hashline",
             "bash": { "rewrite": true, "background": false },
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;
@@ -12343,9 +12301,7 @@ async fn drive_manifest_reachability_daemon(input: FakeDaemonInput) {
         10,
         &root1,
         json!({
-            "callgraph_store": true,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": true },
         }),
     )
     .await;
@@ -12690,9 +12646,7 @@ async fn send_route_bind(
         corr,
         root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;
@@ -12715,9 +12669,7 @@ async fn send_route_bind_epoch(
         &format!("session-{route_channel}"),
         Some(Principal::Direct),
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;
@@ -12755,9 +12707,7 @@ async fn send_route_bind_with_session(
         root,
         session,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;

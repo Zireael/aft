@@ -53,8 +53,7 @@ fn configured_context(root: &Path) -> AppContext {
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false
+            "indexes": { "trigram": false, "semantic": false }
         })),
     }));
     let response = serde_json::to_value(handle_configure(&configure, &ctx))

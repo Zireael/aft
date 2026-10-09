@@ -45,9 +45,7 @@ fn configure_without_indexes(project: &Path) -> String {
         "harness": "opencode",
         "project_root": project.display().to_string(),
         "config": user_config(json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false }
         }))
     }))
     .expect("serialize configure request")
@@ -129,9 +127,7 @@ fn standalone_configure_replays_completed_task_before_queued_completion_drain() 
             "project_root": project.path(),
             "storage_dir": storage.path(),
             "config": user_config(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "experimental": { "bash": { "background": true } }
             })),
             "max_background_bash_tasks": 4
@@ -402,9 +398,7 @@ fn standalone_tool_call_read_finishes_before_slow_inspect() {
             "project_root": project.display().to_string(),
             "storage_dir": storage.display().to_string(),
             "config": user_config(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true },
                 "inspect": {"diagnostics_timeout_ms": 15000}
             }))
         }))
@@ -723,9 +717,7 @@ fn standalone_read_answers_while_inspect_initializes_a_language_server() {
             "project_root": project.display().to_string(),
             "lsp_paths_extra": [bin_dir.display().to_string()],
             "config": user_config(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "inspect": {"diagnostics_timeout_ms": 30000},
                 "lsp": {
                     "servers": {
@@ -792,9 +784,7 @@ fn standalone_read_answers_while_scoped_inspect_waits_for_a_diagnostics_pull() {
             "harness": "opencode",
             "project_root": project.display().to_string(),
             "config": user_config(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "inspect": {"diagnostics_timeout_ms": 30000}
             }))
         }))
@@ -830,7 +820,7 @@ fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
             "project_root": project.path().display().to_string(),
             "storage_dir": storage.path().display().to_string(),
             "config": user_config(json!({
-                "semantic_search": true,
+                "indexes": { "semantic": true },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "test-embedding",
@@ -978,9 +968,7 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
         "harness": "opencode",
         "project_root": project.path().display().to_string(),
         "config": user_config(json!({
-            "search_index": true,
-            "semantic_search": false,
-            "callgraph_store": false,
+            "indexes": { "trigram": true, "semantic": false, "callgraph": false },
             "format_on_edit": true,
             "formatter": { "typescript": "biome" }
         }))
@@ -1082,7 +1070,7 @@ fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
             "id": "configure-partial", "command": "configure", "harness": "opencode",
             "project_root": project, "storage_dir": temp.path().join("storage"),
             "config": user_config(json!({
-                "search_index": false, "semantic_search": false, "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "inspect": {"diagnostics_timeout_ms": 10000},
                 "lsp": {"servers": {
                     "rust": {"binary": binary, "args": []},
@@ -1161,9 +1149,7 @@ fn standalone_search_on_ready_index_answers_without_waiting_for_the_pending_poll
             "project_root": project.display().to_string(),
             "storage_dir": storage.display().to_string(),
             "config": user_config(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))
         }))
         .expect("serialize configure request"),

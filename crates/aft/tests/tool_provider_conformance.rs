@@ -99,7 +99,7 @@ fn prepare_provider_project(root: &Path) -> Result<(), HarnessError> {
         ))
     })?;
     let config = directory.join("aft.jsonc");
-    std::fs::write(&config, serde_json::to_vec(&json!({"disabled_tools": ["aft_outline"], "callgraph_store": false, "search_index": false, "semantic_search": false})).unwrap()).map_err(|error| HarnessError::new(format!("writing provider config {}: {error}", config.display())))?;
+    std::fs::write(&config, serde_json::to_vec(&json!({"disabled_tools": ["aft_outline"], "indexes": {"callgraph": false, "trigram": false, "semantic": false}})).unwrap()).map_err(|error| HarnessError::new(format!("writing provider config {}: {error}", config.display())))?;
     Ok(())
 }
 
@@ -1877,7 +1877,7 @@ async fn real_module_project_harness_matrix_rebind_and_restart_identity() {
     let p2 = state.join("project2");
     std::fs::create_dir_all(p2.join(".cortexkit")).unwrap();
     let project_config = |disabled: Vec<&str>| {
-        serde_json::to_vec(&json!({"disabled_tools": disabled, "callgraph_store":false, "search_index":false, "semantic_search":false})).unwrap()
+        serde_json::to_vec(&json!({"disabled_tools": disabled, "indexes": {"callgraph": false, "trigram": false, "semantic": false}})).unwrap()
     };
     std::fs::write(p1.join(".cortexkit/aft.jsonc"), project_config(vec![])).unwrap();
     std::fs::write(

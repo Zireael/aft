@@ -955,9 +955,7 @@ fn write_user_config(config_home: &Path) {
         config_dir.join("aft.jsonc"),
         serde_json::to_string(&json!({
             "bash": { "background": true },
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }))
         .expect("serialize user config"),
     )
@@ -1114,9 +1112,7 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
     std::fs::write(
         &project_cfg,
         serde_json::to_string(&json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }))
         .expect("serialize project config"),
     )

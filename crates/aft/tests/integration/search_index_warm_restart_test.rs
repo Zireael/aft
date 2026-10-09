@@ -59,8 +59,7 @@ fn configure_search_index(aft: &mut AftProcess, root: &Path, id: &str) -> Value 
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
             "config": user_config(serde_json::json!({
-                "search_index": true,
-                "semantic_search": false
+                "indexes": { "trigram": true, "semantic": false }
             })),
         }),
     )

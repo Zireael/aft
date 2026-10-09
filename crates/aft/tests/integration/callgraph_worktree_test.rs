@@ -89,9 +89,7 @@ fn configure_deferred(checkout: &Path, storage: &Path, views: bool) -> AppContex
             "project_root": checkout,
             "storage_dir": storage,
             "config": crate::test_helpers::user_config(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true },
                 "views": { "enabled": views }
             }))
         })),

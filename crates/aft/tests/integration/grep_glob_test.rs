@@ -1196,8 +1196,7 @@ fn semantic_search_with_both_lanes_off_refuses_instead_of_walking() {
             "harness": "opencode",
             "project_root": project.path(),
             "config": user_config(serde_json::json!({
-                "semantic_search": false,
-                "search_index": false
+                "indexes": { "trigram": false, "semantic": false }
             })),
         }),
     );

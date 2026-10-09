@@ -7727,7 +7727,7 @@ mod tests {
         ));
         let request = configure_request_with_params(json!({
             "project_root": project.path(), "storage_dir": storage.path(), "harness": "opencode",
-            "config": [user_tier(json!({"search_index": true, "semantic_search": false, "callgraph_store": false}))],
+            "config": [user_tier(json!({"indexes": {"trigram": true, "semantic": false, "callgraph": false}}))],
         }));
         assert!(handle_configure_for_test(&request, &ctx).success);
         wait_for_search_index_ready(&ctx, Duration::from_secs(10));
@@ -8153,8 +8153,7 @@ mod tests {
             "harness": "opencode",
             "config": [project_tier(json!({
                 "edit_mode": "hashline",
-                "search_index": false,
-                "semantic_search": false
+                "indexes": { "trigram": false, "semantic": false }
             }))]
         });
         let mut downgraded_params = base_params.clone();
@@ -8275,9 +8274,7 @@ mod tests {
                 "storage_dir": storage.path(),
                 "harness": "opencode",
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             })),
             &ctx,
@@ -8351,9 +8348,7 @@ mod tests {
                 "storage_dir": storage.path(),
                 "harness": "opencode",
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             })),
             &ctx,
@@ -8446,9 +8441,7 @@ mod tests {
             "storage_dir": storage.path(),
             "harness": "opencode",
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         }));
         let (locked_tx, locked_rx) = mpsc::channel();
@@ -8523,9 +8516,7 @@ mod tests {
                 "storage_dir": storage.path(),
                 "harness": "opencode",
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             })),
             &ctx,
@@ -8597,9 +8588,7 @@ mod tests {
                     "harness": "opencode",
                     "search_index_max_file_size": max_file_size,
                     "config": [user_tier(json!({
-                        "search_index": false,
-                        "semantic_search": false,
-                        "callgraph_store": false
+                        "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                     }))]
                 })),
                 &ctx,
@@ -8664,7 +8653,7 @@ mod tests {
         let params = json!({
             "project_root": project.path(), "storage_dir": storage.path(), "harness": "opencode",
             "config": [user_tier(json!({ "views": { "enabled": true },
-                "search_index": false, "semantic_search": false, "callgraph_store": true }))]
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
         });
         let root = project.path().canonicalize().unwrap();
         let scope = crate::path_identity::project_scope_key(&root);
@@ -8827,7 +8816,7 @@ mod tests {
             json!({
                 "project_root": root, "storage_dir": storage, "harness": "opencode",
                 "config": [user_tier(json!({ "views": { "enabled": true },
-                    "search_index": false, "semantic_search": false, "callgraph_store": true }))]
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
             })
         };
         let owner = test_context();
@@ -8974,9 +8963,7 @@ mod tests {
                 "harness": "opencode",
                 "config": [user_tier(json!({
                     "views": { "enabled": true },
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": true
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
                 }))]
             })),
             &ctx,
@@ -9297,9 +9284,7 @@ mod tests {
             "harness": "opencode",
             "config": [user_tier(json!({
                 "views": { "enabled": true },
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         });
 
@@ -9363,9 +9348,7 @@ mod tests {
             "project_root": temp.path(),
             "harness": "opencode",
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))],
         }));
         let response = handle_configure_for_test(&req, &ctx);
@@ -9418,7 +9401,7 @@ mod tests {
             "project_root": root,
             "harness": "opencode",
             "storage_dir": storage,
-            "config": [user_tier(json!({ "search_index": true, "semantic_search": false }))],
+            "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": false } }))],
         }))
     }
 
@@ -9433,9 +9416,7 @@ mod tests {
             "storage_dir": storage,
             "search_index_max_file_size": max_file_size,
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))],
         }))
     }
@@ -9462,9 +9443,11 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": semantic_search,
-                "callgraph_store": callgraph_store,
+                "indexes": {
+                    "trigram": false,
+                    "semantic": semantic_search,
+                    "callgraph": callgraph_store,
+                },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
@@ -9488,9 +9471,7 @@ mod tests {
             "storage_dir": storage,
             "config": [user_tier(json!({
                 "views": { "enabled": true },
-                "search_index": false,
-                "semantic_search": true,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": true, "callgraph": false },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
@@ -10535,7 +10516,7 @@ mod tests {
             "harness": "opencode",
             "config": [
                 { "tier": "user", "source": "/u/aft.jsonc",
-                  "doc": "{ \"restrict_to_project_root\": true, \"search_index\": true, \"backup\": { \"enabled\": false, \"max_depth\": 7 }, \"disabled_tools\": [\"aft_safety\"] }" },
+                  "doc": "{ \"restrict_to_project_root\": true, \"indexes\": { \"trigram\": true }, \"backup\": { \"enabled\": false, \"max_depth\": 7 }, \"disabled_tools\": [\"aft_safety\"] }" },
                 { "tier": "project", "source": "/p/.opencode/aft.jsonc",
                   "doc": "{ \"restrict_to_project_root\": false, \"semantic\": { \"api_key_env\": \"EVIL\" }, \"backup\": { \"enabled\": true, \"max_depth\": 1 }, \"disabled_tools\": [\"aft_safety\"] }" }
             ]
@@ -10544,7 +10525,7 @@ mod tests {
         let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
 
-        // Core-resolved field applied: user search_index=true survived.
+        // Core-resolved field applied: the user trigram setting survived.
         assert!(ctx.config().indexes.trigram);
         // Trust boundary: project tried restrict=false over user restrict=true →
         // user value wins.
@@ -10658,9 +10639,7 @@ mod tests {
                 "harness": "opencode",
                 "config": [user_tier(json!({
                     "restrict_to_project_root": true,
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             }))
         };
@@ -10706,9 +10685,7 @@ mod tests {
                 "harness": "opencode",
                 "config": [user_tier(json!({
                     "restrict_to_project_root": true,
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             }))
         };
@@ -10748,9 +10725,7 @@ mod tests {
                 "harness": "opencode",
                 "storage_dir": storage.clone(),
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false,
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 }))],
             }))
         };
@@ -10817,9 +10792,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
             }))],
         }));
         let request_id = request.id.clone();
@@ -10890,9 +10863,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.clone(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
             }))],
         }));
 
@@ -11831,9 +11802,7 @@ mod tests {
         index_roots: Option<serde_json::Value>,
     ) -> RawRequest {
         let mut user = json!({
-            "search_index": false,
-            "semantic_search": true,
-            "callgraph_store": false,
+            "indexes": { "trigram": false, "semantic": true, "callgraph": false },
             "semantic": {
                 "backend": "openai_compatible",
                 "model": "counting-test-embedding",
@@ -12034,9 +12003,7 @@ mod tests {
                 "tier": "user",
                 "source": "<aft-search-real-query>",
                 "doc": json!({
-                    "search_index": true,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false }
                 }).to_string()
             }],
         }));
@@ -13026,9 +12993,7 @@ mod tests {
                 "harness": "opencode",
                 "storage_dir": storage,
                 "config": [user_tier(json!({
-                    "search_index": true,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false }
                 }))]
             })),
             &ctx,
@@ -13103,9 +13068,7 @@ mod tests {
             "project_root": worktree,
             "harness": "opencode",
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": true,
-                "callgraph_store": true
+                "indexes": { "trigram": true, "semantic": true, "callgraph": true }
             }))]
         }));
 
@@ -13197,9 +13160,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
                 "worktree": { "ram_overlay": true }
             }))]
         }))
@@ -13564,9 +13525,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
                 "worktree": { "ram_overlay": false }
             }))]
         }))
@@ -14241,9 +14200,7 @@ mod tests {
             "project_root": temp.path(),
             "harness": "opencode",
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         }));
 
@@ -14315,9 +14272,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         reset_configure_artifact_load_attempts_for_test();
@@ -14373,9 +14328,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         }));
         let response = handle_configure_for_test(&req, &ctx);
@@ -14662,9 +14615,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": true,
-                "callgraph_store": true,
+                "indexes": { "trigram": true, "semantic": true, "callgraph": true },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
@@ -15016,9 +14967,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         }));
         assert!(handle_configure_for_test(&request, &ctx).success);
@@ -15083,9 +15032,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": suspended_storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         }));
         assert!(handle_configure_for_test(&suspended_request, &suspended_ctx).success);
@@ -15161,9 +15108,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         reset_configure_artifact_load_attempts_for_test();
@@ -15225,9 +15170,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         let ctx = Arc::new(test_context());
@@ -15289,9 +15232,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         let ctx = Arc::new(test_context());
@@ -15346,9 +15287,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         reset_configure_artifact_load_attempts_for_test();
@@ -15396,9 +15335,7 @@ mod tests {
         init_git_fixture(second_root.path());
         let ctx = test_context();
         let config = [user_tier(json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false }
         }))];
         let first = configure_request_with_params(json!({
             "project_root": first_root.path(),
@@ -15457,9 +15394,7 @@ mod tests {
                 "storage_dir": storage.path(),
                 "search_index_max_file_size": max_file_size,
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": true
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
                 }))]
             }))
         };
@@ -15538,9 +15473,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         }));
         assert!(handle_configure_for_test(&disabled, &ctx).success);
@@ -15560,9 +15493,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         }));
         assert!(handle_configure_for_test(&enabled, &ctx).success);
@@ -15608,9 +15539,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "experimental": { "bash": { "compress": true } }
             }))]
         }));
@@ -15630,9 +15559,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         }))
     }
@@ -15859,9 +15786,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         }));
 
@@ -15924,9 +15849,7 @@ mod tests {
             "project_root": temp.path(),
             "harness": "opencode",
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         let response = handle_configure_for_test(&changed, &ctx);
@@ -15962,9 +15885,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         });
 
@@ -16269,7 +16190,7 @@ mod tests {
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
-            "config": [user_tier(json!({ "search_index": true, "semantic_search": true }))],
+            "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": true } }))],
         }));
         let response = handle_configure_for_test(&req, &ctx);
 
@@ -16337,9 +16258,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": temp.path().join("storage"),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
             }))],
         }));
         let response = handle_configure_for_test(&req, &ctx);
@@ -17078,9 +16997,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         });
         let initial = configure_request_with_session(base_params.clone(), "session-a");
@@ -17140,9 +17057,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "lsp": {"servers": {"pushed-path": {
                     "extensions": ["pushedpath"],
                     "binary": binary_name,
@@ -17194,9 +17109,7 @@ mod tests {
                 "harness": "opencode",
                 "storage_dir": storage.path(),
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             });
             let initial = configure_request_with_session(base.clone(), "session-a");
@@ -17219,9 +17132,7 @@ mod tests {
         assert_full_path(
             "semantic",
             json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "reconfigure-test-model",
@@ -17235,9 +17146,7 @@ mod tests {
         assert_full_path(
             "sandbox",
             json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "sandbox": {"enabled": true}
             }),
         );
@@ -17254,9 +17163,7 @@ mod tests {
                 "harness": "opencode",
                 "storage_dir": storage.path(),
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             })
         };
@@ -17299,9 +17206,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         });
         let first = configure_request_with_session(params.clone(), "session-a");
@@ -17359,9 +17264,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         });
         let initial = configure_request_with_session(base.clone(), "session-a");
@@ -17393,9 +17296,7 @@ mod tests {
 
         let mut changed = base;
         changed["config"] = json!([user_tier(json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "semantic": {
                 "backend": "openai_compatible",
                 "model": "watcher-reconfigure-test",
@@ -17514,9 +17415,7 @@ mod tests {
                 "validate_on_edit": "syntax",
                 "formatter": {"typescript": "biome", "rust": "rustfmt"},
                 "checker": {"typescript": "biome", "rust": "cargo"},
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "inspect": {
                     "enabled": false,
                     "duplicates": {

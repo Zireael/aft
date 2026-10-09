@@ -2915,6 +2915,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn release_059_rejects_retired_index_keys_by_default() {
+        let result = resolve_config(&[tier("user", r#"{"search_index":false}"#)]);
+
+        assert_eq!(
+            result.errors,
+            ["removed_config_key:search_index:use:indexes.trigram"]
+        );
+    }
+
     fn tier(tier: &str, doc: &str) -> ConfigTier {
         ConfigTier {
             tier: tier.to_string(),
@@ -3037,10 +3047,14 @@ mod tests {
             r#"{"backup": {"enabled": false}}"#,
             r#"{"bash": false}"#,
         ] {
-            let result = resolve_config(&[
-                tier("user", r#"{"disabled_tools": []}"#),
-                tier("project", project),
-            ]);
+            let result = resolve_config_for_harness_with_phase(
+                &[
+                    tier("user", r#"{"disabled_tools": []}"#),
+                    tier("project", project),
+                ],
+                None,
+                PolicyPhase::Window,
+            );
             assert!(result.errors.is_empty());
             for kept in ["aft_move", "aft_delete"] {
                 assert!(
@@ -3059,14 +3073,12 @@ mod tests {
     /// unknown key. It can NEVER reach Config.
     #[test]
     fn nested_unknown_keys_are_stripped_but_top_level_privileged_keys_cannot_smuggle() {
-        // Nested unknown key: stripped, object survives — parity with TS (golden
-        // `bash_unknown_nested_key`). `bash: { unknown_key }` resolves like
-        // `bash: {}` → object form → bash ENABLED (object presence beats the
-        // minimal surface default). The point: the unknown key did not fail the
+        // Nested unknown key: stripped, object survives, and the bash object
+        // resolves as enabled. The point: the unknown key did not fail the
         // parse — the object survived and resolved.
         let nested = resolve_config(&[tier(
             "user",
-            r#"{ "tool_surface": "minimal", "bash": { "unknown_key": true } }"#,
+            r#"{ "disabled_tools": [], "bash": { "unknown_key": true } }"#,
         )]);
         assert!(nested.config.experimental_bash_rewrite);
         assert!(nested.config.experimental_bash_compress);
@@ -3076,15 +3088,15 @@ mod tests {
         // tier: not in RawAftConfig → full parse fails → partial-parse drops it.
         // It must never appear in Config (Config keeps its default storage_dir).
         let smuggle = resolve_config(&[
-            tier("user", r#"{ "search_index": true }"#),
+            tier("user", r#"{ "indexes": { "trigram": true } }"#),
             tier(
                 "project",
-                r#"{ "storage_dir": "/tmp/evil", "bash_permissions": true, "search_index": false }"#,
+                r#"{ "storage_dir": "/tmp/evil", "bash_permissions": true, "indexes": { "trigram": false } }"#,
             ),
         ]);
-        // The valid project key (search_index) still applies via partial-parse...
+        // The valid project index setting still applies via partial parsing.
         assert!(!smuggle.config.indexes.trigram);
-        // ...but the smuggled process-state fields never reach Config.
+        // The smuggled process-state fields never reach Config.
         assert!(smuggle.config.storage_dir.is_none());
         assert!(!smuggle.config.bash_permissions);
     }
@@ -3212,9 +3224,7 @@ mod tests {
               "formatter": { "rust": "rustfmt", "typescript": "prettier" },
               "checker": { "rust": "cargo", "typescript": "tsc" },
               "restrict_to_project_root": true,
-              "search_index": true,
-              "semantic_search": true,
-              "callgraph_store": false,
+              "indexes": { "trigram": true, "semantic": true, "callgraph": false },
               "callgraph_chunk_size": 17,
               "url_fetch_allow_private": true,
               "semantic": {
@@ -3342,8 +3352,13 @@ mod tests {
             ),
         ];
 
-        let opencode = resolve_config_for_harness(&tiers, Some(&Harness::Opencode));
-        let pi = resolve_config_for_harness(&tiers, Some(&Harness::Pi));
+        let opencode = resolve_config_for_harness_with_phase(
+            &tiers,
+            Some(&Harness::Opencode),
+            PolicyPhase::Window,
+        );
+        let pi =
+            resolve_config_for_harness_with_phase(&tiers, Some(&Harness::Pi), PolicyPhase::Window);
 
         // The legacy hoist choice now translates into disabled host names. The
         // user base (hoist false) already disables them; a harness block can
@@ -3369,15 +3384,23 @@ mod tests {
             r#"{ "harnesses": { "pi": { "hoist_builtin_tools": false } } }"#,
         )];
         assert_eq!(
-            resolve_config_for_harness(&harness_only, Some(&Harness::Opencode))
-                .config
-                .disabled_tools,
+            resolve_config_for_harness_with_phase(
+                &harness_only,
+                Some(&Harness::Opencode),
+                PolicyPhase::Window,
+            )
+            .config
+            .disabled_tools,
             ["aft_delete", "aft_move"]
         );
         assert_eq!(
-            resolve_config_for_harness(&harness_only, Some(&Harness::Pi))
-                .config
-                .disabled_tools,
+            resolve_config_for_harness_with_phase(
+                &harness_only,
+                Some(&Harness::Pi),
+                PolicyPhase::Window,
+            )
+            .config
+            .disabled_tools,
             hosts_and_default
         );
     }
@@ -3508,12 +3531,17 @@ mod tests {
 
     #[test]
     fn github_master_off_fills_absent_leaves_and_explicit_leaves_win() {
-        // The legacy master switch no longer vetoes explicit leaves: it only
-        // generates `false` for leaves the block leaves out.
-        let explicit = resolve_config(&[tier(
-            "user",
-            r#"{"github":{"enabled":false,"shim":true,"read":true,"write":true}}"#,
-        )]);
+        // The legacy GitHub master switch no longer overrides explicit leaves;
+        // it only supplies false for permissions omitted from the block. Resolve
+        // these examples in the 0.58 phase that translates `github.enabled`.
+        let explicit = resolve_config_for_harness_with_phase(
+            &[tier(
+                "user",
+                r#"{"github":{"enabled":false,"shim":true,"read":true,"write":true}}"#,
+            )],
+            None,
+            PolicyPhase::Window,
+        );
         assert!(explicit.errors.is_empty());
         assert_eq!(
             explicit.config.github,
@@ -3524,7 +3552,11 @@ mod tests {
             }
         );
 
-        let master_only = resolve_config(&[tier("user", r#"{"github":{"enabled":false}}"#)]);
+        let master_only = resolve_config_for_harness_with_phase(
+            &[tier("user", r#"{"github":{"enabled":false}}"#)],
+            None,
+            PolicyPhase::Window,
+        );
         assert_eq!(
             master_only.config.github,
             GithubConfig {
@@ -3533,7 +3565,11 @@ mod tests {
                 write: false,
             }
         );
-        let master_true = resolve_config(&[tier("user", r#"{"github":{"enabled":true}}"#)]);
+        let master_true = resolve_config_for_harness_with_phase(
+            &[tier("user", r#"{"github":{"enabled":true}}"#)],
+            None,
+            PolicyPhase::Window,
+        );
         assert_eq!(master_true.config.github, GithubConfig::default());
     }
 
@@ -3614,7 +3650,7 @@ mod tests {
 
         let invalid = resolve_config(&[tier(
             "user",
-            r#"{"git":{"co_author":"not-an-identity"},"search_index":true}"#,
+            r#"{"git":{"co_author":"not-an-identity"},"indexes":{"trigram":true}}"#,
         )]);
         assert_eq!(invalid.config.git.co_author, "off");
         assert!(invalid.config.indexes.trigram);
@@ -3830,10 +3866,14 @@ mod tests {
     fn project_indexes_can_only_turn_an_index_off() {
         // A project may switch an index off but never back on: its values AND
         // with the user resolution (legacy keys translate first).
-        let result = resolve_config(&[
-            tier("user", r#"{ "search_index": false }"#),
-            tier("project", r#"{ "search_index": true }"#),
-        ]);
+        let result = resolve_config_for_harness_with_phase(
+            &[
+                tier("user", r#"{ "search_index": false }"#),
+                tier("project", r#"{ "search_index": true }"#),
+            ],
+            None,
+            PolicyPhase::Window,
+        );
         assert!(!result.config.indexes.trigram);
         assert!(result.dropped.is_empty());
 
@@ -4251,8 +4291,11 @@ mod tests {
 
         // The legacy minimal surface no longer switches the bash runtime off; it
         // unregisters bash and its companions through disabled_tools instead.
-        let minimal_surface_result =
-            resolve_config(&[tier("user", r#"{ "tool_surface": "minimal" }"#)]);
+        let minimal_surface_result = resolve_config_for_harness_with_phase(
+            &[tier("user", r#"{ "tool_surface": "minimal" }"#)],
+            None,
+            PolicyPhase::Window,
+        );
         assert!(minimal_surface_result.config.bash.enabled);
         assert!(minimal_surface_result.config.experimental_bash_rewrite);
         assert!(minimal_surface_result
@@ -4332,7 +4375,7 @@ mod tests {
             "user",
             r#"{
               "semantic": { "timeout_ms": 0 },
-              "search_index": true,
+              "indexes": { "trigram": true },
               "format_on_edit": false
             }"#,
         )]);
@@ -4347,7 +4390,7 @@ mod tests {
     fn config_resolve_unknown_top_level_key_is_dropped_but_rest_survives() {
         let result = resolve_config(&[tier(
             "user",
-            r#"{ "not_a_real_key": true, "search_index": true }"#,
+            r#"{ "not_a_real_key": true, "indexes": { "trigram": true } }"#,
         )]);
 
         assert!(result.config.indexes.trigram);
@@ -4383,7 +4426,10 @@ mod tests {
 
         // Bind 2 omits all three. With reset semantics they return to DEFAULT —
         // the second bind cannot inherit the first bind's capabilities.
-        let _ = resolve_config_onto(&[tier("user", r#"{ "search_index": true }"#)], &mut config);
+        let _ = resolve_config_onto(
+            &[tier("user", r#"{ "indexes": { "trigram": true } }"#)],
+            &mut config,
+        );
         assert!(
             !config.url_fetch_allow_private,
             "url_fetch_allow_private must reset to default, not inherit prior bind"
@@ -4434,7 +4480,10 @@ mod tests {
             ..Default::default()
         };
 
-        let _ = resolve_config_onto(&[tier("user", r#"{ "search_index": true }"#)], &mut config);
+        let _ = resolve_config_onto(
+            &[tier("user", r#"{ "indexes": { "trigram": true } }"#)],
+            &mut config,
+        );
 
         assert_eq!(
             config.storage_dir,
@@ -4532,7 +4581,7 @@ mod tests {
             "user",
             r#"{
               // line comment
-              "search_index": true,
+              "indexes": { "trigram": true },
               "formatter": {
                 "rust": "rustfmt", /* block comment */
               },

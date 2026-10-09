@@ -716,7 +716,7 @@ fn move_symbol_configured_without_store_still_rewrites_ts_consumers() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({ "callgraph_store": false }))
+            "config": user_config(json!({ "indexes": { "callgraph": false } }))
         })
         .to_string(),
     );
@@ -786,7 +786,7 @@ fn move_symbol_large_project_has_no_legacy_file_cap() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({ "callgraph_store": false }))
+            "config": user_config(json!({ "indexes": { "callgraph": false } }))
         })
         .to_string(),
     );

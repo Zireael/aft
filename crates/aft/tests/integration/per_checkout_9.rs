@@ -197,9 +197,11 @@ const TRIGRAM_ONLY: Planes = Planes {
 
 fn config_doc(views: bool, planes: Planes, embedder: Option<&MockEmbedder>) -> Value {
     let mut doc = json!({
-        "search_index": planes.trigram,
-        "semantic_search": planes.semantic,
-        "callgraph_store": planes.callgraph,
+        "indexes": {
+            "trigram": planes.trigram,
+            "semantic": planes.semantic,
+            "callgraph": planes.callgraph,
+        },
         "views": { "enabled": views },
     });
     if let Some(embedder) = embedder {

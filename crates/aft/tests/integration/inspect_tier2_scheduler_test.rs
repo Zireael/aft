@@ -63,9 +63,7 @@ fn configured_context_with_storage(
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": callgraph_store
+            "indexes": { "trigram": false, "semantic": false, "callgraph": callgraph_store }
         })),
     }));
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
@@ -399,9 +397,7 @@ fn automatic_refresh_reincludes_dead_code_after_callgraph_store_reconfigure() {
             "project_root": root.to_string_lossy(),
             "storage_dir": storage_dir.to_string_lossy(),
             "config": crate::helpers::user_config(serde_json::json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             })),
         })),
         &ctx,

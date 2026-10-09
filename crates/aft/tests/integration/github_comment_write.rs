@@ -82,6 +82,29 @@ struct Fixture {
 impl Fixture {
     fn new(github: serde_json::Value) -> Self {
         let root = tempfile::tempdir().expect("create GitHub write fixture");
+        let github = if github.get("enabled").is_some() {
+            // Translate `github.enabled` in the compatibility phase before writing
+            // the resolved `github.read`, `github.write`, and `github.shim` values.
+            // The child process runs at 0.59, where the retired key is rejected.
+            let tier = aft::config_resolve::ConfigTier {
+                tier: "user".to_string(),
+                source: "fixture".to_string(),
+                doc: json!({ "github": github }).to_string(),
+            };
+            let resolved = aft::config_resolve::resolve_config_for_harness_with_phase(
+                &[tier],
+                None,
+                aft::feature_config::PolicyPhase::Window,
+            );
+            assert!(
+                resolved.errors.is_empty(),
+                "legacy GitHub config: {:?}",
+                resolved.errors
+            );
+            serde_json::to_value(resolved.config.github).expect("serialize resolved GitHub config")
+        } else {
+            github
+        };
         let project = root.path().join("project");
         let bin = root.path().join("bin");
         let fake_gh = bin.join("fake-aft-shim");

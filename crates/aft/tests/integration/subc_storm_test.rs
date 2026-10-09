@@ -2305,11 +2305,9 @@ fn write_user_semantic_config(path: &Path, base_url: &str) {
 fn artifact_storm_config(storage_dir: &Path) -> Value {
     json!({
         "storage_dir": storage_dir,
-        "search_index": true,
-        "semantic_search": false,
-        "callgraph_store": true,
+        "indexes": { "trigram": true, "semantic": false, "callgraph": true },
         "inspect": { "enabled": true },
-        "tool_surface": "all",
+        "disabled_tools": [],
     })
 }
 
@@ -2320,11 +2318,13 @@ fn storm_project_config(
     configure_sleep_ms: u64,
 ) -> Value {
     let mut doc = json!({
-        "search_index": search,
-        "semantic_search": semantic,
-        "callgraph_store": false,
+        "indexes": {
+            "trigram": search,
+            "semantic": semantic,
+            "callgraph": false,
+        },
         "inspect": { "enabled": changed },
-        "tool_surface": "all",
+        "disabled_tools": [],
     });
     if configure_sleep_ms > 0 {
         doc["subc_test_configure_sleep_ms"] = json!(configure_sleep_ms);

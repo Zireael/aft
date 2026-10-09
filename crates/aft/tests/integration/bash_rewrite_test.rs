@@ -512,9 +512,7 @@ fn binary_rewrite_matches_bash_for_double_quoted_backslashes() {
             "storage_dir": storage.path(),
             "config": user_config(json!({
                 "bash": { "rewrite": true },
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),
         })
         .to_string(),
@@ -666,9 +664,7 @@ fn binary_ls_rewrite_preserves_hidden_visibility_and_direct_read_default() {
             "storage_dir": storage.path(),
             "config": user_config(json!({
                 "bash": { "rewrite": true },
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),
         })
         .to_string(),

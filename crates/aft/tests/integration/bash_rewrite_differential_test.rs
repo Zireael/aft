@@ -135,9 +135,7 @@ fn run_row(row: &CorpusRow) -> Result<(), String> {
             "storage_dir": storage.path(),
             "config": user_config(json!({
                 "bash": { "rewrite": true },
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),
         })
         .to_string(),

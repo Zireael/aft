@@ -153,9 +153,11 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": callgraph_store
+            "indexes": {
+                "trigram": false,
+                "semantic": false,
+                "callgraph": callgraph_store
+            }
         })),
     }));
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
@@ -185,8 +187,7 @@ fn configured_restricted_context(root: &Path) -> AppContext {
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false },
             "restrict_to_project_root": true
         })),
     }));
@@ -214,9 +215,7 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "inspect": { "diagnostics_timeout_ms": timeout_ms }
         })),
     }));
@@ -1502,7 +1501,7 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
             "id": "configure-view", "command": "configure", "harness": "opencode",
             "project_root": linked, "storage_dir": storage,
             "config": crate::helpers::user_config(json!({
-                "search_index": false, "semantic_search": false, "callgraph_store": true,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true },
                 "views": {"enabled": true}
             }))
         })),
@@ -1639,7 +1638,7 @@ fn inspect_views_owner_persists_and_reuses_tier2_contributions() {
     let configured = handle_configure(
         &request(json!({
             "id": "configure-owner", "command": "configure", "harness": "opencode", "project_root": root, "storage_dir": storage,
-            "config": crate::helpers::user_config(json!({ "search_index": false, "semantic_search": false, "callgraph_store": true, "views": {"enabled": true} }))
+            "config": crate::helpers::user_config(json!({ "indexes": { "trigram": false, "semantic": false, "callgraph": true }, "views": {"enabled": true} }))
         })),
         &ctx,
     );
@@ -5259,8 +5258,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false
+            "indexes": { "trigram": false, "semantic": false }
         })),
     }));
     let configure_response = serde_json::to_value(handle_configure(&configure, &ctx))
@@ -6086,7 +6084,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
             &request(json!({
                 "id": "saved-configure", "command": "configure", "project_root": root, "storage_dir": storage,
                 "harness": "opencode", "config": crate::helpers::user_config(json!({
-                    "search_index": false, "semantic_search": false,
+                    "indexes": { "trigram": false, "semantic": false },
                     "inspect": {"diagnostics_timeout_ms": 40_000}
                 }))
             })),
@@ -6241,7 +6239,7 @@ fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
         let response = handle_configure(
             &request(
                 json!({"id":"unsuccessful-configure", "command":"configure", "harness":"opencode", "project_root":root,"storage_dir":storage,
-            "config":crate::helpers::user_config(json!({"search_index":false,"semantic_search":false,"inspect":{"diagnostics_timeout_ms":40_000}}))}),
+            "config":crate::helpers::user_config(json!({"indexes":{"trigram":false,"semantic":false},"inspect":{"diagnostics_timeout_ms":40_000}}))}),
             ),
             &ctx,
         );

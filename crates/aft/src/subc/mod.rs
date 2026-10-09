@@ -15549,7 +15549,7 @@ mod tests {
             "project_root": root.as_path(), "storage_dir": root.as_path().join("storage"),
             "harness": "opencode", "session_id": "frozen-bind",
             "config": [{"tier": "user", "source": "/user/aft.jsonc", "doc": json!({
-                "search_index": false, "semantic_search": false, "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             }).to_string()}],
         }))
         .unwrap();
@@ -16028,7 +16028,7 @@ mod tests {
                 "config": [{
                     "tier": "user",
                     "source": "/u/aft.jsonc",
-                    "doc": json!({ "semantic_search": false }).to_string(),
+                    "doc": json!({ "indexes": { "semantic": false }, }).to_string(),
                 }],
             }))
             .unwrap();
@@ -16220,7 +16220,7 @@ mod tests {
                 "config": [{
                     "tier": "user",
                     "source": "/u/aft.jsonc",
-                    "doc": json!({ "semantic_search": false }).to_string(),
+                    "doc": json!({ "indexes": { "semantic": false }, }).to_string(),
                 }],
             }))
             .unwrap()
@@ -16949,7 +16949,7 @@ mod tests {
         // directory keeps the database ready.
         let mut same = fixture.bind_request(1, "opencode");
         same.params["config"][0]["doc"] = json!(json!({
-            "semantic_search": false,
+            "indexes": { "semantic": false },
             "restrict_to_project_root": true,
         })
         .to_string());

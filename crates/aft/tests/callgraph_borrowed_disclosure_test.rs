@@ -144,9 +144,7 @@ fn configure(root: &Path, storage: &Path) -> Arc<AppContext> {
             "project_root": root,
             "storage_dir": storage,
             "config": test_helpers::user_config(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": true,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": true },
                 "worktree": { "ram_overlay": true }
             }))
         })),

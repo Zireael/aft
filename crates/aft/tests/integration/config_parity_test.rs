@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aft::config::{Config, UserServerDef};
-use aft::config_resolve::{resolve_config_for_harness, ConfigTier};
+use aft::config_resolve::{resolve_config_for_harness_with_phase, ConfigTier};
 use aft::feature_config::validate_resolved_config;
 use aft::harness::Harness;
 use serde_json::Value;
@@ -102,7 +102,14 @@ fn assert_case(dir: &Path) -> Option<String> {
     }
 
     let harness = read_harness(dir);
-    let result = resolve_config_for_harness(&tiers, Some(&harness));
+    // These shared fixtures include retired keys such as `search_index` and
+    // `tool_surface`, which the 0.58 compatibility phase translates. Keep the
+    // parity run on that phase while the 0.59 crate default rejects those keys.
+    let result = resolve_config_for_harness_with_phase(
+        &tiers,
+        Some(&harness),
+        aft::feature_config::PolicyPhase::Window,
+    );
 
     let golden: Value = serde_json::from_str(
         &fs::read_to_string(dir.join("expected.json")).expect("read expected.json"),

@@ -26,8 +26,7 @@ fn configure_search_index(aft: &mut AftProcess, root: &Path) {
             "harness": "opencode",
             "project_root": root.display().to_string(),
             "config": user_config(serde_json::json!({
-                "search_index": true,
-                "semantic_search": false
+                "indexes": { "trigram": true, "semantic": false }
             })),
         }),
     );
@@ -432,8 +431,7 @@ fn configure_semantic_openai(
             "project_root": root.display().to_string(),
             "storage_dir": storage_dir.display().to_string(),
             "config": user_config(serde_json::json!({
-                "search_index": false,
-                "semantic_search": true,
+                "indexes": { "trigram": false, "semantic": true },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "test-embedding",
