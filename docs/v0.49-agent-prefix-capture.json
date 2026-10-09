@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "31f9ba3df4fd5d9c673a811854f2cbb1128cbb8e",
+  "source_commit": "35bb42b37649dbcb5997cfe43d75201c9d62f2e4",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "31f9ba3df4fd5d9c673a811854f2cbb1128cbb8e",
+      "source_commit": "35bb42b37649dbcb5997cfe43d75201c9d62f2e4",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "31f9ba3df4fd5d9c673a811854f2cbb1128cbb8e",
+      "source_commit": "35bb42b37649dbcb5997cfe43d75201c9d62f2e4",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -1073,13 +1073,15 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "31f9ba3df4fd5d9c673a811854f2cbb1128cbb8e",
+      "source_commit": "35bb42b37649dbcb5997cfe43d75201c9d62f2e4",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
           "aft_conflicts",
+          "aft_delete",
           "aft_import",
           "aft_inspect",
+          "aft_move",
           "aft_outline",
           "aft_safety",
           "aft_search",
@@ -1246,6 +1248,51 @@
               },
               "required": [
                 "patchText"
+              ]
+            }
+          },
+          "aft_delete": {
+            "description": "Delete one or more files (or directories).\n\nEach file is backed up before deletion — use aft_safety undo to recover any of them. A recursive delete backs up the whole tree: directories (empty ones too, with their permissions), file contents, hard links (relinked by undo) and symlinks (the link itself, never its target; restored exactly, even when dangling). Sockets are deleted but undo does not restore them, and a file hard-linked to paths outside the tree comes back as an independent copy; both are reported as warnings. Refused before anything is deleted: mount points of another filesystem, named pipes, device nodes, and symlinks undo cannot recreate exactly (non-UTF-8 target, or on Windows). Paths under the system temp directory are never backed up, so only mount points are refused there. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would record more than 2,000 entries (files, directories and links) or copy 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\nPartial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`.",
+            "schema": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "files": {
+                  "description": "Paths to delete (one or more). May include directories when recursive=true.",
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "recursive": {
+                  "description": "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "files"
+              ]
+            }
+          },
+          "aft_move": {
+            "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for destination automatically\nNote: This moves/renames whole files at the OS level; it does not relocate an individual symbol or rewrite imports.",
+            "schema": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Source file path to move (absolute or relative to project root)",
+                  "type": "string"
+                },
+                "destination": {
+                  "description": "Destination file path (absolute or relative to project root)",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "destination"
               ]
             }
           },
@@ -2006,7 +2053,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "31f9ba3df4fd5d9c673a811854f2cbb1128cbb8e",
+      "source_commit": "35bb42b37649dbcb5997cfe43d75201c9d62f2e4",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2197,7 +2244,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "31f9ba3df4fd5d9c673a811854f2cbb1128cbb8e",
+      "source_commit": "35bb42b37649dbcb5997cfe43d75201c9d62f2e4",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -3179,13 +3226,15 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "31f9ba3df4fd5d9c673a811854f2cbb1128cbb8e",
+      "source_commit": "35bb42b37649dbcb5997cfe43d75201c9d62f2e4",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
           "aft_conflicts",
+          "aft_delete",
           "aft_import",
           "aft_inspect",
+          "aft_move",
           "aft_outline",
           "aft_safety",
           "aft_search",
@@ -4208,6 +4257,53 @@
                 "dryRun": {
                   "type": "boolean",
                   "description": "Preview without applying (default: false)"
+                }
+              }
+            }
+          },
+          "aft_delete": {
+            "name": "aft_delete",
+            "label": "delete",
+            "description": "Delete one or more files (or directories). Each file is backed up before deletion — use `aft_safety undo` to recover any of them. A recursive delete backs up the whole tree: directories (empty ones too, with their permissions), file contents, hard links (relinked by undo) and symlinks (the link itself, never its target; restored exactly, even when dangling). Sockets are deleted but undo does not restore them, and a file hard-linked to paths outside the tree comes back as an independent copy; both are reported as warnings. Refused before anything is deleted: mount points of another filesystem, named pipes, device nodes, and symlinks undo cannot recreate exactly (non-UTF-8 target, or on Windows). Paths under the system temp directory are never backed up, so only mount points are refused there. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would record more than 2,000 entries (files, directories and links) or copy 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. Directory deletion requires recursive: true. Returns { success, complete, deleted, skipped_files }: partial success is allowed; files that fail are reported in skipped_files.",
+            "parameters": {
+              "type": "object",
+              "required": [
+                "files"
+              ],
+              "properties": {
+                "files": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Paths to delete (one or more). May include directories when recursive=true.",
+                  "minItems": 1
+                },
+                "recursive": {
+                  "type": "boolean",
+                  "description": "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error."
+                }
+              }
+            }
+          },
+          "aft_move": {
+            "name": "aft_move",
+            "label": "move",
+            "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for the destination automatically. This operates on whole files at the OS level; it does not relocate an individual symbol or rewrite imports.",
+            "parameters": {
+              "type": "object",
+              "required": [
+                "path",
+                "destination"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Source file path to move (absolute or relative to project root)"
+                },
+                "destination": {
+                  "type": "string",
+                  "description": "Destination file path (absolute or relative to project root)"
                 }
               }
             }
