@@ -24,9 +24,6 @@
     "typescript": "biome"
   },
 
-  // Enable indexed search for grep and glob hoisting
-  "search_index": true,
-
   // Break-glass: when the AFT bridge/daemon is transport-dead, bash may fall
   // back to direct host execution (foreground-only, per-command approval with
   // an AFT UNAVAILABLE banner). This is the repair lane for fixing AFT through
