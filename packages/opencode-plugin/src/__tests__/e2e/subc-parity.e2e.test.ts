@@ -368,11 +368,13 @@ maybeDescribe(describeName, () => {
         // poll BOTH sides to the converged state before comparing. A
         // side that never converges still fails the assertion verbatim.
         // An index that listed a file since deleted is also a transient state:
-        // the watcher's next drain removes it.
+        // the watcher's next drain removes it, as do watcher changes not yet
+        // applied to the index.
         const converged = (text: string) =>
           !text.includes("building/retrying") &&
           !text.includes("[index: building") &&
-          !text.includes("were not on disk in this checkout");
+          !text.includes("were not on disk in this checkout") &&
+          !text.includes("Watcher changes pending");
         const ndjsonText = await toolTextUntil(ndjson, call.name, call.args, converged);
         const subcText = await toolTextUntil(subc, call.name, call.args, converged);
         expect(normalizeRoot(subcText, subc.tempDir), call.name).toBe(
