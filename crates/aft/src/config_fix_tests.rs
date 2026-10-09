@@ -359,7 +359,18 @@ fn auto_migration_rewrites_the_user_file_once_and_keeps_a_backup() {
     assert!(text.contains("// my settings"), "{text}");
     assert!(retired_key_translation(&text).is_none(), "{text}");
     assert_eq!(std::fs::read_to_string(backup).unwrap(), RETIRED_USER_FILE);
-    assert_eq!(backups(dir.path()), vec![backup.clone()]);
+    // The backup sits next to the canonical file, and macOS's temp dir is a
+    // symlink (/var -> /private/var), so compare canonical paths.
+    let canonical = |paths: Vec<std::path::PathBuf>| -> Vec<std::path::PathBuf> {
+        paths
+            .into_iter()
+            .map(|path| std::fs::canonicalize(path).unwrap())
+            .collect()
+    };
+    assert_eq!(
+        canonical(backups(dir.path())),
+        canonical(vec![backup.clone()])
+    );
     assert!(
         notice.contains("hoist_builtin_tools, search_index"),
         "{notice}"
