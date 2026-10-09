@@ -112,6 +112,7 @@ describe("Pi/OMP feature-config registration", () => {
   for (const harness of ["pi", "omp"] as const) {
     for (const { name, user, disabled } of CASES) {
       test(`${harness} registers canonical tools minus resolved disables: ${name}`, () => {
+        if (name.startsWith("legacy ")) setFeatureConfigPolicyVersionForTests("0.58.0");
         const config = loadWithUserConfig(user);
         expect(config.disabled_tools).toEqual([...disabled].sort());
         expect(registeredNames(config, harness)).toEqual(expected(disabled, harness));
@@ -125,6 +126,38 @@ describe("Pi/OMP feature-config registration", () => {
     expect(missing).toEqual(["apply_patch", "glob"]);
     expect(ADAPTER_UNIMPLEMENTED_TOOLS.pi).toEqual(["apply_patch", "glob"]);
     expect(ADAPTER_UNIMPLEMENTED_TOOLS.omp).toEqual(["apply_patch", "glob"]);
+  });
+
+  test("the shipped policy rejects retired registration and index keys with a migration hint", () => {
+    let rejected: unknown;
+    try {
+      loadWithUserConfig({
+        disabled_tools: ["aft_glob"],
+        tool_surface: "all",
+        hoist_builtin_tools: false,
+        enabled: false,
+        search_index: true,
+        experimental_search_index: false,
+        semantic_search: false,
+        experimental_semantic_search: true,
+        callgraph_store: false,
+      });
+    } catch (err) {
+      rejected = err;
+    }
+    expect(rejected).toBeInstanceOf(ConfigRejectedError);
+    expect((rejected as ConfigRejectedError).errors).toEqual([
+      "removed_config_key:aft_glob:use:glob",
+      "removed_config_key:callgraph_store:use:indexes.callgraph",
+      "removed_config_key:enabled:use:disabled_tools",
+      "removed_config_key:experimental_search_index:use:indexes.trigram",
+      "removed_config_key:experimental_semantic_search:use:indexes.semantic",
+      "removed_config_key:hoist_builtin_tools:use:disabled_tools",
+      "removed_config_key:search_index:use:indexes.trigram",
+      "removed_config_key:semantic_search:use:indexes.semantic",
+      "removed_config_key:tool_surface:use:disabled_tools",
+    ]);
+    expect((rejected as ConfigRejectedError).message).toContain("doctor --fix");
   });
 
   test("after the window retired keys and aliases reject the whole load", () => {
@@ -177,6 +210,9 @@ describe("semantic default-on cost notice", () => {
       { harnesses: { pi: { indexes: { semantic: true } } } },
       { semantic: { backend: "openai_compatible", base_url: "http://localhost:1" } },
     ]) {
+      setFeatureConfigPolicyVersionForTests(
+        "semantic_search" in user || "experimental_semantic_search" in user ? "0.58.0" : undefined,
+      );
       loadWithUserConfig(user);
       expect(costNotices()).toHaveLength(0);
     }

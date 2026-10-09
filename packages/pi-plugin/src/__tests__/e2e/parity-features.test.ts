@@ -32,7 +32,7 @@ maybeDescribe("e2e Pi parity features", () => {
   async function harness(): Promise<Harness> {
     const created = await createHarness(preparedBinary, {
       fixtureNames: [],
-      config: { search_index: false },
+      config: { indexes: { trigram: false, semantic: false } },
       timeoutMs: 10_000,
     });
     harnesses.push(created);

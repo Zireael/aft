@@ -368,8 +368,7 @@ Set-Content -Path (Join-Path $ConfigDir "opencode.json") -Value $OpencodeConfig
 # graduated to the top-level `bash` block (experimental.bash.* is legacy-only).
 $AftConfig = @"
 {
-  "search_index": true,
-  "semantic_search": true,
+  "indexes": { "trigram": true, "semantic": true },
   "bash": {
     "rewrite": true,
     "compress": true,

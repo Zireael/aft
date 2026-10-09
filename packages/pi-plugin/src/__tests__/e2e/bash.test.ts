@@ -61,7 +61,10 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
   async function harness(configOverrides: Record<string, unknown> = {}): Promise<Harness> {
     const created = await createHarness(initialBinary, {
       fixtureNames: [],
-      config: { search_index: false, ...toConfigureOverrides(configOverrides) },
+      config: {
+        indexes: { trigram: false, semantic: false },
+        ...toConfigureOverrides(configOverrides),
+      },
       timeoutMs: 60_000,
     });
     harnesses.push(created);

@@ -290,7 +290,7 @@ async function configureBridge(
     configureParamsFromLegacyOverrides({
       project_root: harness.tempDir,
       harness: "opencode",
-      search_index: options.experimentalSearchIndex,
+      indexes: { trigram: options.experimentalSearchIndex },
     }),
   );
 

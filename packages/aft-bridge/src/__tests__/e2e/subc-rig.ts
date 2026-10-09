@@ -179,8 +179,7 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
     JSON.stringify(
       {
         storage_dir: storageDir,
-        search_index: true,
-        semantic_search: false,
+        indexes: { trigram: true, semantic: false },
         disabled_tools: [],
         experimental_bash_background: true,
         bash_permissions: false,
@@ -308,7 +307,7 @@ async function setupProjectFixture(
   await mkdir(join(projectDir, ".cortexkit"), { recursive: true });
   await writeFile(
     join(projectDir, ".cortexkit", "aft.jsonc"),
-    JSON.stringify({ search_index: false, semantic_search: false }, null, 2),
+    JSON.stringify({ indexes: { trigram: false, semantic: false } }, null, 2),
     "utf8",
   );
   await writeFile(join(projectDir, "seed.txt"), "seed\n", "utf8");

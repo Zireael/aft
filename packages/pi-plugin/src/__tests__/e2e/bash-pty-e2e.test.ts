@@ -38,7 +38,7 @@ maybeDescribe("e2e bash PTY (Pi adapter + bridge + Rust)", () => {
   async function pluginHarness() {
     const h = await createHarness(initialBinary, {
       fixtureNames: [],
-      config: { search_index: false },
+      config: { indexes: { trigram: false, semantic: false } },
       timeoutMs: 60_000,
     });
     harnesses.push(h);

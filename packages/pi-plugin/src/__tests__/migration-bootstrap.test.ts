@@ -77,7 +77,7 @@ describe.serial("Pi migration bootstrap", () => {
     mkdirSync(join(home, ".pi", "agent"), { recursive: true });
     writeFileSync(
       join(home, ".pi", "agent", "aft.json"),
-      JSON.stringify({ lsp: { auto_install: false }, semantic_search: false }),
+      JSON.stringify({ lsp: { auto_install: false }, indexes: { semantic: false } }),
       "utf8",
     );
     process.chdir(projectDir);

@@ -37,7 +37,10 @@ maybeDescribe("e2e bg notifications (Pi adapter + bridge + Rust)", () => {
   async function pluginHarness() {
     const h = await createHarness(initialBinary, {
       fixtureNames: [],
-      config: { search_index: false, experimental_bash_background: true } as never,
+      config: {
+        indexes: { trigram: false, semantic: false },
+        experimental_bash_background: true,
+      } as never,
       timeoutMs: 60_000,
     });
     harnesses.push(h);

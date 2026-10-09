@@ -102,8 +102,7 @@ maybeDescribe(describeName, () => {
               source: "/tmp/aft-hashline-plugin.jsonc",
               doc: JSON.stringify({
                 edit_mode: "hashline",
-                search_index: false,
-                semantic_search: false,
+                indexes: { trigram: false, semantic: false },
               }),
             },
           ],
@@ -193,8 +192,7 @@ maybeDescribe(describeName, () => {
                   source: "/tmp/aft-hashline-registration.jsonc",
                   doc: JSON.stringify({
                     edit_mode: testCase.rustMode,
-                    search_index: false,
-                    semantic_search: false,
+                    indexes: { trigram: false, semantic: false },
                   }),
                 },
               ],

@@ -152,7 +152,7 @@ maybeDescribe("e2e semantic search tool", () => {
         ...(warmFastembedCache ? { childEnv: { FASTEMBED_CACHE_DIR: warmFastembedCache } } : {}),
       },
       configureParamsFromLegacyOverrides({
-        semantic_search: options?.experimentalSemanticSearch ?? false,
+        indexes: { semantic: options?.experimentalSemanticSearch ?? false },
         storage_dir: join(harness.tempDir, ".storage"),
         harness: "opencode",
         ...(options?.experimentalSemanticSearch && localOrtDir
@@ -264,8 +264,7 @@ maybeDescribe("e2e semantic search tool", () => {
       harness.binaryPath,
       { timeoutMs: 20_000 },
       configureParamsFromLegacyOverrides({
-        search_index: true,
-        semantic_search: false,
+        indexes: { trigram: true, semantic: false },
         storage_dir: storageDir,
         harness: "opencode",
       }),

@@ -256,11 +256,10 @@ export async function createHarness(
 
   // Full permissive surface so registerAllTools exposes every tool by default.
   const config: AftConfig = {
-    tool_surface: "all",
+    disabled_tools: [],
     format_on_edit: false,
     validate_on_edit: "syntax",
-    search_index: true,
-    semantic_search: false,
+    indexes: { trigram: true, semantic: false },
     restrict_to_project_root: false,
     ...(options.config ?? {}),
   };
@@ -309,7 +308,7 @@ export async function createHarness(
     hoistGrep: true,
     outline: true,
     zoom: true,
-    semantic: config.semantic_search === true,
+    semantic: config.indexes?.semantic === true,
     navigate: true,
     conflicts: true,
     importTool: true,
