@@ -41,8 +41,7 @@ const BASH_FAMILY = ["bash", "bash_status", "bash_watch", "bash_kill", "bash_wri
 
 function resolved(config: AftConfig): AftConfig {
   const doc = structuredClone(config) as Record<string, unknown>;
-  const translation = translateConfigDocument(doc, "window", "user");
-  if (translation.errors.length > 0) throw new Error(translation.errors.join(", "));
+  translateConfigDocument(doc, "user");
   doc.disabled_tools ??= [...DEFAULT_DISABLED_TOOLS];
   return doc as AftConfig;
 }

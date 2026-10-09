@@ -2526,16 +2526,25 @@ fn find_config_tier(
     tiers.iter().find(|tier| tier.tier == tier_name).cloned()
 }
 
+/// The tiers for one configure, plus what the automatic migration of the user
+/// file did while reading it (reported back as a configure warning).
 fn resolve_config_tiers_for_configure(
     params: &serde_json::Value,
     project_root: &Path,
-) -> Result<Vec<crate::config_resolve::ConfigTier>, String> {
+) -> Result<
+    (
+        Vec<crate::config_resolve::ConfigTier>,
+        Option<crate::config_fix::UserConfigMigration>,
+    ),
+    String,
+> {
     let wire_tiers = parse_config_tiers(params).unwrap_or_default();
     let user_config_path = parse_cortexkit_user_config_path(params)?;
-    let file_tiers = crate::subc_config::read_local_cortexkit_config_tiers(
-        user_config_path.as_deref(),
-        project_root,
-    );
+    let (file_tiers, migration) =
+        crate::subc_config::read_local_cortexkit_config_tiers_with_migration(
+            user_config_path.as_deref(),
+            project_root,
+        );
 
     let mut tiers = Vec::new();
     for tier_name in ["user", "project"] {
@@ -2545,7 +2554,7 @@ fn resolve_config_tiers_for_configure(
             tiers.push(tier);
         }
     }
-    Ok(tiers)
+    Ok((tiers, migration))
 }
 
 fn configure_fingerprint(
@@ -2870,10 +2879,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
-    let tiers = match resolve_config_tiers_for_configure(params, &root_path) {
-        Ok(tiers) => tiers,
-        Err(error) => return Response::error(&req.id, "invalid_request", error),
-    };
+    let (tiers, user_config_migration) =
+        match resolve_config_tiers_for_configure(params, &root_path) {
+            Ok(read) => read,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
     let config_diagnostics =
         crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
             &tiers,
@@ -2888,7 +2898,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             &req.id,
             "config_rejected",
             format!(
-                "configure: configuration rejected: {}. Run `aft doctor --fix` to migrate removed keys.",
+                "configure: configuration rejected: {}",
                 config_diagnostics.errors.join(", ")
             ),
         );
@@ -2912,6 +2922,21 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             })
         })
         .collect::<Vec<_>>();
+    // The automatic rewrite of the user file is reported once, by the
+    // configure that performed (or failed) it. `kind`/`hint` is the shape the
+    // host plugins deliver to the user.
+    if let Some(migration) = &user_config_migration {
+        configure_warnings.push(json!({
+            "kind": "config_migrated",
+            "code": match migration {
+                crate::config_fix::UserConfigMigration::Migrated { .. } => "user_config_migrated",
+                crate::config_fix::UserConfigMigration::NotMigrated { .. } => "user_config_not_migrated",
+            },
+            "tier": "user",
+            "hint": migration.notice(),
+            "message": migration.notice(),
+        }));
+    }
 
     // NO configure-time SSRF guard on semantic.base_url — deliberate (config
     // relocation posture). The original guard existed to stop UNTRUSTED *project*
@@ -10411,6 +10436,60 @@ mod tests {
         assert!(!ctx.config().format_on_edit);
         assert!(!ctx.config().url_fetch_allow_private);
         assert_eq!(ctx.config().callgraph_chunk_size, 3);
+    }
+
+    /// Configure migrates a user file that uses retired keys and reports it
+    /// once; a project file with retired keys is translated in memory and its
+    /// bytes are never touched. Neither refuses the configure.
+    #[test]
+    fn configure_migrates_the_user_file_and_translates_the_project_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
+        let project_path = temp.path().join(".cortexkit/aft.jsonc");
+        let project_text = r#"{ "semantic_search": false, "gh_read": { "enabled": true } }"#;
+        write_config(&user_path, r#"{ "search_index": false }"#);
+        write_config(&project_path, project_text);
+        let request = || {
+            configure_request_with_params(json!({
+                "project_root": temp.path(),
+                "harness": "opencode",
+                "cortexkit_user_config_path": user_path,
+            }))
+        };
+
+        let response = handle_configure_for_test(&request(), &ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+        assert!(!ctx.config().indexes.trigram);
+        assert!(!ctx.config().indexes.semantic);
+        assert!(
+            !ctx.config().github.read,
+            "a project cannot enable GitHub reads"
+        );
+        let migrated: Vec<&Value> = response.data["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .filter(|warning| warning["kind"] == "config_migrated")
+            .collect();
+        assert_eq!(migrated.len(), 1, "{:?}", response.data["warnings"]);
+        assert_eq!(migrated[0]["code"], "user_config_migrated");
+        assert!(migrated[0]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("retired keys (search_index)"));
+        let user_text = fs::read_to_string(&user_path).unwrap();
+        assert!(!user_text.contains("search_index"), "{user_text}");
+        assert_eq!(fs::read_to_string(&project_path).unwrap(), project_text);
+
+        let again = handle_configure_for_test(&request(), &ctx);
+        assert!(again.success, "configure failed: {:?}", again.data);
+        assert!(!again.data["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings
+                .iter()
+                .any(|warning| warning["kind"] == "config_migrated")));
+        assert_eq!(fs::read_to_string(&project_path).unwrap(), project_text);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::*;
-use crate::config_resolve::{resolve_config_for_harness_with_phase, ConfigTier};
+use crate::config_resolve::{resolve_config_for_harness, ConfigTier};
 use crate::harness::Harness;
 use serde_json::json;
 
@@ -30,7 +30,7 @@ fn inspect_cleanup_doctor_maps_idle_and_drops_inert_keys() {
     assert_eq!(value["lsp"]["idle_minutes"], "never", "canonical key wins");
 }
 
-fn resolved(doc: &str, tier: &str, harness: Option<&Harness>, phase: PolicyPhase) -> Value {
+fn resolved(doc: &str, tier: &str, harness: Option<&Harness>) -> Value {
     let mut tiers = Vec::new();
     if tier == "project" {
         tiers.push(ConfigTier {
@@ -44,7 +44,7 @@ fn resolved(doc: &str, tier: &str, harness: Option<&Harness>, phase: PolicyPhase
         source: tier.to_string(),
         doc: doc.to_string(),
     });
-    let result = resolve_config_for_harness_with_phase(&tiers, harness, phase);
+    let result = resolve_config_for_harness(&tiers, harness);
     assert!(result.errors.is_empty(), "{doc}: {:?}", result.errors);
     let config = result.config;
     json!({
@@ -57,8 +57,7 @@ fn resolved(doc: &str, tier: &str, harness: Option<&Harness>, phase: PolicyPhase
 }
 
 /// Fixing a file must preserve the values ordinary loading derives from its
-/// retired keys while it still accepts them (`PolicyPhase::Window`), and the
-/// fixed file must load once those keys are rejected (`PolicyPhase::Rejecting`).
+/// retired keys, and the fixed file must use none of them any more.
 fn assert_fix_preserves_intent(doc: &str, tier: FixTier) -> Migration {
     let tier_name = if tier == FixTier::User {
         "user"
@@ -68,25 +67,19 @@ fn assert_fix_preserves_intent(doc: &str, tier: FixTier) -> Migration {
     let migration = migrate_config_text(doc, tier).unwrap();
     assert!(migration.changed, "{doc} needed migration");
     for harness in [None, Some(Harness::Opencode), Some(Harness::Pi)] {
-        let before = resolved(doc, tier_name, harness.as_ref(), PolicyPhase::Window);
-        let after = resolved(
-            &migration.text,
-            tier_name,
-            harness.as_ref(),
-            PolicyPhase::Rejecting,
-        );
+        let before = resolved(doc, tier_name, harness.as_ref());
+        let after = resolved(&migration.text, tier_name, harness.as_ref());
         assert_eq!(before, after, "{doc}\n=>\n{}", migration.text);
     }
     let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&migration.text)).unwrap();
-    let mut rejected = value.as_object().unwrap().clone();
+    let mut fixed = value.as_object().unwrap().clone();
     let document_tier = if tier == FixTier::User {
         feature_config::DocumentTier::User
     } else {
         feature_config::DocumentTier::Project
     };
-    let check =
-        feature_config::translate_document(&mut rejected, PolicyPhase::Rejecting, document_tier);
-    assert!(check.errors.is_empty(), "{:?}", check.errors);
+    let check = feature_config::translate_document(&mut fixed, document_tier);
+    assert!(!check.legacy_input, "{:?}", check.retired_keys);
     migration
 }
 
@@ -97,8 +90,7 @@ fn legacy_registration_and_index_keys_become_canonical() {
         r#"{"tool_surface": "all"}"#,
         r#"{"tool_surface": "minimal", "disabled_tools": []}"#,
         r#"{"hoist_builtin_tools": false}"#,
-        r#"{"backup": {"enabled": false}}"#,
-        r#"{"bash": false, "inspect": {"enabled": false}}"#,
+        r#"{"hoist_builtin_tools": false, "bash": false, "backup": {"enabled": false}}"#,
         r#"{"enabled": false}"#,
         r#"{"disabled_tools": ["aft_glob", "aft_bash", "aft_zoom"]}"#,
         r#"{"search_index": false, "experimental_semantic_search": false, "callgraph_store": true}"#,
@@ -151,6 +143,10 @@ fn files_without_legacy_input_are_left_byte_identical() {
         "{\n  // nothing to do\n  \"disabled_tools\": [\"aft_zoom\"],\n  \"indexes\": {\"semantic\": false}\n}\n",
         "{}",
         r#"{"gh_shim": {"binary_path": "/opt/aft"}}"#,
+        // A false runtime gate is a current key that only switches its
+        // behaviour off, so there is no registration choice to record.
+        r#"{"backup": {"enabled": false}}"#,
+        r#"{"bash": false, "inspect": {"enabled": false}}"#,
     ] {
         let migration = migrate_config_text(doc, FixTier::User).unwrap();
         assert!(!migration.changed, "{doc}");
@@ -159,7 +155,7 @@ fn files_without_legacy_input_are_left_byte_identical() {
 }
 
 #[test]
-fn retired_github_aliases_are_repaired_only_here() {
+fn retired_github_aliases_are_repaired() {
     let migration = migrate_config_text(
         r#"{"gh_read": {"enabled": true}, "gh_shim": {"enabled": false, "binary_path": "/opt/aft"}}"#,
         FixTier::User,
@@ -170,7 +166,7 @@ fn retired_github_aliases_are_repaired_only_here() {
         value,
         json!({"gh_shim": {"binary_path": "/opt/aft"}, "github": {"read": true, "shim": false}})
     );
-    let after = resolved(&migration.text, "user", None, PolicyPhase::Rejecting);
+    let after = resolved(&migration.text, "user", None);
     assert_eq!(
         after["github"],
         json!({"shim": false, "read": true, "write": false})
@@ -241,12 +237,15 @@ fn project_fixes_never_materialize_protected_disables() {
 fn project_fixes_never_materialize_the_default_disables() {
     for (doc, want) in [
         (r#"{"hoist_builtin_tools": false}"#, json!([])),
-        (r#"{"backup": {"enabled": false}}"#, json!([])),
         (
-            r#"{"bash": false}"#,
-            json!(["bash_kill", "bash_status", "bash_watch", "bash_write"]),
+            r#"{"hoist_builtin_tools": false, "bash": false}"#,
+            json!([]),
         ),
-        (r#"{"inspect": {"enabled": false}}"#, json!(["aft_inspect"])),
+        // A false gate beside a retired key still records no disable.
+        (
+            r#"{"search_index": false, "inspect": {"enabled": false}}"#,
+            Value::Null,
+        ),
     ] {
         let migration = migrate_config_text(doc, FixTier::Project).unwrap();
         let value: Value = serde_json::from_str(&migration.text).unwrap();
@@ -264,7 +263,7 @@ fn project_fixes_never_materialize_the_default_disables() {
                     doc: text.to_string(),
                 },
             ];
-            let result = resolve_config_for_harness_with_phase(&tiers, None, PolicyPhase::Window);
+            let result = resolve_config_for_harness(&tiers, None);
             assert!(result.errors.is_empty());
             for kept in ["aft_move", "aft_delete"] {
                 assert!(
@@ -312,4 +311,220 @@ fn without_a_project_file_only_the_user_file_is_a_target() {
     std::fs::write(cwd.join(".cortexkit/aft.jsonc"), "{}").unwrap();
     assert_eq!(fix_targets(None, &cwd).len(), 1);
     assert_eq!(fix_targets(None, &cwd)[0].1, FixTier::Project);
+}
+
+const RETIRED_USER_FILE: &str =
+    "{\n  // my settings\n  \"search_index\": false,\n  \"hoist_builtin_tools\": false\n}\n";
+
+fn backups(dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.to_string_lossy().contains(".bak-"))
+        .collect();
+    found.sort();
+    found
+}
+
+/// The user file is rewritten with the doctor migration, keeps its comment,
+/// leaves the old text in a backup, and a second load changes nothing.
+#[test]
+fn auto_migration_rewrites_the_user_file_once_and_keeps_a_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let outcome = auto_migrate_user_config(&path).expect("migrated");
+    let UserConfigMigration::Migrated { backup, notice, .. } = &outcome else {
+        panic!("expected a rewrite, got {outcome:?}");
+    };
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        text,
+        migrate_config_text(RETIRED_USER_FILE, FixTier::User)
+            .unwrap()
+            .text
+    );
+    assert!(text.contains("// my settings"), "{text}");
+    assert!(retired_key_translation(&text).is_none(), "{text}");
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), RETIRED_USER_FILE);
+    assert_eq!(backups(dir.path()), vec![backup.clone()]);
+    assert!(
+        notice.contains("hoist_builtin_tools, search_index"),
+        "{notice}"
+    );
+    assert!(notice.contains(&backup.display().to_string()), "{notice}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the rewrite keeps the file mode");
+    }
+
+    assert_eq!(
+        auto_migrate_user_config(&path),
+        None,
+        "second run is a no-op"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert_eq!(backups(dir.path()).len(), 1);
+    assert!(
+        !dir.path().join(".aft.jsonc.migrate.lock").exists(),
+        "the lock is released"
+    );
+}
+
+/// Several loaders migrating at once converge on one rewrite, one backup and
+/// one notice.
+#[test]
+fn concurrent_auto_migrations_converge() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                auto_migrate_user_config(&path)
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    let migrated = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Some(UserConfigMigration::Migrated { .. })))
+        .count();
+    assert_eq!(migrated, 1, "{outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| !matches!(outcome, Some(UserConfigMigration::NotMigrated { .. }))),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        migrate_config_text(RETIRED_USER_FILE, FixTier::User)
+            .unwrap()
+            .text
+    );
+    assert_eq!(backups(dir.path()).len(), 1);
+}
+
+/// A read-only user file is never rewritten; the caller translates it in
+/// memory and the notice says why the file was left alone.
+#[test]
+fn a_read_only_user_file_is_left_alone_with_a_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions).unwrap();
+
+    let outcome = auto_migrate_user_config(&path).expect("reported");
+    let UserConfigMigration::NotMigrated { reason, notice, .. } = &outcome else {
+        panic!("expected no rewrite, got {outcome:?}");
+    };
+    assert_eq!(reason, "the file is read-only");
+    assert!(
+        notice.contains("applied their current equivalents"),
+        "{notice}"
+    );
+    assert!(notice.contains("doctor --fix"), "{notice}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), RETIRED_USER_FILE);
+    assert!(backups(dir.path()).is_empty());
+
+    // Loading the same text still resolves, translated in memory.
+    let result = resolve_config_for_harness(
+        &[ConfigTier {
+            tier: "user".to_string(),
+            source: path.display().to_string(),
+            doc: RETIRED_USER_FILE.to_string(),
+        }],
+        None,
+    );
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(!result.config.indexes.trigram);
+
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&path, permissions).unwrap();
+}
+
+#[test]
+fn auto_migration_ignores_current_missing_and_unparsable_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    assert_eq!(auto_migrate_user_config(&path), None);
+    for text in [
+        "{\n  \"indexes\": {\"semantic\": false},\n  \"bash\": false\n}\n",
+        "{ \"search_index\": false",
+    ] {
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(auto_migrate_user_config(&path), None, "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+    assert!(backups(dir.path()).is_empty());
+}
+
+/// A loader that finds another process's fresh lock waits, then leaves the
+/// file to that process; a lock left behind by a crash is cleared.
+#[test]
+fn a_held_lock_defers_and_a_stale_lock_is_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
+    let lock = dir.path().join(".aft.jsonc.migrate.lock");
+    std::fs::write(&lock, "").unwrap();
+    assert_eq!(auto_migrate_user_config(&path), None);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), RETIRED_USER_FILE);
+
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    std::fs::File::options()
+        .write(true)
+        .open(&lock)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    assert!(matches!(
+        auto_migrate_user_config(&path),
+        Some(UserConfigMigration::Migrated { .. })
+    ));
+    assert!(!lock.exists());
+}
+
+/// A symlinked user file (for example from a dotfiles checkout) is rewritten
+/// at its target, so the link itself survives.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_user_file_is_rewritten_at_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("dotfiles-aft.jsonc");
+    std::fs::write(&real, RETIRED_USER_FILE).unwrap();
+    let link_dir = dir.path().join("config");
+    std::fs::create_dir_all(&link_dir).unwrap();
+    let link = link_dir.join("aft.jsonc");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    assert!(matches!(
+        auto_migrate_user_config(&link),
+        Some(UserConfigMigration::Migrated { .. })
+    ));
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(retired_key_translation(&std::fs::read_to_string(&real).unwrap()).is_none());
 }

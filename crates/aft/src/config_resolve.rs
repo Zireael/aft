@@ -24,7 +24,7 @@ use crate::config::{
     MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
     MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
-use crate::feature_config::{self, PolicyPhase};
+use crate::feature_config;
 use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
 
@@ -95,7 +95,8 @@ pub struct ResolveResult {
     pub config: Config,
     pub dropped: Vec<DroppedKey>,
     pub warnings: Vec<ConfigWarning>,
-    /// Rejection diagnostics (for example `removed_config_key:<old>:use:<new>`).
+    /// Rejection diagnostics: a resolved configuration that is missing its
+    /// registration list or an index switch (`invalid_resolved_config:...`).
     /// When non-empty `config` must not be used: the whole candidate load is
     /// rejected rather than continuing with defaults.
     pub errors: Vec<String>,
@@ -702,28 +703,19 @@ pub fn resolve_config_for_harness(
     tiers: &[ConfigTier],
     harness: Option<&Harness>,
 ) -> ResolveResult {
-    resolve_config_for_harness_with_phase(tiers, harness, feature_config::current_policy_phase())
-}
-
-/// [`resolve_config_for_harness`] with an explicit migration-policy phase, so
-/// tests can exercise both the translation window and post-window rejection.
-pub fn resolve_config_for_harness_with_phase(
-    tiers: &[ConfigTier],
-    harness: Option<&Harness>,
-    phase: PolicyPhase,
-) -> ResolveResult {
     let mut merged = RawAftConfig::default();
     let mut dropped = Vec::new();
     let mut warnings = Vec::new();
-    let mut errors = Vec::new();
 
     let mut parsed = Vec::with_capacity(tiers.len());
     for tier in tiers {
-        let Some(outcome) = parse_tier(tier, phase) else {
+        let Some(outcome) = parse_tier(tier) else {
             continue;
         };
         let (raw, translation) = outcome;
-        errors.extend(translation.errors);
+        if translation.legacy_input {
+            log_retired_keys_once(tier, &translation);
+        }
         for warning in translation.warnings {
             // Migration notices are delivered once per identity by the host
             // plugin or CLI; the engine only records them in its log so the
@@ -745,16 +737,6 @@ pub fn resolve_config_for_harness_with_phase(
             );
         }
         parsed.push((tier, raw));
-    }
-    if !errors.is_empty() {
-        errors.sort();
-        errors.dedup();
-        return ResolveResult {
-            config: Config::default(),
-            dropped,
-            warnings,
-            errors,
-        };
     }
 
     // The absent-base default applies exactly once, to the user base, before
@@ -818,7 +800,7 @@ pub fn resolve_config_for_harness_with_phase(
         config,
         dropped,
         warnings,
-        errors,
+        errors: Vec::new(),
     }
 }
 
@@ -924,7 +906,27 @@ fn carry_process_state(base: &Config, resolved: &mut Config) {
     resolved.lsp_inflight_installs = base.lsp_inflight_installs.clone();
 }
 
-/// Whether this superseded-legacy note is new to this process.
+/// Log, once per config file and set of retired keys in this process, that a
+/// tier's retired keys were translated in memory. Reloads and repeated binds
+/// of the same root therefore do not repeat it. The host plugin delivers the
+/// user-facing notice; the user file's automatic rewrite reports its own.
+fn log_retired_keys_once(tier: &ConfigTier, translation: &feature_config::DocumentTranslation) {
+    let keys = translation.retired_keys.join(", ");
+    if !first_superseded_note(&tier.source, "retired_keys", &keys) {
+        return;
+    }
+    let notice = if tier.tier == "user" {
+        format!(
+            "{} uses retired keys ({keys}); AFT applied their current equivalents in memory",
+            tier.source
+        )
+    } else {
+        feature_config::project_retired_keys_notice(&tier.source, translation)
+    };
+    crate::slog_warn!("config {}: {}", tier.tier, notice);
+}
+
+/// Whether this note (keyed by file, key and text) is new to this process.
 fn first_superseded_note(source: &str, key: &str, message: &str) -> bool {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
@@ -934,24 +936,21 @@ fn first_superseded_note(source: &str, key: &str, message: &str) -> bool {
         .insert(format!("{source}\u{0}{key}\u{0}{message}"))
 }
 
-fn parse_tier(
-    tier: &ConfigTier,
-    phase: PolicyPhase,
-) -> Option<(RawAftConfig, feature_config::DocumentTranslation)> {
+fn parse_tier(tier: &ConfigTier) -> Option<(RawAftConfig, feature_config::DocumentTranslation)> {
     let stripped = strip_jsonc(&tier.doc);
     let value = serde_json::from_str::<Value>(&stripped).ok()?;
     let Value::Object(mut map) = value else {
         return None;
     };
-    // Retired keys are translated (or rejected) on the raw document, before
-    // the strict schema sees it, so they never reach `RawAftConfig`. Only the
-    // user tier's base block may receive the absent-base default disables.
+    // Retired keys are translated on the raw document, before the strict
+    // schema sees it, so they never reach `RawAftConfig`. Only the user
+    // tier's base block may receive the absent-base default disables.
     let document_tier = if tier.tier == "user" {
         feature_config::DocumentTier::User
     } else {
         feature_config::DocumentTier::Project
     };
-    let translation = feature_config::translate_document(&mut map, phase, document_tier);
+    let translation = feature_config::translate_document(&mut map, document_tier);
 
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map.clone())) {
         Ok(config) => config,
@@ -969,8 +968,8 @@ fn parse_tier(
 /// A connect keeps that behaviour. A live reload must not: a typo would reset
 /// a key (possibly a security key the harness block set) to its default while
 /// the root stays bound, so the reload calls this first and keeps the last
-/// valid configuration instead. Retired keys are left to the resolver, which
-/// rejects them with its own errors.
+/// valid configuration instead. Retired keys are translated first, exactly as
+/// the resolver translates them, so they never count as invalid here.
 pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option<String> {
     let stripped = strip_jsonc(&tier.doc);
     let value = match serde_json::from_str::<Value>(&stripped) {
@@ -985,14 +984,7 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
     } else {
         feature_config::DocumentTier::Project
     };
-    let translation = feature_config::translate_document(
-        &mut map,
-        feature_config::current_policy_phase(),
-        document_tier,
-    );
-    if !translation.errors.is_empty() {
-        return None;
-    }
+    feature_config::translate_document(&mut map, document_tier);
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map)) {
         Ok(raw) => raw,
         Err(error) => {
@@ -2903,26 +2895,70 @@ mod tests {
         assert!(drop_keys(&result).contains(&"inspect.categories.dead_code".to_string()));
     }
 
+    /// The retired inspect/LSP keys load in either tier. The idle value moves
+    /// to `lsp.idle_minutes` and is then held to that key's project rule: a
+    /// project may only shorten the user's idle window.
     #[test]
-    fn inspect_cleanup_removed_keys_name_replacement() {
-        for (doc, diagnostic) in [
-            (r#"{"idle":{"lsp_ttl_minutes":10}}"#, "removed_config_key:idle.lsp_ttl_minutes:use:lsp.idle_minutes"),
-            (r#"{"inspect":{"tier2_soft_deadline_ms":50}}"#, "removed_config_key:inspect.tier2_soft_deadline_ms:use:inspect.tier2_pass_timeout_ms"),
-            (r#"{"inspect":{"max_drill_down_items":20}}"#, "removed_config_key:inspect.max_drill_down_items:use:aft_inspect.topK"),
+    fn retired_inspect_and_lsp_keys_translate_under_current_key_rules() {
+        let minutes = |result: &ResolveResult| {
+            serde_json::to_value(&result.config).unwrap()["lsp_idle_minutes"].clone()
+        };
+        let user = resolve_config(&[tier("user", r#"{"idle":{"lsp_ttl_minutes":10}}"#)]);
+        assert!(user.errors.is_empty(), "{:?}", user.errors);
+        assert_eq!(minutes(&user), 10);
+
+        let tighten = resolve_config(&[
+            tier("user", r#"{"lsp":{"idle_minutes":30}}"#),
+            tier("project", r#"{"idle":{"lsp_ttl_minutes":10}}"#),
+        ]);
+        assert!(tighten.errors.is_empty(), "{:?}", tighten.errors);
+        assert_eq!(minutes(&tighten), 10);
+
+        let loosen = resolve_config(&[
+            tier("user", r#"{"lsp":{"idle_minutes":30}}"#),
+            tier("project", r#"{"idle":{"lsp_ttl_minutes":120}}"#),
+        ]);
+        assert!(loosen.errors.is_empty(), "{:?}", loosen.errors);
+        assert_eq!(minutes(&loosen), 30);
+        assert!(drop_keys(&loosen).contains(&"lsp.idle_minutes".to_string()));
+
+        for (tier_name, doc) in [
+            ("user", r#"{"inspect":{"tier2_soft_deadline_ms":50}}"#),
+            ("project", r#"{"inspect":{"max_drill_down_items":20}}"#),
         ] {
-            let result = resolve_config(&[tier("user", doc)]);
-            assert_eq!(result.errors, [diagnostic], "{doc}");
+            let result = resolve_config(&[tier(tier_name, doc)]);
+            assert!(result.errors.is_empty(), "{doc}: {:?}", result.errors);
         }
     }
 
+    /// Retired keys never refuse a load, in either tier. A project file's
+    /// translated values are current keys, so the project trust rules apply:
+    /// an index may be switched off, and protected tools stay registered.
     #[test]
-    fn release_059_rejects_retired_index_keys_by_default() {
-        let result = resolve_config(&[tier("user", r#"{"search_index":false}"#)]);
+    fn retired_keys_resolve_in_both_tiers() {
+        let user = resolve_config(&[tier("user", r#"{"search_index":false}"#)]);
+        assert!(user.errors.is_empty(), "{:?}", user.errors);
+        assert!(!user.config.indexes.trigram);
 
-        assert_eq!(
-            result.errors,
-            ["removed_config_key:search_index:use:indexes.trigram"]
-        );
+        let project = resolve_config(&[
+            tier("user", "{}"),
+            tier(
+                "project",
+                r#"{"search_index":false,"hoist_builtin_tools":false,"harnesses":{"opencode":{"tool_surface":"minimal"}}}"#,
+            ),
+        ]);
+        assert!(project.errors.is_empty(), "{:?}", project.errors);
+        assert!(!project.config.indexes.trigram);
+        for host in ["read", "write", "edit", "bash"] {
+            assert!(
+                !project
+                    .config
+                    .disabled_tools
+                    .iter()
+                    .any(|name| name == host),
+                "{host} is protected from a project file"
+            );
+        }
     }
 
     fn tier(tier: &str, doc: &str) -> ConfigTier {
@@ -3047,13 +3083,12 @@ mod tests {
             r#"{"backup": {"enabled": false}}"#,
             r#"{"bash": false}"#,
         ] {
-            let result = resolve_config_for_harness_with_phase(
+            let result = resolve_config_for_harness(
                 &[
                     tier("user", r#"{"disabled_tools": []}"#),
                     tier("project", project),
                 ],
                 None,
-                PolicyPhase::Window,
             );
             assert!(result.errors.is_empty());
             for kept in ["aft_move", "aft_delete"] {
@@ -3352,13 +3387,8 @@ mod tests {
             ),
         ];
 
-        let opencode = resolve_config_for_harness_with_phase(
-            &tiers,
-            Some(&Harness::Opencode),
-            PolicyPhase::Window,
-        );
-        let pi =
-            resolve_config_for_harness_with_phase(&tiers, Some(&Harness::Pi), PolicyPhase::Window);
+        let opencode = resolve_config_for_harness(&tiers, Some(&Harness::Opencode));
+        let pi = resolve_config_for_harness(&tiers, Some(&Harness::Pi));
 
         // The legacy hoist choice now translates into disabled host names. The
         // user base (hoist false) already disables them; a harness block can
@@ -3384,23 +3414,15 @@ mod tests {
             r#"{ "harnesses": { "pi": { "hoist_builtin_tools": false } } }"#,
         )];
         assert_eq!(
-            resolve_config_for_harness_with_phase(
-                &harness_only,
-                Some(&Harness::Opencode),
-                PolicyPhase::Window,
-            )
-            .config
-            .disabled_tools,
+            resolve_config_for_harness(&harness_only, Some(&Harness::Opencode),)
+                .config
+                .disabled_tools,
             ["aft_delete", "aft_move"]
         );
         assert_eq!(
-            resolve_config_for_harness_with_phase(
-                &harness_only,
-                Some(&Harness::Pi),
-                PolicyPhase::Window,
-            )
-            .config
-            .disabled_tools,
+            resolve_config_for_harness(&harness_only, Some(&Harness::Pi),)
+                .config
+                .disabled_tools,
             hosts_and_default
         );
     }
@@ -3532,15 +3554,13 @@ mod tests {
     #[test]
     fn github_master_off_fills_absent_leaves_and_explicit_leaves_win() {
         // The legacy GitHub master switch no longer overrides explicit leaves;
-        // it only supplies false for permissions omitted from the block. Resolve
-        // these examples in the 0.58 phase that translates `github.enabled`.
-        let explicit = resolve_config_for_harness_with_phase(
+        // it only supplies false for permissions omitted from the block.
+        let explicit = resolve_config_for_harness(
             &[tier(
                 "user",
                 r#"{"github":{"enabled":false,"shim":true,"read":true,"write":true}}"#,
             )],
             None,
-            PolicyPhase::Window,
         );
         assert!(explicit.errors.is_empty());
         assert_eq!(
@@ -3552,11 +3572,8 @@ mod tests {
             }
         );
 
-        let master_only = resolve_config_for_harness_with_phase(
-            &[tier("user", r#"{"github":{"enabled":false}}"#)],
-            None,
-            PolicyPhase::Window,
-        );
+        let master_only =
+            resolve_config_for_harness(&[tier("user", r#"{"github":{"enabled":false}}"#)], None);
         assert_eq!(
             master_only.config.github,
             GithubConfig {
@@ -3565,11 +3582,8 @@ mod tests {
                 write: false,
             }
         );
-        let master_true = resolve_config_for_harness_with_phase(
-            &[tier("user", r#"{"github":{"enabled":true}}"#)],
-            None,
-            PolicyPhase::Window,
-        );
+        let master_true =
+            resolve_config_for_harness(&[tier("user", r#"{"github":{"enabled":true}}"#)], None);
         assert_eq!(master_true.config.github, GithubConfig::default());
     }
 
@@ -3589,37 +3603,40 @@ mod tests {
         assert!(warning.message.contains("github.read"));
     }
 
+    /// The GitHub enable aliases translate to the canonical leaves in either
+    /// tier. A canonical leaf in the same block wins, and a project's
+    /// translated leaf is dropped exactly like a spelled-out `github.read`.
     #[test]
-    fn retired_github_aliases_reject_the_whole_load_even_beside_canonical_leaves() {
-        for doc in [
-            r#"{"gh_read":{"enabled":true}}"#,
+    fn retired_github_aliases_translate_and_keep_the_project_boundary() {
+        let alias = resolve_config(&[tier("user", r#"{"gh_read":{"enabled":false}}"#)]);
+        assert!(alias.errors.is_empty(), "{:?}", alias.errors);
+        assert!(!alias.config.github.read);
+        let canonical = resolve_config(&[tier(
+            "user",
             r#"{"github":{"read":false},"gh_read":{"enabled":true}}"#,
-        ] {
-            let result = resolve_config(&[tier("user", doc)]);
-            assert_eq!(
-                result.errors,
-                vec!["removed_config_key:gh_read:use:github.read"]
-            );
-        }
+        )]);
+        assert!(canonical.errors.is_empty(), "{:?}", canonical.errors);
+        assert!(!canonical.config.github.read);
         let shim = resolve_config(&[tier("user", r#"{"gh_shim":{"enabled":false}}"#)]);
-        assert_eq!(
-            shim.errors,
-            vec!["removed_config_key:gh_shim:use:github.shim"]
+        assert!(shim.errors.is_empty(), "{:?}", shim.errors);
+        assert!(!shim.config.github.shim);
+
+        let project = resolve_config(&[
+            tier("user", r#"{"github":{"read":false}}"#),
+            tier("project", r#"{"gh_read":{"enabled":true}}"#),
+        ]);
+        assert!(project.errors.is_empty(), "{:?}", project.errors);
+        assert!(
+            !project.config.github.read,
+            "a project cannot enable GitHub reads"
         );
-        for phase in [PolicyPhase::Window, PolicyPhase::Rejecting] {
-            let project = resolve_config_for_harness_with_phase(
-                &[
-                    tier("user", r#"{"github":{"read":false}}"#),
-                    tier("project", r#"{"gh_read":{"enabled":true}}"#),
-                ],
-                None,
-                phase,
-            );
-            assert_eq!(
-                project.errors,
-                vec!["removed_config_key:gh_read:use:github.read"]
-            );
-        }
+        assert!(
+            drop_keys(&project)
+                .iter()
+                .any(|key| key.starts_with("github")),
+            "{:?}",
+            drop_keys(&project)
+        );
 
         // The supported binary override alone is not a retired alias.
         let binary = resolve_config(&[tier(
@@ -3866,13 +3883,12 @@ mod tests {
     fn project_indexes_can_only_turn_an_index_off() {
         // A project may switch an index off but never back on: its values AND
         // with the user resolution (legacy keys translate first).
-        let result = resolve_config_for_harness_with_phase(
+        let result = resolve_config_for_harness(
             &[
                 tier("user", r#"{ "search_index": false }"#),
                 tier("project", r#"{ "search_index": true }"#),
             ],
             None,
-            PolicyPhase::Window,
         );
         assert!(!result.config.indexes.trigram);
         assert!(result.dropped.is_empty());
@@ -4291,11 +4307,8 @@ mod tests {
 
         // The legacy minimal surface no longer switches the bash runtime off; it
         // unregisters bash and its companions through disabled_tools instead.
-        let minimal_surface_result = resolve_config_for_harness_with_phase(
-            &[tier("user", r#"{ "tool_surface": "minimal" }"#)],
-            None,
-            PolicyPhase::Window,
-        );
+        let minimal_surface_result =
+            resolve_config_for_harness(&[tier("user", r#"{ "tool_surface": "minimal" }"#)], None);
         assert!(minimal_surface_result.config.bash.enabled);
         assert!(minimal_surface_result.config.experimental_bash_rewrite);
         assert!(minimal_surface_result
@@ -4330,13 +4343,10 @@ mod tests {
 
     #[test]
     fn config_resolve_bash_foreground_wait_clamps_to_floor() {
-        let Some((raw, _)) = parse_tier(
-            &tier(
-                "user",
-                r#"{ "bash": { "foreground_wait_window_ms": 1, "subagent_background": true } }"#,
-            ),
-            PolicyPhase::Window,
-        ) else {
+        let Some((raw, _)) = parse_tier(&tier(
+            "user",
+            r#"{ "bash": { "foreground_wait_window_ms": 1, "subagent_background": true } }"#,
+        )) else {
             panic!("test tier should parse");
         };
         let mut warnings = Vec::new();

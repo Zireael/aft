@@ -3,12 +3,7 @@
   "bash": {
     "enabled": false
   },
-  "disabled_tools": [
-    "bash_kill",
-    "bash_status",
-    "bash_watch",
-    "bash_write"
-  ],
+  "disabled_tools": [],
   "experimental_bash_background": false,
   "experimental_bash_compress": false,
   "experimental_bash_rewrite": false,

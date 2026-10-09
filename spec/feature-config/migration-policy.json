@@ -10,7 +10,7 @@
     ]
   },
   "introduced_minor": "0.58",
-  "reject_from_minor": "0.59",
+  "retired_key_handling": "Never rejected. Every load translates retired keys in memory into their current equivalents; the user file is rewritten automatically (doctor --fix migration, with a backup), a project file only gets a notice.",
   "comparison": "major/minor only; patch ignored",
   "paths": {
     "tool_surface": "disabled_tools",
@@ -32,7 +32,7 @@
     "aft_glob": "glob",
     "aft_bash": "bash"
   },
-  "gh_alias_ruling": "gh_read.enabled and gh_shim.enabled were already retired in v0.57.0; they are NOT covered by this new-policy artifact. They reject immediately under their existing policy. Retain gh_shim.binary_path.",
+  "gh_alias_ruling": "gh_read.enabled and gh_shim.enabled were already retired in v0.57.0; they are not in this artifact's path table. Loading translates them exactly as doctor --fix rewrites them (github.read / github.shim). Retain gh_shim.binary_path.",
   "retained_runtime_gates": [
     "backup.enabled",
     "inspect.enabled",

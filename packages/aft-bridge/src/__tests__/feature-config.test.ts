@@ -8,7 +8,6 @@ import {
   legacyConfigNoticeMessage,
   noticeDigest,
   noticeProjection,
-  policyPhaseForVersion,
   SEMANTIC_COST_NOTICE,
   semanticCostNotice,
   suppliesSemanticIndexInput,
@@ -32,34 +31,10 @@ const policy = JSON.parse(
     new URL("../../../../spec/feature-config/migration-policy.json", import.meta.url),
     "utf8",
   ),
-) as { introduced_minor: string; reject_from_minor: string; paths: Record<string, string> };
+) as { introduced_minor: string; reject_from_minor?: string; paths: Record<string, string> };
 
 const roots: string[] = [];
 
-test("inspect and LSP removed keys reject even in the older translation window", () => {
-  const cases: Array<[Record<string, unknown>, string]> = [
-    [
-      { idle: { lsp_ttl_minutes: 10 } },
-      "removed_config_key:idle.lsp_ttl_minutes:use:lsp.idle_minutes",
-    ],
-    [
-      { inspect: { tier2_soft_deadline_ms: 50 } },
-      "removed_config_key:inspect.tier2_soft_deadline_ms:use:inspect.tier2_pass_timeout_ms",
-    ],
-    [
-      { inspect: { max_drill_down_items: 20 } },
-      "removed_config_key:inspect.max_drill_down_items:use:aft_inspect.topK",
-    ],
-  ];
-  for (const [doc, expected] of cases) {
-    expect(translateConfigDocument(structuredClone(doc), "window", "user").errors).toEqual([
-      expected,
-    ]);
-    expect(
-      translateConfigDocument({ harnesses: { pi: doc } }, "rejecting", "project").errors,
-    ).toEqual([expected]);
-  }
-});
 afterEach(() => {
   for (const root of roots.splice(0)) {
     chmodSync(root, 0o755);
@@ -74,36 +49,126 @@ describe("feature-config policy", () => {
     }
   });
 
-  test("policy versions come from the shared artifact and compare major/minor only", () => {
+  test("the shared artifact names no rejection version", () => {
     expect(policy.introduced_minor).toBe("0.58");
-    expect(policy.reject_from_minor).toBe("0.59");
+    expect(policy.reject_from_minor).toBeUndefined();
     expect(Object.keys(policy.paths).some((path) => path.startsWith("gh_"))).toBe(false);
-    expect(policyPhaseForVersion("0.58.9")).toBe("window");
-    expect(policyPhaseForVersion("0.59.0")).toBe("rejecting");
-    expect(policyPhaseForVersion("0.59.3-beta.1")).toBe("rejecting");
   });
 
-  test("gate-only bases union with the default and explicit [] wins", () => {
-    const backup: Record<string, unknown> = { backup: { enabled: false } };
-    const out = translateConfigDocument(backup, "window", "user");
-    expect(backup.disabled_tools).toEqual(["aft_delete", "aft_move", "aft_safety"]);
-    expect(out.warnings.map((warning) => warning.code)).toContain(
-      "legacy_runtime_gate_requires_fix",
+  test("retired keys translate in either tier, are listed, and never error", () => {
+    const doc: Record<string, unknown> = {
+      disabled_tools: ["aft_glob"],
+      search_index: true,
+      harnesses: { pi: { semantic_search: false } },
+    };
+    const out = translateConfigDocument(doc, "user");
+    expect(doc).toEqual({
+      disabled_tools: ["glob"],
+      indexes: { trigram: true },
+      harnesses: { pi: { indexes: { semantic: false } } },
+    });
+    expect(out.legacyInput).toBe(true);
+    expect(out.retiredKeys).toEqual(["aft_glob", "harnesses.pi.semantic_search", "search_index"]);
+    expect("errors" in out).toBe(false);
+  });
+
+  test("GitHub aliases translate with doctor --fix precedence", () => {
+    const doc: Record<string, unknown> = {
+      gh_read: { enabled: true },
+      gh_shim: { enabled: false, binary_path: "/opt/aft" },
+    };
+    const out = translateConfigDocument(doc, "project");
+    expect(doc).toEqual({
+      github: { read: true, shim: false },
+      gh_shim: { binary_path: "/opt/aft" },
+    });
+    expect(out.retiredKeys).toEqual(["gh_read", "gh_shim.enabled"]);
+
+    const canonical: Record<string, unknown> = {
+      gh_read: { enabled: true },
+      github: { read: false },
+    };
+    const conflict = translateConfigDocument(canonical, "user");
+    expect(canonical).toEqual({ github: { read: false } });
+    expect(conflict.warnings[0]?.code).toBe("superseded_legacy_config");
+
+    const master: Record<string, unknown> = {
+      harnesses: { pi: { gh_shim: { enabled: true }, github: { enabled: false } } },
+    };
+    translateConfigDocument(master, "user");
+    expect(master).toEqual({
+      harnesses: { pi: { github: { read: false, write: false, shim: false } } },
+    });
+
+    const binaryOnly = translateConfigDocument({ gh_shim: { binary_path: "/opt/aft" } }, "user");
+    expect(binaryOnly.legacyInput).toBe(false);
+  });
+
+  test("retired inspect and LSP keys translate like doctor --fix", () => {
+    const doc: Record<string, unknown> = {
+      idle: { lsp_ttl_minutes: 3, root_ttl_minutes: 20 },
+      inspect: { tier2_soft_deadline_ms: 50, max_drill_down_items: 20 },
+    };
+    const out = translateConfigDocument(doc, "user");
+    expect(doc).toEqual({ idle: { root_ttl_minutes: 20 }, lsp: { idle_minutes: 5 } });
+    expect(out.retiredKeys).toEqual([
+      "idle.lsp_ttl_minutes",
+      "inspect.max_drill_down_items",
+      "inspect.tier2_soft_deadline_ms",
+    ]);
+    const nonInteger: Record<string, unknown> = { idle: { lsp_ttl_minutes: "x" } };
+    translateConfigDocument(nonInteger, "project");
+    expect(nonInteger).toEqual({ lsp: { idle_minutes: 60 } });
+    const canonical: Record<string, unknown> = {
+      idle: { lsp_ttl_minutes: 10 },
+      lsp: { idle_minutes: "never" },
+    };
+    expect(translateConfigDocument(canonical, "user").warnings[0]?.code).toBe(
+      "superseded_legacy_config",
     );
-    const gateWarning = out.warnings.find(
-      (warning) => warning.code === "legacy_runtime_gate_requires_fix",
-    );
-    expect(gateWarning?.message).toContain("run `npx @cortexkit/aft doctor --fix`");
+    expect(canonical).toEqual({ lsp: { idle_minutes: "never" } });
+  });
+
+  test("a false runtime gate never generates disables and says so", () => {
+    for (const gate of [
+      { backup: { enabled: false } },
+      { inspect: { enabled: false } },
+      { bash: false },
+      { bash: { enabled: false } },
+    ]) {
+      for (const tier of ["user", "project"] as const) {
+        const doc: Record<string, unknown> = structuredClone(gate);
+        const out = translateConfigDocument(doc, tier);
+        expect(doc.disabled_tools).toBeUndefined();
+        expect(out.legacyInput).toBe(false);
+        expect(out.warnings.map((warning) => warning.code)).toContain(
+          "legacy_runtime_gate_runtime_only",
+        );
+      }
+    }
+    const mixed: Record<string, unknown> = { bash: false, hoist_builtin_tools: false };
+    translateConfigDocument(mixed, "user");
+    expect(mixed.disabled_tools).toEqual([
+      "aft_delete",
+      "aft_move",
+      "apply_patch",
+      "bash",
+      "edit",
+      "glob",
+      "grep",
+      "read",
+      "write",
+    ]);
 
     const explicit: Record<string, unknown> = { hoist_builtin_tools: false, disabled_tools: [] };
-    translateConfigDocument(explicit, "window", "user");
+    translateConfigDocument(explicit, "user");
     expect(explicit.disabled_tools).toEqual([]);
     expect(explicit.hoist_builtin_tools).toBeUndefined();
   });
 
   test("project base blocks contribute only what their own legacy keys imply", () => {
     const hoist: Record<string, unknown> = { hoist_builtin_tools: false };
-    translateConfigDocument(hoist, "window", "project");
+    translateConfigDocument(hoist, "project");
     expect(hoist.disabled_tools).toEqual([
       "apply_patch",
       "bash",
@@ -113,30 +178,36 @@ describe("feature-config policy", () => {
       "read",
       "write",
     ]);
-    const backup: Record<string, unknown> = { backup: { enabled: false } };
-    translateConfigDocument(backup, "window", "project");
-    expect(backup.disabled_tools).toEqual(["aft_safety"]);
     const all: Record<string, unknown> = { tool_surface: "all" };
-    translateConfigDocument(all, "window", "project");
+    translateConfigDocument(all, "project");
     expect(all.disabled_tools).toBeUndefined();
   });
 
-  test("only the retained-gate note on an explicit list is delivered once, not per load", () => {
-    const fixed: Record<string, unknown> = { backup: { enabled: false }, disabled_tools: [] };
-    const out = translateConfigDocument(fixed, "window", "user");
+  test("only the explicit-list note is delivered once, not per load", () => {
+    const fixed: Record<string, unknown> = { hoist_builtin_tools: false, disabled_tools: [] };
+    const out = translateConfigDocument(fixed, "user");
     const note = out.warnings.find((warning) => warning.code === "superseded_legacy_config");
     expect(note?.once).toBe(true);
     const conflict = translateConfigDocument(
       { search_index: false, experimental_search_index: true },
-      "window",
       "user",
     );
     expect(conflict.warnings.every((warning) => warning.once !== true)).toBe(true);
   });
 
+  test("the project notice names the file and its retired keys", () => {
+    const out = translateConfigDocument(
+      { search_index: false, hoist_builtin_tools: true },
+      "project",
+    );
+    expect(legacyConfigNoticeMessage("/repo/.cortexkit/aft.jsonc", out)).toBe(
+      "/repo/.cortexkit/aft.jsonc uses retired keys (hoist_builtin_tools, search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file.",
+    );
+  });
+
   test("a retired enabled:false notice says indexes still build and how to stop them", () => {
     const doc: Record<string, unknown> = { enabled: false };
-    const out = translateConfigDocument(doc, "window", "user");
+    const out = translateConfigDocument(doc, "user");
     expect(out.retiredEnabledFalse).toBe(true);
     expect(doc.indexes).toBeUndefined();
     expect(out.warnings.map((warning) => warning.code)).toContain(
@@ -146,7 +217,7 @@ describe("feature-config policy", () => {
     expect(message).toContain("indexes still build");
     expect(message).toContain("indexes.trigram, indexes.semantic and indexes.callgraph to false");
 
-    const other = translateConfigDocument({ tool_surface: "all" }, "window", "user");
+    const other = translateConfigDocument({ tool_surface: "all" }, "user");
     expect(other.retiredEnabledFalse).toBe(false);
     expect(legacyConfigNoticeMessage("/cfg/aft.jsonc", other)).not.toContain("indexes still build");
   });
@@ -200,11 +271,11 @@ describe("migration notice delivery", () => {
 
 describe("semantic cost notice", () => {
   test("uses the spec text, with commands a plugin user can run", () => {
-    // The spec's wording, but `aft setup` / `aft doctor --fix` become the npx
-    // form: the notice reaches users through the plugin, and a plugin user has
-    // no `aft` command on PATH.
+    // The spec's wording, but `aft setup` becomes the npx form: the notice
+    // reaches users through the plugin, and a plugin user has no `aft`
+    // command on PATH.
     expect(SEMANTIC_COST_NOTICE).toBe(
-      "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run npx @cortexkit/aft setup to change indexes.semantic; if legacy configuration is rejected, run npx @cortexkit/aft doctor --fix first.",
+      "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run npx @cortexkit/aft setup to change indexes.semantic.",
     );
   });
 

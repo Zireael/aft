@@ -1,0 +1,13 @@
+{
+  "search_index": false,
+  "hoist_builtin_tools": false,
+  "disabled_tools": [
+    "aft_glob",
+    "aft_zoom"
+  ],
+  "harnesses": {
+    "opencode": {
+      "tool_surface": "recommended"
+    }
+  }
+}

@@ -636,10 +636,23 @@ Compared with Codex's default sandbox, AFT is stricter about credential reads: C
 v0.58 replaces surface levels with one rule — a tool is registered unless it is
 in `disabled_tools` — and makes the background indexes first-class
 (`indexes.trigram`, `indexes.semantic`, `indexes.callgraph`, all default on).
-During v0.58 the retired keys below are translated in memory on every load and
-one migration notice is delivered per unchanged file state; from v0.59 each is
-rejected with `removed_config_key:<old>:use:<replacement>` and the whole
-configuration is not used until `npx @cortexkit/aft doctor --fix` rewrites it.
+Retired keys are never refused. On every load AFT translates them into their
+current equivalents, and those then follow the usual user/project rules:
+
+- **User file** (`~/.config/cortexkit/aft.jsonc`): AFT rewrites the file to the
+  current keys the first time it reads it, with the same comment-preserving
+  migration `npx @cortexkit/aft doctor --fix` performs. The previous text is
+  kept beside it as `aft.jsonc.bak-<unix seconds>`, and one notice says the
+  file was updated. A read-only file, or one AFT cannot write, is left alone:
+  the keys are translated in memory and the notice says why the file was not
+  updated.
+- **Project file** (`<project>/.cortexkit/aft.jsonc`, including its
+  `harnesses` blocks): it is shared through the repository, so AFT never
+  writes it. The keys are translated in memory with the same limits a project
+  config has for the current key (for example, a project's `gh_read` becomes
+  `github.read`, which a project cannot set, so it is ignored), and one notice
+  names the file and its retired keys. Run `npx @cortexkit/aft doctor --fix`
+  in the project to update the file.
 
 | Retired input | Replacement |
 | --- | --- |
@@ -648,6 +661,9 @@ configuration is not used until `npx @cortexkit/aft doctor --fix` rewrites it.
 | `semantic_search`, `experimental_semantic_search` | `indexes.semantic` |
 | `callgraph_store` | `indexes.callgraph` |
 | `github.enabled` | `github.read`, `github.write`, `github.shim` |
+| `gh_read.enabled`, `gh_shim.enabled` | `github.read`, `github.shim` (`gh_shim.binary_path` stays) |
+| `idle.lsp_ttl_minutes` | `lsp.idle_minutes` |
+| `inspect.tier2_soft_deadline_ms`, `inspect.max_drill_down_items` | removed (they had no effect) |
 | `aft_read`, `aft_write`, `aft_edit`, `aft_apply_patch`, `aft_grep`, `aft_glob`, `aft_bash` in `disabled_tools` | `read`, `write`, `edit`, `apply_patch`, `grep`, `glob`, `bash` |
 
 Translation rules: an explicit `tool_surface` in the user base is a complete
@@ -660,17 +676,16 @@ registration choice (`"all"` → `[]`, `"recommended"` → `["aft_callgraph",
 trigram, semantic and callgraph indexes still build, and the migration notice
 says so. To keep AFT from indexing a repository, also set `indexes.trigram`,
 `indexes.semantic` and `indexes.callgraph` to `false`. False `backup.enabled`,
-`inspect.enabled` and `bash`/`bash.enabled` keep restricting runtime behavior
-and, during v0.58 only, also generate `aft_safety`, `aft_inspect` and
-`bash`+companions respectively (each such load warns
-`legacy_runtime_gate_requires_fix`). An explicit `disabled_tools` in the same
+`inspect.enabled` and `bash`/`bash.enabled` only switch their behaviour off;
+they no longer remove tool registrations (a load with one and no
+`disabled_tools` warns `legacy_runtime_gate_runtime_only`), so list the tools
+in `disabled_tools` to unregister them. An explicit `disabled_tools` in the same
 block, including `[]`, wins over every generated name. Project configs cannot
 disable `aft_safety` or host tool slots, whether directly or through a legacy
 key.
 
-A configuration AFT cannot use — a file that does not parse, a rejected key such
-as `gh_read` or `gh_shim.enabled`, or a missing `subc.connection_file` — no
-longer falls back to defaults. The plugin still loads, every AFT tool call
+A configuration AFT cannot use — a file that does not parse or a missing
+`subc.connection_file` — no longer falls back to defaults. The plugin still loads, every AFT tool call
 returns the error and how to fix it, the sidebar and status show it, and no
 indexing starts until the file is fixed and the host restarted.
 
@@ -745,14 +760,16 @@ turn categories off, but cannot turn on a category the user turned off. Category
 changes apply live; work already admitted retains its pinned configuration.
 `inspect.enabled: false` remains the whole-tool runtime switch.
 
-`idle.lsp_ttl_minutes` is removed in favour of `lsp.idle_minutes`.
+`idle.lsp_ttl_minutes` is replaced by `lsp.idle_minutes`.
 `inspect.tier2_soft_deadline_ms` and `inspect.max_drill_down_items` were inert and
-are removed (the diagnostics name `inspect.tier2_pass_timeout_ms` and
-`aft_inspect.topK`, respectively). Loading any of these old keys is rejected as
-`removed_config_key`, including inside harness blocks. Run
-`npx @cortexkit/aft doctor --fix`: it moves the old idle value to `lsp.idle_minutes`,
-clamped to the new range (an existing canonical value wins), and drops the two
-inert inspect keys. There is no load-time compatibility translation.
+are removed (`inspect.tier2_pass_timeout_ms` and `aft_inspect.topK` are what they
+used to approximate). These old keys are retired like the ones in
+[Feature-based configuration](#feature-based-configuration-v058), including inside
+harness blocks: loading moves the old idle value to `lsp.idle_minutes`, clamped
+to the new range (an existing canonical value wins, and a project file may still
+only shorten the window), and drops the two inert inspect keys. The user file is
+rewritten that way automatically; `npx @cortexkit/aft doctor --fix` rewrites a
+project file.
 
 AFT runs language servers in-process for post-edit diagnostics and on-demand `lsp_diagnostics`
 calls. Servers are spawned lazily — only when a file matching their extensions is touched, and

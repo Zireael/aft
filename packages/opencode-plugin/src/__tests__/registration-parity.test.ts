@@ -71,15 +71,14 @@ const manifest = JSON.parse(
 ) as Manifest;
 
 /**
- * Resolve a legacy profile through the same in-window translation the loaders
- * use. The historical v0.49 registration sets must still come out of the
- * translated disabled lists, which proves the frozen surface/hoist/gate
- * mappings against the checked inventory.
+ * Resolve a legacy profile through the same translation the loaders use. The
+ * historical v0.49 registration sets must still come out of the translated
+ * disabled lists, which proves the frozen surface/hoist mappings against the
+ * checked inventory.
  */
 function resolvedProfile(raw: Record<string, unknown>): Record<string, unknown> {
   const doc = structuredClone(raw);
-  const translation = translateConfigDocument(doc, "window", "user");
-  if (translation.errors.length > 0) throw new Error(translation.errors.join(", "));
+  translateConfigDocument(doc, "user");
   doc.disabled_tools = sortedUnique(
     (doc.disabled_tools as string[] | undefined) ?? DEFAULT_DISABLED_TOOLS,
   );

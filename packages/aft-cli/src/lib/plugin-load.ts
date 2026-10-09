@@ -1,12 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import {
   type ConfigErrorCode,
-  ConfigRejectedError,
   formatConfigErrorMessage,
   formatConfigParseErrorMessage,
   formatSubcConnectionMissingMessage,
   mergeIndexes,
-  policyPhaseForVersion,
   type RawIndexesConfig,
   resolveCortexKitProjectConfigPath,
   resolveSubcConnectionFilePath,
@@ -14,15 +12,13 @@ import {
 } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 
-import { CLI } from "./cli.js";
-
 /**
  * What the plugin will do with the AFT config it loads at startup.
  *
  * `doctor` used to read the config only for display, so a config the plugin
  * cannot use still reported "registered, healthy". This mirrors the plugin's
- * startup config checks: retired keys the policy rejects, a file that does not
- * parse, and a `subc.connection_file` that points at no file. On any of them
+ * startup config checks: a file that does not parse and a
+ * `subc.connection_file` that points at no file. On either of them
  * the plugin still loads and registers its tools, but in its config error
  * state: every AFT tool call fails with the error. The text of that error
  * comes from the same `@cortexkit/aft-bridge` helpers the plugins use, so
@@ -42,7 +38,7 @@ export interface PluginLoadBlocker {
   toolCallError: string;
   /** Exactly what the user (or `doctor --fix`) does about it. */
   remediation: string;
-  /** True when `doctor --fix` repairs it (the retired-key migration). */
+  /** True when `doctor --fix` repairs it. */
   fixable: boolean;
 }
 
@@ -102,14 +98,11 @@ export interface PluginLoadInput {
   projectDirectory?: string;
   /** Harness id for `harnesses.<id>` overrides ("opencode" | "pi" | "omp"). */
   harness: string;
-  /** Plugin version whose retired-key policy applies. */
-  pluginVersion: string;
   home?: string;
 }
 
 export function evaluatePluginLoad(input: PluginLoadInput): PluginLoadEvaluation {
   const blockers: PluginLoadBlocker[] = [];
-  const phase = policyPhaseForVersion(input.pluginVersion);
   const tiers: { path: string; tier: "user" | "project" }[] = [
     { path: input.userConfigPath, tier: "user" },
   ];
@@ -136,25 +129,10 @@ export function evaluatePluginLoad(input: PluginLoadInput): PluginLoadEvaluation
       continue;
     }
     if (!value) continue;
+    // Retired keys are translated exactly as the plugin translates them;
+    // they never block the plugin.
     const translated = structuredClone(value);
-    const translation = translateConfigDocument(translated, phase, tier);
-    if (translation.errors.length > 0) {
-      const removed = translation.errors
-        .map((code) => code.replace(/^removed_config_key:([^:]+):use:(.+)$/, "$1 → $2"))
-        .join(", ");
-      const scope = tier === "project" ? " in this project" : "";
-      const toolCallError = formatConfigErrorMessage(
-        new ConfigRejectedError(translation.errors, path).message,
-      );
-      blockers.push({
-        code: "config_rejected",
-        path,
-        message: `${failsEveryToolCall(toolCallError, scope)} (removed keys: ${removed})`,
-        toolCallError,
-        remediation: `Run \`${CLI} doctor --fix\` to migrate the file, then restart the host.`,
-        fixable: true,
-      });
-    }
+    translateConfigDocument(translated, tier);
     loaded[tier] = withHarness(translated, input.harness);
   }
 

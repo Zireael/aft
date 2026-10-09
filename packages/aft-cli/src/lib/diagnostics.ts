@@ -207,7 +207,6 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
     userConfigPath: configPaths.aftConfig,
     projectDirectory: process.cwd(),
     harness: adapter.kind === "opencode" ? "opencode" : "pi",
-    pluginVersion: pluginCache.cached ?? getSelfVersion(),
   });
   const semanticEnabled = aftEnabled && pluginLoad.onnxRequired;
 

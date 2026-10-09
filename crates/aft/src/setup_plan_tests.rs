@@ -23,13 +23,13 @@ fn with_project(mut inputs: ConfigInputs, text: &str) -> ConfigInputs {
 }
 
 fn plan(inputs: &ConfigInputs, harness: Option<SetupHarness>) -> SetupPlan {
-    derive_plan(inputs, harness, &NoRuntimeObservation, PolicyPhase::Window)
+    derive_plan(inputs, harness, &NoRuntimeObservation)
         .expect("plan derives")
         .plan
 }
 
 fn plan_with(inputs: &ConfigInputs, observer: &dyn FeatureObserver) -> SetupPlan {
-    derive_plan(inputs, None, observer, PolicyPhase::Window)
+    derive_plan(inputs, None, observer)
         .expect("plan derives")
         .plan
 }
@@ -436,37 +436,22 @@ fn default_membership_disabled_by_a_later_tier_becomes_configured() {
 }
 
 #[test]
-fn rejected_configuration_produces_no_plan() {
-    let errors = derive_plan(
-        &user(r#"{"gh_read": {"enabled": true}}"#),
-        None,
-        &NoRuntimeObservation,
-        PolicyPhase::Window,
-    )
-    .unwrap_err();
-    assert_eq!(errors, vec!["removed_config_key:gh_read:use:github.read"]);
-    let errors = derive_plan(
-        &user(r#"{"search_index": false}"#),
-        None,
-        &NoRuntimeObservation,
-        PolicyPhase::Rejecting,
-    )
-    .unwrap_err();
-    assert_eq!(
-        errors,
-        vec!["removed_config_key:search_index:use:indexes.trigram"]
-    );
-    assert!(derive_plan(
-        &user("{ nope"),
-        None,
-        &NoRuntimeObservation,
-        PolicyPhase::Window
-    )
-    .is_err());
+fn retired_keys_produce_a_plan_and_unparsable_files_do_not() {
+    for doc in [
+        r#"{"gh_read": {"enabled": true}}"#,
+        r#"{"search_index": false}"#,
+        r#"{"idle": {"lsp_ttl_minutes": 10}}"#,
+    ] {
+        assert!(
+            derive_plan(&user(doc), None, &NoRuntimeObservation).is_ok(),
+            "{doc}"
+        );
+    }
+    assert!(derive_plan(&user("{ nope"), None, &NoRuntimeObservation).is_err());
 }
 
 #[test]
-fn in_window_legacy_inputs_count_as_configured_choices() {
+fn retired_inputs_count_as_configured_choices() {
     let plan = plan(
         &user(r#"{"tool_surface": "all", "semantic_search": false}"#),
         None,
@@ -684,13 +669,7 @@ fn unknown_disabled_entries_are_preserved_and_reported() {
             vec!["aft_future_tool", "typo_name"]
         );
     }
-    let outcome = derive_plan(
-        &user(existing),
-        None,
-        &NoRuntimeObservation,
-        PolicyPhase::Window,
-    )
-    .unwrap();
+    let outcome = derive_plan(&user(existing), None, &NoRuntimeObservation).unwrap();
     assert_eq!(
         outcome.unknown_disabled_tools,
         vec!["aft_future_tool", "typo_name"]

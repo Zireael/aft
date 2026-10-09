@@ -27,7 +27,7 @@ function dependencies(loadConfig: (directory: string) => AftConfig): BridgeBoots
 }
 
 const rejecting = (directory: string): AftConfig => {
-  throw new ConfigRejectedError(["removed_config_key:aft_glob:use:glob"], directory);
+  throw new ConfigRejectedError(["invalid_resolved_config:missing:disabled_tools"], directory);
 };
 
 describe("bootstrap configuration", () => {
@@ -40,8 +40,7 @@ describe("bootstrap configuration", () => {
     );
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("unreachable");
-    expect(result.message).toContain("removed_config_key:aft_glob:use:glob");
-    expect(result.message).toContain("npx @cortexkit/aft doctor --fix");
+    expect(result.message).toContain("invalid_resolved_config:missing:disabled_tools");
     expect(result.message).toContain("restart");
     // A rejected config cannot say which tools to disable, so the default surface registers.
     expect(result.config).toEqual(defaultSurfaceConfig());

@@ -187,7 +187,7 @@ const PLUGIN_VERSION: string = resolvePluginVersion(import.meta.url);
  */
 const ANNOUNCEMENT_VERSION = "0.59.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Config keys retired in 0.58 are now rejected; run `npx @cortexkit/aft doctor --fix` once after upgrading.",
+  "Config keys retired in 0.58 keep working: AFT updates your user config file to the current keys (keeping a backup) and translates a project's in memory; `npx @cortexkit/aft doctor --fix` updates a project file.",
   "New: live pull-request diffs with `read` on `pr://N/diff`, a `pattern` argument for `aft_search`, and per-category switches for `aft_inspect`.",
   "Fixes for issues reported on OpenCode 2, Pi and OMP, and much less repeated indexing and disk work.",
 ];
@@ -267,9 +267,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   const registrationRoot = resolveOpenCodeRegistrationRoot(input.directory, input.worktree);
 
   // Load the AFT config before any binary, storage or index work. An unusable
-  // configuration (a retired key after its migration window, an already
-  // retired GitHub alias, a file that does not parse, a missing subc
-  // connection file) still loads the plugin, in the config error state: the
+  // configuration (a file that does not parse, a missing subc connection
+  // file; retired keys are translated and never make it unusable) still loads the plugin, in the config error state: the
   // tools register but every call fails with the error and its fix. Load order:
   // ~/.config/cortexkit/aft.jsonc → <project>/.cortexkit/aft.jsonc
   const bootstrap = await resolveBootstrapConfig(registrationRoot, (message) =>

@@ -1,0 +1,5 @@
+{
+  "idle": {
+    "lsp_ttl_minutes": 120
+  }
+}

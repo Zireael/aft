@@ -42,30 +42,10 @@ function createConfigFixture() {
   };
 }
 
-let policyVersion: string | undefined;
-
-// Pin translation tests to 0.58, which accepts retired keys. Other loads must
-// use the package version so they still test rejection from 0.59 onward.
-function testInMigrationWindow(name: string, run: () => void) {
-  test(name, () => {
-    policyVersion = "0.58.0";
-    try {
-      run();
-    } finally {
-      policyVersion = undefined;
-    }
-  });
-}
-
 function spawnConfigLoader(projectDirectory: string, env: Record<string, string>) {
   const script = `
-    import { loadAftConfig, setFeatureConfigPolicyVersionForTests } from "./src/config.ts";
-    setFeatureConfigPolicyVersionForTests(${JSON.stringify(policyVersion)});
-    try {
-      console.log(JSON.stringify(loadAftConfig(process.env.PROJECT_DIR!)));
-    } finally {
-      setFeatureConfigPolicyVersionForTests(undefined);
-    }
+    import { loadAftConfig } from "./src/config.ts";
+    console.log(JSON.stringify(loadAftConfig(process.env.PROJECT_DIR!)));
   `;
   return spawnSync(process.execPath, ["-e", script], {
     cwd: packageRoot,
@@ -94,39 +74,36 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
-  test("the shipped policy rejects retired keys and names doctor --fix", () => {
+  test("retired keys in either file load, translated, and are never refused", () => {
     const fixture = createConfigFixture();
-    writeFileSync(
-      fixture.userConfigPath,
-      JSON.stringify({
-        tool_surface: "all",
-        hoist_builtin_tools: false,
-        enabled: false,
-        search_index: true,
-        experimental_search_index: false,
-        semantic_search: false,
-        experimental_semantic_search: true,
-        callgraph_store: false,
-      }),
-    );
-    const result = spawnConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    const userText = JSON.stringify({
+      tool_surface: "all",
+      search_index: true,
+      experimental_search_index: false,
+      semantic_search: false,
+      experimental_semantic_search: true,
+      callgraph_store: false,
+      idle: { lsp_ttl_minutes: 20 },
     });
-    expect(result.error).toBeUndefined();
-    expect(result.status).toBe(1);
-    for (const diagnostic of [
-      "removed_config_key:tool_surface:use:disabled_tools",
-      "removed_config_key:hoist_builtin_tools:use:disabled_tools",
-      "removed_config_key:enabled:use:disabled_tools",
-      "removed_config_key:search_index:use:indexes.trigram",
-      "removed_config_key:experimental_search_index:use:indexes.trigram",
-      "removed_config_key:semantic_search:use:indexes.semantic",
-      "removed_config_key:experimental_semantic_search:use:indexes.semantic",
-      "removed_config_key:callgraph_store:use:indexes.callgraph",
-    ])
-      expect(result.stderr).toContain(diagnostic);
-    expect(result.stderr).toContain("doctor --fix");
+    const projectText = JSON.stringify({
+      search_index: false,
+      inspect: { tier2_soft_deadline_ms: 50 },
+      idle: { lsp_ttl_minutes: 10 },
+    });
+    writeFileSync(fixture.userConfigPath, userText);
+    writeFileSync(fixture.projectConfigPath, projectText);
+    const merged = JSON.parse(
+      runConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      }).stdout,
+    );
+    expect(merged.disabled_tools).toEqual([]);
+    expect(merged.indexes).toEqual({ trigram: false, semantic: false, callgraph: false });
+    expect(merged.lsp.idle_minutes).toBe(10);
+    // Loading never writes either file for retired keys.
+    expect(readFileSync(fixture.userConfigPath, "utf8")).toBe(userText);
+    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(projectText);
   });
 
   test("inspect and LSP resource settings are tighten-only", () => {
@@ -216,35 +193,22 @@ describe("loadAftConfig", () => {
     expect(enabled.stderr).toContain("Ignoring github from project config");
   });
 
-  test("retired GitHub aliases reject the whole load even beside canonical leaves", () => {
+  test("retired GitHub aliases translate, and a canonical leaf beside them wins", () => {
     const fixture = createConfigFixture();
     const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
-    const script = `
-      import { loadAftConfig } from "./src/config.ts";
-      try {
-        loadAftConfig(process.env.PROJECT_DIR!);
-        console.log("loaded");
-      } catch (err) {
-        console.log(JSON.stringify(err.errors));
-      }
-    `;
-    const run = () =>
-      spawnSync(process.execPath, ["-e", script], {
-        cwd: packageRoot,
-        env: { ...process.env, ...env, PROJECT_DIR: fixture.projectDirectory },
-        encoding: "utf8",
-      }).stdout.trim();
+    const github = () => JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).github;
 
     writeFileSync(
       fixture.userConfigPath,
       JSON.stringify({ github: { read: false }, gh_read: { enabled: true } }),
     );
-    expect(JSON.parse(run())).toEqual(["removed_config_key:gh_read:use:github.read"]);
+    expect(github()).toMatchObject({ read: false });
     writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_shim: { enabled: false } }));
-    expect(JSON.parse(run())).toEqual(["removed_config_key:gh_shim:use:github.shim"]);
-    // The supported binary override alone loads.
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_shim: { binary_path: "/opt/aft" } }));
-    expect(run()).toBe("loaded");
+    expect(github()).toMatchObject({ shim: false });
+    // A project alias is held to the project rule for github.read: dropped.
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ github: { read: false } }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
+    expect(github()).toMatchObject({ read: false });
   });
 
   test("edit_mode uses ordinary project-over-user precedence", () => {
@@ -260,7 +224,7 @@ describe("loadAftConfig", () => {
     expect((JSON.parse(result.stdout) as { edit_mode?: string }).edit_mode).toBe("default");
   });
 
-  testInMigrationWindow("selects the OpenCode harness override from a shared config", () => {
+  test("selects the OpenCode harness override from a shared config", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -383,7 +347,7 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("edit_mode");
   });
 
-  testInMigrationWindow("legacy project enabled:false disables only unprotected tools", () => {
+  test("legacy project enabled:false disables only unprotected tools", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: true }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ enabled: false }));
@@ -402,23 +366,20 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("disabled_tools.aft_safety");
   });
 
-  testInMigrationWindow(
-    "legacy user enabled:false disables every tool and project enabled:true adds nothing",
-    () => {
-      const fixture = createConfigFixture();
-      writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: false }));
-      writeFileSync(fixture.projectConfigPath, JSON.stringify({ enabled: true }));
+  test("legacy user enabled:false disables every tool and project enabled:true adds nothing", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: false }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ enabled: true }));
 
-      const result = runConfigLoader(fixture.projectDirectory, {
-        HOME: join(fixture.root, "home"),
-        XDG_CONFIG_HOME: fixture.xdgConfigHome,
-      });
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
-      expect(
-        (JSON.parse(result.stdout) as { disabled_tools: string[] }).disabled_tools,
-      ).toHaveLength(23);
-    },
-  );
+    expect((JSON.parse(result.stdout) as { disabled_tools: string[] }).disabled_tools).toHaveLength(
+      23,
+    );
+  });
 
   test("logs and skips malformed JSONC", () => {
     const fixture = createConfigFixture();
@@ -955,7 +916,7 @@ describe("loadAftConfig", () => {
     });
   });
 
-  testInMigrationWindow("migrates all old config keys to the v0.18 schema", () => {
+  test("migrates all old config keys to the v0.18 schema", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -1098,26 +1059,23 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain(`Migrated config at ${fixture.projectConfigPath}`);
   });
 
-  testInMigrationWindow(
-    "legacy index precedence: immediate legacy name beats the experimental alias",
-    () => {
-      const fixture = createConfigFixture();
-      writeFileSync(
-        fixture.userConfigPath,
-        JSON.stringify({ search_index: false, experimental_search_index: true }),
-      );
+  test("legacy index precedence: immediate legacy name beats the experimental alias", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ search_index: false, experimental_search_index: true }),
+    );
 
-      const result = runConfigLoader(fixture.projectDirectory, {
-        HOME: join(fixture.root, "home"),
-        XDG_CONFIG_HOME: fixture.xdgConfigHome,
-      });
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
 
-      expect(JSON.parse(result.stdout).indexes.trigram).toBe(false);
-      // Ordinary loading never rewrites retired keys.
-      expect(readFileSync(fixture.userConfigPath, "utf-8")).toContain("experimental_search_index");
-      expect(result.stderr).toContain("superseded_legacy_config");
-    },
-  );
+    expect(JSON.parse(result.stdout).indexes.trigram).toBe(false);
+    // Ordinary loading never rewrites retired keys.
+    expect(readFileSync(fixture.userConfigPath, "utf-8")).toContain("experimental_search_index");
+    expect(result.stderr).toContain("superseded_legacy_config");
+  });
 
   test("read-only migration warning does not fail load", () => {
     const fixture = createConfigFixture();

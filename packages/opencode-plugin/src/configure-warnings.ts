@@ -54,7 +54,8 @@ function isConfigureWarning(value: unknown): value is ConfigureWarning {
       warning.kind === "checker_not_installed" ||
       warning.kind === "lsp_binary_missing" ||
       warning.kind === "config_parse_failed" ||
-      warning.kind === "config_key_dropped") &&
+      warning.kind === "config_key_dropped" ||
+      warning.kind === "config_migrated") &&
     typeof warning.hint === "string"
   );
 }

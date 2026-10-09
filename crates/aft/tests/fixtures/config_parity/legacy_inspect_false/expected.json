@@ -2,7 +2,6 @@
   "aft_search_registered": true,
   "disabled_tools": [
     "aft_delete",
-    "aft_inspect",
     "aft_move"
   ],
   "experimental_bash_background": true,

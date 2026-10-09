@@ -98,23 +98,9 @@ export function previewConfigMigration(targets: ConfigMigrationTarget[]): Config
     const raw = readPlainConfig(target.path);
     if (!raw) continue;
     const translated = structuredClone(raw);
-    const translation = translateConfigDocument(translated, "window", target.tier);
-    const retiredGithub =
-      Object.hasOwn(raw, "gh_read") || (isRecord(raw.gh_shim) && "enabled" in raw.gh_shim);
-    if (!translation.legacyInput && translation.errors.length === 0 && !retiredGithub) continue;
+    const translation = translateConfigDocument(translated, target.tier);
+    if (!translation.legacyInput) continue;
     const changes = diffConfig(raw, translated);
-    // Keys the policy rejects outright are not translated, so the diff above
-    // cannot show them; name the replacement the migration moves them to.
-    for (const code of translation.errors) {
-      const match = /^removed_config_key:([^:]+):use:(.+)$/.exec(code);
-      if (match)
-        changes.push({
-          kind: "changed",
-          key: match[1] as string,
-          before: undefined,
-          after: `→ ${match[2]}`,
-        });
-    }
     previews.push({ ...target, changes });
   }
   return previews;
@@ -128,12 +114,5 @@ function show(value: unknown): string {
 export function describeConfigChange(change: ConfigChange): string {
   if (change.kind === "removed") return `removed ${change.key} (was ${show(change.before)})`;
   if (change.kind === "added") return `added ${change.key}: ${show(change.after)}`;
-  if (
-    change.before === undefined &&
-    typeof change.after === "string" &&
-    change.after.startsWith("→ ")
-  ) {
-    return `replaced ${change.key} with ${change.after.slice(2)}`;
-  }
   return `changed ${change.key}: ${show(change.before)} → ${show(change.after)}`;
 }

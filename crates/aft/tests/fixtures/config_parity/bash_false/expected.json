@@ -5,12 +5,7 @@
   },
   "disabled_tools": [
     "aft_delete",
-    "aft_move",
-    "bash",
-    "bash_kill",
-    "bash_status",
-    "bash_watch",
-    "bash_write"
+    "aft_move"
   ],
   "experimental_bash_background": false,
   "experimental_bash_compress": false,

@@ -15,9 +15,7 @@ import {
   noticeDigest,
   noticeProjection,
   PI_ONLY_KEYS,
-  type PolicyPhase,
   partitionProjectDisables,
-  policyPhaseForVersion,
   type ResolvedIndexesConfig,
   readConfigTiers,
   resolveCortexKitConfigPaths,
@@ -38,8 +36,6 @@ import { z } from "zod";
 import { error, log, warn } from "./logger.js";
 
 export { ConfigRejectedError } from "@cortexkit/aft-bridge";
-
-import { resolvePluginVersion } from "./plugin-version.js";
 
 const ACTIVE_HARNESS = "opencode";
 
@@ -1575,20 +1571,6 @@ function recordConfigParseFailure(configPath: string, errorMessage: string): voi
 // Load config from a single file path
 // ---------------------------------------------------------------------------
 
-let policyVersionOverride: string | undefined;
-
-/** Test hook: evaluate the retired-key policy as if running this package version. */
-export function setFeatureConfigPolicyVersionForTests(version: string | undefined): void {
-  policyVersionOverride = version;
-}
-
-let packageVersion: string | undefined;
-
-function currentPolicyPhase(): PolicyPhase {
-  packageVersion ??= resolvePluginVersion(import.meta.url);
-  return policyPhaseForVersion(policyVersionOverride ?? packageVersion);
-}
-
 /** One migration notice awaiting delivery by the plugin. */
 export interface ConfigLoadNotice {
   configPath: string;
@@ -1644,14 +1626,11 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     return null;
   }
 
-  // Retired keys are translated (inside the migration window) or rejected on
-  // the raw document, before schema validation, so they never reach Zod.
+  // Retired keys are translated on the raw document, before schema
+  // validation, so they never reach Zod. They are never refused.
   const projection = noticeProjection(structuredClone(cleanConfig));
   if (suppliesSemanticIndexInput(cleanConfig, ACTIVE_HARNESS)) semanticInputSupplied = true;
-  const translation = translateConfigDocument(cleanConfig, currentPolicyPhase(), tier);
-  if (translation.errors.length > 0) {
-    throw new ConfigRejectedError(translation.errors, configPath);
-  }
+  const translation = translateConfigDocument(cleanConfig, tier);
   for (const warning of translation.warnings) {
     const text = `Config ${configPath} [${warning.key}]: ${warning.message} (${warning.code})`;
     if (warning.once) {
@@ -1666,7 +1645,14 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
       warn(text);
     }
   }
-  if (translation.legacyInput) {
+  if (translation.legacyInput && tier === "user") {
+    // The engine rewrites the user file to current keys when it next reads
+    // it and reports that itself (a configure warning), so the plugin only
+    // logs the in-memory translation here instead of a second notice.
+    log(
+      `Config ${configPath} uses retired keys (${translation.retiredKeys.join(", ")}); applied their current equivalents in memory`,
+    );
+  } else if (translation.legacyInput) {
     configLoadNotices.push({
       configPath,
       digest: noticeDigest(projection),
@@ -2250,9 +2236,10 @@ export function buildConfigTierConfigureParams(
  * Load and resolve the user and project config for one project.
  *
  * The result always carries a sorted `disabled_tools` list (absent user base
- * defaults to aft_move/aft_delete) and fully resolved `indexes`. Throws
- * {@link ConfigRejectedError} when a retired key must be rejected; callers
- * must then publish nothing (startup) or keep their last-good config (reload).
+ * defaults to aft_move/aft_delete) and fully resolved `indexes`. Retired keys
+ * are translated, never refused. Throws {@link ConfigRejectedError} when the
+ * resolved configuration is incomplete; callers must then publish nothing
+ * (startup) or keep their last-good config (reload).
  */
 export function loadAftConfig(projectDirectory: string): AftConfig {
   configLoadErrors = [];

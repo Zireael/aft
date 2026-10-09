@@ -36,14 +36,13 @@ const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 // touches those files, so re-reading them around it would assert nothing.
 
 /**
- * Resolve a profile written with retired keys through the same in-window
+ * Resolve a profile written with retired keys through the same
  * translation the loaders use, so registration sees a resolved config with a
  * present disabled_tools list, exactly as it does in production.
  */
 function resolved(config: AftConfig): AftConfig {
   const doc = structuredClone(config) as Record<string, unknown>;
-  const translation = translateConfigDocument(doc, "window", "user");
-  if (translation.errors.length > 0) throw new Error(translation.errors.join(", "));
+  translateConfigDocument(doc, "user");
   doc.disabled_tools ??= [...DEFAULT_DISABLED_TOOLS];
   return doc as AftConfig;
 }

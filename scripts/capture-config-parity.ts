@@ -613,12 +613,13 @@ const CASES: ParityCase[] = [
     user: { inspect: { tier2_pass_timeout_ms: 45000 } },
   },
   {
-    // The retired gh_shim.enabled alias rejects the whole load.
+    // The retired gh_shim.enabled alias translates to github.shim.
     name: "gh_shim_user_disabled",
     user: { gh_shim: { enabled: false } },
   },
   {
-    // The retired alias rejects even from the project tier.
+    // A project alias translates to github.shim, which a project may only
+    // turn off.
     name: "gh_shim_project_stripped",
     user: {},
     project: { gh_shim: { enabled: false } },
@@ -799,6 +800,7 @@ const CASES: ParityCase[] = [
     harness: "opencode",
     user: { indexes: { semantic: false }, harnesses: { opencode: { indexes: { semantic: true } } } },
   },
+  // The fixture name predates translation: the canonical leaf beside the alias wins.
   { name: "gh_read_alias_rejected", user: { gh_read: { enabled: false }, github: { read: true } } },
   { name: "bash_true", user: { bash: true } },
   { name: "bash_false", user: { bash: false } },
@@ -864,6 +866,44 @@ const CASES: ParityCase[] = [
   {
     name: "idle_non_integer_dropped",
     user: { idle: { root_ttl_minutes: 12.5 } },
+  },
+  // --- Retired keys never refuse a load. Each of the keys that used to be
+  //     rejected at every version translates in both tiers, and a project's
+  //     translated value is held to the current key's project rule. ---
+  { name: "retired_gh_read_project_only", project: { gh_read: { enabled: true } } },
+  {
+    name: "retired_gh_shim_project_enable_dropped",
+    user: { github: { shim: false } },
+    project: { gh_shim: { enabled: true, binary_path: "/tmp/evil-shim" } },
+  },
+  {
+    name: "retired_lsp_ttl_project_loosen_refused",
+    user: { lsp: { idle_minutes: 30 } },
+    project: { idle: { lsp_ttl_minutes: 120 } },
+  },
+  {
+    name: "retired_lsp_ttl_project_tighten",
+    user: { lsp: { idle_minutes: 30 } },
+    project: { idle: { lsp_ttl_minutes: 10 } },
+  },
+  { name: "retired_soft_deadline_project", project: { inspect: { tier2_soft_deadline_ms: 50 } } },
+  { name: "retired_max_items_user", user: { inspect: { max_drill_down_items: 20 } } },
+  {
+    name: "retired_window_keys_project",
+    harness: "opencode",
+    user: { disabled_tools: [] },
+    project: {
+      search_index: false,
+      hoist_builtin_tools: false,
+      disabled_tools: ["aft_glob", "aft_zoom"],
+      harnesses: { opencode: { tool_surface: "recommended" } },
+    },
+  },
+  {
+    // A false runtime gate only switches its behaviour off, even beside a
+    // retired key in the same block.
+    name: "retired_key_beside_false_gates",
+    user: { search_index: false, bash: false, backup: { enabled: false } },
   },
   {
     name: "jsonc_comments",

@@ -239,7 +239,6 @@ fn invalid_edits_keep_the_last_good_config() {
     for (label, text) in [
         ("truncated JSONC", r#"{ "bash": { "enabled": true "#),
         ("not an object", "[1, 2]"),
-        ("retired key", r#"{ "gh_read": true }"#),
         (
             "one bad value next to good ones",
             r#"{ "bash": { "enabled": "nope" }, "format_on_edit": false }"#,
