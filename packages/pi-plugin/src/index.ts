@@ -201,11 +201,11 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.58.0";
+const ANNOUNCEMENT_VERSION = "0.59.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Every AFT tool and background index, including semantic search, is on by default; `disabled_tools` is the one switch, and `npx @cortexkit/aft setup` walks you through the choices.",
-  "Old config keys still work with a notice until 0.59; run `npx @cortexkit/aft doctor --fix` to migrate them.",
-  "ONNX Runtime auto-install works again for new installs, and a config AFT cannot use now shows its error and fix instead of silently stopping the plugin.",
+  "Config keys retired in 0.58 are now rejected; run `npx @cortexkit/aft doctor --fix` once after upgrading.",
+  "New: live pull-request diffs with `read` on `pr://N/diff`, a `pattern` argument for `aft_search`, and per-category switches for `aft_inspect`.",
+  "Fixes for issues reported on OpenCode 2, Pi and OMP, and much less repeated indexing and disk work.",
 ];
 
 /**
