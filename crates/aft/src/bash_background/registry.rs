@@ -6869,8 +6869,11 @@ impl BgTaskRegistry {
         // otherwise never reach `post_terminal_transition`.
         let _release_handles = ReleaseIoHandlesOnExit(&task);
 
+        // The Killing row is captured under the state lock, but its database
+        // mirror must not flush until after signaling. An unrelated aft.db
+        // holder must not consume the command's entire timeout budget.
+        let mut killing_db = DeferredDbWrites::new(self, &task);
         let plan = {
-            let mut db = DeferredDbWrites::new(self, &task);
             let mut state = task
                 .state
                 .lock()
@@ -6906,10 +6909,15 @@ impl BgTaskRegistry {
                         unreachable!()
                     }
                 } else {
+                    let terminal_reason = if marker == ExitMarker::Killed {
+                        reason.clone()
+                    } else {
+                        None
+                    };
                     state.metadata = terminal_metadata_from_marker(
                         state.metadata.clone(),
                         marker,
-                        reason.clone(),
+                        terminal_reason,
                     );
 
                     state.pending_terminal_override = None;
@@ -6935,7 +6943,7 @@ impl BgTaskRegistry {
                         TaskRuntime::Piped(_) => None,
                     };
                     state.detached = true;
-                    self.persist_task_locked(&task, &state.metadata, &mut db)
+                    self.persist_task_locked(&task, &state.metadata, &mut killing_db)
                         .map_err(|e| format!("failed to persist terminal state: {e}"))?;
                     terminalized = true;
                     KillSignalPlan::RetirePty(retired_pty)
@@ -6951,7 +6959,7 @@ impl BgTaskRegistry {
                     state.metadata.status_reason = reason.clone();
                 }
                 if !was_already_killing || reason.is_some() {
-                    self.persist_task_locked(&task, &state.metadata, &mut db)
+                    self.persist_task_locked(&task, &state.metadata, &mut killing_db)
                         .map_err(|e| format!("failed to persist killing state: {e}"))?;
                 }
                 if !was_already_killing
@@ -7015,6 +7023,13 @@ impl BgTaskRegistry {
             } => {
                 #[cfg(test)]
                 wait_on_kill_signal_gate_for_test(&task.task_id);
+                // A command may have finished after Killing was published but
+                // before any signal was delivered. Its own marker wins even
+                // when no status reader has published the terminal state yet.
+                let natural_exit_before_signal = read_exit_marker(&task.paths)
+                    .ok()
+                    .flatten()
+                    .filter(|marker| matches!(marker, ExitMarker::Code(_)));
                 terminate_piped_task(pgid, child_pid, child.as_mut());
                 let child_exit_observed = child.as_mut().is_some_and(|child| child.wait().is_ok());
                 drop(child);
@@ -7032,50 +7047,55 @@ impl BgTaskRegistry {
                 if !state.metadata.status.is_terminal() {
                     state.detached = true;
 
-                    let marker_written = if let Some(handles) = state.io_handles.as_mut() {
-                        match handles.write(TaskArtifact::Exit, b"killed") {
-                            Ok(()) => Ok(()),
-                            Err(error)
-                                if error.kind() == std::io::ErrorKind::Interrupted
-                                    && error.to_string().contains(
-                                        super::persistence::ARTIFACT_CONCURRENTLY_REPLACED,
-                                    ) =>
-                            {
-                                // The child's own temp+rename exit write landed
-                                // between wait() and this write, leaving the
-                                // retained handle at zero links (Windows). The
-                                // replacement is the child's real exit marker;
-                                // re-open by path and keep whichever is there.
-                                write_kill_marker_if_absent(&task.paths).map_err(|e| {
-                                    format!("failed to write kill marker after replace: {e}")
-                                })
-                            }
-                            Err(error) => {
-                                Err(format!("failed to write retained kill marker: {error}"))
-                            }
-                        }
+                    if let Some(marker) = natural_exit_before_signal {
+                        state.metadata =
+                            terminal_metadata_from_marker(state.metadata.clone(), marker, None);
                     } else {
-                        write_kill_marker_if_absent(&task.paths)
-                            .map_err(|e| format!("failed to write kill marker: {e}"))
-                    };
-                    // The process group has already been terminated, so a
-                    // failed marker write must not leave the task in
-                    // `killing`: nothing would ever finish it. End it with
-                    // a reason that names the failed write instead.
-                    let terminal_reason = match marker_written {
-                        Ok(()) => reason.clone(),
-                        Err(error) => {
-                            crate::slog_warn!(
+                        let marker_written = if let Some(handles) = state.io_handles.as_mut() {
+                            match handles.write(TaskArtifact::Exit, b"killed") {
+                                Ok(()) => Ok(()),
+                                Err(error)
+                                    if error.kind() == std::io::ErrorKind::Interrupted
+                                        && error.to_string().contains(
+                                            super::persistence::ARTIFACT_CONCURRENTLY_REPLACED,
+                                        ) =>
+                                {
+                                    // The child's own temp+rename exit write landed
+                                    // between wait() and this write, leaving the
+                                    // retained handle at zero links (Windows). The
+                                    // replacement is the child's real exit marker;
+                                    // re-open by path and keep whichever is there.
+                                    write_kill_marker_if_absent(&task.paths).map_err(|e| {
+                                        format!("failed to write kill marker after replace: {e}")
+                                    })
+                                }
+                                Err(error) => {
+                                    Err(format!("failed to write retained kill marker: {error}"))
+                                }
+                            }
+                        } else {
+                            write_kill_marker_if_absent(&task.paths)
+                                .map_err(|e| format!("failed to write kill marker: {e}"))
+                        };
+                        // The process group has already been terminated, so a
+                        // failed marker write must not leave the task in
+                        // `killing`: nothing would ever finish it. End it with
+                        // a reason that names the failed write instead.
+                        let terminal_reason = match marker_written {
+                            Ok(()) => reason.clone(),
+                            Err(error) => {
+                                crate::slog_warn!(
                                 "background task {task_id} was terminated but its exit marker could not be written: {error}"
                             );
-                            Some(kill_marker_failure_reason(reason.as_deref(), &error))
-                        }
-                    };
+                                Some(kill_marker_failure_reason(reason.as_deref(), &error))
+                            }
+                        };
 
-                    let exit_code = terminal_exit_code_for_status(&terminal_status);
-                    state
-                        .metadata
-                        .mark_terminal(terminal_status, exit_code, terminal_reason);
+                        let exit_code = terminal_exit_code_for_status(&terminal_status);
+                        state
+                            .metadata
+                            .mark_terminal(terminal_status, exit_code, terminal_reason);
+                    }
 
                     state.pending_terminal_override = None;
                     task.mark_terminal_now();
@@ -7288,7 +7308,17 @@ impl BgTaskRegistry {
 
             let pending_override = state.pending_terminal_override.take();
             let is_pty = state.metadata.mode == BgMode::Pty;
-            let reason = reason.or_else(|| state.metadata.status_reason.clone());
+            // A Killing reason describes intent, not the outcome. A numeric
+            // marker is the command's own exit, so it must not inherit a claim
+            // that a timeout (or another kill request) terminated it.
+            let inherited_reason = if state.metadata.status == BgTaskStatus::Killing
+                && matches!(marker, ExitMarker::Code(_))
+            {
+                None
+            } else {
+                state.metadata.status_reason.clone()
+            };
+            let reason = reason.or(inherited_reason);
             let reason = match (reason, output_incomplete) {
                 (Some(reason), Some(incomplete)) => Some(format!("{reason}; {incomplete}")),
                 (None, Some(incomplete)) => Some(incomplete.to_owned()),
@@ -13884,6 +13914,184 @@ mod tests {
         registry.kill(&task_id, "session").unwrap();
         assert!(completions_for(&registry, &task_id).is_empty());
         assert_eq!(pattern_match_frames(&frames).len(), 1);
+    }
+
+    #[cfg(unix)]
+    fn assert_natural_exit_wins_timeout(publish_before_signal: bool) {
+        for code in [0, 7] {
+            let registry = BgTaskRegistry::default();
+            registry.inner.shutdown.store(true, Ordering::SeqCst);
+            let dir = tempfile::tempdir().unwrap();
+            let finish = dir.path().join("finish");
+            let command = format!(
+                "while [ ! -f '{}' ]; do sleep 0.01; done; exit {code}",
+                finish.display()
+            );
+            let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), &command);
+            let task = registry.task_for_test(&task_id).unwrap();
+            let (reached, release) = install_kill_signal_gate_for_test(&task_id);
+            let killer_registry = registry.clone();
+            let killer_task_id = task_id.clone();
+            let killer = std::thread::spawn(move || {
+                killer_registry.kill_for_timeout(&killer_task_id, "session")
+            });
+            reached.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(
+                task.state.lock().unwrap().metadata.status,
+                BgTaskStatus::Killing
+            );
+
+            // Let the real command exit before the paused kill delivers a signal.
+            fs::write(&finish, "finish").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while read_exit_marker(&task.paths).unwrap().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "command did not publish its exit"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if publish_before_signal {
+                registry.poll_task(&task).unwrap();
+            }
+            release.send(()).unwrap();
+            killer.join().unwrap().unwrap();
+
+            let snapshot = registry.status(&task_id, "session", None, None, 0).unwrap();
+            let expected = if code == 0 {
+                BgTaskStatus::Completed
+            } else {
+                BgTaskStatus::Failed
+            };
+            assert_eq!(snapshot.info.status, expected);
+            assert_eq!(snapshot.exit_code, Some(code));
+            assert_eq!(
+                snapshot.info.status_reason, None,
+                "a natural exit was not killed by a timeout"
+            );
+            assert_eq!(read_task(&task.paths.json).unwrap().status_reason, None);
+            let completions = completions_for(&registry, &task_id);
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].status, expected);
+            assert_eq!(completions[0].exit_code, Some(code));
+            assert_eq!(completions[0].status_reason, None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kill_clears_reason_when_natural_exit_wins() {
+        assert_natural_exit_wins_timeout(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kill_preserves_natural_exit_before_signal_without_poll() {
+        assert_natural_exit_wins_timeout(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kill_does_not_claim_a_preexisting_natural_exit() {
+        let registry = BgTaskRegistry::default();
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), QUICK_SUCCESS_COMMAND);
+        let task = registry.task_for_test(&task_id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while read_exit_marker(&task.paths).unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "command did not publish its exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Keep the marker unobserved so this kill, not the watchdog, publishes it.
+        task.state.lock().unwrap().metadata.status = BgTaskStatus::Running;
+        registry.kill_for_timeout(&task_id, "session").unwrap();
+        let snapshot = registry.status(&task_id, "session", None, None, 0).unwrap();
+        assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
+        assert_eq!(snapshot.exit_code, Some(0));
+        assert_eq!(
+            snapshot.info.status_reason, None,
+            "the timeout never signaled this command"
+        );
+        assert_eq!(read_task(&task.paths.json).unwrap().status_reason, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kill_signals_before_waiting_for_database_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(dir.path());
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+        let task = registry.task_for_test(&task_id).unwrap();
+        let (reached, release) = install_kill_signal_gate_for_test(&task_id);
+        let db_guard = db.lock().unwrap();
+        let killer_registry = registry.clone();
+        let killer_task_id = task_id.clone();
+        let killer = std::thread::spawn(move || {
+            killer_registry.kill_for_timeout(&killer_task_id, "session")
+        });
+        let reached_before_db_release = reached.recv_timeout(Duration::from_secs(10)).is_ok();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut terminated_before_db_release = false;
+        if reached_before_db_release {
+            while Instant::now() < deadline {
+                if task.state.lock().unwrap().metadata.status.is_terminal() {
+                    terminated_before_db_release = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let (status_tx, status_rx) = std::sync::mpsc::channel();
+        let status_registry = registry.clone();
+        let status_task_id = task_id.clone();
+        let reader = std::thread::spawn(move || {
+            status_tx
+                .send(status_registry.status_settled(&status_task_id, "session", None, None, 0))
+                .unwrap();
+        });
+        let status_before_db_release = if terminated_before_db_release {
+            status_rx
+                .recv_timeout(Duration::from_secs(10))
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        // Always release the database and join before asserting, even on a red run.
+        drop(db_guard);
+        killer.join().unwrap().unwrap();
+        reader.join().unwrap();
+        assert!(
+            reached_before_db_release,
+            "timeout waited on aft.db before delivering its signal"
+        );
+        assert!(
+            terminated_before_db_release,
+            "command was not terminated while aft.db was held"
+        );
+        let snapshot =
+            status_before_db_release.expect("status must not await the killed task's DB mirror");
+        assert_eq!(snapshot.info.status, BgTaskStatus::TimedOut);
+        assert_eq!(snapshot.exit_code, Some(124));
+        assert!(snapshot.info.status_reason.unwrap().contains("timeout"));
+        let row = crate::db::bash_tasks::get_bash_task(
+            &db.lock().unwrap(),
+            "opencode",
+            "session",
+            &task_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            row.status, "timed_out",
+            "the deferred terminal mirror still lands"
+        );
     }
 
     /// A task can finish on its own while a kill is in flight. If its own
