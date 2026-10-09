@@ -38,7 +38,7 @@ export interface PluginLoadBlocker {
   toolCallError: string;
   /** Exactly what the user (or `doctor --fix`) does about it. */
   remediation: string;
-  /** True when `doctor --fix` repairs it. */
+  /** True when `doctor --fix` can repair this blocker. */
   fixable: boolean;
 }
 

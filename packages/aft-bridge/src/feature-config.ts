@@ -216,9 +216,9 @@ function nestedBool(map: JsonRecord, container: string, leaf: string): boolean |
 /**
  * Translate the GitHub enable aliases (`gh_read.enabled`, `gh_shim.enabled`)
  * of one block into `github.read` / `github.shim`, exactly as `doctor --fix`
- * rewrites them. Precedence: the canonical leaf, then the value a
- * `github.enabled: false` in the same block generates, then the alias. The
- * aliases are removed; `gh_shim.binary_path` is kept.
+ * rewrites them. Precedence: the canonical leaf, then the `false` that a
+ * `github.enabled: false` in the same block sets for every leaf, then the
+ * alias. The aliases are removed; `gh_shim.binary_path` is kept.
  */
 function translateGithubAliases(map: JsonRecord, prefix: string, out: DocumentTranslation): void {
   const masterOff = nestedBool(map, "github", "enabled") === false;

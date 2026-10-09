@@ -800,7 +800,8 @@ const CASES: ParityCase[] = [
     harness: "opencode",
     user: { indexes: { semantic: false }, harnesses: { opencode: { indexes: { semantic: true } } } },
   },
-  // The fixture name predates translation: the canonical leaf beside the alias wins.
+  // The fixture name is older than the alias translation: with both keys
+  // present, github.read wins over the gh_read alias.
   { name: "gh_read_alias_rejected", user: { gh_read: { enabled: false }, github: { read: true } } },
   { name: "bash_true", user: { bash: true } },
   { name: "bash_false", user: { bash: false } },
@@ -867,9 +868,10 @@ const CASES: ParityCase[] = [
     name: "idle_non_integer_dropped",
     user: { idle: { root_ttl_minutes: 12.5 } },
   },
-  // --- Retired keys never refuse a load. Each of the keys that used to be
-  //     rejected at every version translates in both tiers, and a project's
-  //     translated value is held to the current key's project rule. ---
+  // --- Retired keys are translated instead of failing the load. These cover
+  //     gh_read, gh_shim.enabled, idle.lsp_ttl_minutes and the two removed
+  //     inspect keys in both tiers; a project's translated value follows the
+  //     same project rules as the current key. ---
   { name: "retired_gh_read_project_only", project: { gh_read: { enabled: true } } },
   {
     name: "retired_gh_shim_project_enable_dropped",

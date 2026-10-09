@@ -1640,7 +1640,7 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   }
 
   // Retired keys are translated on the raw document, before schema
-  // validation, so they never reach Zod. They are never refused.
+  // validation, so they never reach Zod and never fail the load.
   const projection = noticeProjection(structuredClone(cleanConfig));
   if (suppliesSemanticIndexInput(cleanConfig, ACTIVE_HARNESS)) semanticInputSupplied = true;
   const translation = translateConfigDocument(cleanConfig, tier);
@@ -1659,9 +1659,10 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     }
   }
   if (translation.legacyInput && tier === "user") {
-    // The engine rewrites the user file to current keys when it next reads
-    // it and reports that itself (a configure warning), so the plugin only
-    // logs the in-memory translation here instead of a second notice.
+    // The AFT binary rewrites the user file to current keys when its
+    // configure next reads the file, and reports that rewrite to the user as
+    // a `config_migrated` configure warning. Queuing a notice here as well
+    // would show the user two notices, so the plugin only logs.
     log(
       `Config ${configPath} uses retired keys (${translation.retiredKeys.join(", ")}); applied their current equivalents in memory`,
     );

@@ -197,7 +197,8 @@ describe("loadAftConfig", () => {
     expect(github()).toMatchObject({ read: false });
     writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_shim: { enabled: false } }));
     expect(github()).toMatchObject({ shim: false });
-    // A project alias is held to the project rule for github.read: dropped.
+    // A project may not set github.read, so a project's gh_read alias, once
+    // translated to github.read, is ignored and the user's value stays.
     writeFileSync(fixture.userConfigPath, JSON.stringify({ github: { read: false } }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
     expect(github()).toMatchObject({ read: false });

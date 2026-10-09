@@ -235,9 +235,9 @@ fn false_runtime_gates(map: &Map<String, Value>) -> Vec<&'static str> {
 
 /// Translate the GitHub enable aliases (`gh_read.enabled`, `gh_shim.enabled`)
 /// of one block into `github.read` / `github.shim`, exactly as `doctor --fix`
-/// rewrites them. Precedence: the canonical leaf, then the value a
-/// `github.enabled: false` in the same block generates, then the alias. The
-/// aliases are removed; `gh_shim.binary_path` is kept.
+/// rewrites them. Precedence: the canonical leaf, then the `false` that a
+/// `github.enabled: false` in the same block sets for every leaf, then the
+/// alias. The aliases are removed; `gh_shim.binary_path` is kept.
 fn translate_github_aliases(
     map: &mut Map<String, Value>,
     prefix: &str,
@@ -386,7 +386,8 @@ fn translate_block(
     translate_github_aliases(map, &prefix, out);
     translate_inspect_lsp_paths(map, &prefix, out);
 
-    // Canonicalize historical prefixed names inside disabled lists.
+    // Canonicalize the retired `aft_`-prefixed host tool names (for example
+    // `aft_read` -> `read`) inside the disabled list.
     let mut explicit_list = None;
     if let Some(Value::Array(entries)) = map.get("disabled_tools") {
         if entries.iter().all(Value::is_string) {
@@ -989,7 +990,9 @@ mod tests {
     }
 
     /// A false runtime gate only switches its behaviour off: it never removes
-    /// a registration, alone or beside a retired key, and says so.
+    /// a registration, alone or beside a retired key, and the translation
+    /// warns `legacy_runtime_gate_runtime_only` so the user knows to list the
+    /// tool in `disabled_tools`.
     #[test]
     fn false_runtime_gates_never_generate_disables() {
         for doc in [

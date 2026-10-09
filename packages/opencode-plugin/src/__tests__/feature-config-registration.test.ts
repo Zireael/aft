@@ -179,8 +179,9 @@ describe("OpenCode feature-config registration", () => {
     expect(config.indexes).toEqual({ trigram: true, semantic: false, callgraph: false });
     expect(config.github?.read).toBe(true);
     expect(config.lsp?.idle_minutes).toBe(10);
-    // The plugin never writes the user file for retired keys (the engine owns
-    // that rewrite and reports it), so it queues no notice of its own.
+    // The plugin never writes the user file for retired keys: the AFT binary
+    // rewrites it on configure and reports that itself, so the plugin queues
+    // no retired-key notice of its own.
     const userPath = join(root, "xdg", "cortexkit", "aft.jsonc");
     expect(readFileSync(userPath, "utf8")).toBe(JSON.stringify(user));
     expect(
