@@ -332,7 +332,9 @@ maybeDescribe(describeName, () => {
       expect(after).not.toContain("deleted.ts");
       expect(after).toContain("sample.ts");
       expect(after).toContain("Found 1 match across 1 file");
-      expect(Date.now() - started).toBeLessThan(5_000);
+      // A generous bound for loaded CI runners: the failure this guards is an
+      // entry that is never retired, not a slow watcher.
+      expect(Date.now() - started).toBeLessThan(30_000);
     } finally {
       await harness.cleanup();
     }
