@@ -468,7 +468,22 @@ fn acquire_migration_lock(target: &Path) -> LockAttempt {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            Err(error) => return LockAttempt::Failed(error),
+            Err(error) => {
+                // Windows refuses to create a file whose previous holder is
+                // still deleting it (a delete-pending name) with
+                // ERROR_ACCESS_DENIED rather than AlreadyExists, so a
+                // concurrent migration releasing the lock looks like a
+                // permission error. Retry it like a held lock until the wait
+                // ends; a real permission problem still fails after that.
+                if cfg!(windows)
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                return LockAttempt::Failed(error);
+            }
         }
     }
 }
