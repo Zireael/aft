@@ -1195,6 +1195,7 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "undo" => aft::commands::undo::handle_undo(&req, ctx),
         "edit_history" => aft::commands::edit_history::handle_edit_history(&req, ctx),
         "checkpoint" => aft::commands::checkpoint::handle_checkpoint(&req, ctx),
+        "checkpoint_paths" => aft::commands::checkpoint::handle_checkpoint_paths(&req, ctx),
         "restore_checkpoint" => {
             aft::commands::restore_checkpoint::handle_restore_checkpoint(&req, ctx)
         }
@@ -1706,6 +1707,17 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
         pid: std::process::id(),
         daemon_ver: "subc-test".to_string(),
     };
+    // The connection-file contract rejects writable shared parents, even
+    // when a permissive runner umask gives its temporary directories 0775.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            conn_path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
     connection_file::write_atomic(&conn_path, &conn).expect("write connection file");
 
     let daemon_state = Arc::clone(&state);
@@ -2224,6 +2236,17 @@ fn subc_bridge_tool_calls_carry_route_bind_session() {
 }
 
 #[test]
+fn subc_bridge_checkpoint_paths_survives_sibling_harness_bind_and_root_rebind() {
+    run_subc_bridge_production_test_with_dispatch(
+        "subc_bridge_checkpoint_paths_survives_sibling_harness_bind_and_root_rebind",
+        Duration::from_secs(30),
+        drive_checkpoint_rebind_daemon,
+        |_, _, _| {},
+        real_configure_bridge_dispatch,
+    );
+}
+
+#[test]
 fn subc_bridge_stale_epoch_ingress_is_silent_and_preserves_route_state() {
     run_subc_bridge_test(
         "subc_bridge_stale_epoch_ingress_is_silent_and_preserves_route_state",
@@ -2502,6 +2525,17 @@ fn subc_bridge_status_bar_returns_when_the_reader_goes_stale() {
         Duration::from_secs(30),
         fleet_consumer_env,
         drive_reader_goes_stale_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_status_bar_survives_busy_diagnostics_without_losing_text() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_status_bar_survives_busy_diagnostics_without_losing_text",
+        Duration::from_secs(30),
+        fleet_consumer_env,
+        drive_busy_status_counts_daemon,
         |_, _, _| {},
     );
 }
@@ -4381,9 +4415,7 @@ async fn drive_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
         "repeat-breaker-bash-session",
         json!({
             "bash": { "rewrite": true },
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;
@@ -5499,9 +5531,7 @@ async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
         10,
         &root1,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_configure_warning": {
                 "message": "route-1-maintenance-warning",
             },
@@ -5531,9 +5561,7 @@ async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
         &root1,
         "session-1",
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_configure_warning": {
                 "message": "session-1-reconfigure-warning",
             },
@@ -5814,6 +5842,146 @@ async fn drive_route_bind_session_daemon(input: FakeDaemonInput) {
         Some("session-4"),
     );
 
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_checkpoint_rebind_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    // Join one component at a time so the expected path uses the platform
+    // separator, as the paths AFT returns do on Windows.
+    let nested = root1
+        .join(".cortexkit")
+        .join("alfonso")
+        .join("implementation-worktrees")
+        .join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let file = nested.join("pool-authority.test.ts");
+    std::fs::write(&file, "checkpoint contents").unwrap();
+    let session = "019de471-4fdc-762d-9286-624dfad0b5fe";
+    let doc = json!({ "indexes": { "trigram": false, "semantic": false, "callgraph": false } });
+    send_route_bind_with_harness_session_principal_and_doc(
+        &mut stream,
+        1,
+        101,
+        &root1,
+        "pi",
+        session,
+        Some(Principal::Direct),
+        doc.clone(),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 101).await;
+    let created = call_tool_response(
+        &mut stream,
+        1,
+        102,
+        "safety",
+        json!({ "op": "checkpoint", "name": "proof", "files": [&file] }),
+        "create durable checkpoint",
+    )
+    .await;
+    assert_tool_success(&created, "create durable checkpoint");
+    let storage_path = std::path::PathBuf::from(created["storage_path"].as_str().unwrap());
+    assert!(storage_path.join("meta.json").is_file());
+    assert!(storage_path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .ends_with("pi"));
+    let meta: Value =
+        serde_json::from_slice(&std::fs::read(storage_path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(
+        meta["session_id"], session,
+        "log prefix must not alter storage identity"
+    );
+    std::fs::write(&file, "modified contents").unwrap();
+
+    // Root actors are shared across harnesses. This bind changes the actor's
+    // configured harness without invalidating the first route.
+    send_route_bind_with_harness_session_principal_and_doc(
+        &mut stream,
+        2,
+        103,
+        &root1,
+        "opencode",
+        session,
+        Some(Principal::Direct),
+        doc.clone(),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 103).await;
+    let preview = call_tool_response(
+        &mut stream,
+        1,
+        104,
+        "checkpoint_paths",
+        json!({ "name": "proof", "session_id": "spoofed-body-session" }),
+        "owner preview after sibling bind",
+    )
+    .await;
+    assert_tool_success(&preview, "owner preview after sibling bind");
+    assert_eq!(preview["paths"], json!([&file]));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "modified contents");
+    let sibling = call_tool_response(
+        &mut stream,
+        2,
+        105,
+        "checkpoint_paths",
+        json!({ "name": "proof" }),
+        "sibling namespace isolation",
+    )
+    .await;
+    assert_tool_error_code(
+        &sibling,
+        "checkpoint_not_found",
+        "sibling namespace isolation",
+    );
+
+    // Moving the owner's route to the nested workspace uses a different actor
+    // with an empty cache. It must hydrate the same harness/session disk tree.
+    send_route_bind_with_harness_session_principal_and_doc(
+        &mut stream,
+        3,
+        106,
+        &nested,
+        "pi",
+        session,
+        Some(Principal::Direct),
+        doc,
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 106).await;
+    let preview = call_tool_response(
+        &mut stream,
+        3,
+        107,
+        "checkpoint_paths",
+        json!({ "name": "proof" }),
+        "preview on rebound root",
+    )
+    .await;
+    assert_tool_success(&preview, "preview on rebound root");
+    assert_eq!(preview["paths"], json!([&file]));
+    let restored = call_tool_response(
+        &mut stream,
+        3,
+        108,
+        "safety",
+        json!({ "op": "restore", "name": "proof", "files": [&file] }),
+        "restore on rebound root",
+    )
+    .await;
+    assert_tool_success(&restored, "restore on rebound root");
+    assert_eq!(restored["storage_path"], created["storage_path"]);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "checkpoint contents"
+    );
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -6117,9 +6285,7 @@ async fn drive_routebind_nonblocking_daemon(input: FakeDaemonInput) {
         19,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6237,9 +6403,7 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         19,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6378,9 +6542,7 @@ async fn drive_duplicate_routebind_daemon(input: FakeDaemonInput) {
         111,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6414,9 +6576,7 @@ async fn drive_pending_bind_tool_call_daemon(input: FakeDaemonInput) {
         1200,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6450,9 +6610,7 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
         110,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6610,9 +6768,7 @@ async fn drive_cancelled_first_bind_does_not_orphan_later_bind_daemon(input: Fak
         200,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6660,9 +6816,7 @@ async fn drive_bind_deadline_recovery_daemon(input: FakeDaemonInput) {
         300,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6733,9 +6887,7 @@ async fn drive_goodbye_removes_queued_bind_daemon(input: FakeDaemonInput) {
         400,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_slow_configure": true,
         }),
     )
@@ -6831,9 +6983,7 @@ async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
         &push_burst_root,
         "session-6",
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_configure_status_burst": {
                 "marker": "configure-burst",
                 "count": 16,
@@ -6902,9 +7052,7 @@ async fn drive_lossy_pressure_daemon(input: FakeDaemonInput) {
         &push_burst_root,
         "session-6",
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_configure_status_burst": {
                 "marker": "lossy-pressure",
                 "count": 2048,
@@ -7573,8 +7721,13 @@ impl FakeStatusHolder {
             } }),
         )
         .await;
-        // Let the module record the ack before the next tool call reads it.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Discovery runs serially after publish completion. Seeing its next
+        // catalog request proves the module recorded the ack; a sleep after
+        // writing the reply cannot establish that on a busy runner.
+        let catalog =
+            read_raw_inventory_frame(&mut self.consumer_stream, "catalog after ack").await;
+        assert_eq!(frame_operation(&catalog).as_deref(), Some("catalog.list"));
+        reply_to(&mut self.consumer_stream, &catalog, holder_catalog()).await;
     }
 }
 
@@ -7683,11 +7836,18 @@ async fn agent_text_after_counts(
             && frame.header.channel == 1
             && frame.header.corr == corr
         {
-            let plugin_text = tool_response_json(&frame)["text"]
+            let response = tool_response_json(&frame);
+            assert_eq!(response["success"], true, "status-count call: {response:?}");
+            assert_eq!(response["case"], "status_bar");
+            let plugin_text = response["text"]
                 .as_str()
                 .expect("structured text")
                 .to_string();
             assert_eq!(plugin_text, tool_result_text(&frame));
+            assert!(
+                plugin_text.contains("\"case\":\"status_bar\""),
+                "echo body must remain rendered: {plugin_text:?}"
+            );
             return plugin_text;
         }
     }
@@ -7706,6 +7866,34 @@ fn assert_bar(text: &str, dead_code: u64, context: &str) {
     );
 }
 
+/// Finalization skips a busy diagnostics manager without consuming the bar's
+/// change gate. Wait for a later tool-result signal to render the seeded counts,
+/// rather than assuming RouteBindAck makes every count snapshot available.
+async fn assert_eventual_bar(
+    stream: &mut tokio::net::TcpStream,
+    mut corr: u64,
+    dead_code: u64,
+    context: &str,
+) {
+    let mut last_text = String::new();
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            last_text = agent_text_after_counts(stream, corr, dead_code).await;
+            if last_text.contains("[AFT ") {
+                assert_bar(&last_text, dead_code, context);
+                break;
+            }
+            corr += 1;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "{context}: seeded counts never rendered a status bar: {last_text:?}"
+    );
+}
+
 fn assert_no_bar(text: &str, context: &str) {
     assert!(
         !text.contains("[AFT "),
@@ -7719,23 +7907,26 @@ const PAST_PUBLISH_CADENCE: Duration = Duration::from_millis(2_700);
 
 async fn drive_live_holder_without_reader_daemon(input: FakeDaemonInput) {
     let mut stream = open_status_bar_module(&input).await;
-    let text = agent_text_after_counts(&mut stream, 80, 21).await;
-    assert_bar(&text, 21, "before any holder route");
+    assert_eventual_bar(&mut stream, 80_000, 21, "before any holder route").await;
 
     let mut holder =
         FakeStatusHolder::accept(&input.listener, &input.key, &input.daemon_id, &input.root1).await;
     holder.ack_next_publish(None).await;
 
     // The route to the holder is live, but nothing reads the scope.
-    let text = agent_text_after_counts(&mut stream, 81, 22).await;
-    assert_bar(&text, 22, "live holder route without a reader");
+    assert_eventual_bar(
+        &mut stream,
+        81_000,
+        22,
+        "live holder route without a reader",
+    )
+    .await;
     send_connection_goodbye(&mut stream).await;
 }
 
 async fn drive_recent_reader_daemon(input: FakeDaemonInput) {
     let mut stream = open_status_bar_module(&input).await;
-    let text = agent_text_after_counts(&mut stream, 80, 21).await;
-    assert_bar(&text, 21, "before any holder route");
+    assert_eventual_bar(&mut stream, 80_000, 21, "before any holder route").await;
 
     let mut holder =
         FakeStatusHolder::accept(&input.listener, &input.key, &input.daemon_id, &input.root1).await;
@@ -7749,8 +7940,7 @@ async fn drive_recent_reader_daemon(input: FakeDaemonInput) {
 async fn drive_reader_goes_stale_daemon(input: FakeDaemonInput) {
     let mut stream = open_status_bar_module(&input).await;
     let started = Instant::now();
-    let text = agent_text_after_counts(&mut stream, 80, 21).await;
-    assert_bar(&text, 21, "before any holder route");
+    assert_eventual_bar(&mut stream, 80_000, 21, "before any holder route").await;
 
     let mut holder =
         FakeStatusHolder::accept(&input.listener, &input.key, &input.daemon_id, &input.root1).await;
@@ -7766,8 +7956,28 @@ async fn drive_reader_goes_stale_daemon(input: FakeDaemonInput) {
     holder.ack_next_publish(Some(15_000)).await;
 
     // Counts are unchanged since the hidden bar, yet the agent never saw D22.
-    let text = agent_text_after_counts(&mut stream, 83, 22).await;
-    assert_bar(&text, 22, "reader stale past the window");
+    assert_eventual_bar(&mut stream, 83_000, 22, "reader stale past the window").await;
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_busy_status_counts_daemon(input: FakeDaemonInput) {
+    let mut stream = open_status_bar_module(&input).await;
+    let root_id = ProjectRootId::from_path(&input.root1).expect("bound root id");
+    let ctx = input
+        .executor
+        .actor_context(&root_id)
+        .expect("bound context");
+
+    // Hold the same manager a diagnostics producer uses until the response is
+    // received. This forces the contention window without scheduler timing.
+    let held = ctx.lsp();
+    let text = agent_text_after_counts(&mut stream, 79, 21).await;
+    assert_no_bar(&text, "busy diagnostics skip counts, not the rendered body");
+    drop(held);
+
+    // The skipped result must not swallow D21's change: unchanged counts become
+    // visible once a later result can take the diagnostics snapshot.
+    assert_eventual_bar(&mut stream, 80_000, 21, "diagnostics manager released").await;
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -9714,9 +9924,7 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
 
 fn minimal_bind_doc() -> Value {
     json!({
-        "callgraph_store": false,
-        "search_index": false,
-        "semantic_search": false,
+        "indexes": { "trigram": false, "semantic": false, "callgraph": false },
     })
 }
 
@@ -11143,9 +11351,7 @@ async fn drive_failed_new_root_daemon(input: FakeDaemonInput) {
         50,
         &failed_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "subc_test_configure_status_burst": {
                 "marker": "failed-no-channel",
                 "count": 4,
@@ -11197,9 +11403,7 @@ async fn drive_inspect_dead_code_convergence_daemon(input: FakeDaemonInput) {
         60,
         &callgraph_root,
         json!({
-            "callgraph_store": true,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": true },
         }),
     )
     .await;
@@ -11474,9 +11678,7 @@ async fn drive_pending_bind_health_daemon(input: FakeDaemonInput) {
         110,
         &slow_root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "inspect": { "enabled": false },
             "subc_test_slow_configure": true,
         }),
@@ -11669,9 +11871,7 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
         10,
         &root1,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "inspect": { "enabled": false },
         }),
     )
@@ -11816,9 +12016,7 @@ async fn drive_hashline_edit_round_daemon(input: FakeDaemonInput) {
         &root1,
         json!({
             "edit_mode": "hashline",
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;
@@ -11915,9 +12113,7 @@ async fn drive_disabled_tools_daemon(input: FakeDaemonInput) {
     let victim = root1.join("victim.txt");
     std::fs::write(&victim, "keep me\n").expect("write delete target");
     let doc = json!({
-        "callgraph_store": false,
-        "search_index": false,
-        "semantic_search": false,
+        "indexes": { "trigram": false, "semantic": false, "callgraph": false },
     });
     send_route_bind_with_session_and_doc(
         &mut stream,
@@ -12063,9 +12259,7 @@ async fn drive_hashline_bash_cat_daemon(input: FakeDaemonInput) {
         json!({
             "edit_mode": "hashline",
             "bash": { "rewrite": true, "background": false },
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;
@@ -12107,9 +12301,7 @@ async fn drive_manifest_reachability_daemon(input: FakeDaemonInput) {
         10,
         &root1,
         json!({
-            "callgraph_store": true,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": true },
         }),
     )
     .await;
@@ -12454,9 +12646,7 @@ async fn send_route_bind(
         corr,
         root,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;
@@ -12479,9 +12669,7 @@ async fn send_route_bind_epoch(
         &format!("session-{route_channel}"),
         Some(Principal::Direct),
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;
@@ -12519,9 +12707,7 @@ async fn send_route_bind_with_session(
         root,
         session,
         json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }),
     )
     .await;

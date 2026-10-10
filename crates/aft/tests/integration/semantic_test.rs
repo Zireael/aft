@@ -248,7 +248,7 @@ fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
                 "project_root": project.path().display().to_string(),
                 "storage_dir": storage.path().display().to_string(),
                 "config": user_config(serde_json::json!({
-                    "semantic_search": true,
+                    "indexes": { "semantic": true },
                     "semantic": {
                         "backend": "ollama",
                         "model": "nomic-embed-text",
@@ -287,7 +287,7 @@ fn configure_accepts_user_private_base_url() {
                 "project_root": project.path().display().to_string(),
                 "storage_dir": storage.path().display().to_string(),
                 "config": user_config(serde_json::json!({
-                    "semantic_search": true,
+                    "indexes": { "semantic": true },
                     "semantic": {
                         "backend": "openai_compatible",
                         "model": "text-embedding-3-small",

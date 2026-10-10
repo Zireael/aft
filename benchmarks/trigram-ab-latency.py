@@ -42,7 +42,7 @@ class Aft:
         self.buf = b""; self.id = 0
         cfg = {"id": "cfg", "command": "configure", "project_root": repo,
                "harness": "runner",
-               "config": [{"tier": "user", "doc": json.dumps({"search_index": True, "semantic_search": False, "callgraph_store": False})}]}
+               "config": [{"tier": "user", "doc": json.dumps({"indexes": {"trigram": True, "semantic": False, "callgraph": False}})}]}
         if bypass:
             cfg["_bypass_size_limits"] = True
         self._send(cfg); self._recv(timeout=60)

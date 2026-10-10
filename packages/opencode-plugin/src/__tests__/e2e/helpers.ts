@@ -30,10 +30,11 @@ import {
   type SubcRig,
   startSubcRig,
 } from "../../../../aft-bridge/src/__tests__/e2e/subc-rig.js";
+import { isolatedAftEnvironment } from "../../../../aft-bridge/src/test-child-environment.js";
 import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
-// "[aft] invalidated 7 files") into $TMPDIR/aft-plugin-test.log instead of
+// "[aft] invalidated 7 files") into the process-private test log namespace instead of
 // console.error. Without this, every "invalidated N files" / "watcher started"
 // line emitted by the Rust child during e2e tests leaks onto test stdout and
 // pollutes the bash background-completion output preview.
@@ -415,8 +416,10 @@ export async function createHarness(
       timeoutMs,
       ...(options.bridgeOptions ?? {}),
       childEnv: hermeticGitChildEnv({
-        AFT_CACHE_DIR: join(tempDir, ".aft-cache"),
-        ...(options.bridgeOptions?.childEnv ?? {}),
+        ...isolatedAftEnvironment(join(tempDir, ".aft-env"), {
+          ...process.env,
+          ...(options.bridgeOptions?.childEnv ?? {}),
+        }),
       }),
     };
 

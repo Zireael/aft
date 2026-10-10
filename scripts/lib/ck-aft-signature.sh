@@ -131,10 +131,14 @@ ck_aft_smoke_onnx() {
   # A copy, so the smoke never writes into the operator's model cache; `-c`
   # clones on APFS and costs no space.
   cp -Rc "$models" "$work/storage/semantic/models" 2>/dev/null || cp -R "$models" "$work/storage/semantic/models"
+  # Keep test-launched executables visibly separate from fleet daemons in
+  # Activity Monitor, even when the signed candidate itself is named ck-aft.
+  cp "$binary" "$work/ckdev-aft"
+  chmod 755 "$work/ckdev-aft"
 
   status=0
   output="$(env -i PATH=/usr/bin:/bin HOME="$work/home" AFT_STORAGE_DIR="$work/storage" \
-    ORT_DYLIB_PATH="$ort" "$binary" warmup --root "$work/root" --only semantic --timeout 120000 2>&1)" || status=$?
+    ORT_DYLIB_PATH="$ort" "$work/ckdev-aft" warmup --root "$work/root" --only semantic --timeout 120000 2>&1)" || status=$?
   rm -rf "$work"
   if [ "$status" -ne 0 ] || ! printf '%s\n' "$output" | grep -q '^aft warmup: semantic_index ready$'; then
     printf '%s\n' "$output" | grep -E 'semantic_index|warmup failed|ONNX|onnx' | sed 's/^/    /' >&2

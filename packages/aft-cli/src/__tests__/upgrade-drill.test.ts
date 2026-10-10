@@ -216,23 +216,22 @@ describe("doctor reports every condition that puts the plugin in its config erro
     expect(harness.pluginLoad?.blockers).toEqual([]);
   });
 
-  test("rejected retired keys are HIGH and planned for doctor --fix", async () => {
-    // The retired gh_read key is rejected by every plugin version, never migrated in place.
-    writeUserConfig({ gh_read: true });
-    const { code, text } = await plainDoctor();
-    expect(code).toBe(1);
-    expect(text).toContain("[HIGH] OpenCode: The plugin loads, but every AFT tool call fails with");
-    expect(text).toContain("removed_config_key:gh_read:use:github.read");
-    expect(text).toContain("gh_read → github.read");
-    expect(text).toContain("doctor --fix` to migrate the file");
+  test("retired keys never block the plugin and are still planned for doctor --fix", async () => {
+    // Loading translates retired keys, so they put the plugin in no error
+    // state; doctor --fix still offers to rewrite them.
+    const harness = await harnessFor({ gh_read: true, search_index: false });
+    expect(harness.pluginLoad?.blockers).toEqual([]);
+    const { text } = await plainDoctor();
+    expect(text).not.toContain("removed_config_key");
+    expect(text).not.toContain("every AFT tool call fails with");
     const { buildDoctorFixPlan } = await import("../commands/doctor.js");
     const plan = buildDoctorFixPlan(
       [fixtureAdapter()],
       fixReport(fixtureAdapter(), getSelfVersion()),
     );
-    expect(plan.find((item) => item.kind === "config")?.message).toContain(
-      "replaced gh_read with github.read",
-    );
+    const message = plan.find((item) => item.kind === "config")?.message;
+    expect(message).toContain("removed gh_read (was true)");
+    expect(message).toContain("added indexes.trigram: false");
   });
 
   test("a config that does not parse is HIGH with its path", async () => {

@@ -228,6 +228,23 @@ abort). A move hunk never deletes the source unless the destination write succee
 Context anchors (`@@`) use fuzzy matching to handle whitespace and Unicode differences.
 Diagnostics surface through the AFT status bar and `aft_inspect` (or inline on every edit with `lsp.diagnostics_on_edit: true`).
 
+With `validate_on_edit: "full"` (or a binary request's `validate: "full"` override),
+formatting and syntax validation still happen per write, but type checking waits until
+**all** hunks have succeeded. Each distinct checker runs once for the configured project
+root against the completed patch. File-scoped checkers receive all touched paths when
+their CLI supports it; Go named-file checks across directories fall back to one run per
+file. Deleted files are not checker inputs, and repeated writes to a path are checked once.
+
+Checker diagnostics appear on the existing `metadata.files` entries as `validation_errors`
+(including an empty array for a clean check) and, when necessary, `validate_skipped_reason`.
+Each diagnostic's `file` retains the checker-reported path, resolved against the checker
+root for attribution to the correct touched file.
+For a move hunk, diagnostics belong to the destination. The rendered `output` also includes
+a single summary, for example `type check: 2 errors in 1 of 3 files (cargo check, tsc)`;
+unchecked files are explicitly named by count and skip reason in that line. There is no
+top-level aggregate diagnostic list. Failed or partially applied patches do **not** run
+type checkers, even though their successful writes are kept.
+
 ---
 
 ### bash
@@ -247,8 +264,15 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | `compressed` | boolean | Opt in/out of output compression for this call (default true; requires compression flag) |
 | `pty` | boolean | Run in a real PTY for interactive programs. Implies `background: true`. |
 | `ptyRows` / `ptyCols` | number | PTY dimensions (max 60 rows / 140 cols). Soft-ignored on non-PTY calls. |
+| `runon` | string | Run the whole line on the remote Linux build server (`"linux"`). Offered only where remote runs are configured; see below. |
 
-**Timeout model:** `timeout` is a hard-kill cap, never a polling parameter. A bare foreground
+Calls admitted under the `worker` catalog preset set `NEXTEST_TEST_THREADS` and `RUST_TEST_THREADS` for local bash children from `../.cargo/alfonso-test-threads` (one decimal integer plus newline), defaulting to 4 when the file is missing, invalid, or above 256; valid values through 256 are preserved. Existing inherited or per-call values take precedence, and shell command prefixes still override them; head sessions and unscoped plugin worker flags receive no defaults, and exec-remote requests never carry these variables.
+
+**Timeout model:** `timeout` is a hard-kill cap, never a polling parameter, and starts after
+process spawn (setup time does not count). Expiry sends SIGTERM to the Unix process group, then
+SIGKILL after up to 2 seconds (Windows uses `taskkill /T /F`) and reports exit 124. Unix processes
+that leave the group (`setsid`, `setpgid`, Python `start_new_session=True`) survive; macOS has no
+tree kill. A bare foreground
 `bash({ command })` is polled for a short internal wait window (~5s); if the command hasn't
 finished it auto-promotes to a background task and returns a `taskId` while the command keeps
 running under the 30-minute (or explicit `timeout`) kill cap. `bash({ timeout: 2000 })` polls
@@ -262,6 +286,66 @@ briefly then hard-kills at 2s. `background: true` skips polling entirely.
 
 Returns combined stdout/stderr plus `exit_code`, `duration_ms`, truncation status, and an
 `output_path` when large output spills to disk.
+
+**Running on the remote build server (`runon`)** — `runon: "linux"` sends the whole command
+line, exactly as written (pipes, lists, environment prefixes and all), to the remote Linux
+build server (ck-motor, reached through the Subconscious daemon's `exec-remote/v1`). It runs
+there under `bash -c` in the same working directory, with the same timeout and the same
+environment, minus the secret-shaped and AFT/CortexKit control variables AFT strips before any
+off-host request (the reply names them). New plans require `runon` to send a line away. Deployed
+worker plans with an enabled `commands` prefix list retain their existing automatic routing:
+every literal command must match an allowed prefix, and unsupported syntax stays local.
+Explicit whole-line `runon` also requires the user-only live safety switch
+`bash.runon_enabled: true` (default false); projects cannot enable it. Turning that switch off
+hides and refuses `runon` without disabling legacy prefix routing.
+
+When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.
+
+Who is offered `runon`:
+
+- OpenCode and Pi sessions on macOS or Linux in subc mode, when the user config sets
+  `remote_exec.enabled: true`, the user safety switch `bash.runon_enabled: true`, and the project
+  has not turned remote runs off (see
+  [Configuration](config.md#remote-runs)). The decision is made once when the tool is built;
+  provider discovery happens at call time, without a startup round trip.
+- Head catalogs follow the same user setting. Broca worker catalogs instead use that session's
+  persisted plan, and offer `runon` only when its `remote_exec.enabled` and the user safety switch
+  are true, including after
+  a paramless refetch or restart.
+
+Default schemas and unavailable sessions contain neither the parameter nor remote-build
+instructions. Standalone NDJSON sessions and Windows never advertise it, whatever the user
+setting says.
+
+A call that sets `runon` is refused by name, and runs nowhere, when it cannot run remotely:
+the project turned remote runs off (`remote runs are off for this project`), the session has no
+remote runner (`this session has no remote runner`), the demand is not one AFT knows
+(`unknown runner demand`), or the call also sets `pty: true`, a PowerShell shell, or
+`sandbox: "host"`. On Windows `runon` is refused by name: remote dispatch needs AFT on macOS or
+Linux. If no `exec-remote/v1` provider answers, or daemon discovery fails before dispatch,
+the task is refused by name and the command is not run locally. `background: true` works as
+for local commands, and a background remote task re-attaches after a restart.
+
+When the runner refuses an explicit `runon` job before starting it, the call fails with code
+`remote_unavailable`: `runon refused: remote refused: <reason>; command was not run; retry, or
+omit runon to run locally`. The refusal reason is preserved, including reasons from newer
+runners. This also applies to pending tasks recovered after a restart. No local process is
+spawned. A deliberately backgrounded call still returns its task ID; a later refusal marks
+that task failed and its status includes `remote_refusal` with the same error text.
+
+Successful remote runs begin with `ran remotely on ck-motor`. Only automatic prefix routing
+(without an explicit `runon`) retains local fallback with the advisory
+`ran locally on macOS: remote refused: <reason>` (or the local OS name). A job that started
+remotely is never run again: if AFT loses track of it, the reply says the outcome is unknown
+instead of re-running it. After the
+output, the reply prints what the runner reported about the server's workspace, none of which
+is copied back: the files the run changed (`These files changed on the server and were NOT
+copied back:`), a changed Git state (HEAD before -> after, the symbolic ref or `detached`,
+whether the index tree changed, and the stash count change), new untracked files (marked when
+the runner listed only some of them), and the number of writes under ignored paths with sample
+paths. A kind of change the runner reported as empty is not mentioned. A kind it did not report
+(an older runner) gets one line, such as `git state: not reported by the runner`, and is never
+shown as "nothing changed".
 
 **Rewriter** — when `experimental.bash.rewrite: true`, common shell command shapes route to AFT
 tools instead of spawning bash:
@@ -346,10 +430,27 @@ the next foreground tool call, and a completion reminder is delivered automatica
 needed). Output is buffered in memory up to 1MB and spills beyond that to AFT's bash-output cache
 (default `~/.cache/aft/bash-output/<taskId>.log`, or the harness storage directory when configured).
 Background tasks and undelivered completions are persisted to disk and survive AFT restarts.
+Once a task has finished for 24 hours and its completion has been delivered, its output files are
+deleted; copy evidence you need into your report or a shared file. With project-root restrictions,
+only the starting session gets an ownership exception for output outside the project; another
+session (such as a reviewer reading a worker's path) may be refused even while the files exist.
 
 Foreground bash also starts through the same task flow. Short commands are polled and return inline
 output; commands that exceed the foreground wait window are automatically promoted to background
 and return a `taskId`.
+
+**Background task limit** — at most 8 background tasks (`max_background_bash_tasks`) run at once
+per project root, shared by all sessions in it. Local and remote (`runon`) tasks share the same
+slots. Only background tasks count: `background: true` and
+`pty: true` launches, and foreground commands once they are promoted. A background launch at the
+limit is refused with `background_task_limit_exceeded`; the message lists your own session's tasks
+holding slots (task id, age, the first 60 characters of the command, up to 8 rows), counts the slots
+held by other sessions in one line ("N more held by other sessions in this project", with no task ids
+or commands), and says to free a slot by stopping one of your own tasks with `bash_kill` or to wait
+for a task to finish. A foreground command always starts, even at the limit. If it then outlives
+its wait window it is still promoted (it is
+already running, so refusing it would lose its work) and counts from then on, so the count can
+briefly exceed the limit.
 
 **`bash_status`** — read-only snapshot of a background or PTY task's current state and output.
 Never waits. For PTY tasks, `outputMode` selects `screen` (vt100-rendered), `raw` (byte stream),
@@ -1071,6 +1172,23 @@ to copy+delete for cross-filesystem moves. Backs up the original before moving.
 ```
 
 Returns `{ file, destination, moved, backup_id }` on success.
+
+### move_symbol (binary command)
+
+The symbol-relocation command moves a TypeScript/JavaScript symbol and rewrites its
+consumers. It is separate from `aft_move`, which moves a whole file. Source, destination
+and consumer writes are checkpointed; a write failure or syntax rollback restores the
+operation and does not run the type checker.
+
+With `validate: "full"` or `validate_on_edit: "full"`, type checking runs only after every
+file has been written and formatted, once per distinct checker and configured project
+root. File arguments are batched where supported (Go named-file checks across directories
+fall back to one run per file). Each existing per-file `results` entry carries its own
+`validation_errors` array and optional `validate_skipped_reason`. The rendered `output`
+contains one `type check: …` summary line, not a separate top-level diagnostic list.
+Type errors report the completed project's state; they do not roll back an otherwise
+successful move. Intermediate errors from a consumer's not-yet-rewritten import are not
+reported.
 
 ---
 

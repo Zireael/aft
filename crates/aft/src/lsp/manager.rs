@@ -35,14 +35,19 @@ use crate::lsp::registry::{
 use crate::lsp::roots::ServerKey;
 use crate::lsp::typescript_project::{
     find_project_typescript_package, native_server_misidentified_reason,
-    native_server_unavailable_reason, resolve_native_binary, unservable_typescript_reason,
-    ProjectTypeScript, NATIVE_SERVER_INFO_NAME,
+    native_server_unavailable_reason, resolve_native_binary, typescript_dependency_declared,
+    unservable_typescript_reason, ProjectTypeScript, NATIVE_SERVER_INFO_NAME,
 };
 use crate::lsp::LspError;
 use crate::slog_error;
 use crate::slog_info;
 
 const STDERR_REASON_BYTES: usize = 2 * 1024;
+
+/// Leads the failure reason for TypeScript files that neither an installed
+/// typescript nor a declared typescript dependency covers.
+pub(crate) const NOT_IN_TYPESCRIPT_PROJECT: &str = "not in any TypeScript project";
+
 /// The total grace period for draining every LSP client during process shutdown.
 /// It is a hard ceiling: forced termination of servers that ignore the
 /// graceful handshake happens inside it, not after it.
@@ -127,7 +132,7 @@ pub struct EnsureServerOutcomes {
 /// inspection root. The public record set is deliberately only `ServerKey`s;
 /// the definitions retained internally are used later by the explicit start
 /// step and never cause a process to be opened during resolution.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ApplicableServerSnapshot {
     pub server_keys: Vec<ServerKey>,
     /// Servers whose workspace root marker was found in the resolved area but
@@ -218,7 +223,16 @@ impl ServerAttemptResult {
     pub fn failure_reason(&self) -> String {
         match self {
             Self::BinaryNotInstalled { binary } => format!("{binary} is unavailable"),
-            Self::SpawnFailed { reason, .. } => summarize_failure_reason(reason),
+            Self::SpawnFailed { reason, .. } => {
+                // Files outside every TypeScript project are a coverage gap,
+                // not a server that failed to become ready; drop the
+                // transport prefix so the gap does not read as a crash.
+                let reason = reason
+                    .strip_prefix("server not ready: ")
+                    .filter(|rest| rest.starts_with(NOT_IN_TYPESCRIPT_PROJECT))
+                    .unwrap_or(reason);
+                summarize_failure_reason(reason)
+            }
             Self::NoRootMarker { looked_for } => {
                 format!(
                     "no workspace root marker found (looked for {})",
@@ -2806,6 +2820,35 @@ impl LspManager {
         })
     }
 
+    pub(crate) fn saved_rust_checks(
+        &self,
+        deadline: Instant,
+    ) -> HashMap<ServerKey, super::completed_rust_check::SavedCheck> {
+        self.clients
+            .iter()
+            .filter_map(|(key, client)| {
+                if key.kind != ServerKind::Rust
+                    || self.producer_failure(key).is_some()
+                    || self.rust_check_completed_current(key)
+                {
+                    return None;
+                }
+                let saved = client.completed_rust_check.as_ref()?.validated(deadline)?;
+                Some((key.clone(), saved))
+            })
+            .collect()
+    }
+
+    pub(crate) fn rust_check_running_reason(&self, key: &ServerKey) -> String {
+        self.clients
+            .get(key)
+            .and_then(|c| c.completed_rust_check.as_ref())
+            .and_then(|cache| cache.running_reason())
+            .unwrap_or_else(|| {
+                crate::inspect::diagnostics_category::RUST_CHECK_RUNNING_REASON.to_string()
+            })
+    }
+
     /// Ask rust-analyzer again for a check that was expected and did not
     /// begin by its deadline (see
     /// [`LspClient::rearm_unreported_rust_check`]). Callers do this when they
@@ -2908,6 +2951,15 @@ impl LspManager {
         }
         let has_more = events.len() >= max_events && !self.event_rx.is_empty();
         self.send_due_rust_saves();
+        for client in self.clients.values_mut() {
+            if client.rust_check_completed_current(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
+                && !client.diagnostics_are_provisional()
+            {
+                if let Some(cache) = client.completed_rust_check.as_mut() {
+                    cache.complete();
+                }
+            }
+        }
         DrainedLspEvents {
             events,
             diagnostics_changed,
@@ -4653,6 +4705,15 @@ impl LspManager {
         );
         let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
         let key = ServerKey { kind: server, root };
+        // Preserve the full compiler result independently of the working-set
+        // LRU and document-close exceptions, which must not turn errors clean.
+        if let Some(cache) = self
+            .clients
+            .get_mut(&key)
+            .and_then(|c| c.completed_rust_check.as_mut())
+        {
+            cache.reports.insert(file.clone(), stored.clone());
+        }
         let mut stored = stored;
         if key.kind == ServerKind::Rust && self.server_supports_pull(&key) {
             // Recorded before the close check below: rust-analyzer's reply to
@@ -4744,6 +4805,19 @@ impl LspManager {
                 );
             }
             client.record_rust_progress(&token, kind, title);
+            if kind == "end"
+                && value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| {
+                        message.to_lowercase().contains("cancel")
+                            || message.to_lowercase().contains("fail")
+                    })
+            {
+                if let Some(cache) = client.completed_rust_check.as_mut() {
+                    cache.abort();
+                }
+            }
         }
     }
 
@@ -5035,6 +5109,7 @@ impl LspManager {
             || env_binary_override(&def.kind).is_some();
         let mut runtime_note = None;
         let mut project_typescript = None;
+        let mut typescript_lookup = None;
         let binary = if let ServerKind::TypeScriptNative(package_dir) = &def.kind {
             let project =
                 ProjectTypeScript::read(package_dir).unwrap_or_else(|| ProjectTypeScript {
@@ -5087,6 +5162,9 @@ impl LspManager {
                 .filter(|p| source_file.starts_with(p))
                 .unwrap_or(root);
             project_typescript = find_project_typescript_package(source_file, boundary);
+            if project_typescript.is_none() {
+                typescript_lookup = Some((source_file.to_path_buf(), boundary.to_path_buf()));
+            }
         }
 
         // Merge the server-defined env with our test-injected env.
@@ -5121,6 +5199,8 @@ impl LspManager {
             initialization_options,
             runtime_note,
             project_typescript,
+            storage_root: crate::bash_background::storage_dir(config.storage_dir.as_deref()),
+            typescript_lookup,
         })
     }
 
@@ -5346,9 +5426,13 @@ pub(crate) fn rust_failure_with_root_cause(message: &str, stderr_tail: &str) -> 
     }
 }
 
+/// Explain a TypeScript server that found no usable TypeScript SDK.
+/// `outside_typescript_project` is asked only for a missing installation with
+/// no project TypeScript found, because answering it walks the server root.
 fn typescript_initialize_failure_reason(
     reason: String,
     project_typescript: Option<&ProjectTypeScript>,
+    outside_typescript_project: impl FnOnce() -> bool,
 ) -> String {
     use super::environmental::{TS_LS5_NO_INSTALLATION, TS_LS6_NO_TSSERVER, TS_NATIVE_NO_TSSERVER};
 
@@ -5356,6 +5440,19 @@ fn typescript_initialize_failure_reason(
         reason.contains(TS_LS5_NO_INSTALLATION) || reason.contains(TS_LS6_NO_TSSERVER);
     if !no_usable_sdk {
         return reason;
+    }
+    // Nothing installs or declares TypeScript for these files (stray scripts
+    // at a workspace root whose packages each install their own). The install
+    // is not incomplete, so the install advice below would be false; name the
+    // files as outside every TypeScript project instead. The server's own
+    // words are quoted without its advice to install a dependency.
+    if project_typescript.is_none()
+        && reason.contains(TS_LS5_NO_INSTALLATION)
+        && outside_typescript_project()
+    {
+        return format!(
+            "{NOT_IN_TYPESCRIPT_PROJECT}: no installed typescript and no package.json declaring a typescript dependency covers these files, so typescript-language-server has no TypeScript to check them with (it reported: {TS_LS5_NO_INSTALLATION}). Installing dependencies will not change this; to check these files, put them in a package with a tsconfig.json and a typescript dependency."
+        );
     }
     // Installing dependencies cannot help a TypeScript 7 project: the native
     // compiler never ships the tsserver.js typescript-language-server loads.
@@ -5769,6 +5866,14 @@ struct PreparedSpawn {
     /// For the TypeScript server, the project's own TypeScript package, used
     /// to explain an initialize failure.
     project_typescript: Option<ProjectTypeScript>,
+    storage_root: PathBuf,
+    /// For the TypeScript server when no installed TypeScript was found: the
+    /// file the server starts for and the boundary of its TypeScript lookup.
+    /// After a missing-SDK failure they decide, with
+    /// [`typescript_dependency_declared`], whether the files are outside
+    /// every TypeScript project or only have dependencies not installed. The
+    /// check walks the server root, so it runs only on that failure.
+    typescript_lookup: Option<(PathBuf, PathBuf)>,
 }
 
 /// Why a prepared spawn produced no client. The manager records the details
@@ -5813,6 +5918,24 @@ impl PreparedSpawn {
     /// manager state, so it runs without the manager lock.
     fn run(self, initialize_timeout: Option<Duration>) -> Result<LspClient, SpawnFailure> {
         let initialize_timeout = initialize_timeout.or_else(|| self.test_initialize_timeout());
+        let completed_rust_check = (self.kind == ServerKind::Rust)
+            .then(|| {
+                super::completed_rust_check::CompletedRustCheck::new(
+                    &self.root,
+                    &self.reclaim_root,
+                    &self.storage_root,
+                    super::completed_rust_check::Runtime {
+                        binary: self.binary.clone(),
+                        args: self.args.clone(),
+                        env: self.env.clone(),
+                        options: self.initialization_options.clone(),
+                        launch_env: None,
+                        #[cfg(test)]
+                        validation_delay: Duration::ZERO,
+                    },
+                )
+            })
+            .flatten();
         let mut client = match LspClient::spawn_with_reclaim_root(
             self.kind.clone(),
             self.root.clone(),
@@ -5839,6 +5962,7 @@ impl PreparedSpawn {
             }
         };
         client.runtime_note = self.runtime_note;
+        client.completed_rust_check = completed_rust_check;
         let initialize = match initialize_timeout {
             Some(timeout) => {
                 client.initialize_with_timeout(&self.root, self.initialization_options, timeout)
@@ -5864,7 +5988,18 @@ impl PreparedSpawn {
             let reason = if self.kind == ServerKind::Biome {
                 biome_unavailable_reason(&reason)
             } else if self.kind == ServerKind::TypeScript {
-                typescript_initialize_failure_reason(reason, self.project_typescript.as_ref())
+                let root = &self.root;
+                typescript_initialize_failure_reason(
+                    reason,
+                    self.project_typescript.as_ref(),
+                    || {
+                        self.typescript_lookup
+                            .as_ref()
+                            .is_some_and(|(file, boundary)| {
+                                !typescript_dependency_declared(file, root, boundary)
+                            })
+                    },
+                )
             } else {
                 reason
             };
@@ -6596,10 +6731,8 @@ pub fn walk_applicable_area(
     for root in &walk_roots[1..] {
         builder.add(root);
     }
-    let walker = builder
-        .same_file_system(true)
-        .standard_filters(true)
-        .add_custom_ignore_filename(".aftignore")
+    builder.same_file_system(true).standard_filters(true);
+    let walker = crate::context::apply_project_ignore_rules(&mut builder, &walk_roots[0])
         .filter_entry(|entry| {
             !crate::lsp::roots::skip_in_server_walk(
                 entry.file_name().to_string_lossy().as_ref(),
@@ -7605,6 +7738,88 @@ mod inspect_path_tests {
         assert!(snapshot.candidates.is_empty());
     }
 
+    /// A Bun 1.4 workspace installs per package: each package has its own
+    /// `biome.json` and `node_modules/.bin/biome`, and the root has a
+    /// `node_modules` without `.bin/biome`. Every package's Biome server must
+    /// resolve to that package's binary instead of being reported as
+    /// "biome is unavailable".
+    #[cfg(unix)]
+    #[test]
+    fn per_package_biome_resolves_in_a_bun_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = crate::inspect::job::canonicalize_normalized(temp_dir.path()).join("workspace");
+        let write = |relative: &str, contents: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            path
+        };
+        write(
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        let packages = ["plugin", "cli"];
+        for package in packages {
+            write(
+                &format!("packages/{package}/package.json"),
+                r#"{"devDependencies":{"@biomejs/biome":"^2.5.1"}}"#,
+            );
+            write(&format!("packages/{package}/biome.json"), "{}");
+            write(
+                &format!("packages/{package}/src/index.ts"),
+                "export const value = 1;\n",
+            );
+            // Behaves like the real CLI's `--version`; resolution only needs
+            // an executable file.
+            let biome = write(
+                &format!("packages/{package}/node_modules/.bin/biome"),
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version: 2.5.1'; exit 0; fi\nexit 1\n",
+            );
+            std::fs::set_permissions(&biome, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config = Config {
+            project_root: Some(root.clone()),
+            disabled_lsp: ["typescript", "oxlint"]
+                .iter()
+                .map(|id| id.to_string())
+                .collect(),
+            ..Config::default()
+        };
+        let manager = LspManager::new();
+
+        let snapshot = manager
+            .resolve_applicable_servers_for_root(&root, &config)
+            .expect("resolution succeeds");
+
+        let biome_failures = snapshot
+            .producer_failures
+            .iter()
+            .filter(|failure| failure.server_key.kind == ServerKind::Biome)
+            .map(|failure| (failure.server_key.root.clone(), failure.reason()))
+            .collect::<Vec<_>>();
+        assert!(biome_failures.is_empty(), "{biome_failures:?}");
+        for package in packages {
+            let package_root = root.join("packages").join(package);
+            let candidate = snapshot
+                .candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.key.kind == ServerKind::Biome && candidate.key.root == package_root
+                })
+                .unwrap_or_else(|| panic!("no Biome server for {package}"));
+            let resolved = manager
+                .resolve_binary(&candidate.definition, &candidate.key.root, &config)
+                .expect("package-local Biome resolves");
+            assert_eq!(
+                resolved,
+                package_root.join("node_modules").join(".bin").join("biome")
+            );
+        }
+    }
+
     /// The whole-project walk skips test fixtures, spikes, and ignored
     /// directories, each of which here is its own Cargo workspace that would
     /// otherwise get its own rust-analyzer. A request whose scope is one of
@@ -7857,12 +8072,12 @@ mod typescript_worktree_tests {
 
     #[test]
     fn typescript_sdk_unavailable_requires_actual_server_error() {
-        let missing = typescript_initialize_failure_reason("initialize failed: Could not find a valid TypeScript installation. Please ensure that the typescript dependency is installed".into(), None);
+        let missing = typescript_initialize_failure_reason("initialize failed: Could not find a valid TypeScript installation. Please ensure that the typescript dependency is installed".into(), None, || false);
         assert!(missing.starts_with("TypeScript SDK unavailable:"));
         assert!(missing.contains("run bun install"));
         let unrelated = "initialize failed: connection closed";
         assert_eq!(
-            typescript_initialize_failure_reason(unrelated.into(), None),
+            typescript_initialize_failure_reason(unrelated.into(), None, || true),
             unrelated
         );
     }
@@ -7879,7 +8094,7 @@ mod typescript_worktree_tests {
 
     #[test]
     fn typescript_language_server_6_wording_is_explained_without_install_advice() {
-        let reason = typescript_initialize_failure_reason(LS6_NO_TSSERVER.into(), None);
+        let reason = typescript_initialize_failure_reason(LS6_NO_TSSERVER.into(), None, || true);
         assert!(
             reason.starts_with("TypeScript SDK unavailable:"),
             "{reason}"
@@ -7893,7 +8108,7 @@ mod typescript_worktree_tests {
     fn typescript_7_project_is_named_for_both_server_wordings() {
         let ts7 = project_ts("7.0.2");
         for raw in [LS5_NO_INSTALLATION, LS6_NO_TSSERVER] {
-            let reason = typescript_initialize_failure_reason(raw.into(), Some(&ts7));
+            let reason = typescript_initialize_failure_reason(raw.into(), Some(&ts7), || true);
             assert!(
                 reason.starts_with("TypeScript unavailable: this project uses TypeScript 7.0.2 (native compiler) at /repo/node_modules/typescript, which has no tsserver; typescript-language-server can't serve it."),
                 "{reason}"
@@ -7906,6 +8121,7 @@ mod typescript_worktree_tests {
         let dev = typescript_initialize_failure_reason(
             LS6_NO_TSSERVER.into(),
             Some(&project_ts("7.1.0-dev.20260929.1")),
+            || true,
         );
         assert!(dev.contains("(native compiler)"), "{dev}");
     }
@@ -7915,6 +8131,7 @@ mod typescript_worktree_tests {
         let reason = typescript_initialize_failure_reason(
             LS5_NO_INSTALLATION.into(),
             Some(&project_ts("5.9.3")),
+            || true,
         );
         assert!(
             reason.starts_with("TypeScript SDK unavailable:"),
@@ -7923,6 +8140,123 @@ mod typescript_worktree_tests {
         assert!(reason.contains("run bun install"), "{reason}");
     }
 
+    #[test]
+    fn typescript_files_outside_every_project_get_a_named_gap_without_install_advice() {
+        let reason =
+            typescript_initialize_failure_reason(LS5_NO_INSTALLATION.into(), None, || true);
+        assert!(reason.starts_with(NOT_IN_TYPESCRIPT_PROJECT), "{reason}");
+        assert!(!reason.contains("run bun install"), "{reason}");
+        assert!(!reason.contains("Please ensure"), "{reason}");
+        assert!(!reason.contains("SDK unavailable"), "{reason}");
+        // The gap row reports the reason without the transport prefix every
+        // initialize failure carries, and without cutting it.
+        let attempt = ServerAttemptResult::SpawnFailed {
+            binary: "typescript-language-server".into(),
+            reason: LspError::ServerNotReady(reason.clone()).to_string(),
+        };
+        assert_eq!(attempt.failure_reason(), reason);
+        // Other initialize failures keep the prefix.
+        let other = ServerAttemptResult::SpawnFailed {
+            binary: "typescript-language-server".into(),
+            reason: LspError::ServerNotReady("TypeScript SDK unavailable: x".into()).to_string(),
+        };
+        assert!(other
+            .failure_reason()
+            .starts_with("server not ready: TypeScript SDK unavailable"));
+        // With a project TypeScript found, the project walk is not needed.
+        let installed = typescript_initialize_failure_reason(
+            LS5_NO_INSTALLATION.into(),
+            Some(&project_ts("5.9.3")),
+            || panic!("the project walk runs only when no TypeScript was found"),
+        );
+        assert!(installed.contains("run bun install"), "{installed}");
+    }
+
+    /// A Bun 1.4 workspace whose packages each install TypeScript, with
+    /// stray `.ts` scripts at the root and no `typescript` dependency there.
+    /// The fake `typescript-language-server` answers `initialize` the way the
+    /// real one does when it finds no TypeScript: a -32603 error naming the
+    /// missing installation. The root server's gap must say the files are
+    /// outside every TypeScript project, not that an install is missing.
+    #[cfg(unix)]
+    #[test]
+    fn root_scripts_outside_every_typescript_project_are_a_named_gap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path()).join("workspace");
+        let write = |relative: &str, contents: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        };
+        write(
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        write("scripts/build.ts", "export const build = 1;\n");
+        write(
+            "crates/mc-module/gen/gen-golden.ts",
+            "export const golden = 1;\n",
+        );
+        write("docs/designs/catalog/probe.ts", "export const probe = 1;\n");
+        write(
+            "packages/plugin/package.json",
+            r#"{"name":"plugin","devDependencies":{"typescript":"^5.9.3"}}"#,
+        );
+        write("packages/plugin/tsconfig.json", "{}");
+        write("packages/plugin/src/index.ts", "export const plugin = 1;\n");
+        sdk(&root.join("packages").join("plugin"), "5.9.3");
+
+        let tools = temp.path().join("tools").join("node_modules").join(".bin");
+        std::fs::create_dir_all(&tools).unwrap();
+        let fake = tools.join("typescript-language-server");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+len=0
+while IFS= read -r line; do
+  line=$(printf '%s' "$line" | tr -d '\r')
+  [ -z "$line" ] && break
+  case "$line" in Content-Length:*) len=${line#Content-Length: } ;; esac
+done
+body=$(head -c "$len")
+id=$(printf '%s' "$body" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9]*\),.*/\1/p')
+msg='{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32603,"message":"Request initialize failed with message: Could not find a valid TypeScript installation. Please ensure that the \"typescript\" dependency is installed in the workspace or that a valid `tsserver.path` is specified. Exiting."}}'
+printf 'Content-Length: %d\r\n\r\n%s' "${#msg}" "$msg"
+exit 1
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = Config {
+            project_root: Some(root.clone()),
+            lsp_paths_extra: vec![tools],
+            disabled_lsp: ["biome", "oxlint"]
+                .iter()
+                .map(|id| id.to_string())
+                .collect(),
+            ..Config::default()
+        };
+        let mut manager = LspManager::new();
+        let snapshot = manager
+            .resolve_applicable_servers_for_root(&root, &config)
+            .unwrap();
+        let outcomes = manager.start_applicable_servers(&snapshot, &config);
+        let root_failure = outcomes
+            .failures
+            .iter()
+            .find(|failure| {
+                failure.server_key.kind == ServerKind::TypeScript && failure.server_key.root == root
+            })
+            .unwrap_or_else(|| panic!("no root TypeScript failure: {:?}", outcomes.failures));
+        let reason = root_failure.reason();
+        assert!(reason.starts_with(NOT_IN_TYPESCRIPT_PROJECT), "{reason}");
+        assert!(!reason.contains("run bun install"), "{reason}");
+        assert!(!reason.contains("server not ready"), "{reason}");
+    }
     #[test]
     fn project_typescript_package_is_read_from_node_modules_not_the_lockfile() {
         let temp = tempfile::tempdir().unwrap();

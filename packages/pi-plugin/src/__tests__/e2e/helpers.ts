@@ -19,10 +19,11 @@ import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { BridgePool, inlineUserConfigTier, setActiveLogger } from "@cortexkit/aft-bridge";
 import { hermeticGitChildEnv, withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
 import { warmMacosExec } from "../../../../../tests/helpers/macos-exec-warm.js";
+import { isolatedAftEnvironment } from "../../../../aft-bridge/src/test-child-environment.js";
 import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
-// "[aft] invalidated 7 files") into $TMPDIR/aft-plugin-test.log instead of
+// "[aft] invalidated 7 files") into the process-private test log namespace instead of
 // console.error. Without this, every "invalidated N files" / "watcher started"
 // line emitted by the Rust child during e2e tests leaks onto test stdout and
 // pollutes the bash background-completion output preview.
@@ -255,11 +256,10 @@ export async function createHarness(
 
   // Full permissive surface so registerAllTools exposes every tool by default.
   const config: AftConfig = {
-    tool_surface: "all",
+    disabled_tools: [],
     format_on_edit: false,
     validate_on_edit: "syntax",
-    search_index: true,
-    semantic_search: false,
+    indexes: { trigram: true, semantic: false },
     restrict_to_project_root: false,
     ...(options.config ?? {}),
   };
@@ -279,7 +279,7 @@ export async function createHarness(
       // callgraph_building). Tests need the store ready synchronously; fixtures
       // are tiny so a few seconds is ample headroom.
       childEnv: hermeticGitChildEnv({
-        AFT_CACHE_DIR: join(tempDir, ".aft-cache"),
+        ...isolatedAftEnvironment(join(tempDir, ".aft-env")),
         AFT_CALLGRAPH_BUILD_WAIT_MS: "15000",
       }),
     },
@@ -308,7 +308,7 @@ export async function createHarness(
     hoistGrep: true,
     outline: true,
     zoom: true,
-    semantic: config.semantic_search === true,
+    semantic: config.indexes?.semantic === true,
     navigate: true,
     conflicts: true,
     importTool: true,

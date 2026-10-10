@@ -18,6 +18,8 @@ OMP uses this same CortexKit user file; register its Pi-compatible plugin with `
 
 On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
 
+On macOS, `bash.disclaim_privacy: true` makes agent shells (including background, PTY, and governed `gh` commands) responsible for their own privacy permissions instead of inheriting the supervisor's grants. It defaults to `false`; user config controls it and project config may only turn it on. It is live-reloadable for future commands, not already-running children, and accepted but inert on other platforms. Disclaimed shells cannot rely on inherited access to protected folders such as `~/Downloads`; agents should use AFT's in-process `read` tool for those files (`grep` and `glob` are also unaffected). If macOS cannot apply the responsibility attribute, AFT refuses the command with `privacy disclaim unavailable` rather than running it with inherited grants. Effective per-root settings appear in health, and the first disclaimed command logs an informational message per session.
+
 Background-task completion and pattern-watch notices are delivered only to the session that started the task; other sessions bound to the same project may still inspect or stop the task by ID.
 
 Older installs used per-harness paths (`~/.config/opencode/aft.jsonc`, `~/.pi/agent/aft.jsonc`,
@@ -58,6 +60,10 @@ disable requires editing the base list):
 ```
 
 ## Storage Root Environment Override
+
+On Unix, AFT storage is owner-only (0700 directories and executables, 0600 files), and existing loose storage directories are tightened when opened without walking their contents.
+
+For a missing checkout folder, index retention uses a one-day age window from the last bind when the persisted binding verifies a linked Git worktree, and seven days for main checkouts or older/unknown bindings; reader, pin, lease and mount protections still apply.
 
 Set `AFT_STORAGE_DIR` to place AFT's SQLite databases, WALs, writer leases, and indexes on a local disk when `$HOME` is NFS-mounted (for example on corporate or HPC systems). The variable is process state, not a JSONC configuration key, and an empty value is treated as unset. Relative values are resolved to an absolute path at first read; `~` and `~/...` are expanded using the current user's home directory.
 
@@ -374,6 +380,13 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // consumer's diagnostic completeness.
     "diagnostics_timeout_ms": 120000,
     "tier2_idle_minutes": 5,      // debounce before idle-triggered Tier 2 background scans
+    // Computation switches, all true by default. Projects can turn categories
+    // off, never restore a category the user turned off. Applies live.
+    "categories": {
+      "diagnostics": true, "todos": true, "dead_code": true,
+      "unused_exports": true, "duplicates": true, "cycles": true,
+      "complexity": true
+    },
     "duplicates": {
       // Intentional mirror pairs, matched against project-root-relative
       // forward-slash paths. Groups fully spanning one pair are suppressed but
@@ -384,15 +397,11 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
 
   // Idle reclamation. User and project tiers. Values outside the documented
   // ranges are clamped with a warning; non-integers are dropped with a warning.
-  // Reclaimed indexes rebuild and language servers respawn on the next request.
+  // Reclaimed indexes rebuild on the next request.
   "idle": {
     // Minutes without tool traffic before an unbound root's artifacts are
     // evicted. Default 30; clamped to 5..=30.
-    "root_ttl_minutes": 30,
-    // Minutes without a request before language servers for a root shut down,
-    // even while the root is still bound. Default 10; clamped to 1..=10.
-    // Independent of root_ttl_minutes.
-    "lsp_ttl_minutes": 10
+    "root_ttl_minutes": 30
   },
 
   // Automatic undo snapshots. Existing-file mutations larger than 64 MiB and
@@ -415,6 +424,14 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "write_allow": [],
     // Additional paths to hide from sandboxed commands.
     "read_deny": []
+  },
+
+  // Remote runs requested per bash call with `runon` (subc mode). Default: off.
+  "remote_exec": {
+    // User config only; a project config may set false to turn them off.
+    "enabled": false,
+    // The runner demand a `runon` call without specifics runs under. User config only.
+    "default_demand": "linux"
   },
 
   "experimental": {
@@ -565,6 +582,14 @@ The `opencode` block is honored only in your user config. A project config that 
 
 `git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` derives the repository's bound agent from the gh-shim manifest and cached GitHub numeric ID, and an explicit `"Name <email>"` value is used verbatim. When enabled, AFT selects a complete dispatcher set through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The dispatchers are identical for every project and storage root, so AFT writes them once per user to a directory named by a hash of their content, `<aft-cache>/git-hooks/<content-hash>`, where `<aft-cache>` is `AFT_CACHE_DIR` when set, otherwise `%LOCALAPPDATA%\aft` on Windows and `$XDG_CACHE_HOME/aft` or `~/.cache/aft` elsewhere (`<storage_root>/git-hooks/<content-hash>` when no home directory is known). The set is created atomically and never rewritten while intact, so each hook version is a single new executable per user. Each dispatcher preserves arguments, stdin, and exit status while chaining to the first executable repository hook from local `core.hooksPath`, the repository's Git directory, or `.githooks`. The `prepare-commit-msg` dispatcher adds attribution first so the repository hook can validate or amend it. AFT quarantines unknown or modified entries in its managed directory and regenerates the expected dispatchers before child launch. Project config may override this attribution key because attribution is not a trust boundary.
 
+## Remote runs
+
+Whole-line `runon` additionally requires `bash.runon_enabled: true` in the user config. This live safety switch defaults to false, ignores all project values, and can be changed without restarting AFT. It does not stop deployed worker plans' enabled `commands` prefix routing; those plans retain today's literal matcher even while whole-line runon is off.
+
+`remote_exec.enabled: true` in your user config offers bash's `runon` argument to OpenCode and Pi sessions running in subc mode on macOS or Linux: a call with `runon: "linux"` runs its whole command line on the remote Linux build server instead of this machine (see [bash](tools.md#bash)). Standalone NDJSON sessions never register the parameter, even with this setting enabled. Remote-build guidance is shown only alongside an available parameter; default catalogs show neither. Provider availability is checked at call time, and a missing provider is refused by name without a local run. Nothing runs remotely unless a call asks for it. `remote_exec.default_demand` names the runner demand a `runon` call without specifics runs under; it never makes a call remote by itself.
+
+Both keys are honored only in user config. A project config may set `remote_exec.enabled: false` to turn remote runs off for that project, and then a `runon` call there is refused with `remote runs are off for this project`; a project value of `true`, or any `default_demand`, is ignored with a warning. Whether `runon` is offered is decided when the session starts, so a change takes effect after a restart. Broca workers take the same two fields from their plan's `remote_exec` item instead of this config; an older plan's `remote_exec.commands` list is accepted and ignored.
+
 ## Native command sandbox
 
 Set `sandbox.enabled` to route first-party bash and PTY commands through Seatbelt on macOS or Landlock on Linux. Unsupported platforms, unavailable kernels, Landlock ABIs below V3, invalid profiles, and policies that cannot preserve the credential floor fail closed with a structured `sandbox_unavailable` response. Sandboxed commands receive a private task temporary directory through `TMPDIR`, `TMP`, and `TEMP`; Linux does not grant the shared `/tmp` tree.
@@ -611,10 +636,23 @@ Compared with Codex's default sandbox, AFT is stricter about credential reads: C
 v0.58 replaces surface levels with one rule — a tool is registered unless it is
 in `disabled_tools` — and makes the background indexes first-class
 (`indexes.trigram`, `indexes.semantic`, `indexes.callgraph`, all default on).
-During v0.58 the retired keys below are translated in memory on every load and
-one migration notice is delivered per unchanged file state; from v0.59 each is
-rejected with `removed_config_key:<old>:use:<replacement>` and the whole
-configuration is not used until `npx @cortexkit/aft doctor --fix` rewrites it.
+Retired keys are never refused. On every load AFT translates them into their
+current equivalents, and those then follow the usual user/project rules:
+
+- **User file** (`~/.config/cortexkit/aft.jsonc`): AFT rewrites the file to the
+  current keys the first time it reads it, with the same comment-preserving
+  migration `npx @cortexkit/aft doctor --fix` performs. The previous text is
+  kept beside it as `aft.jsonc.bak-<unix seconds>`, and one notice says the
+  file was updated. A read-only file, or one AFT cannot write, is left alone:
+  the keys are translated in memory and the notice says why the file was not
+  updated.
+- **Project file** (`<project>/.cortexkit/aft.jsonc`, including its
+  `harnesses` blocks): it is shared through the repository, so AFT never
+  writes it. The keys are translated in memory with the same limits a project
+  config has for the current key (for example, a project's `gh_read` becomes
+  `github.read`, which a project cannot set, so it is ignored), and one notice
+  names the file and its retired keys. Run `npx @cortexkit/aft doctor --fix`
+  in the project to update the file.
 
 | Retired input | Replacement |
 | --- | --- |
@@ -623,6 +661,9 @@ configuration is not used until `npx @cortexkit/aft doctor --fix` rewrites it.
 | `semantic_search`, `experimental_semantic_search` | `indexes.semantic` |
 | `callgraph_store` | `indexes.callgraph` |
 | `github.enabled` | `github.read`, `github.write`, `github.shim` |
+| `gh_read.enabled`, `gh_shim.enabled` | `github.read`, `github.shim` (`gh_shim.binary_path` stays) |
+| `idle.lsp_ttl_minutes` | `lsp.idle_minutes` |
+| `inspect.tier2_soft_deadline_ms`, `inspect.max_drill_down_items` | removed (they had no effect) |
 | `aft_read`, `aft_write`, `aft_edit`, `aft_apply_patch`, `aft_grep`, `aft_glob`, `aft_bash` in `disabled_tools` | `read`, `write`, `edit`, `apply_patch`, `grep`, `glob`, `bash` |
 
 Translation rules: an explicit `tool_surface` in the user base is a complete
@@ -635,17 +676,16 @@ registration choice (`"all"` → `[]`, `"recommended"` → `["aft_callgraph",
 trigram, semantic and callgraph indexes still build, and the migration notice
 says so. To keep AFT from indexing a repository, also set `indexes.trigram`,
 `indexes.semantic` and `indexes.callgraph` to `false`. False `backup.enabled`,
-`inspect.enabled` and `bash`/`bash.enabled` keep restricting runtime behavior
-and, during v0.58 only, also generate `aft_safety`, `aft_inspect` and
-`bash`+companions respectively (each such load warns
-`legacy_runtime_gate_requires_fix`). An explicit `disabled_tools` in the same
+`inspect.enabled` and `bash`/`bash.enabled` only switch their behaviour off;
+they no longer remove tool registrations (a load with one and no
+`disabled_tools` warns `legacy_runtime_gate_runtime_only`), so list the tools
+in `disabled_tools` to unregister them. An explicit `disabled_tools` in the same
 block, including `[]`, wins over every generated name. Project configs cannot
 disable `aft_safety` or host tool slots, whether directly or through a legacy
 key.
 
-A configuration AFT cannot use — a file that does not parse, a rejected key such
-as `gh_read` or `gh_shim.enabled`, or a missing `subc.connection_file` — no
-longer falls back to defaults. The plugin still loads, every AFT tool call
+A configuration AFT cannot use — a file that does not parse or a missing
+`subc.connection_file` — no longer falls back to defaults. The plugin still loads, every AFT tool call
 returns the error and how to fix it, the sidebar and status show it, and no
 indexing starts until the file is fixed and the host restarted.
 
@@ -692,6 +732,45 @@ canonical shape is the top-level `bash` block shown above. `experimental` now ho
 
 ## Language servers (LSP)
 
+`lsp.idle_minutes` is **minutes since the last AFT tool call on that repository**,
+not time since the language server last emitted a diagnostic. It defaults to
+`60`; integer values are clamped to `5..=1440`. Set it to `"never"` to disable
+idle reaping. This does not prevent shutdown on unbind, eviction or daemon
+shutdown, and is independent of `idle.root_ttl_minutes`. Reaped servers respawn
+when next needed. The same activity definition applies to standalone and subc.
+
+This is a **tighten-only resource setting**: project config may lower the user's
+number, or choose a number when the user chose `"never"`. A larger project value
+or `"never"` over a user number is ignored and reported as a dropped key by the
+Rust resolver. Both plugins apply the same floor. The default `60` is the floor
+when the user did not set it. Active harness overrides obey their tier's trust
+rules. Changes apply live, at the next request/maintenance boundary, without
+restarting AFT. A project edit cannot remove an already published tightening
+until reconnect; trusted user edits may change the user budget in either direction.
+
+`inspect.categories` has exactly seven boolean keys: `diagnostics`, `todos`,
+`dead_code`, `unused_exports`, `duplicates`, `cycles`, `complexity`. All default
+to `true`. A false category is not scanned, built or refreshed, for scoped or
+unscoped inspections; it emits only e.g. `dead code: off (inspect.categories.dead_code)`.
+It cannot make the header PARTIAL and does not show a cached findings count.
+Status bars use **`○` for off** (e.g. `D○`), distinct from `?` for unknown and
+`0` for verified clean. Metrics remains internal and always computed for scoped
+file counts; it is not a configurable or rendered category. Project config can
+turn categories off, but cannot turn on a category the user turned off. Category
+changes apply live; work already admitted retains its pinned configuration.
+`inspect.enabled: false` remains the whole-tool runtime switch.
+
+`idle.lsp_ttl_minutes` is replaced by `lsp.idle_minutes`.
+`inspect.tier2_soft_deadline_ms` and `inspect.max_drill_down_items` were inert and
+are removed (`inspect.tier2_pass_timeout_ms` and `aft_inspect.topK` are what they
+used to approximate). These old keys are retired like the ones in
+[Feature-based configuration](#feature-based-configuration-v058), including inside
+harness blocks: loading moves the old idle value to `lsp.idle_minutes`, clamped
+to the new range (an existing canonical value wins, and a project file may still
+only shorten the window), and drops the two inert inspect keys. The user file is
+rewritten that way automatically; `npx @cortexkit/aft doctor --fix` rewrites a
+project file.
+
 AFT runs language servers in-process for post-edit diagnostics and on-demand `lsp_diagnostics`
 calls. Servers are spawned lazily — only when a file matching their extensions is touched, and
 only if their binary can be resolved from project `node_modules/.bin`, AFT's managed cache, or
@@ -710,6 +789,11 @@ AFT sets `GIT_OPTIONAL_LOCKS=0` for every language server so Git status calls by
 | gopls | `.go` | `gopls` |
 | bash-language-server | `.sh .bash .zsh` | `bash-language-server` |
 | yaml-language-server | `.yaml .yml` | `yaml-language-server` |
+| Dockerfile Language Server | `.dockerfile` | `docker-language-server start --stdio` (preferred); `docker-langserver --stdio` fallback |
+
+Docker's `docker-language-server` is preferred when available and runs with `start --stdio`.
+The npm `docker-langserver` server remains a fallback; AFT's plugins continue to auto-install
+`dockerfile-language-server-nodejs` when `lsp.auto_install` is enabled.
 
 **TypeScript 7 and later** ship no `tsserver.js`, so `typescript-language-server` cannot
 serve them. When the nearest installed `node_modules/typescript/package.json` reports version
@@ -858,7 +942,9 @@ For best results in very large trees, point AFT at a specific project subdirecto
 Every AFT walk — trigram index, semantic index, call graph, and `aft_inspect` —
 honors `.gitignore` (including `.git/info/exclude` and nested `.gitignore`
 files) and skips common build directories (`node_modules`, `target`, `dist`,
-`build`, `.venv`, and similar).
+`build`, `.venv`, and similar). In a folder that is not a git repository, AFT
+still applies `.gitignore` files and your global git excludes file
+(`core.excludesFile`); `.git/info/exclude` only exists inside a repository.
 
 AFT also honors an optional **`.aftignore`** file: the same syntax as
 `.gitignore`, hierarchical, and working in non-git projects, layered on top of

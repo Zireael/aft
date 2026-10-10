@@ -72,7 +72,7 @@ function spawnHarness(
   writeFileSync(join(projectDir, "package.json"), '{ "name": "headless-exit" }\n');
   writeFileSync(
     join(configDir, "cortexkit", "aft.jsonc"),
-    '{ "semantic_search": true, "lsp": { "versions": { "typescript-language-server": "4.3.3" } } }\n',
+    '{ "indexes": { "semantic": true }, "lsp": { "versions": { "typescript-language-server": "4.3.3" } } }\n',
   );
 
   const env: Record<string, string> = {};

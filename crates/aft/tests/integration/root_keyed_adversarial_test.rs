@@ -186,7 +186,13 @@ fn root_keyed_migration_mid_crash_cleans_partial_and_preserves_legacy_source() {
     let legacy_build_dir = root.join("legacy-build");
 
     publish_project_generation(&root, &legacy_build_dir, "oldLeaf");
+    // Migration needs a superseded source, which retention otherwise correctly
+    // reclaims when the replacement is published. Protect that source explicitly.
+    let source_reader = CallGraphStore::open_readonly(legacy_build_dir.clone(), root.clone())
+        .unwrap()
+        .expect("legacy source reader");
     publish_project_generation(&root, &legacy_build_dir, "newLeaf");
+    drop(source_reader);
     copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
 
     let legacy_source = newest_superseded_generation(&legacy_dir, &root)
@@ -303,8 +309,11 @@ fn root_keyed_old_binary_legacy_writer_does_not_corrupt_or_delete_legacy_data() 
     let legacy_dir = storage.join("opencode/callgraph");
     let legacy_build_dir = root.join("legacy-build");
 
+    // Migration copies the published pointer, not an arbitrary older database
+    // left in the legacy directory. Make the expected snapshot current and
+    // retain a different obsolete generation to catch the wrong selection.
+    publish_project_generation(&root, &legacy_build_dir, "legacyObsoleteLeaf");
     publish_project_generation(&root, &legacy_build_dir, "migratedLeaf");
-    publish_project_generation(&root, &legacy_build_dir, "legacyCurrentLeaf");
     copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
 
     let ctx = root_keyed_context(&root, &storage);

@@ -3,6 +3,9 @@
 //! survive a bridge restart.
 
 pub mod buffer;
+#[cfg(unix)]
+mod exit_observer;
+mod gc_cursor;
 pub mod output;
 pub mod persistence;
 pub mod process;
@@ -30,6 +33,228 @@ use std::time::Duration;
 
 pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry, WatchdogPassCause};
 
+#[cfg(all(test, unix))]
+mod slot_limit_tests;
+
+/// A shell startup has a reply budget even before it has an executor worker.
+/// The short state lock fences process creation against a deadline refusal;
+/// no filesystem operation, process creation, or registry lock runs under it.
+///
+/// The state leaves `Pending` exactly once, under that lock: either the
+/// startup commits (a task record exists and process creation follows, or an
+/// in-process rewrite is about to run) or the reply deadline refuses it. Both
+/// end states are final, so a caller told "refused" can rely on the command
+/// never starting later, and a caller told "committed" gets the task id.
+pub(crate) struct SpawnReceipt {
+    state: std::sync::Mutex<SpawnReceiptState>,
+    deadline: std::time::Instant,
+}
+
+#[derive(Default)]
+enum SpawnReceiptState {
+    #[default]
+    Pending,
+    Refused,
+    Committed(String),
+    /// A bash rewrite is executing the command inside this process (for
+    /// example an append turned into a file edit). It has no task id, so the
+    /// only way to learn its outcome is to wait for its reply.
+    CommittedInline,
+}
+
+/// What the reply deadline found when it settled a startup's receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartupOutcome {
+    /// Nothing had committed; the receipt is now refused and the command can
+    /// never start under it.
+    Refused,
+    /// A task record exists and its process is being (or has been) created.
+    Task(String),
+    /// The command is running inside this process as a bash rewrite.
+    Inline,
+}
+
+impl SpawnReceipt {
+    pub(crate) fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            state: std::sync::Mutex::new(SpawnReceiptState::Pending),
+            deadline,
+        }
+    }
+
+    /// Settles the receipt at the reply deadline. A pending receipt becomes
+    /// refused under the same lock every commit takes, so it is impossible
+    /// for this to return `Refused` and for a commit to succeed afterwards.
+    pub(crate) fn expire(&self) -> StartupOutcome {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            SpawnReceiptState::Committed(id) => StartupOutcome::Task(id.clone()),
+            SpawnReceiptState::CommittedInline => StartupOutcome::Inline,
+            SpawnReceiptState::Pending | SpawnReceiptState::Refused => {
+                *state = SpawnReceiptState::Refused;
+                StartupOutcome::Refused
+            }
+        }
+    }
+
+    fn commit(&self, committed: SpawnReceiptState) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(*state, SpawnReceiptState::Pending)
+            || std::time::Instant::now() >= self.deadline
+        {
+            // A second commit on one receipt is a bug; refusing it keeps an
+            // earlier commit's answer intact instead of overwriting it.
+            if matches!(*state, SpawnReceiptState::Pending) {
+                *state = SpawnReceiptState::Refused;
+            }
+            return Err("bash startup deadline expired before process creation".into());
+        }
+        *state = committed;
+        Ok(())
+    }
+
+    pub(crate) fn refused(&self) -> bool {
+        matches!(
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SpawnReceiptState::Refused
+        )
+    }
+}
+
+fn spawn_receipt_committed() -> bool {
+    CURRENT_SPAWN_RECEIPT.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|receipt| {
+            matches!(
+                *receipt
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                SpawnReceiptState::Committed(_)
+            )
+        })
+    })
+}
+
+thread_local! {
+    static CURRENT_SPAWN_RECEIPT: std::cell::RefCell<Option<std::sync::Arc<SpawnReceipt>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_spawn_receipt<T>(
+    receipt: std::sync::Arc<SpawnReceipt>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::sync::Arc<SpawnReceipt>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_SPAWN_RECEIPT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = CURRENT_SPAWN_RECEIPT.with(|slot| slot.replace(Some(receipt)));
+    let _restore = Restore(previous);
+    run()
+}
+
+/// Called only after the starting record and every control/output file exist,
+/// immediately before process creation. Once committed, the caller can always
+/// get the task id, including while running-record persistence is blocked.
+pub(crate) fn commit_spawn_receipt(task_id: &str) -> Result<(), String> {
+    CURRENT_SPAWN_RECEIPT.with(|slot| match slot.borrow().as_ref() {
+        Some(receipt) => receipt.commit(SpawnReceiptState::Committed(task_id.into())),
+        None => Ok(()),
+    })
+}
+
+/// Called by a bash rewrite immediately before it executes the command inside
+/// this process. A rewrite can mutate files (an append becomes an edit), so it
+/// is fenced exactly like process creation: once the deadline has refused the
+/// startup, the rewrite must not run.
+pub(crate) fn commit_spawn_receipt_inline() -> Result<(), String> {
+    CURRENT_SPAWN_RECEIPT.with(|slot| match slot.borrow().as_ref() {
+        Some(receipt) => receipt.commit(SpawnReceiptState::CommittedInline),
+        None => Ok(()),
+    })
+}
+
+#[cfg(test)]
+mod spawn_receipt_tests {
+    use super::{SpawnReceipt, SpawnReceiptState, StartupOutcome};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    fn far_future() -> Instant {
+        Instant::now() + Duration::from_secs(600)
+    }
+
+    fn commit_task(receipt: &SpawnReceipt) -> Result<(), String> {
+        receipt.commit(SpawnReceiptState::Committed("bgb-task".into()))
+    }
+
+    #[test]
+    fn refused_receipt_never_commits_and_committed_receipt_is_never_refused() {
+        let refused = SpawnReceipt::new(far_future());
+        assert_eq!(refused.expire(), StartupOutcome::Refused);
+        assert!(commit_task(&refused).is_err());
+        assert!(refused.commit(SpawnReceiptState::CommittedInline).is_err());
+        assert_eq!(refused.expire(), StartupOutcome::Refused);
+
+        let committed = SpawnReceipt::new(far_future());
+        assert!(commit_task(&committed).is_ok());
+        assert_eq!(committed.expire(), StartupOutcome::Task("bgb-task".into()));
+        // A second commit must not overwrite the first one's answer.
+        assert!(commit_task(&committed).is_err());
+        assert_eq!(committed.expire(), StartupOutcome::Task("bgb-task".into()));
+
+        let inline = SpawnReceipt::new(far_future());
+        assert!(inline.commit(SpawnReceiptState::CommittedInline).is_ok());
+        assert_eq!(inline.expire(), StartupOutcome::Inline);
+    }
+
+    #[test]
+    fn commit_after_the_deadline_is_refused_even_before_the_timer_settles_it() {
+        let receipt = SpawnReceipt::new(Instant::now());
+        assert!(commit_task(&receipt).is_err());
+        assert_eq!(receipt.expire(), StartupOutcome::Refused);
+    }
+
+    #[test]
+    fn racing_commit_and_expire_always_agree() {
+        // Start both sides together many times. Whichever takes the receipt
+        // lock first decides; the two answers must describe the same fact.
+        for _ in 0..2000 {
+            let receipt = Arc::new(SpawnReceipt::new(far_future()));
+            let start = Arc::new(Barrier::new(2));
+            let committer = {
+                let receipt = Arc::clone(&receipt);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    commit_task(&receipt)
+                })
+            };
+            start.wait();
+            let outcome = receipt.expire();
+            let committed = committer.join().unwrap();
+            match outcome {
+                StartupOutcome::Task(id) => {
+                    assert_eq!(id, "bgb-task");
+                    assert!(committed.is_ok());
+                }
+                StartupOutcome::Refused => assert!(committed.is_err()),
+                StartupOutcome::Inline => panic!("no inline commit in this race"),
+            }
+        }
+    }
+}
+
 /// Who started a background task and the key they gave the call, recorded on
 /// the task so a consumer can find the task its own call started.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,11 +279,16 @@ thread_local! {
     static CURRENT_CALL_KEY: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
     static CURRENT_REMOTE: std::cell::RefCell<Option<RemoteLaunch>> = const { std::cell::RefCell::new(None) };
+    /// True only while dispatching a bash call admitted under the catalog's
+    /// worker preset. Plugin worker-session flags do not set this marker.
+    static CURRENT_WORKER_PRESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteLaunch {
     pub params: crate::exec_remote::FrozenParams,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub explicit_runon: bool,
     // Remote dispatch runs only on Unix; Windows carries the policy but never dials.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub connection_file: Option<PathBuf>,
@@ -66,6 +296,92 @@ pub(crate) struct RemoteLaunch {
     pub harness: String,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub session: String,
+}
+
+/// Decide where a bash call that set `runon` runs, before anything is spawned.
+///
+/// The call names the remote runner itself; nothing about the command line
+/// is inspected. Every reason it cannot run remotely is a refusal naming that
+/// reason, never a silent local run. `runon` is the caller's demand, `pty`,
+/// `powershell` and `host_sandbox` describe the rest of the call, and the
+/// session's remote policy is the one installed by [`with_remote_policy`].
+pub(crate) fn remote_for_runon(
+    config: &crate::config::Config,
+    runon: &str,
+    pty: bool,
+    powershell: bool,
+    host_sandbox: bool,
+) -> Result<RemoteLaunch, String> {
+    if !config.bash.runon_enabled {
+        return Err("runon is disabled by the user safety setting bash.runon_enabled".into());
+    }
+    if cfg!(not(unix)) {
+        return Err(
+            "runon is not available on Windows: remote runs need AFT on macOS or Linux".into(),
+        );
+    }
+    if pty {
+        return Err("runon cannot be combined with pty:true: a remote run has no terminal".into());
+    }
+    if powershell {
+        return Err(
+            "runon cannot run PowerShell: the remote runner runs the line with bash".into(),
+        );
+    }
+    if host_sandbox {
+        return Err("runon cannot be combined with sandbox: \"host\"; the command runs on the remote server, not on this host".into());
+    }
+    // An unknown demand is named before anything else is decided about it.
+    let requested = runon.trim();
+    if !requested.is_empty() && !crate::exec_remote::policy::KNOWN_DEMANDS.contains(&requested) {
+        return Err(crate::exec_remote::policy::unknown_demand(requested));
+    }
+    if config.remote_exec.project_off {
+        return Err("remote runs are off for this project".into());
+    }
+    let mut launch = CURRENT_REMOTE
+        .with(|s| s.borrow().clone())
+        .filter(|launch| {
+            launch
+                .params
+                .remote_exec
+                .as_ref()
+                .is_some_and(|policy| policy.enabled)
+        })
+        .ok_or_else(|| "this session has no remote runner".to_string())?;
+    crate::exec_remote::policy::resolve_demand(
+        runon,
+        launch
+            .params
+            .remote_exec
+            .as_ref()
+            .and_then(|policy| policy.default_demand.as_deref()),
+    )?;
+    launch.explicit_runon = true;
+    Ok(launch)
+}
+
+/// Preserve automatic routing only for deployed plans carrying a prefix list.
+pub(crate) fn remote_for_legacy_command(
+    config: &crate::config::Config,
+    command: &str,
+    pty: bool,
+    powershell: bool,
+) -> Option<RemoteLaunch> {
+    if !cfg!(unix) || powershell || config.remote_exec.project_off {
+        return None;
+    }
+    CURRENT_REMOTE
+        .with(|current| current.borrow().clone())
+        .filter(|launch| {
+            launch.params.remote_exec.as_ref().is_some_and(|policy| {
+                crate::exec_remote::policy::matches(policy, command, pty, false)
+            })
+        })
+        .map(|mut launch| {
+            launch.explicit_runon = false;
+            launch
+        })
 }
 
 pub(crate) fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOnce() -> T) -> T {
@@ -77,6 +393,21 @@ pub(crate) fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOn
     }
     let _restore = Restore(CURRENT_REMOTE.with(|s| s.replace(policy)));
     run()
+}
+
+pub(crate) fn with_worker_preset<T>(worker_preset: bool, run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_WORKER_PRESET.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(CURRENT_WORKER_PRESET.with(|current| current.replace(worker_preset)));
+    run()
+}
+
+pub(crate) fn worker_preset_active() -> bool {
+    CURRENT_WORKER_PRESET.with(std::cell::Cell::get)
 }
 
 /// Run `run` with `call_key` as the current call's key, restoring the
@@ -274,9 +605,40 @@ impl HardKill {
     }
 }
 
-/// Spawn a bash command in the background. Returns a task_id immediately.
+/// Whether a launch takes one of the project root's background-task slots
+/// (`max_background_bash_tasks`). A project root's registry is shared by every
+/// session working in that root, so the slots are too; another root has its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSlot {
+    /// An ordinary foreground command. It always starts, even when every
+    /// background slot is taken: the cap exists to stop runaway detached work,
+    /// not to block the command an agent is waiting on. It holds no slot while
+    /// its caller waits on it. If it outlives its wait window and is promoted
+    /// to a background task, it is still promoted (it is already running, and
+    /// killing or refusing it then would lose its work) and holds a slot from
+    /// then on, so the number of slot holders can briefly exceed the cap until
+    /// tasks finish.
+    Foreground,
+    /// A launch that runs in the background from the start (`background:
+    /// true`, or a PTY). Refused when `max` background tasks are already
+    /// running in this project root. Local and remote tasks share these slots.
+    Background { max: usize },
+}
+
+impl TaskSlot {
+    /// Whether a task launched this way holds a background slot from the start.
+    pub fn holds_slot(self) -> bool {
+        matches!(self, Self::Background { .. })
+    }
+}
+
+/// Spawn a bash command as a task. Returns a task_id immediately.
+///
+/// `require_background_flag` marks a background launch: it needs the
+/// background feature and takes a background slot. A foreground command
+/// (`false`, and not a PTY) always starts; see [`TaskSlot::Foreground`].
 #[allow(clippy::too_many_arguments)]
-pub fn spawn(
+pub(crate) fn spawn(
     request_id: &str,
     session_id: &str,
     command: &str,
@@ -294,6 +656,7 @@ pub fn spawn(
     pty_cols: u16,
     scanner_report: Vec<PermissionAsk>,
     host_escalation: Option<HostEscalationAttempt>,
+    remote: Option<RemoteLaunch>,
 ) -> Response {
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
@@ -310,6 +673,11 @@ pub fn spawn(
     });
     let storage_dir = task_storage_dir(ctx);
     let max_running = ctx.config().max_background_bash_tasks;
+    let slot = if require_background_flag || pty {
+        TaskSlot::Background { max: max_running }
+    } else {
+        TaskSlot::Foreground
+    };
     let project_root = ctx
         .config()
         .project_root
@@ -338,6 +706,10 @@ pub fn spawn(
         gh_shim_ticket.value(),
     ) {
         return Response::error(request_id, "child_environment_unavailable", error);
+    }
+    if worker_preset_active() {
+        let worktree_root = project_root.as_deref().unwrap_or(&workdir);
+        crate::agent_child_env::inject_worker_test_threads(worktree_root, &mut env);
     }
     #[cfg(target_os = "linux")]
     if !pty && config.bash.linux_scope {
@@ -453,14 +825,6 @@ pub fn spawn(
     #[cfg(unix)]
     ctx.bash_background()
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);
-    let remote = CURRENT_REMOTE
-        .with(|s| s.borrow().clone())
-        .filter(|launch| {
-            !shell.is_powershell()
-                && launch.params.remote_exec.as_ref().is_some_and(|policy| {
-                    crate::exec_remote::policy::matches(policy, command, pty, false)
-                })
-        });
     #[cfg(unix)]
     let remote_result = remote.map(|launch| {
         ctx.bash_background().spawn_remote(
@@ -473,7 +837,7 @@ pub fn spawn(
             env.clone(),
             hard_kill,
             storage_dir.clone(),
-            max_running,
+            slot,
             notify_on_completion,
             compressed,
             project_root.clone(),
@@ -487,6 +851,7 @@ pub fn spawn(
     let spawn_result = if let Some(result) = remote_result {
         result
     } else if pty {
+        // A PTY always runs in the background, so it always takes a slot.
         ctx.bash_background().spawn_pty_with_shell(
             spawn_plan,
             command,
@@ -505,7 +870,7 @@ pub fn spawn(
             pty_cols,
         )
     } else {
-        ctx.bash_background().spawn_with_shell(
+        ctx.bash_background().spawn_with_shell_in_slot(
             spawn_plan,
             command,
             shell,
@@ -515,7 +880,7 @@ pub fn spawn(
             env,
             hard_kill,
             storage_dir,
-            max_running,
+            slot,
             notify_on_completion,
             compressed,
             project_root,
@@ -555,12 +920,21 @@ pub fn spawn(
             Response::error(request_id, "background_task_limit_exceeded", message)
         }
         Err(message) => {
-            cleanup_plan.cleanup_unspawned();
+            // A deadline may already have handed the starting task id to its
+            // caller. Keep its terminal failure record available to status.
+            if !spawn_receipt_committed() {
+                cleanup_plan.cleanup_unspawned();
+            }
             #[cfg(unix)]
-            if let Some(task) = unregistered_task.as_ref() {
+            if let Some(task) = unregistered_task
+                .as_ref()
+                .filter(|_| !spawn_receipt_committed())
+            {
                 let _ = persistence::delete_resolved_task(task);
             }
-            if cleanup_plan.is_native_launcher() {
+            if message.contains("startup deadline expired") {
+                Response::error(request_id, "bash_start_deadline", message)
+            } else if cleanup_plan.is_native_launcher() {
                 Response::error(
                     request_id,
                     "sandbox_unavailable",
@@ -803,7 +1177,7 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
         return;
     }
     if let Some(parent) = harness_tasks.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
+        if let Err(error) = crate::private_storage::create_dir_all(parent) {
             crate::slog_warn!(
                 "failed to create harness bash task dir {}: {}",
                 parent.display(),
@@ -827,7 +1201,7 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
                 harness_tasks.display(),
                 error
             );
-            if std::fs::create_dir_all(&harness_tasks).is_err() {
+            if crate::private_storage::create_dir_all(&harness_tasks).is_err() {
                 return;
             }
             if let Ok(entries) = std::fs::read_dir(&root_tasks) {

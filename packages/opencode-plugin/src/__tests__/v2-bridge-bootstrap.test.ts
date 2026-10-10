@@ -187,7 +187,7 @@ describe.serial("OpenCode 1 and OpenCode 2 configure bridges identically", () =>
     mkdirSync(join(configHome, "cortexkit"), { recursive: true });
     writeFileSync(
       join(configHome, "cortexkit", "aft.jsonc"),
-      JSON.stringify({ semantic_search: true, lsp: { auto_install: false } }),
+      JSON.stringify({ indexes: { semantic: true }, lsp: { auto_install: false } }),
     );
     releaseEnv = await acquireEnv({
       AFT_CACHE_DIR: undefined,

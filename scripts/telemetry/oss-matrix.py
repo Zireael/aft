@@ -739,7 +739,7 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
         sampler.start()
         phases = PhaseSampler(client.proc, storage)
         phases.start()
-        config_doc = json.dumps({"search_index": True, "callgraph_store": True, "semantic_search": False})
+        config_doc = json.dumps({"indexes": {"trigram": True, "callgraph": True, "semantic": False}})
         configured = client.request(
             "configure",
             timeout_s=max(0.1, min(30.0, deadline - time.monotonic())),

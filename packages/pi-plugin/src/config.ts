@@ -1,5 +1,4 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import {
@@ -16,9 +15,7 @@ import {
   noticeDigest,
   noticeProjection,
   OPENCODE_ONLY_KEYS,
-  type PolicyPhase,
   partitionProjectDisables,
-  policyPhaseForVersion,
   type RawIndexesConfig,
   type ResolvedIndexesConfig,
   readConfigTiers,
@@ -237,9 +234,18 @@ export interface InspectConfig {
   diagnostics_timeout_ms?: number;
   tier2_idle_minutes?: number;
   tier2_pass_timeout_ms?: number;
-  categories?: Record<string, boolean>;
-  tier2_soft_deadline_ms?: number;
-  max_drill_down_items?: number;
+  categories?: Partial<
+    Record<
+      | "diagnostics"
+      | "todos"
+      | "dead_code"
+      | "unused_exports"
+      | "duplicates"
+      | "cycles"
+      | "complexity",
+      boolean
+    >
+  >;
   duplicates?: {
     expected_mirrors?: [string, string][];
   };
@@ -248,8 +254,6 @@ export interface InspectConfig {
 export interface IdleConfig {
   /** Unbound-root artifact eviction idle window in minutes. Default 30; clamped to 5..=30. */
   root_ttl_minutes?: number;
-  /** Language-server idle window in minutes. Default 10; clamped to 1..=10. */
-  lsp_ttl_minutes?: number;
 }
 
 export const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 120_000;
@@ -277,6 +281,8 @@ export interface BackupConfig {
 }
 
 export interface LspConfig {
+  /** Minutes since the last AFT tool call on that repository; default 60. */
+  idle_minutes?: number | "never";
   servers?: Record<string, Omit<LspServerConfig, "id">>;
   disabled?: string[];
   python?: "pyright" | "ty" | "auto";
@@ -335,6 +341,7 @@ export interface BashConfig {
   background?: boolean;
   /** Permit per-command host fallback after AFT transport failure. Default false. */
   host_fallback?: boolean;
+  runon_enabled?: boolean;
   /**
    * Allow worker sessions (headless `pi -p` / JSON runs, or MAGIC_CONTEXT_PI_SUBAGENT=1)
    * to use background bash; when false, requests block to completion and async
@@ -361,6 +368,8 @@ export interface BashConfig {
   worker_wait_max_ms?: number;
   /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
   linux_scope?: boolean;
+  /** macOS agent commands do not inherit the supervisor's privacy grants. Default false. */
+  disclaim_privacy?: boolean;
   /** Manual fallback for Pi versions that do not expose enabled default tools. */
   powershell_tool?: boolean;
 }
@@ -409,6 +418,17 @@ export function resolvedIndexes(config: AftConfig): ResolvedIndexesConfig {
 export interface ViewsConfig {
   /** Enable content-addressed index views. Default: false. */
   enabled?: boolean;
+}
+
+/** `remote_exec` (see `RemoteExecConfigSchema`). */
+export interface RemoteExecConfig {
+  enabled?: boolean;
+  default_demand?: string;
+  /**
+   * Set by the tier merge, never read from a file: a project config turned
+   * remote runs off, so a `runon` call can be refused with that reason.
+   */
+  project_off?: boolean;
 }
 
 export interface AftConfig {
@@ -485,6 +505,8 @@ export interface AftConfig {
   github?: GithubConfig;
   /** Managed `gh` shim binary override (user-only). Whether the shim is used is `github.shim`. */
   gh_shim?: GhShimConfig;
+  /** Remote runs requested per bash call with `runon` (user-only; a project may only turn it off). */
+  remote_exec?: RemoteExecConfig;
   git?: GitConfig;
   /** Pi and OMP harness-specific configuration. */
   pi?: PiConfig;
@@ -502,6 +524,7 @@ export interface ResolvedBashConfig {
   background: boolean;
   /** Emergency local execution gate. Default false, including for `bash: true`. */
   host_fallback: boolean;
+  runon_enabled: boolean;
   /** Allow subagents to use background bash; default true. */
   subagent_background: boolean;
   /** Detach wait:true bash calls on user messages; `&detach` overrides, is stripped before delivery, and a token-only message gets a minimal replacement. */
@@ -594,6 +617,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     compress: false,
     background: false,
     host_fallback: false,
+    runon_enabled: false,
     subagent_background: true,
     detach_on_user_message: true,
     db_schema_hints: typeof top === "object" && top !== null ? (top.db_schema_hints ?? true) : true,
@@ -620,6 +644,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       compress: top.compress ?? true,
       background: top.background ?? true,
       host_fallback: top.host_fallback ?? false,
+      runon_enabled: top.runon_enabled ?? false,
       subagent_background: top.subagent_background ?? true,
       detach_on_user_message: topDetachOnUserMessage,
     };
@@ -763,6 +788,15 @@ const LspServerEntrySchema = z.object({
 });
 
 const LspConfigSchema = z.object({
+  idle_minutes: z
+    .union([
+      z
+        .number()
+        .int()
+        .transform((value) => Math.min(1440, Math.max(5, value))),
+      z.literal("never"),
+    ])
+    .optional(),
   servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
   disabled: z.array(z.string().trim().min(1)).optional(),
   python: z.enum(["pyright", "ty", "auto"]).optional(),
@@ -821,6 +855,7 @@ const BashFeaturesSchema = z.object({
   compress: z.boolean().optional(),
   background: z.boolean().optional(),
   host_fallback: z.boolean().optional(),
+  runon_enabled: z.boolean().optional(),
   /** When false, subagent background requests block up to the hard cap. Default true for multi-turn workers using bash_watch. */
   subagent_background: z.boolean().optional(),
   detach_on_user_message: z.boolean().optional(),
@@ -840,6 +875,7 @@ const BashFeaturesSchema = z.object({
     .optional(),
   /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
   linux_scope: z.boolean().optional(),
+  disclaim_privacy: z.boolean().optional(),
   // Pi mirrors the host's optional PowerShell default tool when its API can
   // report that state. This project-safe fallback is used only on older hosts.
   powershell_tool: z.boolean().optional(),
@@ -878,6 +914,17 @@ const GhShimConfigSchema = z.object({
     .trim()
     .refine(isAbsolute, "gh_shim.binary_path must be absolute")
     .optional(),
+});
+
+/**
+ * `remote_exec`: whether bash calls may ask, with `runon`, to run on the remote
+ * build server. USER-tier only, except that a project may turn it off for
+ * itself (never on). `default_demand` is the runner demand a `runon` call
+ * without specifics runs under; it never makes a call remote by itself.
+ */
+const RemoteExecConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  default_demand: z.string().optional(),
 });
 
 const OpenCodeHostConfigSchema = z.object({
@@ -926,9 +973,18 @@ const InspectConfigSchema = z.object({
     ),
   tier2_idle_minutes: z.number().min(0).optional(),
   tier2_pass_timeout_ms: z.number().int().positive().optional(),
-  categories: z.record(z.string(), z.boolean()).optional(),
-  tier2_soft_deadline_ms: z.number().int().positive().optional(),
-  max_drill_down_items: z.number().int().positive().max(100).optional(),
+  categories: z
+    .object({
+      diagnostics: z.boolean().optional(),
+      todos: z.boolean().optional(),
+      dead_code: z.boolean().optional(),
+      unused_exports: z.boolean().optional(),
+      duplicates: z.boolean().optional(),
+      cycles: z.boolean().optional(),
+      complexity: z.boolean().optional(),
+    })
+    .strict()
+    .optional(),
   duplicates: z
     .object({
       expected_mirrors: z
@@ -942,21 +998,12 @@ function clampIdleRootTtlMinutes(value: number): number {
   return Math.min(30, Math.max(5, value));
 }
 
-function clampIdleLspTtlMinutes(value: number): number {
-  return Math.min(10, Math.max(1, value));
-}
-
 const IdleConfigSchema = z.object({
   root_ttl_minutes: z
     .number()
     .int()
     .optional()
     .transform((value) => (value === undefined ? undefined : clampIdleRootTtlMinutes(value))),
-  lsp_ttl_minutes: z
-    .number()
-    .int()
-    .optional()
-    .transform((value) => (value === undefined ? undefined : clampIdleLspTtlMinutes(value))),
 });
 
 const ViewsConfigSchema = z.object({
@@ -1029,6 +1076,7 @@ const AftConfigFieldsSchema = z.object({
   opencode: OpenCodeHostConfigSchema.optional(),
   github: GithubConfigSchema.optional(),
   gh_shim: GhShimConfigSchema.optional(),
+  remote_exec: RemoteExecConfigSchema.optional(),
   git: GitConfigSchema.optional(),
 });
 
@@ -1162,15 +1210,23 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (
     typeof config.bash === "object" &&
     (config.bash.enabled !== undefined ||
+      config.bash.runon_enabled !== undefined ||
       config.bash.host_fallback !== undefined ||
       config.bash.detach_on_user_message !== undefined ||
       config.bash.db_schema_hints !== undefined ||
       config.bash.watch_sync_max_ms !== undefined ||
       config.bash.worker_wait_max_ms !== undefined ||
+      config.bash.disclaim_privacy !== undefined ||
       config.bash.powershell_tool !== undefined)
   ) {
     overrides.bash = {
+      ...(config.bash.disclaim_privacy !== undefined
+        ? { disclaim_privacy: config.bash.disclaim_privacy }
+        : {}),
       ...(config.bash.enabled !== undefined ? { enabled: config.bash.enabled } : {}),
+      ...(config.bash.runon_enabled !== undefined
+        ? { runon_enabled: config.bash.runon_enabled }
+        : {}),
       ...(config.bash.host_fallback !== undefined
         ? { host_fallback: config.bash.host_fallback }
         : {}),
@@ -1192,6 +1248,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
     };
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
+  if (config.lsp?.idle_minutes !== undefined) overrides.lsp_idle_minutes = config.lsp.idle_minutes;
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   const rerank = definedEntries(config.search?.rerank);
   if (rerank !== undefined) overrides.search = { rerank };
@@ -1203,6 +1260,16 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.github !== undefined) overrides.github = resolveGithubConfig(config);
   if (config.bash === false) overrides.bash = { enabled: false };
   if (config.git !== undefined) overrides.git = config.git;
+  if (config.remote_exec !== undefined) {
+    const remoteExec = config.remote_exec;
+    overrides.remote_exec = {
+      enabled: remoteExec.enabled === true && remoteExec.project_off !== true,
+      ...(remoteExec.default_demand !== undefined
+        ? { default_demand: remoteExec.default_demand }
+        : {}),
+      ...(remoteExec.project_off === true ? { project_off: true } : {}),
+    };
+  }
 
   return overrides;
 }
@@ -1522,32 +1589,6 @@ function warnIgnoredHarnessSpecificConfigKeys(
   );
 }
 
-let policyVersionOverride: string | undefined;
-let packageVersion: string | undefined;
-
-/** Test hook: evaluate the retired-key policy as if running this package version. */
-export function setFeatureConfigPolicyVersionForTests(version: string | undefined): void {
-  policyVersionOverride = version;
-}
-
-function resolvePackageVersion(): string {
-  const req = createRequire(import.meta.url);
-  for (const candidate of ["../package.json", "../../package.json"]) {
-    try {
-      const manifest = req(candidate) as { name?: string; version?: string };
-      if (manifest.name === "@cortexkit/aft-pi" && manifest.version) return manifest.version;
-    } catch {
-      // Not at this depth; try the next.
-    }
-  }
-  return "0.0.0";
-}
-
-function currentPolicyPhase(): PolicyPhase {
-  packageVersion ??= resolvePackageVersion();
-  return policyPhaseForVersion(policyVersionOverride ?? packageVersion);
-}
-
 /** One migration notice awaiting delivery by the plugin. */
 export interface ConfigLoadNotice {
   configPath: string;
@@ -1598,14 +1639,11 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     return null;
   }
 
-  // Retired keys are translated (inside the migration window) or rejected on
-  // the raw document, before schema validation, so they never reach Zod.
+  // Retired keys are translated on the raw document, before schema
+  // validation, so they never reach Zod and never fail the load.
   const projection = noticeProjection(structuredClone(cleanConfig));
   if (suppliesSemanticIndexInput(cleanConfig, ACTIVE_HARNESS)) semanticInputSupplied = true;
-  const translation = translateConfigDocument(cleanConfig, currentPolicyPhase(), tier);
-  if (translation.errors.length > 0) {
-    throw new ConfigRejectedError(translation.errors, configPath);
-  }
+  const translation = translateConfigDocument(cleanConfig, tier);
   for (const warning of translation.warnings) {
     const text = `Config ${configPath} [${warning.key}]: ${warning.message} (${warning.code})`;
     if (warning.once) {
@@ -1620,7 +1658,15 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
       warn(text);
     }
   }
-  if (translation.legacyInput) {
+  if (translation.legacyInput && tier === "user") {
+    // The AFT binary rewrites the user file to current keys when its
+    // configure next reads the file, and reports that rewrite to the user as
+    // a `config_migrated` configure warning. Queuing a notice here as well
+    // would show the user two notices, so the plugin only logs.
+    log(
+      `Config ${configPath} uses retired keys (${translation.retiredKeys.join(", ")}); applied their current equivalents in memory`,
+    );
+  } else if (translation.legacyInput) {
     configLoadNotices.push({
       configPath,
       digest: noticeDigest(projection),
@@ -1733,6 +1779,11 @@ function mergeLspConfig(base?: LspConfig, override?: LspConfig): LspConfig | und
   if (override?.diagnostics_on_edit !== undefined) {
     projectSafe.diagnostics_on_edit = override.diagnostics_on_edit;
   }
+  const floor = base?.idle_minutes ?? 60;
+  const idle = override?.idle_minutes;
+  if (idle !== undefined && (floor === "never" || (idle !== "never" && idle <= floor))) {
+    projectSafe.idle_minutes = idle;
+  }
 
   // disabled comes from user config ONLY.
   const userDisabled = base?.disabled ?? [];
@@ -1778,6 +1829,19 @@ function mergeInspectConfig(
   const inspect = {
     ...baseInspect,
     ...overrideInspect,
+    categories:
+      baseInspect?.categories || overrideInspect?.categories
+        ? Object.fromEntries([
+            ...Object.entries(baseInspect?.categories ?? {}),
+            ...Object.entries(overrideInspect?.categories ?? {}).map(([key, enabled]) => [
+              key,
+              enabled &&
+                (baseInspect?.categories as Record<string, boolean | undefined> | undefined)?.[
+                  key
+                ] !== false,
+            ]),
+          ])
+        : undefined,
     ...(diagnosticsTimeoutConfigured ? { diagnostics_timeout_ms: diagnosticsTimeoutMs } : {}),
     duplicates:
       baseInspect?.duplicates || overrideInspect?.duplicates
@@ -1793,6 +1857,33 @@ function mergeInspectConfig(
   return Object.fromEntries(
     Object.entries(inspect).filter(([, value]) => value !== undefined),
   ) as AftConfig["inspect"];
+}
+
+/**
+ * Whether bash offers `runon`: only in subc mode (the remote runner is reached
+ * through the daemon), and only when the user config enables remote runs and
+ * the project has not turned them off. Decided once, when the tool is built.
+ */
+export function remoteRunsOffered(config: AftConfig): boolean {
+  return (
+    process.platform !== "win32" &&
+    resolveBashConfig(config).runon_enabled &&
+    Boolean(config.subc?.connection_file?.trim()) &&
+    config.remote_exec?.enabled === true &&
+    config.remote_exec.project_off !== true
+  );
+}
+
+/**
+ * Merge `remote_exec`: the user tier decides it, and a project may only turn it
+ * off (recorded as `project_off`, so the refusal can name the project).
+ */
+function mergeRemoteExecConfig(
+  base: RemoteExecConfig | undefined,
+  project: RemoteExecConfig | undefined,
+): RemoteExecConfig | undefined {
+  if (project?.enabled !== false) return base;
+  return { ...base, enabled: false, project_off: true };
 }
 
 function mergeSandboxConfig(
@@ -1949,11 +2040,16 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   // enabled:true is an accepted project-tier hardening opt-in; only the
   // weakening direction (enabled:false) is stripped as user-only.
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
+  if (typeof override.bash === "object" && override.bash.disclaim_privacy === false)
+    stripped.push("bash.disclaim_privacy");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.opencode !== undefined) stripped.push("opencode");
   if (override.github !== undefined) stripped.push("github");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");
+  if (override.remote_exec?.enabled === true) stripped.push("remote_exec.enabled");
+  if (override.remote_exec?.default_demand !== undefined)
+    stripped.push("remote_exec.default_demand");
   for (const tool of partitionProjectDisables(override.disabled_tools).ignored) {
     stripped.push(`disabled_tools.${tool}`);
   }
@@ -2004,10 +2100,16 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const search = mergeProjectSearchConfig(base.search, override.search);
   const lsp = mergeLspConfig(base.lsp, override.lsp);
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
-  const bash = mergeBashConfig(base.bash, override.bash);
+  const projectBash = typeof override.bash === "object" ? { ...override.bash } : override.bash;
+  if (typeof projectBash === "object" && projectBash.disclaim_privacy !== true)
+    delete projectBash.disclaim_privacy;
+  // Strip only the weakening direction before the usual field-wise merge.
+  if (typeof projectBash === "object") delete projectBash.runon_enabled;
+  const bash = mergeBashConfig(base.bash, projectBash);
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
+  const remoteExec = mergeRemoteExecConfig(base.remote_exec, override.remote_exec);
   const backup = mergeProjectBackupConfig(base.backup, override.backup);
   const pi = mergePiConfig(base.pi, override.pi);
   const bridge = base.bridge;
@@ -2034,6 +2136,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(inspect !== undefined ? { inspect } : {}),
     ...(worktree !== undefined ? { worktree } : {}),
     ...(sandbox !== undefined ? { sandbox } : {}),
+    ...(remoteExec !== undefined ? { remote_exec: remoteExec } : {}),
     ...(backup !== undefined ? { backup } : {}),
     ...(pi !== undefined ? { pi } : {}),
     experimental,
@@ -2145,7 +2248,8 @@ export function buildConfigTierConfigureParams(
 /**
  * Load and resolve the user and project config for one project. The result
  * always carries a sorted `disabled_tools` list and fully resolved `indexes`.
- * Throws {@link ConfigRejectedError} when a retired key must be rejected.
+ * Retired keys are translated, never refused. Throws {@link ConfigRejectedError}
+ * when the resolved configuration is incomplete.
  */
 export function loadAftConfig(projectDirectory: string): AftConfig {
   configLoadErrors = [];

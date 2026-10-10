@@ -121,26 +121,6 @@ describe.serial("OpenCode config error state", () => {
     expect(errors.filter((line) => line.includes("no subc connection file"))).toHaveLength(1);
   });
 
-  test("a rejected legacy key registers the default surface and fails every call", async () => {
-    const layout = await sandbox();
-    // An already retired alias rejects the whole load.
-    writeFileSync(
-      join(layout.projectDir, ".cortexkit", "aft.jsonc"),
-      '{ "gh_read": { "enabled": true } }\n',
-    );
-
-    const { tools, errorSpy } = await bootInErrorState(layout);
-
-    expect(Object.keys(tools)).toContain("read");
-    expect(Object.keys(tools)).not.toContain("aft_move");
-    await expectFailingCall(tools, "npx @cortexkit/aft doctor --fix");
-    await expect(tools.read.execute({ filePath: "a.ts" }, {})).rejects.toThrow(
-      "removed_config_key:gh_read:use:github.read",
-    );
-    const errors = errorSpy.mock.calls.map((call) => String(call[0]));
-    expect(errors.filter((line) => line.includes("removed_config_key:gh_read"))).toHaveLength(1);
-  });
-
   test("a config file that does not parse registers the default surface and fails every call", async () => {
     const layout = await sandbox();
     writeFileSync(

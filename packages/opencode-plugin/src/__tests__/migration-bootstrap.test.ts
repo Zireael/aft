@@ -71,7 +71,7 @@ describe.serial("OpenCode migration bootstrap", () => {
     mkdirSync(opencodeConfigDir, { recursive: true });
     writeFileSync(
       join(opencodeConfigDir, "aft.json"),
-      JSON.stringify({ lsp: { auto_install: false }, semantic_search: false }),
+      JSON.stringify({ lsp: { auto_install: false }, indexes: { semantic: false } }),
       "utf8",
     );
   });

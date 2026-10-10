@@ -247,9 +247,31 @@ fn is_consumer_only(property: &Value) -> bool {
     property.get(CONSUMER_ONLY_MARKER).and_then(Value::as_bool) == Some(true)
 }
 
-/// Removes consumer-only properties (and their `required` entries) from a
-/// tool schema so a consumer handing the catalog straight to a model does not
-/// invite the model to set them.
+/// Enabled-only bash overrides are separate from the default artifacts, so
+/// neither the default manifest nor a session without a remote policy advertises
+/// an argument that it cannot use.
+static SUBC_REMOTE_TOOL_SCHEMAS: LazyLock<serde_json::Map<String, Value>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../subc_tool_remote_schemas.json"))
+        .unwrap_or_else(|e| panic!("subc_tool_remote_schemas.json: {e}"))
+});
+
+/// The remote-enabled bash schema and description for a catalog preset.
+/// Only sessions admitted with an enabled policy may select this override.
+pub(super) fn remote_tool(preset: Option<&str>, name: &str) -> Option<(Value, Option<String>)> {
+    let mut schema = SUBC_REMOTE_TOOL_SCHEMAS
+        .get(preset.unwrap_or("head"))?
+        .get(name)?
+        .clone();
+    let description = schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    strip_consumer_only_properties(&mut schema);
+    Some((schema, description))
+}
+
+/// Removes consumer-only properties (and their `required` entries) so a
+/// consumer handing the catalog to a model does not invite it to set them.
 fn strip_consumer_only_properties(schema: &mut Value) {
     let Some(object) = schema.as_object_mut() else {
         return;
@@ -1101,6 +1123,47 @@ mod tests {
                 }
             }
             _ => {}
+        }
+    }
+
+    #[test]
+    fn default_artifacts_omit_runon_and_enabled_overrides_add_it_for_bash_only() {
+        for schema in SUBC_TOOL_SCHEMAS.values() {
+            assert!(schema["properties"].get("runon").is_none());
+            assert!(!schema["description"]
+                .as_str()
+                .unwrap()
+                .contains("When remote runs are available"));
+        }
+        for preset in SUBC_TOOL_PRESETS.values() {
+            for schema in preset.as_object().unwrap().values() {
+                assert!(schema["properties"].get("runon").is_none());
+                assert!(!schema["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("When remote runs are available"));
+            }
+        }
+        for preset in [None, Some("worker")] {
+            let (schema, description) = remote_tool(preset, "bash").expect("enabled bash override");
+            assert_eq!(schema["properties"]["runon"]["type"], "string");
+            assert!(description
+                .unwrap()
+                .contains("When remote runs are available"));
+            assert!(remote_tool(preset, "powershell").is_none());
+        }
+        for powershell_available in [true, false] {
+            let manifest = build_manifest_for_host(powershell_available);
+            let Some(ProviderRole::ToolProvider { tools, .. }) = manifest.provides.first() else {
+                panic!("expected ToolProvider");
+            };
+            for tool in tools {
+                assert!(
+                    tool.schema["properties"].get("runon").is_none(),
+                    "{} offers runon in the manifest",
+                    tool.name
+                );
+            }
         }
     }
 

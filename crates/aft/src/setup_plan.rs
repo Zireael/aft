@@ -24,8 +24,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::config::Config;
-use crate::config_resolve::{resolve_config_for_harness_with_phase, ConfigTier};
-use crate::feature_config::{self, PolicyPhase};
+use crate::config_resolve::{resolve_config_for_harness, ConfigTier};
+use crate::feature_config;
 use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
 use crate::jsonc_edit::JsoncDocument;
@@ -587,13 +587,12 @@ struct TierBlocks {
 fn tier_blocks(
     raw: Option<Map<String, Value>>,
     harness_key: Option<&str>,
-    phase: PolicyPhase,
     tier: feature_config::DocumentTier,
 ) -> TierBlocks {
     let Some(mut map) = raw else {
         return TierBlocks::default();
     };
-    feature_config::translate_document(&mut map, phase, tier);
+    feature_config::translate_document(&mut map, tier);
     let harness = harness_key
         .and_then(|key| map.get("harnesses")?.get(key)?.as_object().cloned())
         .unwrap_or_default();
@@ -660,13 +659,12 @@ fn tool_runtime_block(tool: &str, config: &Config) -> Option<&'static str> {
 /// Derive the plan for one invocation context.
 ///
 /// Fails (returning every diagnostic, sorted) when ordinary loading would
-/// reject the configuration, e.g. a removed key after the migration window or
-/// an already-retired GitHub alias; callers must then produce no plan output.
+/// reject the configuration, e.g. a file that is not a JSON object; callers
+/// must then produce no plan output.
 pub fn derive_plan(
     inputs: &ConfigInputs,
     harness: Option<SetupHarness>,
     observer: &dyn FeatureObserver,
-    phase: PolicyPhase,
 ) -> Result<PlanOutcome, Vec<String>> {
     let user_raw = inputs.user.as_ref().map(parse_config_object).transpose();
     let project_raw = inputs.project.as_ref().map(parse_config_object).transpose();
@@ -696,7 +694,7 @@ pub fn derive_plan(
         });
     }
     let runtime_harness = harness.map(SetupHarness::runtime_harness);
-    let resolved = resolve_config_for_harness_with_phase(&tiers, runtime_harness.as_ref(), phase);
+    let resolved = resolve_config_for_harness(&tiers, runtime_harness.as_ref());
     if !resolved.errors.is_empty() {
         return Err(resolved.errors);
     }
@@ -706,13 +704,11 @@ pub fn derive_plan(
     let user = tier_blocks(
         user_raw,
         harness_key.as_deref(),
-        phase,
         feature_config::DocumentTier::User,
     );
     let project = tier_blocks(
         project_raw,
         harness_key.as_deref(),
-        phase,
         feature_config::DocumentTier::Project,
     );
 

@@ -27,11 +27,32 @@ fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdenti
 }
 
 fn context(root: &Path, storage: &Path, connection: Option<PathBuf>) -> AppContext {
+    context_with_user_remote(root, storage, connection, false)
+}
+
+fn context_with_user_remote(
+    root: &Path,
+    storage: &Path,
+    connection: Option<PathBuf>,
+    enabled: bool,
+) -> AppContext {
+    context_with_switch(root, storage, connection, enabled, true)
+}
+
+fn context_with_switch(
+    root: &Path,
+    storage: &Path,
+    connection: Option<PathBuf>,
+    enabled: bool,
+    runon_enabled: bool,
+) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.into());
     config.storage_dir = Some(storage.into());
     config.experimental_bash_background = true;
     config.sandbox.enabled = false;
+    config.remote_exec.enabled = enabled;
+    config.bash.runon_enabled = runon_enabled;
     config.semantic.subc_connection_file = connection;
     let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_db(Arc::new(StdMutex::new(
@@ -60,6 +81,133 @@ fn fetch(plan: &Value) -> Value {
     json!({"op":"tool.catalog","preset":"worker","params":plan["tool_items"][0]["params"],"composition":plan["composition"]})
 }
 
+#[cfg(unix)]
+fn bash_catalog_entry(reply: &Value) -> &Value {
+    reply["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "bash")
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_without_remote_execution_omit_runon_and_guidance() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let worker = identity(root.path(), "disabled-worker", 7, true);
+    for reply in [
+        catalog(json!({"preset":"worker"}), &worker, &ctx).unwrap(),
+        catalog(fetch(&plan("broca-worker-policy-disabled")), &worker, &ctx).unwrap(),
+        catalog(
+            json!({"preset":"head"}),
+            &identity(root.path(), "head", 7, false),
+            &ctx,
+        )
+        .unwrap(),
+    ] {
+        let bash = bash_catalog_entry(&reply);
+        assert!(
+            bash["input_schema"]["properties"].get("runon").is_none(),
+            "{bash}"
+        );
+        assert!(
+            !bash["description"].as_str().unwrap().contains("runon"),
+            "{bash}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn safety_switch_hides_runon_without_disabling_the_persisted_old_prefix_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context_with_switch(root.path(), storage.path(), None, true, false);
+    let worker = identity(root.path(), "old-worker", 7, true);
+    let mut old = plan("broca-worker");
+    old["tool_items"][0]["params"]["remote_exec"] =
+        json!({"enabled":true,"commands":["cargo test"]});
+    let reply = catalog(fetch(&old), &worker, &ctx).unwrap();
+    let bash = bash_catalog_entry(&reply);
+    assert!(bash["input_schema"]["properties"].get("runon").is_none());
+    assert!(!bash["description"].as_str().unwrap().contains("runon"));
+    let launch = lookup(&ctx, &source(&worker, Some("worker"))).unwrap();
+    assert!(crate::exec_remote::policy::matches(
+        launch.params.remote_exec.as_ref().unwrap(),
+        "cargo test",
+        false,
+        false
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn enabled_worker_sessions_offer_runon_and_guidance_from_the_persisted_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let worker = identity(root.path(), "enabled-worker", 7, true);
+    let ctx = context(root.path(), storage.path(), None);
+    let first = catalog(fetch(&plan("broca-worker")), &worker, &ctx).unwrap();
+    drop(ctx);
+    let restarted = context(root.path(), storage.path(), None);
+    let refetch = catalog(json!({"preset":"worker"}), &worker, &restarted).unwrap();
+    for reply in [first, refetch] {
+        let bash = bash_catalog_entry(&reply);
+        assert_eq!(
+            bash["input_schema"]["properties"]["runon"]["type"],
+            "string"
+        );
+        assert!(
+            bash["description"]
+                .as_str()
+                .unwrap()
+                .contains("When remote runs are available"),
+            "{bash}"
+        );
+        assert!(bash["description"]
+            .as_str()
+            .unwrap()
+            .contains("including chains and pipes"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn enabled_head_sessions_offer_runon_and_guidance_from_user_config() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context_with_user_remote(
+        root.path(),
+        storage.path(),
+        Some(root.path().join("connection.json")),
+        true,
+    );
+    let head = identity(root.path(), "configured-head", 7, false);
+    let reply = catalog(json!({"preset":"head"}), &head, &ctx).unwrap();
+    let bash = bash_catalog_entry(&reply);
+    assert_eq!(
+        bash["input_schema"]["properties"]["runon"]["type"],
+        "string"
+    );
+    assert!(bash["description"]
+        .as_str()
+        .unwrap()
+        .contains("When remote runs are available"));
+    // The user setting does not grant a worker a remote runner without its own plan.
+    let worker = catalog(
+        json!({"preset":"worker"}),
+        &identity(root.path(), "unplanned-worker", 7, true),
+        &ctx,
+    )
+    .unwrap();
+    assert!(bash_catalog_entry(&worker)["input_schema"]["properties"]
+        .get("runon")
+        .is_none());
+}
+
 // Remote routing runs only on Unix; the plan fixtures carry Unix sibling paths,
 // which a Windows decode rightly rejects as not absolute.
 #[cfg(unix)]
@@ -75,7 +223,7 @@ fn exec_remote_catalog_freezes_verbatim_plan_and_isolates_scope_epoch_and_sessio
     catalog(fetch(&enabled), &first, &ctx).unwrap();
     catalog(fetch(&disabled), &second, &ctx).unwrap();
     assert!(
-        lookup(&ctx, key(&first, Some("worker")).as_ref())
+        lookup(&ctx, &RemoteSource::Worker(key(&first, Some("worker"))))
             .unwrap()
             .params
             .remote_exec
@@ -83,7 +231,7 @@ fn exec_remote_catalog_freezes_verbatim_plan_and_isolates_scope_epoch_and_sessio
             .enabled
     );
     assert!(
-        !lookup(&ctx, key(&second, Some("worker")).as_ref())
+        !lookup(&ctx, &RemoteSource::Worker(key(&second, Some("worker"))))
             .unwrap()
             .params
             .remote_exec
@@ -101,24 +249,27 @@ fn exec_remote_catalog_freezes_verbatim_plan_and_isolates_scope_epoch_and_sessio
     {
         *principal_id = Some("reserved:another-carrier".into());
     }
-    assert!(lookup(&ctx, key(&other_principal, Some("worker")).as_ref()).is_none());
-    assert!(lookup(&ctx, key(&new_epoch, Some("worker")).as_ref()).is_none());
-    let unscoped = identity(root.path(), "one", 7, false);
-    assert!(lookup(&ctx, key(&unscoped, Some("worker")).as_ref()).is_none());
-    assert!(lookup(&ctx, key(&first, Some("head")).as_ref()).is_none());
     assert!(lookup(
         &ctx,
-        key(
+        &RemoteSource::Worker(key(&other_principal, Some("worker")))
+    )
+    .is_none());
+    assert!(lookup(&ctx, &RemoteSource::Worker(key(&new_epoch, Some("worker")))).is_none());
+    let unscoped = identity(root.path(), "one", 7, false);
+    assert!(lookup(&ctx, &RemoteSource::Worker(key(&unscoped, Some("worker")))).is_none());
+    assert!(lookup(&ctx, &RemoteSource::Worker(key(&first, Some("head")))).is_none());
+    assert!(lookup(
+        &ctx,
+        &RemoteSource::Worker(key(
             &identity(root.path(), "not-fetched", 7, true),
             Some("worker")
-        )
-        .as_ref()
+        ))
     )
     .is_none());
     // Freeze is immutable within one bind/scope identity.
     catalog(fetch(&disabled), &first, &ctx).unwrap();
     assert!(
-        lookup(&ctx, key(&first, Some("worker")).as_ref())
+        lookup(&ctx, &RemoteSource::Worker(key(&first, Some("worker"))))
             .unwrap()
             .params
             .remote_exec
@@ -185,11 +336,13 @@ fn exec_remote_catalog_validates_vocabulary_and_disables_malformed_routing_only(
     {
         let bind = identity(root.path(), &format!("malformed-{n}"), 7, true);
         catalog(json!({"preset":"worker","params":malformed}), &bind, &ctx).unwrap();
-        assert!(lookup(&ctx, key(&bind, Some("worker")).as_ref())
-            .unwrap()
-            .params
-            .remote_exec
-            .is_none());
+        assert!(
+            lookup(&ctx, &RemoteSource::Worker(key(&bind, Some("worker"))))
+                .unwrap()
+                .params
+                .remote_exec
+                .is_none()
+        );
     }
 }
 
@@ -222,7 +375,7 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
         serde_json::to_vec(&planned).unwrap(),
         serde_json::to_vec(&paramless).unwrap()
     );
-    assert!(lookup(&ctx, key(&bind, Some("worker")).as_ref()).is_none());
+    assert!(lookup(&ctx, &RemoteSource::Worker(key(&bind, Some("worker")))).is_none());
     let error = catalog(
         json!({"preset":"worker","params":{"not_a_key":true}}),
         &bind,
@@ -245,12 +398,35 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
 #[cfg(unix)]
 #[tokio::test]
 async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
-    let daemon = crate::exec_remote::wire_tests::daemon(
-        crate::exec_remote::wire_tests::Script::Utf8,
-        "exec-remote/v1",
-    )
-    .await;
+    exercise_catalog_remote_bash(crate::exec_remote::wire_tests::Script::Utf8, None).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runon_subc_executor_refusal_returns_error_without_local_spawn() {
+    use crate::exec_remote::wire_tests::Script;
+    for (script, reason) in [
+        (Script::KnownRefused, "unreachable"),
+        (Script::WorkspaceSetupRefused, "workspace_setup_failed"),
+        (Script::Refused, "future_refusal"),
+    ] {
+        exercise_catalog_remote_bash(script, Some(reason)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn exercise_catalog_remote_bash(
+    script: crate::exec_remote::wire_tests::Script,
+    refusal: Option<&str>,
+) {
+    let daemon = crate::exec_remote::wire_tests::daemon(script, "exec-remote/v1").await;
     let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("must-not-run-locally");
+    let command = if refusal.is_some() {
+        format!("printf local-proof > '{}'", marker.display())
+    } else {
+        "cargo test".into()
+    };
     let storage = tempfile::tempdir().unwrap();
     let bind = identity(root.path(), "one", 7, true);
     let root_id = bind.root.clone();
@@ -294,7 +470,7 @@ async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
         1,
         8,
         serde_json::to_vec(
-            &json!({"name":"bash","preset":"worker","arguments":{"command":"cargo test"}}),
+            &json!({"name":"bash","preset":"worker","arguments":{"command":command,"runon":"linux"}}),
         )
         .unwrap(),
     )
@@ -341,13 +517,26 @@ async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        done.response_for_test().data["output"]
-            .as_str()
-            .is_some_and(|s| s.contains("ran remotely on ck-motor")),
-        "{:?}",
-        done.response_for_test()
-    );
+    let response = done.response_for_test();
+    if let Some(reason) = refusal {
+        assert!(
+            !marker.exists(),
+            "subc runon spawned locally after {reason}"
+        );
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
+        assert_eq!(response.data["message"], format!(
+            "runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally"
+        ));
+    } else {
+        assert!(response.success, "{response:?}");
+        assert!(
+            response.data["output"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("ran remotely on ck-motor\n")),
+            "{response:?}"
+        );
+    }
     let log = daemon.log.lock().unwrap();
     assert_eq!(
         log.iter()
@@ -416,6 +605,7 @@ async fn exec_remote_module_loop_captures_its_authenticated_daemon_endpoint() {
         None,
         dir.path(),
         None,
+        None,
     );
     let (result, _) = tokio::join!(module_task, peer_task);
     result.unwrap();
@@ -437,6 +627,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
         let task = registry
             .spawn_remote(
                 crate::bash_background::RemoteLaunch {
+                    explicit_runon: false,
                     params: Default::default(),
                     connection_file: Some(daemon.connection.clone()),
                     harness: "runner".into(),
@@ -450,7 +641,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().into(),
-                10,
+                crate::bash_background::TaskSlot::Background { max: 10 },
                 true,
                 false,
                 Some(dir.path().into()),
@@ -505,4 +696,130 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                 .unwrap();
         }
     }
+}
+
+fn bash_properties(answer: &Value, tool: &str) -> Vec<String> {
+    answer["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == tool)
+        .unwrap_or_else(|| panic!("{tool} is served: {answer}"))["input_schema"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_catalog_offers_runon_only_with_an_enabled_frozen_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let enabled = catalog(
+        fetch(&plan("broca-worker")),
+        &identity(root.path(), "enabled", 7, true),
+        &ctx,
+    )
+    .unwrap();
+    assert!(bash_properties(&enabled, "bash").contains(&"runon".to_string()));
+    // The PowerShell tool never offers it: the runner runs bash.
+    if crate::bash_background::powershell_available() {
+        assert!(!bash_properties(&enabled, "powershell").contains(&"runon".to_string()));
+    }
+    let disabled = catalog(
+        fetch(&plan("broca-worker-policy-disabled")),
+        &identity(root.path(), "disabled", 7, true),
+        &ctx,
+    )
+    .unwrap();
+    assert!(!bash_properties(&disabled, "bash").contains(&"runon".to_string()));
+    let paramless = catalog(
+        json!({"op":"tool.catalog","preset":"worker"}),
+        &identity(root.path(), "paramless", 7, true),
+        &ctx,
+    )
+    .unwrap();
+    assert!(!bash_properties(&paramless, "bash").contains(&"runon".to_string()));
+    // The same enabled plan on an unscoped preflight freezes nothing, so
+    // nothing could honour the argument and it is not offered.
+    let unscoped = catalog(
+        fetch(&plan("broca-worker")),
+        &identity(root.path(), "unscoped", 7, false),
+        &ctx,
+    )
+    .unwrap();
+    assert!(!bash_properties(&unscoped, "bash").contains(&"runon".to_string()));
+    // A project that turned remote runs off is never offered them.
+    let mut off = crate::config::Config::default();
+    off.project_root = Some(root.path().into());
+    off.storage_dir = Some(storage.path().into());
+    off.sandbox.enabled = false;
+    off.remote_exec.project_off = true;
+    let off_ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), off);
+    off_ctx.set_db(Arc::new(StdMutex::new(
+        crate::db::open(&storage.path().join("aft.db")).unwrap(),
+    )));
+    let project_off = catalog(
+        fetch(&plan("broca-worker")),
+        &identity(root.path(), "project-off", 7, true),
+        &off_ctx,
+    )
+    .unwrap();
+    assert!(!bash_properties(&project_off, "bash").contains(&"runon".to_string()));
+}
+
+#[test]
+fn new_plan_shape_decodes_and_its_default_demand_reaches_the_session() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let bind = identity(root.path(), "new-shape", 7, true);
+    let answer = catalog(
+        json!({"op":"tool.catalog","preset":"worker","params":{"remote_exec":{"enabled":true,"default_demand":"linux"}}}),
+        &bind,
+        &ctx,
+    )
+    .unwrap();
+    // A frozen plan is portable, but only Unix hosts can execute remote bash.
+    // Decoding and retaining the policy must not advertise an unusable argument.
+    #[cfg(unix)]
+    assert!(bash_properties(&answer, "bash").contains(&"runon".to_string()));
+    #[cfg(not(unix))]
+    assert!(!bash_properties(&answer, "bash").contains(&"runon".to_string()));
+    let policy = lookup(&ctx, &RemoteSource::Worker(key(&bind, Some("worker"))))
+        .unwrap()
+        .params
+        .remote_exec
+        .unwrap();
+    assert!(policy.enabled);
+    assert_eq!(policy.default_demand.as_deref(), Some("linux"));
+}
+
+#[test]
+fn head_sessions_take_remote_runs_from_the_user_config_only() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let head = RemoteSource::Head {
+        harness: "opencode".into(),
+        session: "head".into(),
+    };
+    let ctx = context(root.path(), storage.path(), None);
+    assert!(lookup(&ctx, &head).is_none());
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.path().into());
+    config.remote_exec.enabled = true;
+    config.remote_exec.default_demand = Some("linux".into());
+    let enabled = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let launch = lookup(&enabled, &head).unwrap();
+    assert_eq!(launch.harness, "opencode");
+    assert_eq!(launch.session, "head");
+    let policy = launch.params.remote_exec.unwrap();
+    assert!(policy.enabled);
+    assert_eq!(policy.default_demand.as_deref(), Some("linux"));
+    // A worker never inherits the head's user config.
+    assert!(lookup(&enabled, &RemoteSource::Worker(None)).is_none());
+    assert!(lookup(&enabled, &RemoteSource::None).is_none());
 }

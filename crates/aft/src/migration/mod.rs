@@ -18,7 +18,7 @@ pub mod prune_legacy;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -593,7 +593,7 @@ struct RebuildState {
 fn write_rebuild_state(path: &Path, state: &RebuildState) -> Result<(), MigrationError> {
     let temporary = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let result = (|| -> Result<(), MigrationError> {
-        let mut file = File::create(&temporary)?;
+        let mut file = crate::private_storage::create(&temporary)?;
         serde_json::to_writer(&mut file, state)
             .map_err(|error| MigrationError::InvalidLegacySnapshot(error.to_string()))?;
         use std::io::Write as _;
@@ -654,6 +654,7 @@ fn create_publication_artifacts(
     semantic_database: &Path,
     alias_database: &Path,
 ) -> Result<PublicationArtifacts, MigrationError> {
+    crate::production_storage::refuse_write(view_dir)?;
     let derived_database = view_dir.join("derived.sqlite");
     let derived = Connection::open(&derived_database)?;
     derived.execute_batch(
@@ -664,7 +665,7 @@ fn create_publication_artifacts(
     drop(derived);
 
     let trigram_artifact = view_dir.join("trigram.bin");
-    let trigram = File::create(&trigram_artifact)?;
+    let trigram = crate::private_storage::create(&trigram_artifact)?;
     trigram.sync_all()?;
     drop(trigram);
     crate::fs_lock::sync_parent(&trigram_artifact);

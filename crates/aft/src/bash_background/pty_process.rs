@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 #[cfg(any(windows, test))]
+#[cfg(all(test, unix))]
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -73,7 +74,7 @@ pub(crate) fn spawn_pty_for_command(
         for shell in candidates {
             let wrapper_body = shell.wrapper_script_bytes(user_command, &paths.exit);
             let wrapper_path = windows_wrapper_path(paths, &shell);
-            if let Err(error) = fs::write(&wrapper_path, wrapper_body) {
+            if let Err(error) = crate::private_storage::write(&wrapper_path, wrapper_body) {
                 last_err = format!("write wrapper {wrapper_path:?}: {error}");
                 continue;
             }
@@ -165,10 +166,22 @@ fn try_spawn_pty(
             pixel_height: 0,
         })
         .map_err(|error| format!("open PTY failed: {error}"))?;
+    #[cfg(target_os = "macos")]
+    let child = if crate::privacy_spawn::requested(env) {
+        crate::privacy_spawn::spawn_pty(command, pair.master.as_ref())?
+    } else {
+        pair.slave
+            .spawn_command(command)
+            .map_err(|error| format!("spawn PTY command failed: {error}"))?
+    };
+    #[cfg(not(target_os = "macos"))]
     let child = pair
         .slave
         .spawn_command(command)
         .map_err(|error| format!("spawn PTY command failed: {error}"))?;
+    if crate::privacy_spawn::requested(env) {
+        crate::privacy_spawn::note_session(session_id);
+    }
     drop(profile_handle);
     let child_pid = child.process_id();
     let killer = child.clone_killer();
@@ -274,6 +287,7 @@ pub(crate) fn spawn_reader(
             }
             Ok(())
         })();
+        drop(file);
         if let Err(ref error) = result {
             crate::slog_warn!(
                 "PTY reader for {}:{} stopped with error: {error}",
@@ -384,6 +398,7 @@ pub(crate) fn spawn_waiter(
                 coordinator.task_id
             );
         }
+        drop(exit_file);
         exit_observed.store(true, Ordering::SeqCst);
         coordinator.signal_one_done();
     });

@@ -285,15 +285,18 @@ describe("V2 server effect", () => {
   });
 
   test("a rejected configuration registers failing tools and acquires no bridge", async () => {
-    // Top-level `enabled` is retired; a rejected configuration puts the
-    // Location in the config error state instead of leaving it without tools.
+    // A rejected configuration puts the Location in the config error state
+    // instead of leaving it without tools.
     const events: string[] = [];
     const added: Array<Record<string, unknown>> = [];
     const dependencies = {
       ...testDependencies(events),
       loadConfig: (directory: string) => {
         events.push(`config:${directory}`);
-        throw new ConfigRejectedError(["removed_config_key:aft_glob:use:glob"], directory);
+        throw new ConfigRejectedError(
+          ["invalid_resolved_config:missing:disabled_tools"],
+          directory,
+        );
       },
     };
     const host = hostContext("/work/rejected", events, added);
@@ -309,7 +312,7 @@ describe("V2 server effect", () => {
       "add:/work/rejected:aft_probe",
       "config-error-rpc-dispose",
     ]);
-    await expectConfigErrorCall(added[0], "npx @cortexkit/aft doctor --fix");
+    await expectConfigErrorCall(added[0], "invalid_resolved_config:missing:disabled_tools");
   });
 
   test("a config file that does not parse registers failing tools and acquires no bridge", async () => {

@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Release 0.59.0 migrates benchmark configure payloads and generated AFT config to the current index keys. Derived from git diff --name-only against the merge-base with main: no ranking-fenced paths changed; search ranking and routing are unchanged."
+}

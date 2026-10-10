@@ -15,7 +15,7 @@ fn git(project: &Path, args: &[&str]) {
 }
 
 /// A committed TypeScript repository with one cross-file call per pair.
-fn repository(files: usize) -> tempfile::TempDir {
+pub(super) fn repository(files: usize) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
     for index in 0..files {
         fs::write(
@@ -271,6 +271,33 @@ fn fingerprint_mismatch_falls_back_to_a_cold_build() {
         !has_marker(&published.derived),
         "mismatched base was reused"
     );
+    assert_matches_cold(storage.path(), &published);
+}
+
+#[test]
+fn missing_shared_owner_manifest_falls_back_to_a_cold_build() {
+    let project = repository(4);
+    let storage = tempfile::tempdir().unwrap();
+    let (view, _) = publish_marked_base(project.path(), storage.path());
+    let owner = view.current_generation().unwrap().unwrap();
+    view.reuse_derived("shared", &owner).unwrap();
+    fs::copy(
+        view.manifest_path(&owner).unwrap(),
+        view.manifest_path("shared").unwrap(),
+    )
+    .unwrap();
+    view.open_pointer_connection()
+        .unwrap()
+        .execute("UPDATE pointer SET generation = 'shared'", [])
+        .unwrap();
+    fs::remove_file(view.manifest_path(&owner).unwrap()).unwrap();
+
+    let published = publish_edit(project.path(), storage.path(), &view, &[1]);
+    assert!(
+        !has_marker(&published.derived),
+        "a missing owner manifest must not seed an incremental clone"
+    );
+    assert_eq!(published.counts.base_not_ready, 1);
     assert_matches_cold(storage.path(), &published);
 }
 

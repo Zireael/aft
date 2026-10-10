@@ -302,6 +302,7 @@ fn acquire_with_config(
     timeout: Option<Duration>,
     config: LockConfig,
 ) -> Result<LockGuard, AcquireError> {
+    crate::production_storage::refuse_write(path)?;
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let hostname = current_hostname();
     let mut warned_live_owner = false;
@@ -760,22 +761,11 @@ fn read_lock_metadata(path: &Path) -> Result<LockMetadata, ReadLockError> {
     serde_json::from_slice(&bytes).map_err(ReadLockError::Malformed)
 }
 
-#[cfg(unix)]
 fn open_new_lock_file(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = OpenOptions::new()
+    let file = crate::private_storage::options()
         .write(true)
         .create_new(true)
-        .mode(0o600)
         .open(path)?;
-    io_ledger::record(|ledger| ledger.new_files += 1);
-    Ok(file)
-}
-
-#[cfg(not(unix))]
-fn open_new_lock_file(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
     io_ledger::record(|ledger| ledger.new_files += 1);
     Ok(file)
 }
@@ -1320,7 +1310,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-struct RetrySleepObserverGuard {
+pub(crate) struct RetrySleepObserverGuard {
     previous: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
@@ -1334,7 +1324,7 @@ impl Drop for RetrySleepObserverGuard {
 }
 
 #[cfg(test)]
-fn observe_retry_sleeps_for_test(
+pub(crate) fn observe_retry_sleeps_for_test(
     observer: Arc<std::sync::atomic::AtomicUsize>,
 ) -> RetrySleepObserverGuard {
     let previous = RETRY_SLEEP_OBSERVER.with(|slot| slot.replace(Some(observer)));

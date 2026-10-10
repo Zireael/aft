@@ -53,7 +53,9 @@ mod per_checkout_core_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+#[cfg(windows)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -475,6 +477,16 @@ impl Manifest {
         self.entries.iter()
     }
 
+    /// Start at a bytewise lower bound without requiring it to be a valid member
+    /// path. Directory prefixes end in `/`, and the root prefix is empty.
+    pub(crate) fn entries_from(
+        &self,
+        lower: &[u8],
+    ) -> impl Iterator<Item = (&RelPath, &ManifestEntry)> {
+        self.entries
+            .range(RelPath(ByteString::new(lower.to_vec()))..)
+    }
+
     pub fn get(&self, rel_path: &RelPath) -> Option<&ManifestEntry> {
         self.entries.get(rel_path)
     }
@@ -735,9 +747,11 @@ impl ViewStore {
     /// Opens `<storage>/views/<project_scope_key>` and initializes its singleton
     /// pointer row under `BEGIN IMMEDIATE` so concurrent first opens agree.
     pub fn open(storage: impl AsRef<Path>, project_scope_key: &str) -> Result<Self> {
+        crate::production_storage::refuse_write(storage.as_ref())
+            .map_err(|error| ViewError::io_at("opening writable view", storage.as_ref(), error))?;
         validate_scope_key(project_scope_key)?;
         let view_dir = storage.as_ref().join("views").join(project_scope_key);
-        fs::create_dir_all(&view_dir)
+        crate::private_storage::open_dir(storage.as_ref(), &view_dir)
             .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
         let store = Self { view_dir };
         store.initialize_pointer()?;
@@ -748,7 +762,9 @@ impl ViewStore {
     /// per-checkout (v2) layout keeps views under `views/v2/<scope>` and
     /// reaches this only through a registered view.
     pub(crate) fn open_dir(view_dir: PathBuf) -> Result<Self> {
-        fs::create_dir_all(&view_dir)
+        crate::production_storage::refuse_write(&view_dir)
+            .map_err(|error| ViewError::io_at("opening writable view", &view_dir, error))?;
+        crate::private_storage::open_dir(view_storage_root(&view_dir), &view_dir)
             .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
         let store = Self { view_dir };
         store.initialize_pointer()?;
@@ -758,6 +774,7 @@ impl ViewStore {
     /// A view directory that already has a pointer database, without creating
     /// or initializing anything. Registry readers use this.
     pub(crate) fn existing_dir(view_dir: PathBuf) -> Option<Self> {
+        crate::private_storage::tighten_open_dir(view_storage_root(&view_dir), &view_dir);
         view_dir
             .join(POINTER_DATABASE)
             .is_file()
@@ -1030,6 +1047,16 @@ impl ViewStore {
     }
 }
 
+fn view_storage_root(view_dir: &Path) -> &Path {
+    view_dir
+        .parent()
+        .filter(|parent| parent.ends_with("v2"))
+        .and_then(Path::parent)
+        .filter(|parent| parent.ends_with("views"))
+        .and_then(Path::parent)
+        .unwrap_or(view_dir)
+}
+
 fn validate_filesystem_rel_path(bytes: &[u8]) -> Result<()> {
     if bytes.is_empty()
         || bytes.first() == Some(&b'/')
@@ -1183,6 +1210,8 @@ fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {
 }
 
 fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
+    crate::production_storage::refuse_write(path)
+        .map_err(|error| ViewError::io_at("writing manifest", path, error))?;
     let parent = path.parent().ok_or_else(|| {
         ViewError::InvalidManifest("manifest path must have a parent directory".to_string())
     })?;
@@ -1198,7 +1227,7 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
             .as_nanos()
     ));
     let write_result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
+        let mut file = crate::private_storage::options()
             .create_new(true)
             .write(true)
             .open(&temporary)

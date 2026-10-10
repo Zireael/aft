@@ -71,6 +71,9 @@ struct BashParams {
     permissions_requested: bool,
     #[serde(default)]
     env: HashMap<String, String>,
+    /// Run the whole line on the remote runner this demand names.
+    #[serde(default)]
+    runon: Option<String>,
 }
 
 /// The hard kill for a bash request: the caller's explicit `timeout`, or the
@@ -104,9 +107,50 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         params.shell = crate::bash_background::BashShell::Powershell;
     }
 
+    // Reject before permissions, rewrites, or process creation. The worker
+    // flag is resolved by the caller's session context, not command text.
+    if req.worker_session()
+        && !params.shell.is_powershell()
+        && crate::bash_permissions::synthetic_load::is_synthetic_load(&params.command)
+    {
+        return Response::error(
+            &req.id,
+            "synthetic_load_refused",
+            "synthetic CPU load is not allowed on the shared machine; reproduce on the remote runner or prove the mechanism deterministically",
+        );
+    }
+
     if let Some(description) = params.description.as_deref() {
         log::debug!("bash description: {description}");
     }
+
+    // `runon` sends the whole line, as written, to the remote runner. Every
+    // reason that cannot happen is refused here, before any local work (even
+    // resolving a local shell).
+    let remote = match params.runon.as_deref() {
+        None => crate::bash_background::remote_for_legacy_command(
+            &ctx.config(),
+            &params.command,
+            params.pty,
+            params.shell.is_powershell(),
+        ),
+        Some(runon) => match crate::bash_background::remote_for_runon(
+            &ctx.config(),
+            runon,
+            params.pty,
+            params.shell.is_powershell(),
+            matches!(params.sandbox, Some(BashSandbox::Host)),
+        ) {
+            Ok(launch) => Some(launch),
+            Err(message) => {
+                return Response::error(
+                    &req.id,
+                    "remote_run_refused",
+                    format!("runon refused: {message}"),
+                );
+            }
+        },
+    };
 
     let shell_path = match crate::bash_background::resolve_shell_path(params.pty, params.shell) {
         Ok(path) => path,
@@ -175,6 +219,14 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             "sandbox_escalation_denied",
             "sandbox host escalation is unavailable to untrusted principals",
         );
+    }
+    if host_requested && crate::bash_background::worker_preset_active() {
+        let bound_root = ctx
+            .config()
+            .project_root
+            .clone()
+            .unwrap_or_else(|| workdir.clone());
+        crate::agent_child_env::inject_worker_test_threads(&bound_root, &mut params.env);
     }
 
     #[cfg(unix)]
@@ -306,6 +358,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // command verbatim when the workdir differs from the project root.
     if !params.shell.is_powershell()
         && host_escalation.is_none()
+        && remote.is_none()
         && workdir_matches_project_root(&workdir, ctx)
     {
         if let Some(response) = crate::bash_rewrite::try_rewrite_for_request(
@@ -323,16 +376,19 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         let reason = if params.shell.is_powershell() {
             "PowerShell syntax bypasses POSIX rewrite rules"
+        } else if remote.is_some() {
+            "runon sends the whole line to the remote runner"
         } else if host_escalation.is_some() {
             "host escalation owns process execution"
         } else {
             "bash workdir differs from the project root"
         };
-        let branch = if params.shell.is_powershell() || host_escalation.is_some() {
-            "dispatch.native.no_rule"
-        } else {
-            "dispatch.native.non_root_workdir"
-        };
+        let branch =
+            if params.shell.is_powershell() || host_escalation.is_some() || remote.is_some() {
+                "dispatch.native.no_rule"
+            } else {
+                "dispatch.native.non_root_workdir"
+            };
         crate::bash_rewrite::dispatch::record_native(
             &req.id,
             crate::bash_rewrite::catalog::ControlRole::Native,
@@ -377,6 +433,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         pty_cols,
         scanner_report,
         host_escalation,
+        remote,
     )
 }
 
@@ -539,6 +596,40 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     use crate::windows_shell::WindowsShell;
+
+    #[test]
+    fn standalone_runon_is_refused_by_name_even_with_remote_execution_enabled() {
+        for enabled in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let mut config = crate::config::Config::default();
+            config.project_root = Some(root.path().into());
+            config.storage_dir = Some(storage.path().into());
+            config.remote_exec.enabled = enabled;
+            config.bash.runon_enabled = true;
+            config.sandbox.enabled = false;
+            let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+            let marker = root.path().join("must-not-run-locally");
+            let req = RawRequest {
+                id: "standalone-runon".into(),
+                command: "bash".into(),
+                lsp_hints: None,
+                session_id: Some("standalone".into()),
+                params: serde_json::json!({
+                    "command": format!("echo SHOULD_NOT_RUN > \"{}\"", marker.display()),
+                    "runon": "linux"
+                }),
+            };
+            let response = handle(&req, &ctx);
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "remote_run_refused");
+            assert!(
+                response.data["message"].as_str().unwrap().contains("runon"),
+                "{response:?}"
+            );
+            assert!(!marker.exists(), "unsupported runon must never run locally");
+        }
+    }
 
     fn ctx_with_root(root: &std::path::Path) -> AppContext {
         AppContext::new(
@@ -814,6 +905,57 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn synthetic_load_role_gate_refuses_worker_not_head() {
+        use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        // A refusing spawn seam keeps this test safe even when the load guard is
+        // removed: no real load generator is ever launched by either role.
+        for background in [false, true] {
+            let mut request = spawn_test_request("synthetic-load", "yes > /dev/null &", background);
+            request.params[crate::protocol::WORKER_SESSION_FIELD] = json!(true);
+            let worker =
+                with_spawn_plan_for_test(SpawnPlan::refused_for_test("test_no_execution"), || {
+                    handle(&request, &ctx)
+                });
+            assert!(!worker.success);
+            assert_eq!(worker.data["code"], "synthetic_load_refused");
+            assert_eq!(
+                worker.data["message"].as_str(),
+                Some("synthetic CPU load is not allowed on the shared machine; reproduce on the remote runner or prove the mechanism deterministically")
+            );
+
+            request.params[crate::protocol::WORKER_SESSION_FIELD] = json!(false);
+            let head =
+                with_spawn_plan_for_test(SpawnPlan::refused_for_test("test_no_execution"), || {
+                    handle(&request, &ctx)
+                });
+            assert_eq!(head.data["code"], "test_no_execution");
+
+            // Both PowerShell selectors bypass the POSIX-only guard, whether
+            // PowerShell is installed locally or not. The spawn seam still
+            // prevents execution if it is installed and permission is granted.
+            request.params[crate::protocol::WORKER_SESSION_FIELD] = json!(true);
+            for dedicated_route in [false, true] {
+                request.command = if dedicated_route {
+                    "powershell"
+                } else {
+                    "bash"
+                }
+                .to_string();
+                request.params["params"]["shell"] = json!("powershell");
+                let powershell = with_spawn_plan_for_test(
+                    SpawnPlan::refused_for_test("test_no_execution"),
+                    || handle(&request, &ctx),
+                );
+                assert_ne!(powershell.data["code"], "synthetic_load_refused");
+            }
+        }
+    }
+
     fn stop_spawned_test_task(ctx: &AppContext, response: &Response) {
         if let Some(task_id) = response
             .data
@@ -1010,6 +1152,173 @@ mod tests {
         let response = handle(&request, ctx);
         assert!(response.success, "spawn failed: {:?}", response.data);
         response.data["task_id"].as_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    fn bash_output_for_test(
+        ctx: &AppContext,
+        project_root: &Path,
+        request: &RawRequest,
+        worker_preset: bool,
+    ) -> String {
+        let response =
+            crate::bash_background::with_worker_preset(worker_preset, || handle(request, ctx));
+        assert!(response.success, "bash spawn failed: {:?}", response.data);
+        let task_id = response.data["task_id"].as_str().unwrap();
+        let storage = crate::bash_background::task_storage_dir(ctx);
+        let started = std::time::Instant::now();
+        loop {
+            let snapshot = ctx
+                .bash_background()
+                .status(
+                    task_id,
+                    "sandbox-spawn-test",
+                    Some(project_root),
+                    Some(&storage),
+                    4096,
+                )
+                .expect("spawned task should be visible");
+            if snapshot.info.status.is_terminal() {
+                return snapshot.output_preview;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "bash test task did not finish: {snapshot:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(unix)]
+    fn worker_thread_output_request(id: &str) -> RawRequest {
+        spawn_test_request(
+            id,
+            r#"printf '%s|%s' "${NEXTEST_TEST_THREADS-unset}" "${RUST_TEST_THREADS-unset}""#,
+            true,
+        )
+    }
+
+    #[cfg(unix)]
+    fn without_test_thread_environment() -> impl Drop {
+        struct Restore {
+            values: [(&'static str, Option<std::ffi::OsString>); 2],
+            _lock: crate::test_env::ProcessEnvLockGuard,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in &self.values {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+        }
+        let lock = crate::test_env::process_env_lock();
+        let values = ["NEXTEST_TEST_THREADS", "RUST_TEST_THREADS"].map(|name| {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            (name, previous)
+        });
+        Restore {
+            values,
+            _lock: lock,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_preset_bash_reads_budget_file_and_defaults_missing_or_garbage_to_four() {
+        // Defaults apply only when the child inherits no caller-selected budget.
+        // Nextest itself sets NEXTEST_TEST_THREADS in the fixture's environment.
+        let _environment = without_test_thread_environment();
+        let container = tempfile::tempdir().unwrap();
+        let project = container.path().join("worktree");
+        std::fs::create_dir(&project).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(&project, storage.path());
+        let budget_path = container.path().join(".cargo/alfonso-test-threads");
+
+        std::fs::create_dir_all(budget_path.parent().unwrap()).unwrap();
+        std::fs::write(&budget_path, "7\n").unwrap();
+        let mut budget_request = worker_thread_output_request("budget-file");
+        budget_request.params["params"]["workdir"] = json!(project.join("nested"));
+        std::fs::create_dir(project.join("nested")).unwrap();
+        assert_eq!(
+            bash_output_for_test(&ctx, &project, &budget_request, true),
+            "7|7"
+        );
+
+        std::fs::remove_file(&budget_path).unwrap();
+        assert_eq!(
+            bash_output_for_test(
+                &ctx,
+                &project,
+                &worker_thread_output_request("budget-missing"),
+                true
+            ),
+            "4|4"
+        );
+
+        std::fs::write(&budget_path, "garbage\n").unwrap();
+        assert_eq!(
+            bash_output_for_test(
+                &ctx,
+                &project,
+                &worker_thread_output_request("budget-invalid"),
+                true
+            ),
+            "4|4"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_bash_respects_call_environment_and_head_or_plugin_worker_gets_no_default() {
+        let _environment = without_test_thread_environment();
+        let container = tempfile::tempdir().unwrap();
+        let project = container.path().join("worktree");
+        std::fs::create_dir(&project).unwrap();
+        let budget_path = container.path().join(".cargo/alfonso-test-threads");
+        std::fs::create_dir_all(budget_path.parent().unwrap()).unwrap();
+        std::fs::write(&budget_path, "8\n").unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(&project, storage.path());
+
+        let mut explicit = worker_thread_output_request("budget-explicit");
+        explicit.params["params"]["env"] = json!({
+            "NEXTEST_TEST_THREADS": "13",
+            "RUST_TEST_THREADS": "17"
+        });
+        assert_eq!(
+            bash_output_for_test(&ctx, &project, &explicit, true),
+            "13|17"
+        );
+
+        let mut head = worker_thread_output_request("budget-head");
+        head.params[crate::protocol::WORKER_SESSION_FIELD] = json!(true);
+        assert_eq!(
+            bash_output_for_test(&ctx, &project, &head, false),
+            "unset|unset"
+        );
+
+        std::env::set_var("NEXTEST_TEST_THREADS", "19");
+        std::env::set_var("RUST_TEST_THREADS", "23");
+        assert_eq!(
+            bash_output_for_test(
+                &ctx,
+                &project,
+                &worker_thread_output_request("budget-inherited"),
+                true
+            ),
+            "19|23"
+        );
+        assert_eq!(bash_output_for_test(&ctx, &project, &head, false), "19|23");
+        assert_eq!(
+            bash_output_for_test(&ctx, &project, &explicit, true),
+            "13|17"
+        );
     }
 
     #[cfg(unix)]

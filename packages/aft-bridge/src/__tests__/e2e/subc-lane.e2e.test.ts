@@ -58,8 +58,7 @@ maybeDescribe(describeName, () => {
         {
           edit_mode: "hashline",
           bash: { rewrite: true, background: false },
-          search_index: false,
-          semantic_search: false,
+          indexes: { trigram: false, semantic: false },
         },
         null,
         2,

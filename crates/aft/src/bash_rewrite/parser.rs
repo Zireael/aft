@@ -293,9 +293,8 @@ fn tokenize_literal_word(input: &str, top_level: bool) -> Option<(String, usize)
     }
 }
 
-/// Literal top-level commands for whole-line execution policy. Uses the same
-/// quote removal and expansion rejection as bash rewriting. Unsupported syntax
-/// (including stdin and file writes) declines rather than guessing.
+/// Literal top-level commands for the legacy prefix policy. Unsupported
+/// expansions, background execution, stdin and file writes decline routing.
 pub fn parse_top_level(line: &str) -> Option<Vec<Vec<String>>> {
     let mut rest = line;
     let mut commands = Vec::new();

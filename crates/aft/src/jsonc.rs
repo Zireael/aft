@@ -177,14 +177,14 @@ mod tests {
     fn strip_jsonc_removes_comments_and_trailing_commas() {
         let source = r#"{
   // line comment
-  "search_index": true,
+  "indexes": { "trigram": true },
   "formatter": {
     "rust": "rustfmt", /* block comment */
   },
 }"#;
 
         let value = serde_json::from_str::<Value>(&strip_jsonc(source)).unwrap();
-        assert_eq!(value["search_index"], Value::Bool(true));
+        assert_eq!(value["indexes"]["trigram"], Value::Bool(true));
         assert_eq!(value["formatter"]["rust"], Value::String("rustfmt".into()));
     }
 }

@@ -113,9 +113,7 @@ fn run_session(fixture: &Fixture, root: &Path) -> SessionOutcome {
             "project_root": root.display().to_string(),
             "storage_dir": fixture.storage.display().to_string(),
             "config": user_config(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
                 "worktree": { "ram_overlay": true }
             })),
         }),

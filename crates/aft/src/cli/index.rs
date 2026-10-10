@@ -153,7 +153,7 @@ fn run_with_paths(
     ));
     if !errors.is_empty() {
         return Err(IndexError::validation(format!(
-            "configuration rejected: {}; run `aft doctor --fix`",
+            "configuration rejected: {}",
             errors.join(", ")
         )));
     }

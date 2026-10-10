@@ -8,7 +8,6 @@
   "experimental_bash_compress": true,
   "experimental_bash_rewrite": true,
   "idle": {
-    "lsp_ttl_minutes": 3,
     "root_ttl_minutes": 15
   },
   "indexes": {
@@ -16,5 +15,6 @@
     "semantic": true,
     "trigram": true
   },
+  "lsp_idle_minutes": 5,
   "restrict_to_project_root": false
 }

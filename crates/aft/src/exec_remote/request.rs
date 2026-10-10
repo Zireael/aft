@@ -28,14 +28,13 @@ impl FrozenParams {
                     .map_err(|e| format!("remote_exec: {e}"))
             })
             .transpose()?;
-        if let Some(policy) = &remote_exec {
-            if policy
-                .commands
-                .iter()
-                .any(|p| !super::policy::valid_prefix(p))
-            {
-                return Err("remote_exec.commands: malformed prefix".into());
-            }
+        if remote_exec
+            .as_ref()
+            .is_some_and(|policy| policy.legacy_commands.is_some())
+        {
+            log::debug!(
+                "remote_exec.commands in the worker plan is ignored: a call runs remotely only when it sets runon"
+            );
         }
         let siblings: Vec<String> = params
             .get("siblings")
@@ -83,6 +82,8 @@ pub(crate) fn denied_environment_name(name: &str) -> bool {
         .iter()
         .any(|prefix| name.starts_with(prefix))
         || name == "SSH_AUTH_SOCK"
+        || name == "NEXTEST_TEST_THREADS"
+        || name == "RUST_TEST_THREADS"
 }
 
 /// Build the caller request from bash's launch inputs. Secret-shaped and

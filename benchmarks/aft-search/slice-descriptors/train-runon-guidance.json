@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["runon-guidance"],
+  "note": "Derived from git diff --name-only origin/main...HEAD: no changed path matches RANKING_FENCE_PREFIXES. This changes remote-only bash guidance, its enabled-only schema/catalog copies and agent-facing docs; it does not change search ranking or routing. The fenced default crates/aft/src/subc_tool_schemas.json remains unchanged because runon guidance stays gated with remote execution."
+}

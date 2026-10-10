@@ -160,7 +160,10 @@ fn release_guard_unblocks_gated_child_after_panic() {
 
     assert!(panic_result.is_err());
     let child_pid = child_pid.expect("panic test recorded child PID");
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // A positive wait: on a loaded Windows runner a PowerShell child can take
+    // seconds to notice the sentinel and exit. Without the guard the child
+    // polls for its full 300 s gate, so 30 s still proves the guard fired.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while aft::bash_background::process::is_process_alive(child_pid) {
         assert!(
             Instant::now() < deadline,

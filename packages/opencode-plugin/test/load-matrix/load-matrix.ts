@@ -7,6 +7,7 @@
 // The CLI's V1 version probe (setup/host-generation.ts) reads the same variable the other
 // way round: it is tolerant of concurrent operator writes unless the variable is exactly "0",
 // because in production an OpenCode host is usually running beside the probe.
+
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -16,6 +17,7 @@ import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { CANONICAL_TOOLS } from "@cortexkit/aft-bridge";
 import ts from "typescript";
 import {
   prepareSubcLane,
@@ -472,6 +474,7 @@ async function runPinnedV1CoreLoaderRow(input: {
   if (input.seedSpec) {
     await seedCoreNpmCache(isolation, input.seedSpec, input.packageRoot);
   }
+  // Deliberately use retired enabled:false: 0.59 rejects the config before this loader probe can start AFT.
   await writeV1PluginSpecs(isolation, input.specs, { enabled: false });
   const result = await withOperatorCanary(input.label, () =>
     runV1CoreLoaderHost(v1, isolation, { allowFailure: input.allowFailure }),
@@ -1211,6 +1214,7 @@ async function runV2TuiHost(input: {
   await writeV2HostConfig(
     isolation,
     [...(input.pluginsBefore ?? []), input.packageRoot],
+    // Deliberately use retired enabled:false: 0.59 rejects the config before this loader probe can start AFT.
     input.aftConfig ?? { enabled: false },
     input.pluginKey,
   );
@@ -2201,6 +2205,7 @@ export default {
       `throw new Error("ROOT_ENTRY_SELECTED");\nexport default async function rootTrap() {}\n`,
     );
     isolation.env.AFT_LOAD_MATRIX_MARKER = marker;
+    // Deliberately use retired enabled:false: 0.59 rejects the config before this loader probe can start AFT.
     await writeV1Configs(isolation, [packageRoot], { enabled: false });
 
     const result = await withOperatorCanary("v1-server", () => runV1ConfigHost(v1, isolation));
@@ -2246,6 +2251,7 @@ export default {
 `,
     );
     isolation.env.AFT_LOAD_MATRIX_MARKER = marker;
+    // Deliberately use retired enabled:false: 0.59 rejects the config before this loader probe can start AFT.
     await writeV1Configs(isolation, [packageRoot], { enabled: false }, true);
 
     await withOperatorCanary("v1-tui", () =>
@@ -2264,6 +2270,7 @@ export default {
       const packageRoot = await copyInstalledPlugin(v2, `v2-${runtime}`);
       const isolation = await makeIsolation(`v2-${runtime}`);
       const marker = join(isolation.root, "entry.log");
+      // Deliberately use retired enabled:false: 0.59 rejects the config before this loader probe can start AFT.
       await writeAftConfig(isolation, { enabled: false });
       const manifestPath = join(packageRoot, "package.json");
       const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
@@ -2314,11 +2321,8 @@ export default { id: original.id, effect, setup };
       join(repoRoot, "target", "debug", process.platform === "win32" ? "aft.exe" : "aft");
     expect(existsSync(binaryPath)).toBe(true);
     await writeAftConfig(isolation, {
-      enabled: true,
-      search_index: false,
-      semantic_search: false,
-      tool_surface: "all",
-      hoist_builtin_tools: true,
+      indexes: { trigram: false, semantic: false },
+      disabled_tools: [],
       bash: true,
       lsp: { auto_install: false },
     });
@@ -2446,11 +2450,8 @@ export default { id: original.id, effect };
     // would hand the plugin the operator's process. The plugin list is empty
     // because the probe loads AFT itself; the service must not load it again.
     await writeV2HostConfig(isolation, [], {
-      enabled: true,
-      search_index: false,
-      semantic_search: false,
-      tool_surface: "all",
-      hoist_builtin_tools: true,
+      indexes: { trigram: false, semantic: false },
+      disabled_tools: [],
       bash: true,
       lsp: { auto_install: false },
     });
@@ -2689,11 +2690,8 @@ export default { id: original.id, effect };
       packageRoot,
       pluginsBefore: [rivalRoot],
       aftConfig: {
-        enabled: true,
-        search_index: false,
-        semantic_search: false,
-        tool_surface: "all",
-        hoist_builtin_tools: true,
+        indexes: { trigram: false, semantic: false },
+        disabled_tools: [],
         bash: true,
         lsp: { auto_install: false },
       },
@@ -2803,9 +2801,10 @@ export default async function initialize(input, options) {
     }
     isolation.env.AFT_LOAD_MATRIX_MARKER = marker;
     await writeV1Configs(isolation, packageRoots, {
-      search_index: false,
-      semantic_search: false,
-      tool_surface: "minimal",
+      indexes: { trigram: false, semantic: false },
+      disabled_tools: CANONICAL_TOOLS.filter(
+        (name) => name !== "aft_outline" && name !== "aft_zoom" && name !== "aft_safety",
+      ),
     });
     const userConfigDir = join(isolation.env.XDG_CONFIG_HOME ?? "", "cortexkit");
     await mkdir(userConfigDir, { recursive: true });
@@ -2814,9 +2813,10 @@ export default async function initialize(input, options) {
       `${JSON.stringify(
         {
           subc: { connection_file: subcRig.connectionFile },
-          search_index: false,
-          semantic_search: false,
-          tool_surface: "minimal",
+          indexes: { trigram: false, semantic: false },
+          disabled_tools: CANONICAL_TOOLS.filter(
+            (name) => name !== "aft_outline" && name !== "aft_zoom" && name !== "aft_safety",
+          ),
           lsp: { auto_install: false },
         },
         null,

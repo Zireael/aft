@@ -153,9 +153,11 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": callgraph_store
+            "indexes": {
+                "trigram": false,
+                "semantic": false,
+                "callgraph": callgraph_store
+            }
         })),
     }));
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
@@ -185,8 +187,7 @@ fn configured_restricted_context(root: &Path) -> AppContext {
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false },
             "restrict_to_project_root": true
         })),
     }));
@@ -214,9 +215,7 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "inspect": { "diagnostics_timeout_ms": timeout_ms }
         })),
     }));
@@ -1502,7 +1501,7 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
             "id": "configure-view", "command": "configure", "harness": "opencode",
             "project_root": linked, "storage_dir": storage,
             "config": crate::helpers::user_config(json!({
-                "search_index": false, "semantic_search": false, "callgraph_store": true,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true },
                 "views": {"enabled": true}
             }))
         })),
@@ -1639,7 +1638,7 @@ fn inspect_views_owner_persists_and_reuses_tier2_contributions() {
     let configured = handle_configure(
         &request(json!({
             "id": "configure-owner", "command": "configure", "harness": "opencode", "project_root": root, "storage_dir": storage,
-            "config": crate::helpers::user_config(json!({ "search_index": false, "semantic_search": false, "callgraph_store": true, "views": {"enabled": true} }))
+            "config": crate::helpers::user_config(json!({ "indexes": { "trigram": false, "semantic": false, "callgraph": true }, "views": {"enabled": true} }))
         })),
         &ctx,
     );
@@ -5259,8 +5258,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false
+            "indexes": { "trigram": false, "semantic": false }
         })),
     }));
     let configure_response = serde_json::to_value(handle_configure(&configure, &ctx))
@@ -6043,6 +6041,251 @@ fn reported_check_still_running(response: &Value) -> bool {
         );
     }
     still_checking
+}
+
+#[test]
+fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "rust_inspect_restores_completed_check_after_module_restart_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("checkout");
+    let storage = temp.path().join("storage");
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"saved-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub fn answer() -> u8 { 42 }\n");
+    write_file(
+        &root,
+        "build.rs",
+        "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); }\n",
+    );
+    // Pre-create the lockfile: its creation during the first check changes an input.
+    write_file(
+        &root,
+        "Cargo.lock",
+        "version = 4\n[[package]]\nname = \"saved-check\"\nversion = \"0.1.0\"\n",
+    );
+    let new_context = || {
+        crate::helpers::disable_in_process_file_watcher();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let response = handle_configure(
+            &request(json!({
+                "id": "saved-configure", "command": "configure", "project_root": root, "storage_dir": storage,
+                "harness": "opencode", "config": crate::helpers::user_config(json!({
+                    "indexes": { "trigram": false, "semantic": false },
+                    "inspect": {"diagnostics_timeout_ms": 40_000}
+                }))
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        ctx.lsp()
+            .override_binary(ServerKind::Rust, fake_server_path());
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_PROXY", "rust-analyzer");
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_PROXY_CHECK_DELAY_MS", "45000");
+        ctx
+    };
+    let ctx = new_context();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let warm = loop {
+        let warm = scoped_diagnostics_inspect(&ctx, "saved-warm", "src");
+        if warm["summary"]["diagnostics"]["errors"] == 0 {
+            break warm;
+        }
+        assert!(std::time::Instant::now() < deadline, "{warm:#}");
+    };
+    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+    assert!(
+        fs::read_dir(storage.join("rust-completed-checks"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "json")),
+        "no completed check was persisted: {warm:#}"
+    );
+    drop(ctx);
+    let ctx = new_context();
+    let started = std::time::Instant::now();
+    let cold = scoped_diagnostics_inspect(&ctx, "saved-cold", "src");
+    assert!(
+        cold["text"]
+            .as_str()
+            .unwrap()
+            .contains("last completed check"),
+        "{cold:#}"
+    );
+    assert_eq!(cold["summary"]["diagnostics"]["errors"], 0, "{cold:#}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let record = fs::read_dir(storage.join("rust-completed-checks"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    println!(
+        "real restart: cold inspect {} ms; record {} bytes at {}",
+        started.elapsed().as_millis(),
+        fs::metadata(&record).unwrap().len(),
+        record.display()
+    );
+    // A cold request after an edit cannot reuse the previous clean check.
+    drop(ctx);
+    write_file(&root, "src/lib.rs", "pub fn answer() -> u8 { unknown }\n");
+    let ctx = new_context();
+    let config = ctx.config();
+    let file = root.join("src/lib.rs");
+    ctx.lsp().ensure_server_for_file(&file, &config);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        ctx.lsp().drain_events();
+        if ctx
+            .lsp()
+            .client_for_file(&file, &config)
+            .is_some_and(|client| !client.diagnostics_are_provisional())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "real analyzer did not finish indexing"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let changed = scoped_diagnostics_inspect(&ctx, "saved-changed", "src");
+    assert!(
+        !changed["text"]
+            .as_str()
+            .unwrap()
+            .contains("no Rust inputs changed"),
+        "{changed:#}"
+    );
+    assert!(reported_check_still_running(&changed), "{changed:#}");
+    let errors = loop {
+        let response = scoped_diagnostics_inspect(&ctx, "saved-errors-warm", "src");
+        if response["summary"]["diagnostics"]["errors"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+        {
+            break response;
+        }
+        assert!(std::time::Instant::now() < deadline, "{response:#}");
+    };
+    drop(ctx);
+    let ctx = new_context();
+    let restored_errors = scoped_diagnostics_inspect(&ctx, "saved-errors-cold", "src");
+    assert!(
+        restored_errors["text"]
+            .as_str()
+            .unwrap()
+            .contains("last completed check"),
+        "{restored_errors:#}"
+    );
+    assert_eq!(
+        restored_errors["summary"]["diagnostics"]["errors"],
+        errors["summary"]["diagnostics"]["errors"],
+        "{restored_errors:#}"
+    );
+}
+
+fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
+    crate::helpers::disable_in_process_file_watcher();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("storage");
+    let records = || {
+        fs::read_dir(storage.join("rust-completed-checks"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .count()
+    };
+    for (index, result) in [None, Some(message)].into_iter().enumerate() {
+        let root = temp.path().join(format!("checkout-{index}"));
+        write_file(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"saved-fake-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write_file(&root, "src/lib.rs", "pub fn f() {}\n");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let response = handle_configure(
+            &request(
+                json!({"id":"unsuccessful-configure", "command":"configure", "harness":"opencode", "project_root":root,"storage_dir":storage,
+            "config":crate::helpers::user_config(json!({"indexes":{"trigram":false,"semantic":false},"inspect":{"diagnostics_timeout_ms":40_000}}))}),
+            ),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        configure_fake_rust_lsp(&ctx);
+        // Default fake startup is already quiescent; its check therefore begins
+        // after workspace load. The warming variant settles only on didOpen,
+        // which would leave a second compiler run owed after its first run.
+        // The successful control must begin after its freshly created inputs
+        // are outside the completed-check timestamp ambiguity window.
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "3000");
+        if let Some(message) = result {
+            ctx.lsp()
+                .set_extra_env("AFT_FAKE_LSP_CHECK_END_MESSAGE", message);
+        }
+        let response = scoped_diagnostics_inspect(&ctx, "unsuccessful-check", "src");
+        assert_eq!(
+            response["summary"]["diagnostics"]["errors"], 1,
+            "{response:#}"
+        );
+        if result.is_none() {
+            // The production library persists certified checks on a detached
+            // writer. Observe the successful control's record before using it
+            // as the baseline for the unsuccessful run.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while records() == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            records(),
+            1,
+            "control writes one record, but the {result:?} run must not write another"
+        );
+    }
+}
+
+#[test]
+fn cancelled_rust_check_is_never_saved() {
+    assert_unsuccessful_rust_check_is_not_persisted("cancelled");
+}
+
+#[test]
+fn failed_rust_check_is_never_saved() {
+    assert_unsuccessful_rust_check_is_not_persisted("failed");
 }
 
 /// rust-analyzer starts its first `cargo check` just after it reports

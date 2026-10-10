@@ -70,9 +70,7 @@ fn configure_project(aft: &mut AftProcess, root: &Path, id: &str) {
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
             "config": crate::helpers::user_config(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             })),
         }),
     );

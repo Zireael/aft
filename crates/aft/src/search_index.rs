@@ -351,7 +351,7 @@ impl CacheLock {
         if !artifact_write_allowed(project_root, cache_dir, &path) {
             return Ok(Self { _guard: None });
         }
-        fs::create_dir_all(cache_dir)?;
+        crate::private_storage::open_keyed_dir(cache_dir, "index")?;
         let _acquire_guard = CACHE_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("search cache lock acquisition mutex poisoned"))?;
@@ -1687,6 +1687,13 @@ impl SearchIndex {
     }
 
     fn build_in_memory(root: &Path, max_file_size: u64, started: Instant) -> Self {
+        let _progress = crate::cold_build_limiter::progress::start(
+            root,
+            "trigram build",
+            None,
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
+        crate::cold_build_limiter::progress::phase("enumerating", None);
         let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let mut index = SearchIndex {
             project_root: project_root.clone(),
@@ -1696,6 +1703,7 @@ impl SearchIndex {
         };
         let filters = PathFilters::default();
         let paths: Vec<PathBuf> = walk_project_files(&index.project_root, &filters);
+        crate::cold_build_limiter::progress::phase("indexing", Some(paths.len()));
         let indexed = index.ingest_paths_parallel(&paths);
         index.git_head = current_git_head(&index.project_root);
         index.ready = true;
@@ -1772,6 +1780,7 @@ impl SearchIndex {
                     indexed += 1;
                 }
             }
+            crate::cold_build_limiter::progress::advance(chunk.len());
         }
 
         indexed
@@ -2066,6 +2075,7 @@ impl SearchIndex {
     }
 
     pub fn read_from_disk(cache_dir: &Path, current_canonical_root: &Path) -> Option<Self> {
+        crate::private_storage::tighten_keyed_dir(cache_dir, "index");
         Self::read_from_disk_with_options(cache_dir, current_canonical_root, true)
     }
 
@@ -3077,6 +3087,7 @@ impl SearchIndexSnapshot {
         max_files: Option<usize>,
         scan_budget: Duration,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
+        let _io_scope = crate::bounded_io::enter_if_absent(scan_budget);
         let matcher = match pattern {
             CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
             CompiledPattern::Regex { compiled, .. } => SearchMatcher::Regex(compiled.clone()),
@@ -3114,6 +3125,7 @@ impl SearchIndexSnapshot {
         let stop_after = max_results.saturating_mul(2);
         let stop_scan = Arc::new(AtomicBool::new(false));
         let deadline = GrepScanDeadline::after(scan_budget);
+        let io_budget = crate::bounded_io::current();
         let verification_claims = AtomicUsize::new(0);
         let claim_verification = || {
             let Some(max_files) = max_files else {
@@ -3126,41 +3138,44 @@ impl SearchIndexSnapshot {
         let mut matches = if candidate_files.len() > 10 {
             candidate_files
                 .par_iter()
-                .map(|file| {
-                    if grep_scan_should_stop(
-                        Some(&stop_scan),
-                        &truncated,
-                        &total_matches,
-                        stop_after,
-                        job_cancellation.as_ref(),
-                        &deadline,
-                    ) {
-                        engine_capped.store(true, Ordering::Relaxed);
-                        return Vec::new();
-                    }
-                    if !claim_verification() {
-                        truncated.store(true, Ordering::Relaxed);
-                        engine_capped.store(true, Ordering::Relaxed);
-                        stop_scan.store(true, Ordering::Relaxed);
-                        return Vec::new();
-                    }
-                    search_candidate_file(
-                        file,
-                        &matcher,
-                        max_results,
-                        stop_after,
-                        &total_matches,
-                        &files_searched,
-                        &files_with_matches,
-                        &bytes_verified,
-                        &truncated,
-                        &engine_capped,
-                        &missing_on_disk,
-                        Some(&stop_scan),
-                        job_cancellation.as_ref(),
-                        &deadline,
-                    )
-                })
+                .map_init(
+                    || crate::bounded_io::enter(io_budget.clone()),
+                    |_scope, file| {
+                        if grep_scan_should_stop(
+                            Some(&stop_scan),
+                            &truncated,
+                            &total_matches,
+                            stop_after,
+                            job_cancellation.as_ref(),
+                            &deadline,
+                        ) {
+                            engine_capped.store(true, Ordering::Relaxed);
+                            return Vec::new();
+                        }
+                        if !claim_verification() {
+                            truncated.store(true, Ordering::Relaxed);
+                            engine_capped.store(true, Ordering::Relaxed);
+                            stop_scan.store(true, Ordering::Relaxed);
+                            return Vec::new();
+                        }
+                        search_candidate_file(
+                            file,
+                            &matcher,
+                            max_results,
+                            stop_after,
+                            &total_matches,
+                            &files_searched,
+                            &files_with_matches,
+                            &bytes_verified,
+                            &truncated,
+                            &engine_capped,
+                            &missing_on_disk,
+                            Some(&stop_scan),
+                            job_cancellation.as_ref(),
+                            &deadline,
+                        )
+                    },
+                )
                 .reduce(Vec::new, |mut left, mut right| {
                     // When concatenating partial match lists from parallel file
                     // searches, simply append the chunks. The stop checks in
@@ -3312,47 +3327,58 @@ impl SearchIndexSnapshot {
         let job_cancellation = crate::executor::current_job_cancellation();
         let started = Instant::now();
         let stopped_early = AtomicBool::new(false);
+        let io_budget = crate::bounded_io::current();
         let files_examined = AtomicUsize::new(0);
         let missing_on_disk = AtomicUsize::new(0);
         let files: Vec<GrepFileMatches> = examined_slice
             .par_iter()
-            .filter_map(|(_, file)| {
-                if started.elapsed() >= limits.budget
-                    || job_cancellation
-                        .as_ref()
-                        .is_some_and(|token| token.cancel_requested_before_commit())
-                {
-                    stopped_early.store(true, Ordering::Relaxed);
-                    return None;
-                }
-                let content = match read_indexed_file_bytes(&file.path) {
-                    Ok(content) => content,
-                    Err(missing) => {
-                        if missing {
-                            missing_on_disk.fetch_add(1, Ordering::Relaxed);
-                        }
-                        files_examined.fetch_add(1, Ordering::Relaxed);
+            .map_init(
+                || crate::bounded_io::enter(io_budget.clone()),
+                |_scope, (_, file)| {
+                    if started.elapsed() >= limits.budget
+                        || job_cancellation
+                            .as_ref()
+                            .is_some_and(|token| token.cancel_requested_before_commit())
+                    {
+                        stopped_early.store(true, Ordering::Relaxed);
                         return None;
                     }
-                };
-                files_examined.fetch_add(1, Ordering::Relaxed);
-                if is_binary_bytes(&content) {
-                    return None;
-                }
-                let (matches, matched_lines) = matching_lines_in_content(
-                    &file.path,
-                    &content,
-                    &matcher,
-                    limits.max_lines_per_file,
-                    keep_past_limit,
-                );
-                (matched_lines > 0).then(|| GrepFileMatches {
-                    path: file.path.clone(),
-                    modified: file.modified,
-                    matches,
-                    matched_lines,
-                })
-            })
+                    let content = match read_indexed_file_bytes(
+                        &file.path,
+                        started.checked_add(limits.budget),
+                    ) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            if error.kind() == std::io::ErrorKind::TimedOut {
+                                stopped_early.store(true, Ordering::Relaxed);
+                            }
+                            if io_error_means_missing_on_disk(&error) {
+                                missing_on_disk.fetch_add(1, Ordering::Relaxed);
+                            }
+                            files_examined.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
+                    };
+                    files_examined.fetch_add(1, Ordering::Relaxed);
+                    if is_binary_bytes(&content) {
+                        return None;
+                    }
+                    let (matches, matched_lines) = matching_lines_in_content(
+                        &file.path,
+                        &content,
+                        &matcher,
+                        limits.max_lines_per_file,
+                        keep_past_limit,
+                    );
+                    (matched_lines > 0).then(|| GrepFileMatches {
+                        path: file.path.clone(),
+                        modified: file.modified,
+                        matches,
+                        matched_lines,
+                    })
+                },
+            )
+            .filter_map(|file| file)
             .collect();
 
         GrepFileCollection {
@@ -3661,10 +3687,14 @@ fn search_candidate_file(
         return Vec::new();
     }
 
-    let content = match read_indexed_file_bytes(&file.path) {
+    let content = match read_indexed_file_bytes(&file.path, deadline.at) {
         Ok(content) => content,
-        Err(missing) => {
-            if missing {
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                deadline.reached.store(true, Ordering::Relaxed);
+                engine_capped.store(true, Ordering::Relaxed);
+            }
+            if io_error_means_missing_on_disk(&error) {
                 missing_on_disk.fetch_add(1, Ordering::Relaxed);
             }
             return Vec::new();
@@ -3880,7 +3910,9 @@ pub(crate) struct GrepScanDeadline {
 impl GrepScanDeadline {
     pub(crate) fn after(budget: Duration) -> Self {
         Self {
-            at: Instant::now().checked_add(budget),
+            at: Instant::now().checked_add(budget).map(|at| {
+                crate::bounded_io::current().map_or(at, |budget| at.min(budget.deadline))
+            }),
             reached: AtomicBool::new(false),
         }
     }
@@ -4268,12 +4300,20 @@ fn build_streaming_index(
     max_file_size: u64,
     cache_dir: &Path,
 ) -> std::io::Result<(SearchIndex, usize)> {
-    fs::create_dir_all(cache_dir)?;
+    let _progress = crate::cold_build_limiter::progress::start(
+        root,
+        "trigram build",
+        None,
+        crate::cold_build_limiter::progress::StartLog::Info,
+    );
+    crate::cold_build_limiter::progress::phase("enumerating", None);
+    crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     sweep_stale_search_build_dirs(cache_dir);
     let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let ignore_fingerprint = ignore_rules_fingerprint(&project_root);
     let filters = PathFilters::default();
     let paths: Vec<PathBuf> = walk_project_files(&project_root, &filters);
+    crate::cold_build_limiter::progress::phase("indexing", Some(paths.len()));
     let pool_size = search_index_build_pool_size();
     let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -4358,8 +4398,10 @@ fn build_streaming_index(
                     spill_seq += 1;
                 }
             }
+            crate::cold_build_limiter::progress::advance(chunk.len());
         }
 
+        crate::cold_build_limiter::progress::phase("publishing", None);
         block.sort_unstable_by_key(|record| (record.trigram, record.file_id));
         let mut sources: Vec<Box<dyn PostingRecordSource>> = Vec::new();
         for path in &spill_paths {
@@ -4432,7 +4474,7 @@ fn write_cache_file_from_sources(
     sources: &mut [Box<dyn PostingRecordSource>],
     domain: crate::write_ledger::Domain,
 ) -> std::io::Result<BasePostings> {
-    fs::create_dir_all(cache_dir)?;
+    crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     sweep_stale_search_build_dirs(cache_dir);
     let cache_path = cache_dir.join("cache.bin");
     let tmp_cache = cache_dir.join(format!(
@@ -4445,7 +4487,7 @@ fn write_cache_file_from_sources(
     ));
 
     let write_result = (|| -> std::io::Result<BasePostings> {
-        let raw = OpenOptions::new()
+        let raw = crate::private_storage::options()
             .write(true)
             .create_new(true)
             .open(&tmp_cache)?;
@@ -4702,7 +4744,7 @@ fn flush_spill_segment(
     }
     block.sort_unstable_by_key(|record| (record.trigram, record.file_id));
     let path = spill_dir.join(format!("segment.{seq:06}.bin"));
-    let mut writer = BufWriter::new(File::create(&path)?);
+    let mut writer = BufWriter::new(crate::private_storage::create(&path)?);
     writer.write_all(SPILL_MAGIC)?;
     write_u32(&mut writer, INDEX_VERSION)?;
     write_u64(
@@ -4746,7 +4788,7 @@ fn create_spill_dir(cache_dir: &Path) -> std::io::Result<PathBuf> {
             .unwrap_or(Duration::ZERO)
             .as_nanos()
     ));
-    fs::create_dir_all(&dir)?;
+    crate::private_storage::create_dir_all(&dir)?;
     Ok(dir)
 }
 
@@ -4811,7 +4853,7 @@ fn transient_search_cache_build_lock(cache_dir: &Path) -> Arc<Mutex<()>> {
 /// opens cache.bin as its postings store, so its previous files must be removed
 /// only while the process-local cache lock is held.
 fn truncate_transient_search_cache_dir(cache_dir: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(cache_dir)?;
+    crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     for entry in fs::read_dir(cache_dir)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -5695,31 +5737,25 @@ pub(crate) fn project_walk_builder(search_root: &Path) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
-    builder
-        .same_file_system(true)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                return !matches!(
-                    name.as_ref(),
-                    "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | ".git"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                );
-            }
-            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
-        });
+    builder.same_file_system(true).hidden(false);
+    crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(|entry| {
+        let name = entry.file_name().to_string_lossy();
+        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            return !matches!(
+                name.as_ref(),
+                "node_modules"
+                    | "target"
+                    | "venv"
+                    | ".venv"
+                    | ".git"
+                    | "__pycache__"
+                    | ".tox"
+                    | "dist"
+                    | "build"
+            );
+        }
+        !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+    });
     builder
 }
 
@@ -5760,18 +5796,17 @@ where
 }
 
 pub(crate) fn read_searchable_text(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
+    let bytes = crate::bounded_io::read(path, None).ok()?;
     if is_binary_bytes(&bytes) {
         return None;
     }
     String::from_utf8(bytes).ok()
 }
 
-/// Read an indexed file for grep verification. `Err(true)` means the file is
-/// not on disk in this checkout, so the index entry is stale; `Err(false)` is any
-/// other read failure.
-fn read_indexed_file_bytes(path: &Path) -> Result<Vec<u8>, bool> {
-    fs::read(path).map_err(|error| io_error_means_missing_on_disk(&error))
+/// Read an indexed file for grep verification. Keep the original I/O error so
+/// callers distinguish a missing entry from blocked access or a scan timeout.
+fn read_indexed_file_bytes(path: &Path, deadline: Option<Instant>) -> std::io::Result<Vec<u8>> {
+    crate::bounded_io::read(path, deadline)
 }
 
 /// Whether an I/O error says the path does not exist (including a path whose
@@ -5789,7 +5824,7 @@ fn io_error_means_missing_on_disk(error: &std::io::Error) -> bool {
 pub(crate) fn path_missing_on_disk(path: &Path) -> bool {
     #[cfg(test)]
     audit_record(|work| work.presence_checks += 1);
-    fs::metadata(path).is_err_and(|error| io_error_means_missing_on_disk(&error))
+    crate::bounded_io::metadata(path).is_err_and(|error| io_error_means_missing_on_disk(&error))
 }
 
 /// Extra paths one listing may `stat` beyond its page while replacing entries
@@ -6593,7 +6628,7 @@ fn write_artifact_cache_key_memo_file(
     storage_root: &Path,
     entries: &BTreeMap<String, ArtifactCacheKeyMemoEntry>,
 ) -> std::io::Result<()> {
-    fs::create_dir_all(storage_root)?;
+    crate::private_storage::open_root(storage_root)?;
     let path = artifact_cache_key_memo_path(storage_root);
     let temp_path = storage_root.join(format!(
         ".{ARTIFACT_CACHE_KEY_MEMO_FILE}.tmp.{}.{}",
@@ -6605,7 +6640,7 @@ fn write_artifact_cache_key_memo_file(
     ));
     let bytes = serde_json::to_vec_pretty(entries).map_err(std::io::Error::other)?;
     {
-        let mut file = File::create(&temp_path)?;
+        let mut file = crate::private_storage::create(&temp_path)?;
         file.write_all(&bytes)?;
     }
     if let Err(error) = fs::rename(&temp_path, &path) {
@@ -6622,6 +6657,9 @@ fn artifact_key_looks_valid(key: &str) -> bool {
 /// Reclaim old index directories that no configured or in-process root can use.
 /// Each candidate holds both search and root-keyed writer leases until deletion,
 /// so a concurrent publisher leaves the directory for a later maintenance pass.
+// Retained for isolated cache-lock fixtures; production eviction is scheduled
+// through storage_retention rather than inferring abandonment from payload age.
+#[allow(dead_code)]
 pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
     let index_root = storage_root.join("index");
     let referenced_keys = match referenced_artifact_cache_keys(storage_root) {
@@ -7204,31 +7242,27 @@ fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
     let mut builder = WalkBuilder::new(root);
     // Nested ignore discovery is a background recursive walk; a disappearing
     // mount must not turn ReadDir::drop's ENXIO into a daemon abort.
-    builder
-        .same_file_system(true)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                return !matches!(
-                    name.as_ref(),
-                    ".git"
-                        | "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                );
-            }
-            true
-        });
+    builder.same_file_system(true).hidden(false);
+    // Same rules as the project walk, so rule files inside ignored trees
+    // (which cannot change what is indexed) are not discovered.
+    crate::context::apply_project_ignore_rules(&mut builder, root).filter_entry(|entry| {
+        let name = entry.file_name().to_string_lossy();
+        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            return !matches!(
+                name.as_ref(),
+                ".git"
+                    | "node_modules"
+                    | "target"
+                    | "venv"
+                    | ".venv"
+                    | "__pycache__"
+                    | ".tox"
+                    | "dist"
+                    | "build"
+            );
+        }
+        true
+    });
 
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         if !entry
@@ -7249,13 +7283,8 @@ fn collect_ignore_rule_files(root: &Path, files: &mut Vec<PathBuf>) {
 pub(crate) fn count_ignore_rule_discovery_dirs(root: &Path) -> usize {
     let mut dirs = 0usize;
     let mut builder = WalkBuilder::new(root);
-    builder
-        .same_file_system(true)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore");
+    builder.same_file_system(true).hidden(false);
+    crate::context::apply_project_ignore_rules(&mut builder, root);
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         if entry.file_type().map_or(false, |ft| ft.is_dir()) {
             dirs += 1;
@@ -7343,11 +7372,14 @@ fn canonicalize_for_search_membership(path: &Path) -> PathBuf {
     // `fs::canonicalize` yields a Windows verbatim (`\\?\`) path, while the
     // lexical fallback does not, so the two success/failure forms would silently
     // miss each other without this shared non-verbatim normalizer.
-    crate::inspect::job::canonicalize_normalized(path)
+    crate::bounded_io::run(path, None, |path| {
+        Ok(crate::inspect::job::canonicalize_normalized(&path))
+    })
+    .unwrap_or_else(|_| crate::inspect::job::normalize_path(path))
 }
 
 fn canonicalize_or_normalize(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+    crate::bounded_io::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
 }
 
 fn resolve_match_path(project_root: &Path, path: &Path) -> PathBuf {
@@ -7363,7 +7395,7 @@ fn path_modified_time(path: &Path) -> Option<SystemTime> {
     audit_record(|work| work.sort_stats += 1);
     #[cfg(test)]
     cache_freshness::record_metadata_call(path);
-    fs::metadata(path)
+    crate::bounded_io::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
 }
@@ -10456,6 +10488,74 @@ mod tests {
         }
     }
 
+    /// A real FIFO open in verification's first-access directory probe stands
+    /// in for consent. Stale FIFO index entries are rejected in a separate test.
+    #[cfg(unix)]
+    #[test]
+    fn indexed_grep_scan_deadline_bounds_blocked_file_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let path = root.join("indexed.txt");
+        fs::write(&path, "needle\n").unwrap();
+        let index = SearchIndex::build_with_limit(&root, 1024 * 1024);
+        let fifo = root.join("consent-probe");
+        crate::bounded_io::tests::fifo(&fifo);
+        let probe = crate::bounded_io::tests::block_directory_probe(&root, &fifo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            tx.send(indexed_grep_with_budget(
+                &index,
+                &root,
+                &compile_grep_pattern("needle", true, false),
+                100,
+                Duration::from_millis(80),
+            ))
+            .unwrap();
+        });
+        let before_writer = rx.recv_timeout(Duration::from_millis(800));
+        crate::bounded_io::tests::release_fifo(&fifo);
+        thread.join().unwrap();
+        let result =
+            before_writer.expect("indexed verification waited in open beyond its scan deadline");
+        assert!(result.matches.is_empty());
+        assert_eq!(
+            probe.fired.load(Ordering::Relaxed),
+            1,
+            "verification's boundary probe must run"
+        );
+        assert_eq!(result.files_searched, 0);
+        assert_eq!(
+            result.missing_on_disk, 0,
+            "blocked access is not a deleted index entry"
+        );
+        assert!(result.scan_deadline_reached);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_grep_never_opens_a_stale_fifo_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let path = root.join("indexed.txt");
+        fs::write(&path, "needle\n").unwrap();
+        let index = SearchIndex::build_with_limit(&root, 1024 * 1024);
+        fs::remove_file(&path).unwrap();
+        crate::bounded_io::tests::fifo(&path);
+        let result = indexed_grep_with_budget(
+            &index,
+            &root,
+            &compile_grep_pattern("needle", true, false),
+            100,
+            Duration::from_millis(800),
+        );
+        assert!(result.matches.is_empty());
+        assert_eq!(result.files_searched, 0);
+        assert!(
+            !result.scan_deadline_reached,
+            "a FIFO is excluded, not opened until a deadline"
+        );
+    }
+
     /// Indexed grep over `root` with an explicit scan budget, run on the
     /// calling thread when there are at most 10 candidate files.
     fn indexed_grep_with_budget(
@@ -11516,6 +11616,140 @@ mod interactive_artifact_read_budget_tests {
         assert!(
             elapsed < Duration::from_millis(60),
             "contended read exceeded its 20ms budget: {elapsed:?}"
+        );
+    }
+}
+
+/// The search index, its glob, and the project walker it shares with the
+/// semantic collector and views membership apply `.gitignore` files the same
+/// way in a plain folder as in a git repository.
+#[cfg(test)]
+mod project_ignore_rule_tests {
+    use super::*;
+    use crate::context::ignore_rules_fixture as fixture;
+    use std::collections::BTreeSet;
+
+    fn fixture_root(git: bool) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fixture::write(&root, git);
+        (dir, root)
+    }
+
+    fn indexed_needle_files(root: &Path) -> BTreeSet<String> {
+        let index = SearchIndex::build(root);
+        let result = index.grep(fixture::NEEDLE, true, &[], &[], root, 1000);
+        let files = result
+            .matches
+            .iter()
+            .map(|found| found.file.clone())
+            .collect::<Vec<_>>();
+        fixture::relative_set(root, &files)
+    }
+
+    fn indexed_glob_files(root: &Path) -> BTreeSet<String> {
+        let index = SearchIndex::build(root);
+        fixture::relative_set(root, &index.glob("**/*", root))
+    }
+
+    fn walked_files(root: &Path) -> BTreeSet<String> {
+        fixture::relative_set(root, &walk_project_files(root, &PathFilters::default()))
+    }
+
+    #[test]
+    fn non_git_root_index_excludes_top_level_and_nested_gitignored_paths() {
+        let (_dir, root) = fixture_root(false);
+
+        let grepped = indexed_needle_files(&root);
+        fixture::assert_honours_ignore_rules(&grepped, "trigram grep");
+        assert_eq!(
+            grepped.len(),
+            fixture::VISIBLE_SOURCES.len(),
+            "grep must find the needle only in the visible sources: {grepped:?}"
+        );
+        fixture::assert_honours_ignore_rules(&indexed_glob_files(&root), "trigram glob");
+        fixture::assert_honours_ignore_rules(&walked_files(&root), "project walk");
+    }
+
+    #[test]
+    fn non_git_and_git_roots_index_the_identical_file_set() {
+        let (_plain_dir, plain) = fixture_root(false);
+        let (_git_dir, git) = fixture_root(true);
+
+        assert_eq!(walked_files(&plain), walked_files(&git));
+        assert_eq!(indexed_needle_files(&plain), indexed_needle_files(&git));
+        assert_eq!(indexed_glob_files(&plain), indexed_glob_files(&git));
+    }
+
+    /// The project walker as it was built before every walker shared
+    /// `apply_project_ignore_rules`, reproduced independently with the
+    /// crate's default `require_git`, so the comparison below is not two
+    /// calls through the same implementation.
+    fn pre_change_project_walk(root: &Path) -> BTreeSet<String> {
+        let mut builder = WalkBuilder::new(root);
+        builder
+            .same_file_system(true)
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .add_custom_ignore_filename(".aftignore")
+            .filter_entry(|entry| {
+                let name = entry.file_name().to_string_lossy();
+                if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                    return !matches!(
+                        name.as_ref(),
+                        "node_modules"
+                            | "target"
+                            | "venv"
+                            | ".venv"
+                            | ".git"
+                            | "__pycache__"
+                            | ".tox"
+                            | "dist"
+                            | "build"
+                    );
+                }
+                !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+            });
+        let files = builder
+            .build()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .map(|entry| entry.into_path())
+            .collect::<Vec<_>>();
+        fixture::relative_set(root, &files)
+    }
+
+    #[test]
+    fn git_root_index_file_set_is_unchanged_from_the_pre_change_walker() {
+        let (_dir, root) = fixture_root(true);
+        // A nested repository starts its own rule scope in git: the outer
+        // `*.log` rule does not reach inside it. A walker that simply turned
+        // `require_git` off everywhere would drop this file.
+        fs::create_dir_all(root.join("vendor/nested_repo/.git")).unwrap();
+        fs::write(root.join("vendor/nested_repo/kept.log"), fixture::NEEDLE).unwrap();
+        fs::write(root.join("vendor/nested_repo/.gitignore"), "skipped.rs\n").unwrap();
+        fs::write(root.join("vendor/nested_repo/skipped.rs"), fixture::NEEDLE).unwrap();
+        fs::create_dir_all(root.join(".git/info")).unwrap();
+        fs::write(root.join(".git/info/exclude"), "excluded_by_info.rs\n").unwrap();
+        fs::write(root.join("excluded_by_info.rs"), fixture::NEEDLE).unwrap();
+
+        let before = pre_change_project_walk(&root);
+        let after = walked_files(&root);
+        assert_eq!(after, before, "git roots must walk exactly as before");
+        assert!(after.contains("vendor/nested_repo/kept.log"), "{after:?}");
+        assert!(
+            !after.contains("vendor/nested_repo/skipped.rs"),
+            "{after:?}"
+        );
+        assert!(!after.contains("excluded_by_info.rs"), "{after:?}");
+        fixture::assert_honours_ignore_rules(&after, "git project walk");
+
+        assert_eq!(
+            indexed_glob_files(&root),
+            before,
+            "the index must hold the pre-change file set"
         );
     }
 }

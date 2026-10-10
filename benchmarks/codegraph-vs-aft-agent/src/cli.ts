@@ -471,20 +471,13 @@ const CODEGRAPH_PKG = "@colbymchenry/codegraph@0.9.6";
  * Fair-comparison AFT surface. Disables every AFT tool that is NOT the
  * code-intelligence comparator, so AFT's aft_search/aft_outline/aft_zoom/
  * aft_callgraph are pitted against codegraph_* while file/edit/grep/bash stay
- * native on both arms.
- *   - hoist_builtin_tools:false → native read/write/edit (AFT aft_* prefixed; disabled below)
- *   - bash:false                → native bash on both arms (AFT otherwise hoists bash)
- *   - grep/glob disabled         → native grep/glob (search_index stays true so aft_search keeps its lexical lane)
- *   - tool_surface:"all"         → expose aft_callgraph (the codegraph_trace/callers comparator)
- *   - everything non-comparison disabled (safety/import/ast-grep/conflicts/lsp/refactor/transform/move/delete)
+ * native on both arms. Both search indexes stay enabled for the AFT comparator;
+ * the explicit disabled-tools list keeps unrelated AFT tools out of the comparison.
  */
 function aftBenchConfig(): Record<string, unknown> {
   return {
-    search_index: true,
-    semantic_search: true,
-    hoist_builtin_tools: false,
+    indexes: { trigram: true, semantic: true },
     bash: false,
-    tool_surface: "all",
     disabled_tools: [
       "aft_read",
       "aft_write",

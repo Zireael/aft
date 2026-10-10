@@ -1,5 +1,7 @@
 import {
   BASH_HOST_FALLBACK_REFUSAL,
+  BASH_RUNON_DESCRIPTION,
+  BASH_RUNON_GUIDANCE,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
@@ -16,8 +18,9 @@ import {
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
-import { resolveBashConfig, toolEnabled } from "../config.js";
+import { remoteRunsOffered, resolveBashConfig, toolEnabled } from "../config.js";
 import { flushLog, sessionLog } from "../logger.js";
+import { normalizeToolArgSchemas } from "../normalize-schemas.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
@@ -249,6 +252,8 @@ export interface BashDescriptionSurface {
    * completion reminder or ending the turn.
    */
   role?: WatchCallerRole;
+  /** Add remote-run guidance only where the tool also offers its parameter. */
+  remoteRuns?: boolean;
 }
 
 export function bashToolDescription(
@@ -280,7 +285,13 @@ export function bashToolDescription(
   const tasks = backgroundOn
     ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; ${autoPromote}. Use background: true yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitDescription(watchToolRegistered, status, role)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(status, write)}.`
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
-  return `Execute shell commands.${compression}${tasks}
+  const outputRules = backgroundOn
+    ? " Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report."
+    : "";
+  const timeoutRules =
+    " `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.";
+  const remoteRuns = surface.remoteRuns ? ` ${BASH_RUNON_GUIDANCE}` : "";
+  return `Execute shell commands.${compression}${tasks}${outputRules}${timeoutRules}${remoteRuns}
 
 DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`;
 }
@@ -502,6 +513,11 @@ export function createBashTool(
         ),
       }
     : {};
+  // `runon` exists only in subc mode with remote runs enabled in the user
+  // config (and not turned off by the project), decided once here; runner
+  // health never adds or removes it.
+  const remoteRuns = () => remoteRunsOffered(ctx.config);
+  const runonArg = { runon: z.string().optional().describe(BASH_RUNON_DESCRIPTION) };
   const args = {
     command: z
       .string()
@@ -532,22 +548,40 @@ export function createBashTool(
   // probes the module first; it only records whether the previous command used the
   // host path so the first successful module call clears fallback mode immediately.
   let hostFallbackActive = false;
+  let surfaceDescription: string | undefined;
 
   return {
-    description: bashToolDescription(
-      false,
-      initialBashCfg.compress,
-      initialBashCfg.background,
-      true,
-      toolEnabled(ctx.config, "aft_zoom"),
-      bashCompanionRegistered(ctx.config, "bash_watch"),
-      {
-        outline: toolEnabled(ctx.config, "aft_outline"),
-        status: statusRegistered,
-        write: writeRegistered,
-      },
-    ),
-    args: args as ToolDefinition["args"],
+    get description() {
+      const baseDescription =
+        surfaceDescription ??
+        bashToolDescription(
+          false,
+          initialBashCfg.compress,
+          initialBashCfg.background,
+          true,
+          toolEnabled(ctx.config, "aft_zoom"),
+          bashCompanionRegistered(ctx.config, "bash_watch"),
+          {
+            outline: toolEnabled(ctx.config, "aft_outline"),
+            status: statusRegistered,
+            write: writeRegistered,
+            remoteRuns: false,
+          },
+        );
+      return remoteRuns() ? `${baseDescription}\n\n${BASH_RUNON_GUIDANCE}` : baseDescription;
+    },
+    set description(value: string) {
+      // Registration narrows companion wording after disabled tools are known.
+      // Keep that wording, but derive remote guidance from the live gate.
+      surfaceDescription = value
+        .replaceAll(` ${BASH_RUNON_GUIDANCE}`, "")
+        .replaceAll(`\n\n${BASH_RUNON_GUIDANCE}`, "");
+    },
+    get args() {
+      return normalizeToolArgSchemas({
+        args: { ...args, ...(remoteRuns() ? runonArg : {}) } as ToolDefinition["args"],
+      }).args;
+    },
     execute: async (args, context) => {
       const bashCfg = resolveBashConfig(ctx.config);
       const ctxAftSearchRegistered =
@@ -621,6 +655,15 @@ export function createBashTool(
       const ptyRows = coerceOptionalInt(args.ptyRows, "ptyRows", 1, 60);
       const ptyCols = coerceOptionalInt(args.ptyCols, "ptyCols", 1, 140);
       const compressed = coerceBoolean(args.compressed, true);
+      // Forwarded whenever present, even if this surface does not offer it:
+      // the engine refuses a remote run it cannot make by name, and a stale
+      // `runon` must never quietly become a local run.
+      const runon = args.runon;
+      if (runon !== undefined && !remoteRunsOffered(ctx.config)) {
+        throw new Error(
+          "runon refused: remote execution or bash.runon_enabled is unavailable in this session",
+        );
+      }
       const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
       // Only log when the gate actually changes behavior (subagent path).
       // The common primary-session foreground case is the overwhelming
@@ -665,6 +708,7 @@ export function createBashTool(
             block_to_completion: blockToCompletion,
             wait: requestedWait,
             sandbox: args.sandbox,
+            ...(runon !== undefined ? { runon } : {}),
           },
           callBashBridge,
           {
@@ -689,6 +733,11 @@ export function createBashTool(
         }
         if (requestedPty) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; pty:true is unsupported.`);
+        }
+        if (runon !== undefined) {
+          throw new Error(
+            `${BASH_HOST_FALLBACK_REFUSAL}; runon is unsupported, and the command was not run locally.`,
+          );
         }
 
         const projectRoot = projectRootFor(context);

@@ -1,0 +1,6 @@
+{
+  "gh_shim": {
+    "enabled": true,
+    "binary_path": "/tmp/evil-shim"
+  }
+}

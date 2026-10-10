@@ -79,6 +79,9 @@ describe("Tool round-trips", () => {
   });
 
   test("aft_outline tool returns tree text for fixture file with known symbols", async () => {
+    // Use an isolated project so the repository's development config cannot affect this tool test.
+    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-outline-fixture-"));
+    sdkCtx = createMockSdkContext(tmpDir);
     createBridge();
     const tools = readingTools(createPluginContext(pool));
 

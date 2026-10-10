@@ -1,16 +1,17 @@
-//! The `aft doctor --fix` configuration migration.
+//! The retired-key configuration migration behind `aft doctor --fix` and the
+//! automatic rewrite of the user config file.
 //!
-//! Ordinary loading translates the keys retired by the switch to
-//! `disabled_tools`/`indexes` (`tool_surface`, `hoist_builtin_tools`,
-//! top-level `enabled`, `search_index`, `semantic_search`, `callgraph_store`,
-//! `github.enabled` and the prefixed `aft_*` host names) during the migration
-//! window ([`PolicyPhase::Window`], the releases that still accept them) and
-//! rejects them afterwards; it rejects the already-retired GitHub enable
-//! aliases (`gh_read`, `gh_shim.enabled`) at every version. This module is the
-//! only reader allowed to repair them. It
-//! rewrites each consumed config file so that it states the same intent with
-//! canonical keys, and splices the changes into the original text so comments,
-//! formatting and unrelated keys survive.
+//! Ordinary loading translates the retired keys (`tool_surface`,
+//! `hoist_builtin_tools`, top-level `enabled`, `search_index`,
+//! `semantic_search`, `callgraph_store`, `github.enabled`, the GitHub enable
+//! aliases `gh_read`/`gh_shim.enabled`, the prefixed `aft_*` host names,
+//! `idle.lsp_ttl_minutes` and the two removed inspect keys) in memory and never
+//! refuses them. This module rewrites a config file so that it states the same
+//! intent with canonical keys, and splices the changes into the original text
+//! so comments, formatting and unrelated keys survive. `doctor --fix` runs it
+//! for the user and project files on request; [`auto_migrate_user_config`]
+//! runs it for the user file whenever AFT loads that file. A project file is
+//! shared through its repository and is never rewritten automatically.
 //!
 //! Every block is repaired: the base object and each embedded
 //! `harnesses.<id>` object. A project file only ever gains disables for
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::feature_config::{self, PolicyPhase, INDEX_INPUTS, RETIRED_PATHS};
+use crate::feature_config::{self, INDEX_INPUTS, RETIRED_PATHS};
 use crate::jsonc_edit::{self, JsoncDocument};
 
 /// Which trust tier a config file belongs to.
@@ -141,7 +142,7 @@ fn repair_github_aliases(
 }
 
 /// Rewrite one block's retired keys to the canonical values ordinary loading
-/// derives from them while it still accepts them ([`PolicyPhase::Window`]).
+/// derives from them ([`feature_config::translate_document`]).
 fn migrate_block(
     doc: &mut JsoncDocument,
     prefix: &[String],
@@ -208,7 +209,24 @@ fn migrate_block(
         }
     }
 
-    for (path, _) in RETIRED_PATHS {
+    if let Some(value) = raw.get("idle").and_then(|idle| idle.get("lsp_ttl_minutes")) {
+        if raw
+            .get("lsp")
+            .and_then(|lsp| lsp.get("idle_minutes"))
+            .is_none()
+        {
+            let minutes = feature_config::retired_lsp_idle_minutes(value);
+            doc.set(
+                &path_of(prefix, &["lsp", "idle_minutes"]),
+                &Value::from(minutes),
+            )?;
+        }
+    }
+
+    for (path, _) in RETIRED_PATHS
+        .into_iter()
+        .chain(feature_config::REMOVED_INSPECT_LSP_PATHS)
+    {
         let segments: Vec<&str> = path.split('.').collect();
         let present = match segments.as_slice() {
             [key] => raw.contains_key(*key),
@@ -263,11 +281,7 @@ pub fn migrate_config_text(text: &str, tier: FixTier) -> Result<Migration, Strin
         FixTier::User => feature_config::DocumentTier::User,
         FixTier::Project => feature_config::DocumentTier::Project,
     };
-    let translation =
-        feature_config::translate_document(&mut translated, PolicyPhase::Window, document_tier);
-    if !translation.errors.is_empty() {
-        return Err(translation.errors.join("\n"));
-    }
+    feature_config::translate_document(&mut translated, document_tier);
     let translated = Value::Object(translated);
     for prefix in &prefixes {
         let (Some(raw_block), Some(translated_block)) =
@@ -358,6 +372,249 @@ pub fn fix_files(targets: &[(PathBuf, FixTier)]) -> Vec<FixOutcome> {
             }
         })
         .collect()
+}
+
+/// What the automatic migration of the user config file did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserConfigMigration {
+    /// The file was rewritten to current keys; `backup` holds its previous text.
+    Migrated {
+        path: PathBuf,
+        backup: PathBuf,
+        notice: String,
+    },
+    /// The file still uses retired keys because it could not be rewritten.
+    /// Loading translates them in memory, so nothing is refused.
+    NotMigrated {
+        path: PathBuf,
+        reason: String,
+        notice: String,
+    },
+}
+
+impl UserConfigMigration {
+    /// The user-facing notice for this outcome.
+    pub fn notice(&self) -> &str {
+        match self {
+            Self::Migrated { notice, .. } | Self::NotMigrated { notice, .. } => notice,
+        }
+    }
+}
+
+/// How long another process's migration lock is honoured before it is
+/// treated as left behind by a crash and removed.
+const MIGRATION_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a loader waits for another process that is migrating the same
+/// file before it gives up and translates in memory.
+const MIGRATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The retired-key translation of a config text, when it parses as an object
+/// and uses at least one retired key.
+fn retired_key_translation(text: &str) -> Option<feature_config::DocumentTranslation> {
+    let value = serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(text)).ok()?;
+    let Value::Object(mut map) = value else {
+        return None;
+    };
+    let translation =
+        feature_config::translate_document(&mut map, feature_config::DocumentTier::User);
+    translation.legacy_input.then_some(translation)
+}
+
+/// Exclusive, cross-process right to rewrite one config file, held as a lock
+/// file next to it and removed on drop.
+struct MigrationLock {
+    path: PathBuf,
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+enum LockAttempt {
+    Acquired(MigrationLock),
+    /// Another process holds the lock and did not release it in time.
+    Busy,
+    Failed(std::io::Error),
+}
+
+fn acquire_migration_lock(target: &Path) -> LockAttempt {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "aft.jsonc".to_string());
+    let path = target.with_file_name(format!(".{name}.migrate.lock"));
+    let deadline = std::time::Instant::now() + MIGRATION_LOCK_WAIT;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return LockAttempt::Acquired(MigrationLock { path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > MIGRATION_LOCK_STALE);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return LockAttempt::Busy;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => {
+                // Windows refuses to create a file whose previous holder is
+                // still deleting it (a delete-pending name) with
+                // ERROR_ACCESS_DENIED rather than AlreadyExists, so a
+                // concurrent migration releasing the lock looks like a
+                // permission error. Retry it like a held lock until the wait
+                // ends; a real permission problem still fails after that.
+                if cfg!(windows)
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                return LockAttempt::Failed(error);
+            }
+        }
+    }
+}
+
+/// Write `text` to a new sibling backup file `<name>.bak-<unix seconds>`
+/// (with a counter when that name is taken) carrying `target`'s permissions.
+fn write_backup(target: &Path, text: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "aft.jsonc".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let mut attempt = 0u32;
+    loop {
+        let candidate = if attempt == 0 {
+            target.with_file_name(format!("{name}.bak-{stamp}"))
+        } else {
+            target.with_file_name(format!("{name}.bak-{stamp}-{attempt}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let written = (|| {
+                    file.write_all(text.as_bytes())?;
+                    file.sync_all()?;
+                    if let Ok(metadata) = std::fs::metadata(target) {
+                        std::fs::set_permissions(&candidate, metadata.permissions())?;
+                    }
+                    Ok(())
+                })();
+                return match written {
+                    Ok(()) => Ok(candidate),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&candidate);
+                        Err(error)
+                    }
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Rewrite the user config file at `path` to current keys when it uses
+/// retired ones, with the same comment-preserving migration `doctor --fix`
+/// performs.
+///
+/// Returns `None` when there is nothing to report: the file is missing,
+/// unreadable, does not parse (ordinary loading reports that), uses no retired
+/// key, or another process migrated it meanwhile. The rewrite is atomic (a
+/// sibling temporary file renamed over the target, keeping its permissions),
+/// keeps the previous text in a `<name>.bak-<unix seconds>` file beside it,
+/// and is serialized across processes by a lock file, so only one of several
+/// loaders rewrites the file and reports it. A symlinked file is rewritten at
+/// its target so the link survives. A read-only file, a debug build pointed at
+/// the account's own config directory (see
+/// [`crate::production_storage::config_write_refusal`]), or any failure leaves
+/// the file as it was and returns [`UserConfigMigration::NotMigrated`]; the
+/// caller's in-memory translation still applies its current equivalents.
+pub fn auto_migrate_user_config(path: &Path) -> Option<UserConfigMigration> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let translation = retired_key_translation(&text)?;
+    let display = path.display().to_string();
+    let not_migrated = |reason: String, translation: &feature_config::DocumentTranslation| {
+        Some(UserConfigMigration::NotMigrated {
+            path: path.to_path_buf(),
+            notice: feature_config::user_config_not_migrated_notice(&display, &reason, translation),
+            reason,
+        })
+    };
+
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(reason) = crate::production_storage::config_write_refusal(&target) {
+        return not_migrated(reason, &translation);
+    }
+    match std::fs::metadata(&target) {
+        Ok(metadata) if metadata.permissions().readonly() => {
+            return not_migrated("the file is read-only".to_string(), &translation);
+        }
+        Ok(_) => {}
+        Err(error) => return not_migrated(format!("could not inspect it: {error}"), &translation),
+    }
+    let _lock = match acquire_migration_lock(&target) {
+        LockAttempt::Acquired(lock) => lock,
+        // Another loader is rewriting the file and will report it.
+        LockAttempt::Busy => return None,
+        LockAttempt::Failed(error) => {
+            return not_migrated(format!("could not lock it: {error}"), &translation);
+        }
+    };
+
+    // Re-read under the lock: another process may have finished meanwhile.
+    let text = match std::fs::read_to_string(&target) {
+        Ok(text) => text,
+        Err(error) => return not_migrated(format!("could not read it: {error}"), &translation),
+    };
+    let translation = retired_key_translation(&text)?;
+    let migration = match migrate_config_text(&text, FixTier::User) {
+        Ok(migration) if migration.changed => migration,
+        Ok(_) => return None,
+        Err(error) => return not_migrated(error, &translation),
+    };
+    let backup = match write_backup(&target, &text) {
+        Ok(backup) => backup,
+        Err(error) => {
+            return not_migrated(format!("could not write a backup: {error}"), &translation);
+        }
+    };
+    if let Err(error) = jsonc_edit::write_atomic(&target, &migration.text) {
+        let _ = std::fs::remove_file(&backup);
+        return not_migrated(format!("could not write it: {error}"), &translation);
+    }
+    Some(UserConfigMigration::Migrated {
+        path: path.to_path_buf(),
+        notice: feature_config::user_config_migrated_notice(
+            &display,
+            &backup.display().to_string(),
+            &translation,
+        ),
+        backup,
+    })
 }
 
 #[cfg(test)]

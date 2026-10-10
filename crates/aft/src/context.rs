@@ -41,6 +41,11 @@ use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThread
 #[path = "gitignore_state.rs"]
 mod gitignore_state;
 pub(crate) use gitignore_state::IgnoreRuleChange;
+// The shared ignore-rule definition every project walker applies; see
+// `apply_project_ignore_rules`.
+pub(crate) use gitignore_state::apply_project_ignore_rules;
+#[cfg(test)]
+pub(crate) use gitignore_state::ignore_rules_fixture;
 
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
@@ -504,6 +509,7 @@ pub struct StatusBarCounts {
 /// value and remains absent instead of being converted to a clean zero.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatusBarCountValues {
+    pub disabled_categories: Vec<&'static str>,
     pub errors: Option<usize>,
     pub warnings: Option<usize>,
     pub dead_code: Option<usize>,
@@ -514,6 +520,39 @@ pub struct StatusBarCountValues {
 }
 
 impl StatusBarCountValues {
+    fn mask_disabled(mut self, inspect: &crate::config::InspectConfig) -> Self {
+        self.disabled_categories = InspectCategory::active()
+            .iter()
+            .copied()
+            .filter(|category| {
+                *category != InspectCategory::Metrics && !inspect.category_enabled(*category)
+            })
+            .map(InspectCategory::as_str)
+            .collect();
+        if self.disabled_categories.contains(&"diagnostics") {
+            self.errors = None;
+            self.warnings = None;
+        }
+        if self.disabled_categories.contains(&"dead_code") {
+            self.dead_code = None;
+        }
+        if self.disabled_categories.contains(&"unused_exports") {
+            self.unused_exports = None;
+        }
+        if self.disabled_categories.contains(&"duplicates") {
+            self.duplicates = None;
+        }
+        if self.disabled_categories.contains(&"todos") {
+            self.todos = None;
+        }
+        if ["dead_code", "unused_exports", "duplicates"]
+            .iter()
+            .all(|key| self.disabled_categories.contains(key))
+        {
+            self.tier2_stale = false;
+        }
+        self
+    }
     pub(crate) fn legacy_projection(&self) -> Option<StatusBarCounts> {
         let [Some(errors), Some(warnings), Some(dead_code), Some(unused_exports), Some(duplicates), Some(todos)] = [
             self.errors,
@@ -703,6 +742,18 @@ pub struct Tier2HealthSnapshot {
     pub next_refresh_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_paths: Option<usize>,
+    /// Categories whose last build failed, with the failure reason, that
+    /// automatic refreshes skip until their retry pause ends.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub retry_paused: Vec<Tier2RetryPausedHealthSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Tier2RetryPausedHealthSnapshot {
+    pub category: &'static str,
+    pub reason: String,
+    pub identical_failures: u32,
+    pub retry_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -752,6 +803,7 @@ pub(crate) struct RootHealthSummary {
     tier2_stale_since_ms: Option<u64>,
     tier2_next_refresh_at_ms: Option<u64>,
     tier2_pending_paths: Option<usize>,
+    tier2_retry_paused: Vec<Tier2RetryPausedHealthSnapshot>,
     bash: Option<BgTaskHealthCounts>,
     suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
 }
@@ -769,6 +821,7 @@ impl RootHealthSummary {
             tier2_stale_since_ms: None,
             tier2_next_refresh_at_ms: None,
             tier2_pending_paths: None,
+            tier2_retry_paused: Vec::new(),
             bash: None,
             suspended_domains: Vec::new(),
         }
@@ -839,6 +892,7 @@ impl RootHealthSummary {
                 stale_since_ms: self.tier2_stale_since_ms,
                 next_refresh_at_ms: self.tier2_next_refresh_at_ms,
                 pending_paths: self.tier2_pending_paths,
+                retry_paused: self.tier2_retry_paused,
             }),
             bash: self.bash,
             suspended_domains: self.suspended_domains,
@@ -3905,23 +3959,26 @@ impl AppContext {
     /// checked before project scoping or tsconfig-membership work, so a cache hit
     /// faithfully reuses each category's presence or absence.
     pub fn status_bar_count_values(&self) -> StatusBarCountValues {
-        self.try_status_bar_count_values().unwrap_or_else(|| {
-            // Explicit status reads may still report independent Tier-2
-            // categories. Publishers use the try accessor and skip contention.
-            let tier2 = self
-                .status_bar_tier2
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            StatusBarCountValues {
-                errors: None,
-                warnings: None,
-                dead_code: tier2.dead_code,
-                unused_exports: tier2.unused_exports,
-                duplicates: tier2.duplicates,
-                todos: tier2.todos,
-                tier2_stale: tier2.stale,
-            }
-        })
+        self.try_status_bar_count_values()
+            .unwrap_or_else(|| {
+                // Explicit status reads may still report independent Tier-2
+                // categories. Publishers use the try accessor and skip contention.
+                let tier2 = self
+                    .status_bar_tier2
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                StatusBarCountValues {
+                    errors: None,
+                    warnings: None,
+                    dead_code: tier2.dead_code,
+                    unused_exports: tier2.unused_exports,
+                    duplicates: tier2.duplicates,
+                    todos: tier2.todos,
+                    tier2_stale: tier2.stale,
+                    disabled_categories: Vec::new(),
+                }
+            })
+            .mask_disabled(&self.config().inspect)
     }
 
     /// A busy manager is not a missing diagnostic producer. Publishers must
@@ -3944,7 +4001,7 @@ impl AppContext {
                 counts.errors = None;
                 counts.warnings = None;
             }
-            counts
+            counts.mask_disabled(&self.config().inspect)
         };
 
         {
@@ -4004,6 +4061,7 @@ impl AppContext {
             duplicates: tier2.duplicates,
             todos: tier2.todos,
             tier2_stale: tier2.stale,
+            disabled_categories: Vec::new(),
         };
 
         *self
@@ -4056,6 +4114,18 @@ impl AppContext {
         // is still building.
         let tier2_builder_busy = match self.inspect_manager.try_tier2_builder_busy() {
             Some(busy) => busy,
+            None => return RootHealthSummary::busy(),
+        };
+        let tier2_retry_paused = match self.inspect_manager.try_tier2_retry_pauses() {
+            Some(pauses) => pauses
+                .into_iter()
+                .map(|pause| Tier2RetryPausedHealthSnapshot {
+                    category: pause.category.as_str(),
+                    reason: pause.reason,
+                    identical_failures: pause.identical_failures,
+                    retry_at_ms: pause.retry_at_ms,
+                })
+                .collect(),
             None => return RootHealthSummary::busy(),
         };
         let bash = match self.bash_background.try_health_counts() {
@@ -4180,6 +4250,21 @@ impl AppContext {
                     current_batch: None,
                     total_batches: None,
                 },
+                SemanticIndexStatus::Failed(message)
+                    if crate::semantic_admission::is_not_opened_status(message) =>
+                {
+                    SemanticHealthComponentSnapshot {
+                        status: crate::semantic_admission::NOT_OPENED_LABEL,
+                        reason: None,
+                        since_ms: None,
+                        next_retry_ms: None,
+                        stage: None,
+                        embedded_chunks: None,
+                        total_chunks: None,
+                        current_batch: None,
+                        total_batches: None,
+                    }
+                }
                 SemanticIndexStatus::Failed(_) => SemanticHealthComponentSnapshot {
                     status: "degraded",
                     reason: None,
@@ -4282,6 +4367,7 @@ impl AppContext {
             tier2_stale_since_ms,
             tier2_next_refresh_at_ms,
             tier2_pending_paths,
+            tier2_retry_paused,
             bash: Some(bash),
             suspended_domains,
         }
@@ -5817,6 +5903,14 @@ impl AppContext {
         }
         publish(&mut slot);
         drop(slot);
+        // Database recovery can be the only event on a refused route. Queue its
+        // current status after releasing the open slot. Transport roots register
+        // their Arc; do not build a synchronous snapshot here for library callers
+        // that may still hold the process-shared connection or App slot.
+        let context = self.status_emitter.context.lock().unwrap().clone();
+        if context.strong_count() > 0 {
+            self.status_emitter.signal_context(context);
+        }
         true
     }
 
@@ -5923,7 +6017,7 @@ impl AppContext {
         // Some library callers enter this gate without transport admission.
         // They get the same bounded reopen as standalone and daemon calls,
         // never the bind's longer deferred initialization retry loop.
-        if self.database_runtime_state.load(Ordering::Acquire) == 3
+        if matches!(self.database_runtime_state.load(Ordering::Acquire), 3 | 5)
             && self.claim_database_runtime_retry(command)
         {
             self.retry_database_runtime();
@@ -6528,6 +6622,9 @@ impl AppContext {
             return false;
         }
         if !self.deleted_view_root_retired.swap(true, Ordering::AcqRel) {
+            if let Some(root) = self.canonical_cache_root_opt() {
+                crate::cold_build_limiter::progress::cancel_root(&root);
+            }
             crate::executor::view_publication::cancel_for_context(self);
             self.clear_view_runtime();
             log::info!(
@@ -6546,6 +6643,9 @@ impl AppContext {
     }
 
     pub(crate) fn clear_view_runtime(&self) {
+        if let Some(root) = self.canonical_cache_root_opt() {
+            crate::cold_build_limiter::progress::cancel_root(&root);
+        }
         self.reset_view_publication_retry();
         self.checkout_driver.clear();
         self.checkout_semantic.clear();
@@ -7452,11 +7552,16 @@ impl AppContext {
                     };
                 }
             }
-            // The detached standalone view publication owns this graph. A query
-            // before installation must disclose loading, not start a legacy
-            // graph on stdin. Daemon and in-process warmers keep their fallback.
-            if self.daemonless_query_mode()
-                && (self.git_common_dir().is_some() || self.view_runtime_snapshot().is_some())
+            // Borrowers assemble their own view from shared blobs, not the
+            // owner's legacy graph. Until its first generation is pinned, stay
+            // on the view route even before configure maintenance installs the
+            // runtime. Falling through would refuse a missing legacy store
+            // that a views-on owner never needs to build.
+            // Standalone queries also leave publication to their detached worker;
+            // writer-backed daemon and in-process warmers retain their fallback.
+            if self.shared_artifacts_read_only()
+                || (self.daemonless_query_mode()
+                    && (self.git_common_dir().is_some() || self.view_runtime_snapshot().is_some()))
             {
                 return CallgraphStoreAccess::Building;
             }
@@ -8525,6 +8630,9 @@ impl AppContext {
     /// (transactional take in the TTL reaper), whose strict invalidation
     /// subsumes their purpose.
     pub(crate) fn cancel_unbound_artifact_work(&self) {
+        if let Some(root) = self.canonical_cache_root_opt() {
+            crate::cold_build_limiter::progress::cancel_root(&root);
+        }
         // A cancelled non-ready search corpus refresh left the resident index
         // marked not-ready; retiring its receiver alone would strand it
         // (equivalent rebind only reloads a MISSING index). Drop the resident
@@ -8784,6 +8892,15 @@ impl AppContext {
     where
         I: IntoIterator<Item = PathBuf>,
     {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        // A change to a Tier-2 input ends any automatic-retry pause on a
+        // failed category, so a fix is picked up by the next automatic
+        // refresh instead of after the pause.
+        let project_root = self.config().project_root.clone();
+        self.inspect_manager.note_tier2_input_paths_changed(
+            project_root.as_deref(),
+            paths.iter().map(PathBuf::as_path),
+        );
         self.pending_tier2_paths.lock().extend(paths);
     }
 
@@ -8822,6 +8939,8 @@ impl AppContext {
     }
 
     pub fn reset_tier2_refresh_scheduler(&self) {
+        // A configure that changes the Tier-2 work can change its inputs.
+        self.inspect_manager.clear_tier2_retry_pauses();
         let now = Instant::now();
         let cold_ready_at = crate::inspect::tier2_scheduler::process_tier2_cold_start_pacer()
             .lock()
@@ -8990,7 +9109,12 @@ impl AppContext {
         // whole session in which nobody ran one. Refresh it on the same cadence
         // as the Tier-2 counts; its completion is drained with theirs. Linked
         // worktrees skip automatic scans for Tier-2 and do the same here.
-        if manager.automatic_tier2_refresh_enabled() {
+        if manager.automatic_tier2_refresh_enabled()
+            && snapshot
+                .config
+                .inspect
+                .category_enabled(InspectCategory::Todos)
+        {
             if let Err(error) = manager.submit_background(
                 snapshot.clone(),
                 InspectCategory::Todos,
@@ -9032,6 +9156,15 @@ impl AppContext {
                 error.message
             );
         }
+        for pause in submission.retry_paused {
+            crate::slog_info!(
+                "tier2 refresh skipped {}: last build failed ({}); identical_failures={}, automatic retries paused until unix_ms={}",
+                pause.category,
+                pause.reason,
+                pause.identical_failures,
+                pause.retry_at_ms
+            );
+        }
     }
 
     fn automatic_tier2_refresh_categories(snapshot: &InspectSnapshot) -> Vec<InspectCategory> {
@@ -9040,6 +9173,7 @@ impl AppContext {
             .iter()
             .copied()
             .filter(|category| category.is_tier2())
+            .filter(|category| snapshot.config.inspect.category_enabled(*category))
             .filter(|category| {
                 if *category == InspectCategory::DeadCode && !callgraph_store_enabled {
                     // With callgraph_store=false, the scan produces zero reusable
@@ -10963,9 +11097,13 @@ impl AppContext {
     fn resolved_path_restriction_root(&self, root: &Path) -> PathBuf {
         let mut memo = self.path_restriction_root_memo.lock();
         if let Some(cached) = memo.as_ref() {
-            if cached.configured_root.as_os_str() == root.as_os_str()
-                && cached.resolved_root.exists()
-            {
+            let root_exists = cached.configured_root.as_os_str() == root.as_os_str()
+                && if crate::bounded_io::current().is_some() {
+                    crate::bounded_io::metadata(&cached.resolved_root).is_ok()
+                } else {
+                    cached.resolved_root.exists()
+                };
+            if root_exists {
                 return cached.resolved_root.clone();
             }
         }
@@ -10978,7 +11116,19 @@ impl AppContext {
         #[cfg(test)]
         self.path_restriction_root_canonicalizations
             .fetch_add(1, Ordering::SeqCst);
-        let resolved_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let resolved_root = if crate::bounded_io::current().is_some() {
+            match crate::bounded_io::canonicalize(root) {
+                Ok(root) => root,
+                // The request will return read_blocked; do not cache a lexical
+                // root identity from a timed-out probe for subsequent requests.
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    return root.to_path_buf()
+                }
+                Err(_) => root.to_path_buf(),
+            }
+        } else {
+            std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+        };
         *memo = Some(PathRestrictionRootMemo {
             configured_root: root.to_path_buf(),
             resolved_root: resolved_root.clone(),
@@ -11147,19 +11297,31 @@ impl AppContext {
         // fails (e.g. path does not exist or traverses a broken symlink), inspect
         // every existing component with lstat before falling back lexically so a
         // broken in-root symlink cannot be used to write outside project_root.
-        let resolved = match std::fs::canonicalize(&path_for_resolution) {
-            Ok(resolved) => resolved,
-            Err(_) => {
-                let normalized = normalize_path(&path_for_resolution);
-                reject_escaping_symlink(
-                    req_id,
-                    &path_for_resolution,
-                    &normalized,
-                    &resolved_root,
-                    &raw_root,
-                )?;
-                resolve_with_existing_ancestors(&normalized)
+        let resolve = |req_id: &str, path: &Path, resolved_root: &Path, raw_root: &Path| {
+            match std::fs::canonicalize(path) {
+                Ok(resolved) => Ok(resolved),
+                Err(_) => {
+                    let normalized = normalize_path(path);
+                    reject_escaping_symlink(req_id, path, &normalized, resolved_root, raw_root)?;
+                    Ok(resolve_with_existing_ancestors(&normalized))
+                }
             }
+        };
+        let resolved = if crate::bounded_io::current().is_some() {
+            // Even authorization's symlink/ancestor probes can block on a
+            // remote volume. Keep the work owned and fail closed on timeout;
+            // never fall back to a lexical authorization after a timed-out stat.
+            let id = req_id.to_string();
+            let owned_resolved_root = resolved_root.clone();
+            let owned_raw_root = raw_root.clone();
+            crate::bounded_io::run(&path_for_resolution, None, move |path| {
+                Ok(resolve(&id, &path, &owned_resolved_root, &owned_raw_root))
+            })
+            .map_err(|error| {
+                crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
+            })??
+        } else {
+            resolve(req_id, &path_for_resolution, &resolved_root, &raw_root)?
         };
 
         if !resolved.starts_with(&resolved_root) {
@@ -12374,9 +12536,7 @@ mod callgraph_store_for_ops_tests {
                 "harness": "opencode",
                 "storage_dir": storage_dir,
                 "config": [user_tier(json!({
-                    "callgraph_store": true,
-                    "search_index": true,
-                    "semantic_search": true,
+                    "indexes": { "trigram": true, "semantic": true, "callgraph": true },
                 }))],
             })),
             &ctx,
@@ -15358,6 +15518,221 @@ mod shared_db_tests {
     fn make_database_retry_due(ctx: &AppContext) {
         ctx.database_runtime_failure.lock().retry_at =
             Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    fn resident_database_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+        let storage = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let ctx = AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "resident-recovery".into(),
+        );
+        crate::database_open::run_staged_open(
+            &ctx,
+            crate::database_open::DatabaseOpenRunner::ConfigureTail,
+            true,
+        );
+        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 2);
+        (storage, root, ctx)
+    }
+
+    // A separate process, not a second fd in this process, changes the live
+    // fixture while the App retains its SQLite handle and WAL locks.
+    fn change_schema_in_child(path: &Path, version: u32) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "context::shared_db_tests::repaired_resident_database_rechecks_schema_and_pushes_recovered_status",
+                "--nocapture",
+            ])
+            .env("AFT_TEST_SCHEMA_REPAIR_PATH", path)
+            .env("AFT_TEST_SCHEMA_REPAIR_VERSION", version.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "schema repair child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    fn assert_database_status(ctx: &AppContext, refused: bool) {
+        let status = ctx.build_status_snapshot();
+        let reasons = status["degraded_reasons"].as_array().unwrap();
+        assert_eq!(
+            reasons
+                .iter()
+                .any(|reason| reason == "storage_requires_newer_reader:aft.db"),
+            refused,
+            "unexpected database degraded reasons: {reasons:?}"
+        );
+        assert_eq!(
+            status["storage_refusals"].as_array().unwrap().len(),
+            usize::from(refused)
+        );
+    }
+
+    #[test]
+    fn repaired_resident_database_rechecks_schema_and_pushes_recovered_status() {
+        if let Some(path) = std::env::var_os("AFT_TEST_SCHEMA_REPAIR_PATH") {
+            crate::test_storage::assert_database(Path::new(&path));
+            let version: u32 = std::env::var("AFT_TEST_SCHEMA_REPAIR_VERSION")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            conn.execute("UPDATE schema_version SET version = ?1", [version])
+                .unwrap();
+            conn.execute_batch("COMMIT").unwrap();
+            return;
+        }
+        let (storage, _root, owner) = resident_database_context();
+        let resident = owner.db().unwrap();
+        let path = storage.path().join("aft.db");
+        change_schema_in_child(&path, crate::db::CURRENT_SCHEMA_VERSION + 1);
+        let affected_root = tempdir().unwrap();
+        let ctx = Arc::new(AppContext::from_app(
+            owner.app(),
+            Config {
+                project_root: Some(affected_root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.set_degraded_reasons(vec!["artifact_owner_read_only".into()]);
+        ctx.set_canonical_cache_root(affected_root.path().to_path_buf());
+        ctx.begin_database_runtime(
+            affected_root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "affected-route".into(),
+        );
+        let peeks = crate::db::schema_peek_count_for_test();
+        crate::database_open::run_staged_open(
+            &ctx,
+            crate::database_open::DatabaseOpenRunner::ConfigureTail,
+            true,
+        );
+        assert!(persistence_call(&ctx).is_some());
+        assert_database_status(&ctx, true);
+
+        change_schema_in_child(&path, crate::db::CURRENT_SCHEMA_VERSION);
+        // Expire the real two-second backoff deterministically without sleeping.
+        assert_eq!(
+            ctx.database_runtime_failure.lock().backoff,
+            Duration::from_secs(2)
+        );
+        make_database_retry_due(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctx.bind_status_context();
+        ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            let _ = tx.send(frame);
+        }))));
+        assert!(
+            persistence_call(&ctx).is_none(),
+            "repaired schema remained refused"
+        );
+        assert_database_status(&ctx, false);
+        assert!(Arc::ptr_eq(&resident, &ctx.db().unwrap()));
+        assert_eq!(
+            crate::db::schema_peek_count_for_test(),
+            peeks,
+            "recovery opened a second descriptor"
+        );
+        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "persist", "command": "db_set_host_state",
+            "params": {"key": "recovered", "value": "resident"}
+        }))
+        .unwrap();
+        assert!(crate::commands::state::handle_db_set_host_state(&request, &ctx).success);
+        assert_eq!(
+            crate::db::state::get_host_state(&resident.lock().unwrap(), "recovered").unwrap(),
+            Some("resident".into())
+        );
+        let frame = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("recovery must push status_changed without another index event");
+        let crate::protocol::PushFrame::StatusChanged(status) = frame else {
+            panic!("unexpected frame: {frame:?}")
+        };
+        assert!(!status.snapshot["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "storage_requires_newer_reader:aft.db"));
+        assert!(status.snapshot["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "artifact_owner_read_only"));
+    }
+
+    #[test]
+    fn resident_database_busy_retry_preserves_refusal_until_schema_is_rechecked() {
+        let (storage, _root, ctx) = resident_database_context();
+        let resident = ctx.db().unwrap();
+        let path = storage.path().join("aft.db");
+        change_schema_in_child(&path, crate::db::CURRENT_SCHEMA_VERSION + 1);
+        ctx.finish_database_runtime_error("recheck schema".into(), false);
+        make_database_retry_due(&ctx);
+        assert!(persistence_call(&ctx).is_some());
+        assert_database_status(&ctx, true);
+        let peeks = crate::db::schema_peek_count_for_test();
+        let held = resident.lock().unwrap();
+        make_database_retry_due(&ctx);
+        let response = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+        assert!(response["message"]
+            .as_str()
+            .unwrap()
+            .contains("process-shared database connection is in use"));
+        drop(held);
+        assert_database_status(&ctx, true);
+        change_schema_in_child(&path, crate::db::CURRENT_SCHEMA_VERSION);
+        assert!(
+            persistence_call(&ctx).is_none(),
+            "busy refusal stayed latched after releasing the connection"
+        );
+        assert_database_status(&ctx, false);
+        assert!(Arc::ptr_eq(&resident, &ctx.db().unwrap()));
+        assert_eq!(crate::db::schema_peek_count_for_test(), peeks);
+    }
+
+    #[test]
+    fn resident_database_open_slot_busy_recovers_on_next_call() {
+        let (_storage, _root, ctx) = resident_database_context();
+        let resident = ctx.db().unwrap();
+        let peeks = crate::db::schema_peek_count_for_test();
+        ctx.finish_database_runtime_error("retry open".into(), false);
+        make_database_retry_due(&ctx);
+        let app = ctx.app();
+        let held = app.db.lock();
+        let response = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+        assert!(response["message"]
+            .as_str()
+            .unwrap()
+            .contains("process-shared database connection is in use"));
+        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 5);
+        drop(held);
+        assert!(
+            persistence_call(&ctx).is_none(),
+            "busy refusal stayed latched after releasing the open slot"
+        );
+        assert!(Arc::ptr_eq(&resident, &ctx.db().unwrap()));
+        assert_eq!(crate::db::schema_peek_count_for_test(), peeks);
     }
 
     #[test]

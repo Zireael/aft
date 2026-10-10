@@ -818,7 +818,7 @@ impl SemanticIndexLock {
         if !access.allows_write(project_key, &path) {
             return Ok(Self { _guard: None });
         }
-        fs::create_dir_all(&dir)?;
+        crate::private_storage::open_dir(storage_dir, &dir)?;
         let _acquire_guard = SEMANTIC_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("semantic cache lock acquisition mutex poisoned"))?;
@@ -2371,6 +2371,7 @@ impl SemanticEmbeddingModel {
         match self.embed_texts(texts.clone(), EmbeddingRequestPolicy::Build(budget)) {
             Ok(vectors) => {
                 validate_embedding_batch(&vectors, texts.len(), "embedding backend")?;
+                crate::cold_build_limiter::progress::embedded(texts.len());
                 Ok(texts
                     .into_iter()
                     .zip(vectors)
@@ -2416,6 +2417,7 @@ impl SemanticEmbeddingModel {
                     ) {
                         Ok(mut vectors) => {
                             validate_embedding_batch(&vectors, 1, "embedding backend")?;
+                            crate::cold_build_limiter::progress::embedded(1);
                             return Ok(vec![AdaptiveBuildRow {
                                 metadata: BuildEmbeddingRowMetadata {
                                     embedded_text,
@@ -3663,7 +3665,7 @@ impl EmbeddingEntry {
     }
 }
 
-enum BuildEmbeddingRow {
+pub(crate) enum BuildEmbeddingRow {
     Embedded {
         embedded_text: String,
         vector: Vec<f32>,
@@ -3674,7 +3676,7 @@ enum BuildEmbeddingRow {
     },
 }
 
-fn execute_build_embedding_batch<F>(
+pub(crate) fn execute_build_embedding_batch<F>(
     texts: Vec<String>,
     embed_fn: &mut F,
 ) -> Result<Vec<BuildEmbeddingRow>, String>
@@ -3685,6 +3687,9 @@ where
     let requested_texts = texts.clone();
     let vectors = embed_fn(texts)?;
     let metadata = take_http_build_metadata();
+    // Adaptive HTTP requests report their successful sub-batches immediately,
+    // including when later requests fail. Generic/local providers report here.
+    let reported_by_http = metadata.is_some();
 
     // Skipped rows carry an empty vector on purpose; the count check still
     // applies because every requested row must have exactly one slot.
@@ -3737,6 +3742,13 @@ where
         });
     }
 
+    if !reported_by_http {
+        crate::cold_build_limiter::progress::embedded(
+            rows.iter()
+                .filter(|row| matches!(row, BuildEmbeddingRow::Embedded { .. }))
+                .count(),
+        );
+    }
     Ok(rows)
 }
 
@@ -4927,12 +4939,16 @@ impl SemanticIndex {
         embed_text_caps: EmbedTextCaps,
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
         let collect_started = Instant::now();
+        let progress = crate::cold_build_limiter::progress::counter();
         let collect_one = |file: &Path, sched: Duration| {
             let mut phases = SemanticCollectPhaseTimings {
                 sched,
                 ..SemanticCollectPhaseTimings::default()
             };
             let result = collect_semantic_file(project_root, file, embed_text_caps, &mut phases);
+            if let Some(progress) = &progress {
+                progress.advance(1);
+            }
             (file.to_path_buf(), result, phases)
         };
         let per_file: Vec<CollectedSemanticFile> = if files.len() <= 2 {
@@ -5251,6 +5267,18 @@ impl SemanticIndex {
     {
         debug_assert!(project_root.is_absolute());
         let total_chunks = chunks.len();
+        crate::cold_build_limiter::progress::phase("embedding", Some(file_metadata.len()));
+        // A file is complete only after its last chunk's batch has returned.
+        // Chunkless files need no model work; skipped rows still finish a file.
+        let mut last_chunk = HashMap::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            last_chunk.insert(&chunk.file, index);
+        }
+        crate::cold_build_limiter::progress::advance(
+            file_metadata.len().saturating_sub(last_chunk.len()),
+        );
+        let mut file_ends: Vec<usize> = last_chunk.into_values().collect();
+        file_ends.sort_unstable();
 
         if chunks.is_empty() {
             return Ok(Self {
@@ -5339,6 +5367,9 @@ impl SemanticIndex {
             }
 
             completed_rows += batch_end - batch_start;
+            let finished_files = file_ends.partition_point(|end| *end < batch_end)
+                - file_ends.partition_point(|end| *end < batch_start);
+            crate::cold_build_limiter::progress::advance(finished_files);
             if let Some(callback) = progress.as_mut() {
                 callback(completed_rows, total_chunks);
             }
@@ -5450,6 +5481,13 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
+        let _progress = crate::cold_build_limiter::progress::start(
+            project_root,
+            "semantic build",
+            Some(files.len()),
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
+        crate::cold_build_limiter::progress::phase("collecting", Some(files.len()));
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, embed_text_caps);
         let mut should_continue = || true;
         let result = Self::build_from_chunks(
@@ -5478,6 +5516,13 @@ impl SemanticIndex {
         P: FnMut(usize, usize),
     {
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
+        let _progress = crate::cold_build_limiter::progress::start(
+            project_root,
+            "semantic build",
+            Some(files.len()),
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
+        crate::cold_build_limiter::progress::phase("collecting", Some(files.len()));
         let (chunks, file_mtimes) =
             Self::collect_chunks(project_root, files, EmbedTextCaps::default());
         let total_chunks = chunks.len();
@@ -5538,6 +5583,13 @@ impl SemanticIndex {
         C: FnMut() -> bool,
     {
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
+        let _progress = crate::cold_build_limiter::progress::start(
+            project_root,
+            "semantic build",
+            Some(files.len()),
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
+        crate::cold_build_limiter::progress::phase("collecting", Some(files.len()));
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, embed_text_caps);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
@@ -6400,9 +6452,11 @@ impl SemanticIndex {
         let query_norm = vector_norm(query_vector);
         let cancellation = crate::executor::current_job_cancellation();
         let mut scored: Vec<(f32, usize)> = Vec::with_capacity(entries.len());
-        // Shared chunks repeat relative file paths. Eligibility is stable within
-        // a request, so resolve and filter each distinct shared file once.
-        let mut included_paths: HashMap<&Path, bool> = HashMap::new();
+        // Chunks repeat file paths in both the base and the local overlay.
+        // Eligibility is stable within a request, so filter each file once.
+        // Keep the representation in the key: shared paths resolve under the
+        // root, whereas local paths are passed to the predicate as recorded.
+        let mut included_paths: HashMap<(&Path, bool), bool> = HashMap::new();
         for (i, (entry, shared)) in entries.iter().enumerate() {
             if i % 64 == 0
                 && cancellation
@@ -6411,13 +6465,15 @@ impl SemanticIndex {
             {
                 break;
             }
-            let included = if *shared {
-                *included_paths
-                    .entry(entry.chunk.file.as_path())
-                    .or_insert_with(|| include(&self.project_root.join(&entry.chunk.file)))
-            } else {
-                include(&entry.chunk.file)
-            };
+            let included = *included_paths
+                .entry((entry.chunk.file.as_path(), *shared))
+                .or_insert_with(|| {
+                    if *shared {
+                        include(&self.project_root.join(&entry.chunk.file))
+                    } else {
+                        include(&entry.chunk.file)
+                    }
+                });
             if !included {
                 continue;
             }
@@ -6788,7 +6844,7 @@ impl SemanticIndex {
                 .as_nanos()
         ));
         let write_result = (|| -> io::Result<usize> {
-            let file = fs::File::create(&tmp_path)?;
+            let file = crate::private_storage::create(&tmp_path)?;
             let mut writer = BufWriter::new(file);
             let bytes_written = self.write_to_writer(&mut writer)?;
             writer.flush()?;
@@ -7049,7 +7105,7 @@ impl SemanticIndex {
         {
             return false;
         }
-        if let Err(error) = fs::create_dir_all(&dir) {
+        if let Err(error) = crate::private_storage::open_dir(storage_dir, &dir) {
             slog_warn!("failed to create semantic cache dir: {}", error);
             return false;
         }
@@ -7579,6 +7635,10 @@ impl SemanticIndex {
         expected_fingerprint: Option<&str>,
     ) -> Option<Self> {
         debug_assert!(current_canonical_root.is_absolute());
+        crate::private_storage::tighten_open_dir(
+            storage_dir,
+            &storage_dir.join("semantic").join(project_key),
+        );
         let data_path = storage_dir
             .join("semantic")
             .join(project_key)
@@ -7725,6 +7785,10 @@ impl SemanticIndex {
         project_key: &str,
         current_canonical_root: &Path,
     ) -> Option<Self> {
+        crate::private_storage::tighten_open_dir(
+            storage_dir,
+            &storage_dir.join("semantic").join(project_key),
+        );
         let load_started = Instant::now();
         let loaded = Self::read_from_disk_borrow_tolerant_inner(
             storage_dir,
@@ -8230,6 +8294,12 @@ impl SemanticIndex {
 
         // Entries
         let mut entries = Vec::with_capacity(entry_count);
+        // The dimension is validated above. Reuse one bounded byte buffer for
+        // complete vectors instead of dispatching a reader call for each float.
+        let vec_bytes = dimension
+            .checked_mul(F32_BYTES)
+            .ok_or_else(|| "semantic vector allocation overflow".to_string())?;
+        let mut vector_bytes = vec![0u8; vec_bytes];
         for _ in 0..entry_count {
             let raw_file = PathBuf::from(read_string_stream(&mut reader, total_len)?);
             let file = if version == SEMANTIC_INDEX_VERSION_V6
@@ -8263,22 +8333,18 @@ impl SemanticIndex {
             let embed_text = read_string_stream(&mut reader, total_len)?;
 
             // Vector
-            let vec_bytes = dimension
-                .checked_mul(F32_BYTES)
-                .ok_or_else(|| "semantic vector allocation overflow".to_string())?;
             if total_len.is_some_and(|len| reader.bytes_read().saturating_add(vec_bytes) > len) {
                 return Err("unexpected end of data reading vector".to_string());
             }
-            let mut vector = Vec::with_capacity(dimension);
-            for _ in 0..dimension {
-                let mut bytes = [0u8; F32_BYTES];
-                read_exact_stream(
-                    &mut reader,
-                    &mut bytes,
-                    "unexpected end of data reading vector",
-                )?;
-                vector.push(f32::from_le_bytes(bytes));
-            }
+            read_exact_stream(
+                &mut reader,
+                &mut vector_bytes,
+                "unexpected end of data reading vector",
+            )?;
+            let vector = vector_bytes
+                .chunks_exact(F32_BYTES)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect();
 
             entries.push(EmbeddingEntry::new(
                 SemanticChunk {
@@ -9200,9 +9266,8 @@ impl SemanticVectors {
     /// Decodes a stored view payload for `rel_path`. A payload stamped by any
     /// other producer is refused rather than read as current vectors.
     ///
-    /// The embedded text is not kept: views reuse whole runs by key, never
-    /// single chunks by text, and dropping it keeps the resident arena close to
-    /// the vectors themselves.
+    /// The embedded text is not kept in resident file runs. Chunk-vector reuse
+    /// uses separate indexed family rows, keeping the arena close to the vectors.
     pub(crate) fn decode_view_payload(
         payload: &[u8],
         rel_path: &Path,
@@ -9323,6 +9388,7 @@ pub(crate) fn chunk_view_file(
 /// Embeds several files' chunks in shared batches of `max_batch_size` texts and
 /// returns one run per file, in input order. Rows the backend skips are dropped
 /// exactly as a full build drops them.
+#[cfg(test)]
 pub(crate) fn embed_view_files<F>(
     files: Vec<Vec<SemanticChunk>>,
     embed_fn: &mut F,
@@ -9330,6 +9396,22 @@ pub(crate) fn embed_view_files<F>(
 ) -> Result<Vec<SemanticVectors>, String>
 where
     F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+{
+    embed_view_files_with_rows(
+        files,
+        &mut |texts| execute_build_embedding_batch(texts, embed_fn),
+        max_batch_size,
+    )
+}
+
+/// Assembles the same canonical file runs from validated fresh or reused rows.
+pub(crate) fn embed_view_files_with_rows<F>(
+    files: Vec<Vec<SemanticChunk>>,
+    rows_fn: &mut F,
+    max_batch_size: usize,
+) -> Result<Vec<SemanticVectors>, String>
+where
+    F: FnMut(Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
 {
     let mut runs = files
         .iter()
@@ -9346,7 +9428,7 @@ where
             .iter()
             .map(|(_, chunk)| chunk.embed_text.clone())
             .collect();
-        let rows = execute_build_embedding_batch(texts, embed_fn)?;
+        let rows = rows_fn(texts)?;
         for ((file, chunk), row) in batch.iter().zip(rows) {
             let mut chunk = chunk.clone();
             match row {
@@ -10834,6 +10916,50 @@ Connection: close
             format!("pub fn {function_name}() -> bool {{\n    true\n}}\n"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn live_semantic_build_reports_completed_files_and_chunks_inside_embed_loop() {
+        let root = tempfile::tempdir().unwrap();
+        let files = [root.path().join("one.rs"), root.path().join("two.rs")];
+        write_rust_file(&files[0], "one");
+        write_rust_file(&files[1], "two");
+        let mut observed_completed_file = false;
+        let mut calls = 0;
+        SemanticIndex::build(
+            root.path(),
+            &files,
+            &mut |texts| {
+                calls += 1;
+                let snapshot =
+                    crate::cold_build_limiter::progress::snapshot_for_root(root.path(), 0);
+                let job = snapshot
+                    .running
+                    .iter()
+                    .find(|job| job.root == root.path().to_string_lossy())
+                    .unwrap();
+                assert_eq!(job.kind, "semantic build");
+                assert_eq!(job.phase, "embedding");
+                assert_eq!(job.total, Some(2));
+                if calls > 1 {
+                    assert_eq!(job.chunks_embedded, Some((calls - 1) as u64));
+                }
+                observed_completed_file |= job.done == 1;
+                test_vector_for_texts(texts)
+            },
+            1,
+        )
+        .unwrap();
+        assert!(
+            observed_completed_file,
+            "one file must finish before the next file embeds"
+        );
+        assert!(
+            !crate::cold_build_limiter::progress::snapshot_for_root(root.path(), 0)
+                .running
+                .iter()
+                .any(|job| job.root == root.path().to_string_lossy())
+        );
     }
 
     #[test]
@@ -12339,6 +12465,255 @@ Connection: close
             crate::search_hot_path_measurements::counts().refresh_entry_visits,
             entries
         );
+    }
+
+    #[test]
+    #[ignore = "opt-in counts for unchanged semantic lifecycle audit findings"]
+    fn semantic_audit_remaining_work_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let paths = (0..200)
+            .map(|ordinal| {
+                let path = root.join(format!("file_{ordinal}.rs"));
+                fs::write(&path, b"fn symbol() {}\n").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let mut index = SemanticIndex::new(root.clone(), 2);
+        for ordinal in 0..8_000 {
+            add_invalidation_fixture_entry(
+                &mut index,
+                paths[ordinal as usize % 200].clone(),
+                ordinal,
+            );
+        }
+        for path in &paths {
+            let metadata = fs::metadata(path).unwrap();
+            index
+                .file_mtimes
+                .insert(path.clone(), metadata.modified().unwrap());
+            index.file_sizes.insert(path.clone(), metadata.len());
+            index
+                .file_hashes
+                .insert(path.clone(), blake3::hash(b"fn symbol() {}\n"));
+        }
+        let requested = BTreeSet::from([paths[0].clone()]);
+        let shared = Arc::new(index.clone().into_shared_base().ok().unwrap());
+        let borrowed = SemanticIndex::from_shared_base(root.clone(), shared);
+        let (files, count_allocations) =
+            crate::test_allocations::count(|| borrowed.indexed_file_count());
+        assert_eq!(files, 200);
+        let (delta, delta_allocations) =
+            crate::test_allocations::count(|| borrowed.delta_for_paths(&requested));
+        assert_eq!(delta.entries.len(), 40);
+        let mut overlay = borrowed.clone();
+        overlay.hide_base_files(requested.iter());
+        overlay.entries = delta.entries.clone();
+        let (fork, fork_allocations) =
+            crate::test_allocations::count(|| overlay.fork_for_refresh());
+        assert_eq!(fork.entries.len(), 40);
+        crate::cache_freshness::reset_hash_file_if_small_count_for_debug();
+        let (changed, adoption_allocations) =
+            crate::test_allocations::count(|| borrowed.borrowed_changed_paths(&paths));
+        assert!(changed.is_empty());
+        let adoption_hashes = crate::cache_freshness::hash_file_if_small_count_for_debug();
+        assert_eq!(adoption_hashes, 200);
+        crate::search_hot_path_measurements::reset();
+        let (audit, audit_allocations) =
+            crate::test_allocations::count(|| borrowed.search(&[1.0, 0.5], usize::MAX));
+        assert_eq!(audit.len(), 8_000);
+        assert_eq!(
+            crate::search_hot_path_measurements::counts().score_evaluations,
+            8_000
+        );
+        println!("SEMANTIC_WORK unchanged_lifecycle: chunks=8000 files=200 indexed_file_count_allocations={count_allocations} delta_1_file_allocations={delta_allocations} fork_40_chunk_overlay_allocations={fork_allocations} adoption_allocations={adoption_allocations} adoption_hashes={adoption_hashes} full_recall_scores=8000 full_recall_allocations={audit_allocations}");
+    }
+
+    #[test]
+    fn private_semantic_filter_runs_once_per_file_and_keeps_result_bytes() {
+        let root = test_project_root();
+        let mut index = SemanticIndex::new(root.clone(), 2);
+        for ordinal in 0..8_000 {
+            // The production walker constructs native paths component by
+            // component. A slash-containing join would create mixed separators
+            // in this private fixture on Windows, unlike the shared-base paths.
+            let file = root.join("src").join(format!("file_{}.rs", ordinal % 200));
+            add_invalidation_fixture_entry(&mut index, file, ordinal);
+        }
+        let query = [1.0, 0.5];
+        // The shared-base path already caches eligibility per file; it supplies
+        // an independent representation of the same chunks, order and scores.
+        let borrowed = SemanticIndex::from_shared_base(
+            root,
+            Arc::new(index.clone().into_shared_base().ok().unwrap()),
+        );
+        let expected = borrowed.search_filtered(&query, 50, |path| !path.ends_with("file_1.rs"));
+        let calls = std::cell::Cell::new(0);
+        crate::search_hot_path_measurements::reset();
+        let (actual, allocations) = crate::test_allocations::count(|| {
+            index.search_filtered(&query, 50, |path| {
+                calls.set(calls.get() + 1);
+                // Match the allocating test-file predicate used by public search.
+                !path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .ends_with("file_1.rs")
+            })
+        });
+        let bytes = |results: &[SemanticResult]| {
+            serde_json::to_vec(
+                &results
+                    .iter()
+                    .map(|result| {
+                        (
+                            &result.file,
+                            &result.name,
+                            &result.snippet,
+                            result.score.to_bits(),
+                            result.rank_score.to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        assert_eq!(bytes(&actual), bytes(&expected));
+        let work = crate::search_hot_path_measurements::counts();
+        println!("SEMANTIC_WORK private_filter: chunks=8000 files=200 calls={} allocations={allocations} scores={} sorted={}", calls.get(), work.score_evaluations, work.candidates_sorted);
+        assert_eq!(
+            calls.get(),
+            200,
+            "private eligibility must be cached per file"
+        );
+    }
+
+    #[test]
+    fn shared_semantic_native_paths_preserve_persisted_bytes_and_identity() {
+        let root = test_project_root();
+        let file = root.join("src").join("lib.rs");
+        let mut index = SemanticIndex::new(root.clone(), 2);
+        add_invalidation_fixture_entry(&mut index, file.clone(), 0);
+        let private_bytes = index.to_bytes();
+        let private_identity = blake3::hash(&private_bytes);
+        let private_results = index.search(&[1.0, 0.5], 1);
+        let borrowed =
+            SemanticIndex::from_shared_base(root, Arc::new(index.into_shared_base().ok().unwrap()));
+        let shared_results = borrowed.search(&[1.0, 0.5], 1);
+        assert_eq!(private_results.len(), 1);
+        assert_eq!(shared_results.len(), 1);
+        // Compare spelling, not Path equality, which accepts either separator
+        // on Windows and would hide the mixed-separator regression.
+        assert_eq!(shared_results[0].file.as_os_str(), file.as_os_str());
+        assert_eq!(
+            shared_results[0].score.to_bits(),
+            private_results[0].score.to_bits()
+        );
+        let shared_bytes = borrowed.to_bytes();
+        assert_eq!(shared_bytes, private_bytes);
+        assert_eq!(blake3::hash(&shared_bytes), private_identity);
+    }
+
+    #[test]
+    fn semantic_decode_reads_one_vector_at_a_time_and_preserves_bits() {
+        struct Reads<'a> {
+            cursor: std::io::Cursor<&'a [u8]>,
+            calls: std::rc::Rc<std::cell::Cell<usize>>,
+            vector_reads: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Read for Reads<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.calls.set(self.calls.get() + 1);
+                if buf.len() == 384 * F32_BYTES {
+                    self.vector_reads.set(self.vector_reads.get() + 1);
+                }
+                self.cursor.read(buf)
+            }
+        }
+        let root = test_project_root();
+        let mut index = SemanticIndex::new(root.clone(), 384);
+        for ordinal in 0..8_000 {
+            let file = root.join(format!("src/file_{}.rs", ordinal % 200));
+            add_invalidation_fixture_entry(&mut index, file, ordinal);
+            let entry = index.entries.last_mut().unwrap();
+            entry.vector = (0..384).map(|lane| (lane as f32 - 192.0) / 17.0).collect();
+            entry.vector[0] = -0.0;
+            entry.vector[1] = f32::from_bits(1);
+            entry.norm = vector_norm(&entry.vector);
+        }
+        let bytes = index.to_bytes();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let vector_reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = Reads {
+            cursor: std::io::Cursor::new(&bytes[1..]),
+            calls: calls.clone(),
+            vector_reads: vector_reads.clone(),
+        };
+        let (loaded, bytes_read) =
+            SemanticIndex::from_reader_after_version(reader, bytes[0], &root, Some(bytes.len()), 1)
+                .unwrap();
+        assert_eq!(bytes_read, bytes.len());
+        assert_eq!(loaded.to_bytes(), bytes);
+        for (before, after) in index.entries.iter().zip(&loaded.entries) {
+            assert_eq!(before.norm.to_bits(), after.norm.to_bits());
+            assert_eq!(
+                before
+                    .vector
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                after.vector.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        println!(
+            "SEMANTIC_WORK decode: chunks=8000 dim=384 reader_calls={} vector_reads={}",
+            calls.get(),
+            vector_reads.get()
+        );
+        assert_eq!(
+            vector_reads.get(),
+            8_000,
+            "read each vector in one request, not one request per float"
+        );
+    }
+
+    #[test]
+    fn semantic_decode_preserves_short_reads_and_vector_eof_errors() {
+        struct ShortReader<'a>(&'a [u8]);
+        impl Read for ShortReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                // An underlying stream is allowed to return less than requested.
+                let length = buf.len().min(self.0.len()).min(3);
+                buf[..length].copy_from_slice(&self.0[..length]);
+                self.0 = &self.0[length..];
+                Ok(length)
+            }
+        }
+        let root = test_project_root();
+        let mut index = SemanticIndex::new(root.clone(), 2);
+        add_invalidation_fixture_entry(&mut index, root.join("lib.rs"), 0);
+        let bytes = index.to_bytes();
+        let (loaded, read) = SemanticIndex::from_reader_after_version(
+            ShortReader(&bytes[1..]),
+            bytes[0],
+            &root,
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(loaded.to_bytes(), bytes);
+        assert_eq!(read, bytes.len());
+        for total_len in [None, Some(bytes.len() - 1)] {
+            let error = SemanticIndex::from_reader_after_version(
+                ShortReader(&bytes[1..bytes.len() - 1]),
+                bytes[0],
+                &root,
+                total_len,
+                1,
+            )
+            .unwrap_err();
+            assert_eq!(error, "unexpected end of data reading vector");
+        }
     }
 
     #[test]
@@ -14139,6 +14514,43 @@ public class Greeter {
 
     fn embedding_inputs(count: usize) -> Vec<String> {
         (0..count).map(|index| format!("chunk {index}")).collect()
+    }
+
+    #[test]
+    fn live_http_progress_counts_adaptive_requests_without_double_counting() {
+        let root = tempfile::tempdir().unwrap();
+        let server = ProgrammableEmbeddingServer::start(Duration::ZERO);
+        let mut config = programmable_http_config(&server);
+        config.max_batch_size = 4;
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        model.adaptive_build_batch_size = 1;
+        let _progress = crate::cold_build_limiter::progress::start(
+            root.path(),
+            "semantic build",
+            Some(2),
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
+        model.embed(embedding_inputs(4)).unwrap();
+        let chunks = || {
+            crate::cold_build_limiter::progress::snapshot_for_root(root.path(), 0)
+                .running
+                .into_iter()
+                .find(|job| job.root == root.path().to_string_lossy())
+                .unwrap()
+                .chunks_embedded
+        };
+        assert_eq!(
+            chunks(),
+            Some(4),
+            "HTTP requests must report before the outer embedding batch returns"
+        );
+        execute_build_embedding_batch(embedding_inputs(4), &mut |texts| model.embed(texts))
+            .unwrap();
+        assert_eq!(
+            chunks(),
+            Some(8),
+            "adaptive requests must not be counted twice"
+        );
     }
 
     fn overflow_http_config(server: &OverflowEmbeddingServer) -> SemanticBackendConfig {

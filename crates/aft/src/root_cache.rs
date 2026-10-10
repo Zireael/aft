@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,7 +30,11 @@ use serde::{Deserialize, Serialize};
 use crate::fs_lock;
 
 static MARKER_SEQ: AtomicU64 = AtomicU64::new(0);
-static LIVE_SCOPE_KEYS: OnceLock<Mutex<HashMap<(PathBuf, String), usize>>> = OnceLock::new();
+struct LiveScope {
+    count: usize,
+    _marker: Option<ReadMarker>,
+}
+static LIVE_SCOPE_KEYS: OnceLock<Mutex<HashMap<(PathBuf, String), LiveScope>>> = OnceLock::new();
 
 /// Read-marker heartbeats refresh no more often than the filesystem lock
 /// heartbeat. Active readers piggyback this on normal read paths instead of
@@ -188,6 +192,10 @@ impl ArtifactAccess {
     /// Return whether this root may write the keyed artifact, logging the first
     /// denial for each concrete path so read-only degradation stays observable.
     pub fn allows_write(&self, artifact_key: &str, write_path: &Path) -> bool {
+        if let Err(error) = crate::production_storage::refuse_write(write_path) {
+            crate::slog_warn!("{error}");
+            return false;
+        }
         let writes_keyed_dir = write_path
             .ancestors()
             .any(|ancestor| ancestor.file_name() == Some(OsStr::new(artifact_key)));
@@ -217,6 +225,10 @@ impl ArtifactAccess {
         artifact_key: &str,
         write_path: &Path,
     ) -> bool {
+        if let Err(error) = crate::production_storage::refuse_write(write_path) {
+            crate::slog_warn!("{error}");
+            return false;
+        }
         // Classify the layout from a comparison-local canonical copy rather
         // than trusting key equality. A key derived while the root's final
         // component was absent can encode a symlink alias (for example,
@@ -276,7 +288,7 @@ fn configured_artifact_access() -> &'static Mutex<HashMap<PathBuf, ArtifactAcces
 /// Track scope keys belonging to roots currently bound in this process. The
 /// inspect sweep snapshots this registry at publication time so a live actor's
 /// cache cannot be mistaken for a reclaimed worktree cache.
-fn live_scope_keys() -> &'static Mutex<HashMap<(PathBuf, String), usize>> {
+fn live_scope_keys() -> &'static Mutex<HashMap<(PathBuf, String), LiveScope>> {
     LIVE_SCOPE_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -287,7 +299,16 @@ pub(crate) fn register_live_scope(storage_root: &Path, project_root: &Path) {
         Ok(scopes) => scopes,
         Err(poisoned) => poisoned.into_inner(),
     };
-    *scopes.entry((storage_root, scope_key)).or_default() += 1;
+    let marker_root = storage_root.join("retention");
+    let entry = scopes
+        .entry((storage_root, scope_key.clone()))
+        .or_insert_with(|| LiveScope {
+            count: 0,
+            _marker: ReadMarker::create(&marker_root, &scope_key)
+                .map_err(|error| crate::slog_warn!("root residency marker unavailable: {error}"))
+                .ok(),
+        });
+    entry.count += 1;
 }
 
 pub(crate) fn unregister_live_scope(storage_root: &Path, project_root: &Path) {
@@ -298,9 +319,9 @@ pub(crate) fn unregister_live_scope(storage_root: &Path, project_root: &Path) {
         Err(poisoned) => poisoned.into_inner(),
     };
     let key = (storage_root, scope_key);
-    if let Some(count) = scopes.get_mut(&key) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
+    if let Some(scope) = scopes.get_mut(&key) {
+        scope.count = scope.count.saturating_sub(1);
+        if scope.count == 0 {
             scopes.remove(&key);
         }
     }
@@ -314,7 +335,7 @@ pub(crate) fn live_scope_keys_for_storage(storage_root: &Path) -> HashSet<String
     };
     scopes
         .iter()
-        .filter(|((root, _), count)| root == &storage_root && **count > 0)
+        .filter(|((root, _), scope)| root == &storage_root && scope.count > 0)
         .map(|((_, key), _)| key.clone())
         .collect()
 }
@@ -337,7 +358,7 @@ pub fn configure_artifact_access(project_root: &Path, shared_key: &str, borrow_o
     }
 }
 
-fn canonical_root(project_root: &Path) -> PathBuf {
+pub(crate) fn canonical_root(project_root: &Path) -> PathBuf {
     // Nearest-existing-ancestor canonicalization, not a raw-spelling fallback:
     // registration can precede the directory's creation (and lookups can follow
     // it), and on macOS the raw tempdir spelling (/var/...) differs from the
@@ -424,6 +445,15 @@ fn shared_process_lease(
         leases.remove(registry_key);
     }
     Ok(None)
+}
+
+pub(crate) fn local_callgraph_writer(cache_dir: &Path) -> Option<Arc<WriterLease>> {
+    shared_process_lease(&ProcessLeaseKey {
+        domain: RootCacheDomain::Callgraph,
+        cache_dir: canonical_process_lease_dir(cache_dir),
+    })
+    .ok()
+    .flatten()
 }
 
 fn process_lease_acquisition_lock(
@@ -608,7 +638,7 @@ impl WriterLease {
                 "root-keyed writer lease",
             )?;
         }
-        fs::create_dir_all(cache_dir)?;
+        crate::private_storage::open_keyed_dir(cache_dir, domain.as_str())?;
         let guard = fs_lock::try_acquire(&writer_lease_path(cache_dir), timeout)?;
         if !guard.verify_writer_epoch()? {
             return Err(fs_lock::AcquireError::Io(io::Error::other(
@@ -676,7 +706,7 @@ impl ReadMarker {
             created_at_ms: now_ms(),
         };
         let dir = read_marker_dir(cache_dir, generation_label);
-        fs::create_dir_all(&dir)?;
+        crate::private_storage::open_dir(cache_dir, &dir)?;
         let seq = MARKER_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(
             "{}.{}.{}.{}.json",
@@ -805,7 +835,15 @@ fn read_marker_protection(
     let hostname = current_hostname();
     let now = now_ms();
     let mut sweep = ReadMarkerSweep::default();
-    for entry in entries.flatten() {
+    for (index, entry) in entries.take(4097).enumerate() {
+        if index == 4096 {
+            sweep.protected = true;
+            break;
+        }
+        let Ok(entry) = entry else {
+            sweep.protected = true;
+            continue;
+        };
         let path = entry.path();
         match marker_file_is_protected(&path, now, &hostname) {
             MarkerProtection::Protected => sweep.protected = true,
@@ -903,20 +941,11 @@ fn write_marker_file(path: &Path, metadata: &ReadMarkerMetadata) -> io::Result<(
     result
 }
 
-#[cfg(unix)]
 fn open_private_file(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    OpenOptions::new()
+    crate::private_storage::options()
         .write(true)
         .create_new(true)
-        .mode(0o600)
         .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_private_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 fn sanitize_marker_component(value: &str) -> String {

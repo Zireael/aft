@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Train 344 stacks accepted whole-line bash runon routing, 0.2.2 run reports, worker test-thread budgets and oversized-budget defaults, payload-free view-publication membership, and the pinned Windows task-deletion fix on train 343 (c8a4f5aa3). Remote parameters and guidance are rendered only for enabled sessions, with separate generated bash overrides for head and worker catalogs. Derived from git diff --name-only c8a4f5aa3..HEAD against RANKING_FENCE_PREFIXES: no fenced paths remain changed. The default crates/aft/src/subc_tool_schemas.json is byte-identical to the base after removing unconditional runon metadata; enabled variants are pinned separately. Search ranking and routing are unchanged, and targeted_mechanism remains explicitly none."
+}

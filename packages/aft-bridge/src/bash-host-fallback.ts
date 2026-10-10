@@ -12,6 +12,18 @@ export const BASH_HOST_FALLBACK_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 export const BASH_HOST_FALLBACK_REFUSAL =
   "AFT transport is down; only foreground execution is available in host fallback";
 
+/**
+ * The bash `runon` argument's description. It is paid in every prompt that
+ * offers the argument, so it is one short sentence; docs/tools.md explains
+ * the rest. Shared by the OpenCode and Pi tools and the module catalog.
+ */
+export const BASH_RUNON_DESCRIPTION =
+  'Run this command on the remote Linux build server instead of this machine; the only value is "linux".';
+
+/** Guidance served only beside an available remote-run parameter. */
+export const BASH_RUNON_GUIDANCE =
+  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.';
+
 export interface BashHostFallbackOptions {
   command: string;
   projectRoot: string;

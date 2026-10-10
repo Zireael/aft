@@ -5,10 +5,15 @@
 //! mode (`hoist_builtin_tools`) and a set of index booleans. It now has one
 //! registration rule — a tool is registered unless its canonical name is in
 //! `disabled_tools` — plus three first-class index switches under `indexes`.
-//! This module owns the literal tool inventory, the one-release migration
-//! policy for the retired keys, the per-block translation of those keys into
-//! canonical ones, validation of a resolved configuration object and the
-//! migration-notice projection digest. The TypeScript plugins carry a mirror of
+//! This module owns the literal tool inventory, the table of retired keys, the
+//! per-block translation of those keys into canonical ones, validation of a
+//! resolved configuration object and the migration-notice projection digest.
+//!
+//! Retired keys are never refused. Every load translates them in memory into
+//! their current equivalents, and the current keys then pass through the
+//! normal user/project trust rules. The user's own file is additionally
+//! rewritten on disk by [`crate::config_fix::auto_migrate_user_config`]; a
+//! project file is never written, only reported with a notice. The TypeScript plugins carry a mirror of
 //! the same rules in `packages/aft-bridge/src/feature-config.ts`; the config
 //! parity fixtures and the shared notice-projection fixtures keep them equal.
 
@@ -85,13 +90,10 @@ pub const BASH_GATE_DISABLES: [&str; 5] = [
 
 /// Identity of the migration policy that retires the keys below.
 pub const MIGRATION_POLICY_ID: &str = "feature-config-v1";
-/// First minor release that ships the translation window.
+/// First minor release that translates the retired keys.
 pub const POLICY_INTRODUCED_MINOR: (u64, u64) = (0, 58);
-/// First minor release that rejects the retired keys instead of translating.
-pub const POLICY_REJECT_FROM_MINOR: (u64, u64) = (0, 59);
 
-/// Retired top-level (or nested) config paths and the replacement named in
-/// their rejection diagnostic.
+/// Retired top-level (or nested) config paths and their replacement.
 pub const RETIRED_PATHS: [(&str, &str); 9] = [
     ("tool_surface", "disabled_tools"),
     ("hoist_builtin_tools", "disabled_tools"),
@@ -102,6 +104,18 @@ pub const RETIRED_PATHS: [(&str, &str); 9] = [
     ("experimental_semantic_search", "indexes.semantic"),
     ("callgraph_store", "indexes.callgraph"),
     ("github.enabled", "github.read,github.write,github.shim"),
+];
+
+/// Retired inspect/LSP paths and their replacement. `idle.lsp_ttl_minutes`
+/// moves to `lsp.idle_minutes`; the two inspect keys never had an effect and
+/// are dropped.
+pub const REMOVED_INSPECT_LSP_PATHS: [(&str, &str); 3] = [
+    ("idle.lsp_ttl_minutes", "lsp.idle_minutes"),
+    (
+        "inspect.tier2_soft_deadline_ms",
+        "inspect.tier2_pass_timeout_ms",
+    ),
+    ("inspect.max_drill_down_items", "aft_inspect.topK"),
 ];
 
 /// Index leaf, its immediate legacy key and (when one exists) the older
@@ -152,38 +166,6 @@ pub fn surface_disables(surface: &str) -> Option<Vec<&'static str>> {
     }
 }
 
-/// Whether the retired keys translate (inside the window) or reject.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyPhase {
-    Window,
-    Rejecting,
-}
-
-/// Parse `major.minor[.patch...]`; patch and pre-release parts are ignored.
-fn parse_minor(version: &str) -> Option<(u64, u64)> {
-    let mut parts = version.trim().trim_start_matches('v').split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor_part = parts.next()?;
-    let minor_digits: String = minor_part
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    Some((major, minor_digits.parse().ok()?))
-}
-
-/// Policy phase for a package version (major/minor comparison only).
-pub fn policy_phase_for_version(version: &str) -> PolicyPhase {
-    match parse_minor(version) {
-        Some(minor) if minor >= POLICY_REJECT_FROM_MINOR => PolicyPhase::Rejecting,
-        _ => PolicyPhase::Window,
-    }
-}
-
-/// Policy phase of the running binary.
-pub fn current_policy_phase() -> PolicyPhase {
-    policy_phase_for_version(env!("CARGO_PKG_VERSION"))
-}
-
 /// A non-fatal translation notice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslationWarning {
@@ -195,28 +177,27 @@ pub struct TranslationWarning {
 /// Result of translating one raw configuration document.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocumentTranslation {
-    /// Rejection diagnostics; any entry aborts the whole candidate load.
-    pub errors: Vec<String>,
     pub warnings: Vec<TranslationWarning>,
     /// True when any retired key or alias was supplied (a migration notice applies).
     pub legacy_input: bool,
+    /// Every retired key the document supplied, sorted and de-duplicated. A
+    /// key inside a harness block carries its `harnesses.<id>.` prefix; a
+    /// prefixed tool name inside `disabled_tools` is listed by that name.
+    pub retired_keys: Vec<String>,
 }
 
-fn removed(old: &str, replacement: &str) -> String {
-    format!("removed_config_key:{old}:use:{replacement}")
+/// Record one supplied retired key of the block whose key prefix is `prefix`.
+fn record_retired(out: &mut DocumentTranslation, prefix: &str, key: &str) {
+    out.legacy_input = true;
+    out.retired_keys.push(format!("{prefix}{key}"));
 }
 
-/// Reject the already-retired GitHub enable aliases. These are errors at every
-/// version; only `doctor --fix` may repair them.
-fn reject_retired_github_aliases(map: &Map<String, Value>, errors: &mut Vec<String>) {
-    if map.contains_key("gh_read") {
-        errors.push(removed("gh_read", "github.read"));
-    }
-    if let Some(Value::Object(shim)) = map.get("gh_shim") {
-        if shim.contains_key("enabled") {
-            errors.push(removed("gh_shim", "github.shim"));
-        }
-    }
+fn superseded(out: &mut DocumentTranslation, key: String, message: String) {
+    out.warnings.push(TranslationWarning {
+        code: "superseded_legacy_config",
+        key,
+        message,
+    });
 }
 
 fn nested_bool(map: &Map<String, Value>, container: &str, leaf: &str) -> Option<bool> {
@@ -252,76 +233,213 @@ fn false_runtime_gates(map: &Map<String, Value>) -> Vec<&'static str> {
     gates
 }
 
-/// Translate or reject the retired keys of one tier/harness block in place.
+/// Translate the GitHub enable aliases (`gh_read.enabled`, `gh_shim.enabled`)
+/// of one block into `github.read` / `github.shim`, exactly as `doctor --fix`
+/// rewrites them. Precedence: the canonical leaf, then the `false` that a
+/// `github.enabled: false` in the same block sets for every leaf, then the
+/// alias. The aliases are removed; `gh_shim.binary_path` is kept.
+fn translate_github_aliases(
+    map: &mut Map<String, Value>,
+    prefix: &str,
+    out: &mut DocumentTranslation,
+) {
+    let master_off = nested_bool(map, "github", "enabled") == Some(false);
+    for (alias, leaf, retired_key) in [
+        ("gh_read", "read", "gh_read"),
+        ("gh_shim", "shim", "gh_shim.enabled"),
+    ] {
+        let supplied = if alias == "gh_read" {
+            map.contains_key(alias)
+        } else {
+            map.get(alias)
+                .and_then(Value::as_object)
+                .is_some_and(|shim| shim.contains_key("enabled"))
+        };
+        if !supplied {
+            continue;
+        }
+        record_retired(out, prefix, retired_key);
+        let alias_value = map
+            .get(alias)
+            .and_then(|value| value.get("enabled"))
+            .and_then(Value::as_bool);
+        if let Some(value) = alias_value {
+            match nested_bool(map, "github", leaf) {
+                Some(canonical) => {
+                    if canonical != value {
+                        superseded(
+                            out,
+                            format!("{prefix}{retired_key}"),
+                            format!("{alias}.enabled={value} is ignored because github.{leaf}={canonical} is set"),
+                        );
+                    }
+                }
+                None if master_off => {
+                    if value {
+                        superseded(
+                            out,
+                            format!("{prefix}{retired_key}"),
+                            format!("{alias}.enabled=true is ignored because github.enabled=false switches github.{leaf} off"),
+                        );
+                    }
+                }
+                None => {
+                    let github = map
+                        .entry("github".to_string())
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    if let Value::Object(github) = github {
+                        github.insert(leaf.to_string(), Value::Bool(value));
+                    }
+                }
+            }
+        }
+        if alias == "gh_read" {
+            map.remove(alias);
+        } else if let Some(Value::Object(shim)) = map.get_mut(alias) {
+            shim.remove("enabled");
+            if shim.is_empty() {
+                map.remove(alias);
+            }
+        }
+    }
+}
+
+/// Remove `container.leaf` when present, dropping the container if that left
+/// it empty. Returns the removed value.
+fn take_nested(map: &mut Map<String, Value>, container: &str, leaf: &str) -> Option<Value> {
+    let inner = map.get_mut(container)?.as_object_mut()?;
+    let value = inner.remove(leaf)?;
+    if inner.is_empty() {
+        map.remove(container);
+    }
+    Some(value)
+}
+
+/// Largest integer a JSON number keeps exactly in JavaScript
+/// (`Number.MAX_SAFE_INTEGER`).
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+/// The whole number a JSON value spells, the way JavaScript's
+/// `Number.isSafeInteger` reads the parsed value: `12` and `12.0` are both 12,
+/// while `12.5`, non-numbers and integers beyond the exactly representable
+/// range are not whole numbers. Keeps the Rust and TypeScript translations
+/// equal, since JavaScript cannot tell `12.0` from `12`.
+fn safe_whole_number(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return (number.unsigned_abs() <= MAX_SAFE_INTEGER as u64).then_some(number);
+    }
+    let number = value.as_f64()?;
+    (number.is_finite() && number.fract() == 0.0 && number.abs() <= MAX_SAFE_INTEGER as f64)
+        .then_some(number as i64)
+}
+
+/// The `lsp.idle_minutes` value a retired `idle.lsp_ttl_minutes` value
+/// becomes: a whole number clamped to the current range, or the default for
+/// anything else. Shared by load-time translation and `doctor --fix`; mirrors
+/// the TypeScript translation.
+pub fn retired_lsp_idle_minutes(value: &Value) -> i64 {
+    safe_whole_number(value)
+        .unwrap_or(i64::from(crate::config::DEFAULT_LSP_IDLE_MINUTES))
+        .clamp(
+            i64::from(crate::config::MIN_LSP_IDLE_MINUTES),
+            i64::from(crate::config::MAX_LSP_IDLE_MINUTES),
+        )
+}
+
+/// Translate the retired inspect/LSP keys of one block, exactly as
+/// `doctor --fix` rewrites them: `idle.lsp_ttl_minutes` becomes
+/// `lsp.idle_minutes` (clamped to its range) unless that is already set, and
+/// the two inspect keys that never had an effect are dropped.
+fn translate_inspect_lsp_paths(
+    map: &mut Map<String, Value>,
+    prefix: &str,
+    out: &mut DocumentTranslation,
+) {
+    if let Some(value) = take_nested(map, "idle", "lsp_ttl_minutes") {
+        record_retired(out, prefix, "idle.lsp_ttl_minutes");
+        if map
+            .get("lsp")
+            .and_then(|lsp| lsp.get("idle_minutes"))
+            .is_some()
+        {
+            superseded(
+                out,
+                format!("{prefix}idle.lsp_ttl_minutes"),
+                "idle.lsp_ttl_minutes is ignored because lsp.idle_minutes is set".to_string(),
+            );
+        } else {
+            let minutes = retired_lsp_idle_minutes(&value);
+            let lsp = map
+                .entry("lsp".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(lsp) = lsp {
+                lsp.insert("idle_minutes".to_string(), Value::from(minutes));
+            }
+        }
+    }
+    for leaf in ["tier2_soft_deadline_ms", "max_drill_down_items"] {
+        if take_nested(map, "inspect", leaf).is_some() {
+            record_retired(out, prefix, &format!("inspect.{leaf}"));
+        }
+    }
+}
+
 /// What a retired `enabled: false` no longer does. The translation only hides
 /// tools; indexing continues, so a user who relied on it to keep AFT out of a
 /// repository must also switch the indexes off. Mirrors the TypeScript
 /// `RETIRED_ENABLED_FALSE_INDEXES_NOTE`.
 pub const RETIRED_ENABLED_FALSE_INDEXES_NOTE: &str = "enabled: false no longer turns AFT off: it is translated to disabling every tool, but the trigram, semantic and callgraph indexes still build. To keep AFT from indexing this repository, also set indexes.trigram, indexes.semantic and indexes.callgraph to false.";
 
+/// Translate the retired keys of one tier/harness block in place.
+///
+/// The false runtime gates (`backup.enabled`, `inspect.enabled`, `bash`,
+/// `bash.enabled`) are current keys and only switch their behaviour off; they
+/// never remove a tool registration. Only `disabled_tools` does that.
 fn translate_block(
     map: &mut Map<String, Value>,
     // True only for the user file's base block, the one place the
     // absent-base default disables may be added.
     user_base: bool,
-    phase: PolicyPhase,
     block_label: &str,
     out: &mut DocumentTranslation,
 ) {
-    reject_retired_github_aliases(map, &mut out.errors);
+    let prefix = if block_label == "base" {
+        String::new()
+    } else {
+        format!("{block_label}.")
+    };
+    translate_github_aliases(map, &prefix, out);
+    translate_inspect_lsp_paths(map, &prefix, out);
 
-    // Canonicalize (or reject) historical prefixed names inside disabled lists.
+    // Canonicalize the retired `aft_`-prefixed host tool names (for example
+    // `aft_read` -> `read`) inside the disabled list.
     let mut explicit_list = None;
     if let Some(Value::Array(entries)) = map.get("disabled_tools") {
         if entries.iter().all(Value::is_string) {
             let mut canonical = Vec::with_capacity(entries.len());
+            let mut aliases = Vec::new();
             for name in entries.iter().filter_map(Value::as_str) {
                 match legacy_tool_alias(name) {
                     Some(host) => {
-                        out.legacy_input = true;
-                        if phase == PolicyPhase::Rejecting {
-                            out.errors.push(removed(name, host));
-                        }
+                        aliases.push(name.to_string());
                         canonical.push(host.to_string());
                     }
                     None => canonical.push(name.to_string()),
                 }
             }
+            for alias in aliases {
+                record_retired(out, &prefix, &alias);
+            }
             explicit_list = Some(canonical);
         }
     }
 
-    let supplied_paths: Vec<&str> = RETIRED_PATHS
-        .iter()
-        .map(|(path, _)| *path)
-        .filter(|path| has_path(map, path))
-        .collect();
-    if !supplied_paths.is_empty() {
-        out.legacy_input = true;
+    for (path, _) in RETIRED_PATHS {
+        if has_path(map, path) {
+            record_retired(out, &prefix, path);
+        }
     }
     let gates = false_runtime_gates(map);
-
-    if phase == PolicyPhase::Rejecting {
-        for path in &supplied_paths {
-            let replacement = RETIRED_PATHS
-                .iter()
-                .find(|(old, _)| old == path)
-                .map(|(_, replacement)| *replacement)
-                .unwrap_or("disabled_tools");
-            out.errors.push(removed(path, replacement));
-        }
-        if !gates.is_empty() && explicit_list.is_none() {
-            out.warnings.push(TranslationWarning {
-                code: "legacy_runtime_gate_runtime_only",
-                key: block_label.to_string(),
-                message: format!(
-                    "{} now restricts runtime behavior only and no longer removes tool registrations; list tools in disabled_tools to unregister them",
-                    gates.join(", ")
-                ),
-            });
-        }
-        return;
-    }
 
     if let Some(list) = &explicit_list {
         map.insert(
@@ -358,23 +476,23 @@ fn translate_block(
             };
             if let Some(canonical) = canonical {
                 if canonical != value {
-                    out.warnings.push(TranslationWarning {
-                        code: "superseded_legacy_config",
-                        key: key.to_string(),
-                        message: format!(
+                    superseded(
+                        out,
+                        key.to_string(),
+                        format!(
                             "{key}={value} is ignored because indexes.{leaf}={canonical} is set"
                         ),
-                    });
+                    );
                 }
             } else if let Some(previous) = chosen {
                 if previous != value {
-                    out.warnings.push(TranslationWarning {
-                        code: "superseded_legacy_config",
-                        key: key.to_string(),
-                        message: format!(
+                    superseded(
+                        out,
+                        key.to_string(),
+                        format!(
                             "{key}={value} is ignored because {legacy}={previous} takes precedence"
                         ),
-                    });
+                    );
                 }
             } else {
                 chosen = Some(value);
@@ -396,20 +514,20 @@ fn translate_block(
     if let Some(Value::Object(github)) = map.get_mut("github") {
         if let Some(master) = github.remove("enabled") {
             if master == Value::Bool(false) {
+                let mut notes = Vec::new();
                 for leaf in ["read", "write", "shim"] {
                     match github.get(leaf) {
                         None => {
                             github.insert(leaf.to_string(), Value::Bool(false));
                         }
-                        Some(Value::Bool(true)) => out.warnings.push(TranslationWarning {
-                            code: "superseded_legacy_config",
-                            key: "github.enabled".to_string(),
-                            message: format!(
-                                "github.enabled=false is ignored for github.{leaf} because github.{leaf}=true is set"
-                            ),
-                        }),
+                        Some(Value::Bool(true)) => notes.push(format!(
+                            "github.enabled=false is ignored for github.{leaf} because github.{leaf}=true is set"
+                        )),
                         Some(_) => {}
                     }
+                }
+                for note in notes {
+                    superseded(out, "github.enabled".to_string(), note);
                 }
             }
         }
@@ -449,25 +567,25 @@ fn translate_block(
             message: RETIRED_ENABLED_FALSE_INDEXES_NOTE.to_string(),
         });
     }
-    for gate in &gates {
-        match *gate {
-            "backup.enabled" => {
-                generated.insert("aft_safety".to_string());
-            }
-            "inspect.enabled" => {
-                generated.insert("aft_inspect".to_string());
-            }
-            _ => generated.extend(BASH_GATE_DISABLES.iter().map(|name| (*name).to_string())),
-        }
+
+    if !gates.is_empty() && explicit_list.is_none() {
+        out.warnings.push(TranslationWarning {
+            code: "legacy_runtime_gate_runtime_only",
+            key: block_label.to_string(),
+            message: format!(
+                "{} now restricts runtime behavior only and no longer removes tool registrations; list tools in disabled_tools to unregister them",
+                gates.join(", ")
+            ),
+        });
     }
 
     if explicit_list.is_some() {
         if explicit_surface || !generated.is_empty() {
-            out.warnings.push(TranslationWarning {
-                code: "superseded_legacy_config",
-                key: block_label.to_string(),
-                message: "disabled_tools is set explicitly, so legacy tool_surface/hoist_builtin_tools/enabled and runtime gates do not change registration".to_string(),
-            });
+            superseded(
+                out,
+                block_label.to_string(),
+                "disabled_tools is set explicitly, so legacy tool_surface/hoist_builtin_tools/enabled do not change registration".to_string(),
+            );
         }
         return;
     }
@@ -495,16 +613,6 @@ fn translate_block(
             Value::Array(list.into_iter().map(Value::String).collect()),
         );
     }
-    if !gates.is_empty() {
-        out.warnings.push(TranslationWarning {
-            code: "legacy_runtime_gate_requires_fix",
-            key: block_label.to_string(),
-            message: format!(
-                "{} still removes tool registrations during this release only; run `aft doctor --fix` to record the choice in disabled_tools",
-                gates.join(", ")
-            ),
-        });
-    }
 }
 
 /// Which trust tier a raw document belongs to.
@@ -514,31 +622,89 @@ pub enum DocumentTier {
     Project,
 }
 
-/// Translate or reject every block (base plus each `harnesses.<id>` object)
-/// of one raw configuration document, in place.
+/// Translate every block (base plus each `harnesses.<id>` object) of one raw
+/// configuration document, in place.
 ///
 /// Only the user file's base block receives the absent-base default
 /// (`aft_move`/`aft_delete`) when its legacy keys generate disables: that
 /// default applies once, at user-base resolution. A project file's base block
 /// contributes only the names its own legacy keys imply, so a legacy key in a
-/// repository can never re-disable tools the user enabled.
-pub fn translate_document(
-    map: &mut Map<String, Value>,
-    phase: PolicyPhase,
-    tier: DocumentTier,
-) -> DocumentTranslation {
+/// repository can never re-disable tools the user enabled. The translated
+/// values are current keys, so the resolver's project-tier rules apply to them
+/// exactly as if the file had spelled them out.
+pub fn translate_document(map: &mut Map<String, Value>, tier: DocumentTier) -> DocumentTranslation {
     let mut out = DocumentTranslation::default();
-    translate_block(map, tier == DocumentTier::User, phase, "base", &mut out);
+    translate_block(map, tier == DocumentTier::User, "base", &mut out);
     if let Some(Value::Object(harnesses)) = map.get_mut("harnesses") {
         for (name, block) in harnesses.iter_mut() {
             if let Value::Object(block) = block {
-                translate_block(block, false, phase, &format!("harnesses.{name}"), &mut out);
+                translate_block(block, false, &format!("harnesses.{name}"), &mut out);
             }
         }
     }
-    out.errors.sort();
-    out.errors.dedup();
+    out.retired_keys.sort();
+    out.retired_keys.dedup();
     out
+}
+
+/// Whether a translation carries the retired `enabled: false` note.
+fn has_enabled_false_note(translation: &DocumentTranslation) -> bool {
+    translation
+        .warnings
+        .iter()
+        .any(|warning| warning.code == "legacy_enabled_false_indexes_still_build")
+}
+
+fn with_enabled_false_note(text: String, translation: &DocumentTranslation) -> String {
+    if has_enabled_false_note(translation) {
+        format!("{text} {RETIRED_ENABLED_FALSE_INDEXES_NOTE}")
+    } else {
+        text
+    }
+}
+
+/// Notice for a project config file whose retired keys were translated in
+/// memory. The file itself is never written: it is shared through the
+/// repository. Mirrors the TypeScript `retiredKeysNoticeMessage`.
+pub fn project_retired_keys_notice(path: &str, translation: &DocumentTranslation) -> String {
+    with_enabled_false_note(
+        format!(
+            "{path} uses retired keys ({}); AFT applied their current equivalents, with the same limits a project config has for those keys. Run `npx @cortexkit/aft doctor --fix` to update the file.",
+            translation.retired_keys.join(", ")
+        ),
+        translation,
+    )
+}
+
+/// Notice for the user config file after AFT rewrote its retired keys.
+pub fn user_config_migrated_notice(
+    path: &str,
+    backup: &str,
+    translation: &DocumentTranslation,
+) -> String {
+    with_enabled_false_note(
+        format!(
+            "AFT updated {path}: its retired keys ({}) now use their current equivalents. The previous file is saved as {backup}.",
+            translation.retired_keys.join(", ")
+        ),
+        translation,
+    )
+}
+
+/// Notice for the user config file when AFT could not rewrite it and applied
+/// the current equivalents in memory instead.
+pub fn user_config_not_migrated_notice(
+    path: &str,
+    reason: &str,
+    translation: &DocumentTranslation,
+) -> String {
+    with_enabled_false_note(
+        format!(
+            "{path} uses retired keys ({}); AFT applied their current equivalents but could not update the file ({reason}). Run `npx @cortexkit/aft doctor --fix` to update it.",
+            translation.retired_keys.join(", ")
+        ),
+        translation,
+    )
 }
 
 /// Sorted, de-duplicated disabled list.
@@ -789,10 +955,28 @@ pub fn notice_digest(projection: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn translate(doc: Value) -> (Value, DocumentTranslation) {
+        let Value::Object(mut map) = doc else {
+            panic!("object")
+        };
+        let out = translate_document(&mut map, DocumentTier::User);
+        (Value::Object(map), out)
+    }
+
+    fn translate_project(doc: Value) -> Value {
+        let Value::Object(mut map) = doc else {
+            panic!("object")
+        };
+        translate_document(&mut map, DocumentTier::Project);
+        Value::Object(map)
+    }
 
     #[test]
     fn legacy_enabled_false_warns_that_indexes_still_build() {
-        let (doc, out) = translate(json!({"enabled": false}), PolicyPhase::Window);
+        let (doc, out) = translate(json!({"enabled": false}));
         assert!(
             doc.get("indexes").is_none(),
             "indexes stay at their defaults"
@@ -805,24 +989,6 @@ mod tests {
         assert_eq!(warning.key, "enabled");
         assert!(warning.message.contains("indexes still build"));
         assert!(warning.message.contains("indexes.trigram"));
-    }
-    use super::*;
-    use serde_json::json;
-
-    fn translate(doc: Value, phase: PolicyPhase) -> (Value, DocumentTranslation) {
-        let Value::Object(mut map) = doc else {
-            panic!("object")
-        };
-        let out = translate_document(&mut map, phase, DocumentTier::User);
-        (Value::Object(map), out)
-    }
-
-    fn translate_project(doc: Value) -> Value {
-        let Value::Object(mut map) = doc else {
-            panic!("object")
-        };
-        translate_document(&mut map, PolicyPhase::Window, DocumentTier::Project);
-        Value::Object(map)
     }
 
     /// A project block contributes only what its own legacy keys imply; the
@@ -841,20 +1007,6 @@ mod tests {
                 "write"
             ])
         );
-        assert_eq!(
-            translate_project(json!({"backup": {"enabled": false}}))["disabled_tools"],
-            json!(["aft_safety"])
-        );
-        assert_eq!(
-            translate_project(json!({"bash": false}))["disabled_tools"],
-            json!([
-                "bash",
-                "bash_kill",
-                "bash_status",
-                "bash_watch",
-                "bash_write"
-            ])
-        );
         assert_eq!(translate_project(json!({"tool_surface": "all"})), json!({}));
         assert_eq!(
             translate_project(json!({"tool_surface": "recommended"}))["disabled_tools"],
@@ -862,16 +1014,47 @@ mod tests {
         );
     }
 
+    /// A false runtime gate only switches its behaviour off: it never removes
+    /// a registration, alone or beside a retired key, and the translation
+    /// warns `legacy_runtime_gate_runtime_only` so the user knows to list the
+    /// tool in `disabled_tools`.
     #[test]
-    fn policy_versions_compare_major_minor_only() {
-        assert_eq!(policy_phase_for_version("0.57.2"), PolicyPhase::Window);
-        assert_eq!(policy_phase_for_version("0.58.9"), PolicyPhase::Window);
-        assert_eq!(policy_phase_for_version("0.59.0"), PolicyPhase::Rejecting);
+    fn false_runtime_gates_never_generate_disables() {
+        for doc in [
+            json!({"backup": {"enabled": false}}),
+            json!({"inspect": {"enabled": false}}),
+            json!({"bash": false}),
+            json!({"bash": {"enabled": false}}),
+        ] {
+            let (value, out) = translate(doc.clone());
+            assert!(value.get("disabled_tools").is_none(), "{doc}");
+            assert!(!out.legacy_input, "{doc}");
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|warning| warning.code == "legacy_runtime_gate_runtime_only"),
+                "{doc}"
+            );
+            assert!(translate_project(doc.clone())
+                .get("disabled_tools")
+                .is_none());
+        }
+        let (value, _) = translate(json!({"bash": false, "hoist_builtin_tools": false}));
         assert_eq!(
-            policy_phase_for_version("0.59.0-rc.1"),
-            PolicyPhase::Rejecting
+            value["disabled_tools"],
+            json!([
+                "aft_delete",
+                "aft_move",
+                "apply_patch",
+                "bash",
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "write"
+            ]),
+            "only the retired hoist key generates disables"
         );
-        assert_eq!(policy_phase_for_version("1.0.0"), PolicyPhase::Rejecting);
     }
 
     #[test]
@@ -884,39 +1067,34 @@ mod tests {
         let artifact: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(artifact["id"], MIGRATION_POLICY_ID);
         assert_eq!(artifact["introduced_minor"], "0.58");
-        assert_eq!(artifact["reject_from_minor"], "0.59");
+        assert!(
+            artifact.get("reject_from_minor").is_none(),
+            "retired keys are never rejected"
+        );
         for (path, replacement) in RETIRED_PATHS {
             assert_eq!(artifact["paths"][path], replacement, "{path}");
         }
         for (alias, canonical) in LEGACY_TOOL_ALIASES {
             assert_eq!(artifact["disabled_list_names"][alias], canonical);
         }
-        let text = text.to_string();
-        assert!(!artifact["paths"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .any(|key| key.starts_with("gh_")));
-        assert!(!text.contains("\"gh_read\":"));
     }
 
     #[test]
     fn surfaces_translate_to_literal_sets() {
-        let (all, _) = translate(json!({"tool_surface": "all"}), PolicyPhase::Window);
+        let (all, _) = translate(json!({"tool_surface": "all"}));
         assert_eq!(all, json!({"disabled_tools": []}));
-        let (recommended, _) =
-            translate(json!({"tool_surface": "recommended"}), PolicyPhase::Window);
+        let (recommended, _) = translate(json!({"tool_surface": "recommended"}));
         assert_eq!(
             recommended["disabled_tools"],
             json!(["aft_callgraph", "aft_delete", "aft_move"])
         );
-        let (minimal, _) = translate(json!({"tool_surface": "minimal"}), PolicyPhase::Window);
+        let (minimal, _) = translate(json!({"tool_surface": "minimal"}));
         assert_eq!(minimal["disabled_tools"].as_array().unwrap().len(), 20);
     }
 
     #[test]
-    fn gate_only_base_unions_with_default_and_explicit_empty_wins() {
-        let (hoist, out) = translate(json!({"hoist_builtin_tools": false}), PolicyPhase::Window);
+    fn retired_base_key_unions_with_default_and_explicit_empty_wins() {
+        let (hoist, out) = translate(json!({"hoist_builtin_tools": false}));
         assert_eq!(
             hoist["disabled_tools"],
             json!([
@@ -932,94 +1110,152 @@ mod tests {
             ])
         );
         assert!(out.legacy_input);
-        let (backup, out) = translate(json!({"backup": {"enabled": false}}), PolicyPhase::Window);
-        assert_eq!(
-            backup["disabled_tools"],
-            json!(["aft_delete", "aft_move", "aft_safety"])
-        );
-        assert!(out
-            .warnings
-            .iter()
-            .any(|warning| warning.code == "legacy_runtime_gate_requires_fix"));
-        let (explicit, _) = translate(
-            json!({"backup": {"enabled": false}, "hoist_builtin_tools": false, "disabled_tools": []}),
-            PolicyPhase::Window,
-        );
+        assert_eq!(out.retired_keys, vec!["hoist_builtin_tools"]);
+        let (explicit, _) = translate(json!({"hoist_builtin_tools": false, "disabled_tools": []}));
         assert_eq!(explicit["disabled_tools"], json!([]));
     }
 
+    /// Every retired key translates; none is ever refused, and the translation
+    /// names each one (harness keys with their block prefix).
     #[test]
-    fn aliases_translate_in_window_and_reject_after() {
-        let (value, out) = translate(json!({"disabled_tools": ["aft_glob"]}), PolicyPhase::Window);
-        assert_eq!(value["disabled_tools"], json!(["glob"]));
-        assert!(out.errors.is_empty());
-        let (_, out) = translate(
-            json!({"disabled_tools": ["aft_glob"], "search_index": true}),
-            PolicyPhase::Rejecting,
-        );
+    fn retired_keys_translate_and_are_listed() {
+        let (value, out) = translate(json!({
+            "disabled_tools": ["aft_glob"],
+            "search_index": true,
+            "harnesses": {"pi": {"semantic_search": false}}
+        }));
         assert_eq!(
-            out.errors,
-            vec![
-                "removed_config_key:aft_glob:use:glob".to_string(),
-                "removed_config_key:search_index:use:indexes.trigram".to_string()
-            ]
+            value,
+            json!({
+                "disabled_tools": ["glob"],
+                "indexes": {"trigram": true},
+                "harnesses": {"pi": {"indexes": {"semantic": false}}}
+            })
+        );
+        assert!(out.legacy_input);
+        assert_eq!(
+            out.retired_keys,
+            vec!["aft_glob", "harnesses.pi.semantic_search", "search_index"]
         );
     }
 
     #[test]
     fn index_precedence_is_canonical_then_legacy_then_experimental() {
-        let (value, _) = translate(
-            json!({"experimental_search_index": false, "search_index": true}),
-            PolicyPhase::Window,
-        );
+        let (value, _) =
+            translate(json!({"experimental_search_index": false, "search_index": true}));
         assert_eq!(value, json!({"indexes": {"trigram": true}}));
-        let (value, out) = translate(
-            json!({"indexes": {"semantic": false}, "semantic_search": true}),
-            PolicyPhase::Window,
-        );
+        let (value, out) =
+            translate(json!({"indexes": {"semantic": false}, "semantic_search": true}));
         assert_eq!(value, json!({"indexes": {"semantic": false}}));
         assert_eq!(out.warnings[0].code, "superseded_legacy_config");
     }
 
+    /// The GitHub enable aliases translate to the canonical leaves with the
+    /// same precedence `doctor --fix` uses: canonical leaf, then a
+    /// `github.enabled: false` in the same block, then the alias.
     #[test]
-    fn retired_github_aliases_reject_in_every_phase() {
-        for phase in [PolicyPhase::Window, PolicyPhase::Rejecting] {
-            let (_, out) = translate(
-                json!({"gh_read": {"enabled": true}, "github": {"read": true}}),
-                phase,
-            );
-            assert_eq!(
-                out.errors,
-                vec!["removed_config_key:gh_read:use:github.read"]
-            );
-            let (_, out) = translate(
-                json!({"harnesses": {"pi": {"gh_shim": {"enabled": false}}}}),
-                phase,
-            );
-            assert_eq!(
-                out.errors,
-                vec!["removed_config_key:gh_shim:use:github.shim"]
-            );
-        }
-        let (_, out) = translate(
-            json!({"gh_shim": {"binary_path": "/opt/aft"}}),
-            PolicyPhase::Window,
+    fn retired_github_aliases_translate_like_doctor_fix() {
+        let (value, out) = translate(json!({
+            "gh_read": {"enabled": true},
+            "gh_shim": {"enabled": false, "binary_path": "/opt/aft"}
+        }));
+        assert_eq!(
+            value,
+            json!({
+                "github": {"read": true, "shim": false},
+                "gh_shim": {"binary_path": "/opt/aft"}
+            })
         );
-        assert!(out.errors.is_empty());
+        assert_eq!(out.retired_keys, vec!["gh_read", "gh_shim.enabled"]);
+
+        let (value, out) =
+            translate(json!({"gh_read": {"enabled": true}, "github": {"read": false}}));
+        assert_eq!(value, json!({"github": {"read": false}}));
+        assert_eq!(out.warnings[0].code, "superseded_legacy_config");
+
+        let (value, _) = translate(json!({
+            "harnesses": {"pi": {"gh_shim": {"enabled": true}, "github": {"enabled": false}}}
+        }));
+        assert_eq!(
+            value,
+            json!({"harnesses": {"pi": {"github": {"read": false, "write": false, "shim": false}}}})
+        );
+
+        let (value, out) = translate(json!({"gh_shim": {"binary_path": "/opt/aft"}}));
+        assert_eq!(value, json!({"gh_shim": {"binary_path": "/opt/aft"}}));
+        assert!(!out.legacy_input);
+    }
+
+    #[test]
+    fn retired_inspect_and_lsp_keys_translate_like_doctor_fix() {
+        let (value, out) = translate(json!({
+            "idle": {"lsp_ttl_minutes": 3, "root_ttl_minutes": 20},
+            "inspect": {"tier2_soft_deadline_ms": 50, "max_drill_down_items": 20}
+        }));
+        assert_eq!(
+            value,
+            json!({"idle": {"root_ttl_minutes": 20}, "lsp": {"idle_minutes": 5}})
+        );
+        assert_eq!(
+            out.retired_keys,
+            vec![
+                "idle.lsp_ttl_minutes",
+                "inspect.max_drill_down_items",
+                "inspect.tier2_soft_deadline_ms"
+            ]
+        );
+        let (value, _) = translate(json!({"idle": {"lsp_ttl_minutes": "x"}}));
+        assert_eq!(value, json!({"lsp": {"idle_minutes": 60}}));
+        // A whole number written as a float is that number, as JavaScript
+        // (and so the TypeScript translation) reads it; anything else is the
+        // default.
+        for (text, minutes) in [
+            ("12.0", 12),
+            ("12", 12),
+            ("1e3", 1000),
+            ("12.5", 60),
+            ("1e20", 60),
+            ("9007199254740993", 60),
+        ] {
+            let doc: Value =
+                serde_json::from_str(&format!(r#"{{"idle": {{"lsp_ttl_minutes": {text}}}}}"#))
+                    .unwrap();
+            let (value, _) = translate(doc);
+            assert_eq!(value, json!({"lsp": {"idle_minutes": minutes}}), "{text}");
+        }
+        let (value, out) = translate(json!({
+            "idle": {"lsp_ttl_minutes": 10},
+            "lsp": {"idle_minutes": "never"}
+        }));
+        assert_eq!(value, json!({"lsp": {"idle_minutes": "never"}}));
+        assert_eq!(out.warnings[0].code, "superseded_legacy_config");
     }
 
     #[test]
     fn github_master_false_fills_absent_leaves() {
-        let (value, _) = translate(
-            json!({"github": {"enabled": false, "shim": true}}),
-            PolicyPhase::Window,
-        );
+        let (value, _) = translate(json!({"github": {"enabled": false, "shim": true}}));
         assert_eq!(
             value,
             json!({"github": {"shim": true, "read": false, "write": false}})
         );
     }
 
+    #[test]
+    fn notices_name_the_file_and_the_retired_keys() {
+        let (_, out) = translate(json!({"search_index": false, "hoist_builtin_tools": true}));
+        let project = project_retired_keys_notice("/repo/.cortexkit/aft.jsonc", &out);
+        assert!(project.starts_with(
+            "/repo/.cortexkit/aft.jsonc uses retired keys (hoist_builtin_tools, search_index); AFT applied their current equivalents"
+        ));
+        assert!(project.contains("npx @cortexkit/aft doctor --fix"));
+        let migrated = user_config_migrated_notice("/u/aft.jsonc", "/u/aft.jsonc.bak-1", &out);
+        assert!(migrated.contains("/u/aft.jsonc.bak-1"));
+        let (_, out) = translate(json!({"enabled": false}));
+        assert!(
+            user_config_not_migrated_notice("/u/aft.jsonc", "read-only", &out)
+                .ends_with(RETIRED_ENABLED_FALSE_INDEXES_NOTE)
+        );
+    }
     #[test]
     fn resolved_validation_reports_sorted_paths_and_containers_only() {
         assert_eq!(

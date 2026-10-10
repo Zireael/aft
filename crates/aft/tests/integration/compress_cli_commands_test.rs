@@ -16,8 +16,7 @@ fn configure(aft: &mut AftProcess, project: &std::path::Path, storage: &std::pat
             "storage_dir": storage,
             "config": user_config(serde_json::json!({
                 "experimental": { "bash": { "compress": true } },
-                "search_index": false,
-                "semantic_search": false
+                "indexes": { "trigram": false, "semantic": false }
             }))
         })
         .to_string(),

@@ -14,7 +14,7 @@ fn configure_with_search_index(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(serde_json::json!({ "search_index": true })),
+            "config": user_config(serde_json::json!({ "indexes": { "trigram": true } })),
         })
         .to_string(),
     );
@@ -173,9 +173,7 @@ fn dispatch_stays_responsive_under_ignored_event_flood() {
             "harness": "opencode",
             "project_root": dir.path(),
             "config": user_config(serde_json::json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             })),
         })
         .to_string(),

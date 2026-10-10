@@ -877,11 +877,71 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     if response.success {
         let embedding_counts = crate::search_b2::embed_counter::read(&req.id);
         attach_search_execution_metadata(&mut response, &plan, embedding_counts);
+        attach_not_opened_notice(
+            &mut response,
+            req,
+            ctx,
+            &plan,
+            external_root.as_deref(),
+            &project_root,
+        );
         if external_root.is_none() {
             SearchLaneStatus::observe_current(ctx).attach_labels(&mut response, ctx);
         }
     }
     response
+}
+
+/// Tell the agent, once per session and root, that a query which would have
+/// used semantic results got none because nobody has the project open, so
+/// AFT does not embed it (see `semantic_admission`). The agent is told to ask
+/// the user rather than enable it itself. Later searches in the session stay
+/// silent; the lane footer still says `semantic: off (not opened)`.
+fn attach_not_opened_notice(
+    response: &mut Response,
+    req: &RawRequest,
+    ctx: &AppContext,
+    plan: &extensions::LanePlan<'_>,
+    external_root: Option<&Path>,
+    project_root: &Path,
+) {
+    let would_use_semantic = ctx.config().indexes.semantic
+        && !plan.contains(SearchLaneKind::Semantic)
+        && crate::search_b2::lane_plan::legal_lanes(plan.shape, &plan.query_facts)
+            .contains(&SearchLaneKind::Semantic);
+    if !would_use_semantic {
+        return;
+    }
+    // This session's own root records why it has no semantic index; another
+    // project searched with `path` is judged by the same admission rule.
+    let searched_root = match external_root {
+        Some(root) => {
+            let standing_roots = ctx.config().index.roots.clone();
+            if crate::semantic_admission::admission(root, &standing_roots).admits() {
+                return;
+            }
+            root
+        }
+        None => {
+            let observed = observed_index_status(ctx, IndexPlane::Semantic);
+            if observed.unavailable_reason.as_deref() != Some(feature_cause::SEMANTIC_NOT_OPENED) {
+                return;
+            }
+            project_root
+        }
+    };
+    let Some(notice) = crate::semantic_admission::take_notice(req.session(), searched_root) else {
+        return;
+    };
+    let Some(data) = response.data.as_object_mut() else {
+        return;
+    };
+    if let Some(text) = data.get_mut("text") {
+        if let Some(current) = text.as_str() {
+            *text = serde_json::json!(format!("{current}\n{notice}"));
+        }
+    }
+    data.insert("semantic_notice".to_string(), serde_json::json!(notice));
 }
 
 /// The request's `pattern`, compiled with grep's syntax and case default
@@ -1695,6 +1755,12 @@ impl SearchLaneStatus {
             .into_iter()
             .map(|(name, lane)| {
                 let state = match lane.effective {
+                    IndexEffective::Unavailable
+                        if lane.unavailable_reason.as_deref()
+                            == Some(feature_cause::SEMANTIC_NOT_OPENED) =>
+                    {
+                        crate::semantic_admission::NOT_OPENED_LABEL.to_string()
+                    }
                     IndexEffective::Unavailable => format!(
                         "unavailable: {}",
                         lane.unavailable_reason.as_deref().unwrap_or("unknown")
@@ -6289,13 +6355,9 @@ fn collect_degraded_grep_files(
     // abort the daemon if a disappearing child mount reports ENXIO.
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(project_root).ok();
-    let walker = ignore::WalkBuilder::new(project_root)
-        .same_file_system(true)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
+    let mut builder = ignore::WalkBuilder::new(project_root);
+    builder.same_file_system(true).hidden(false);
+    let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
         .filter_entry({
             let skipped_foreign_mounts = Arc::clone(&skipped_foreign_mounts);
             move |entry| {
@@ -12888,6 +12950,100 @@ mod split_request_tests {
             assert_eq!(answer["semantic_score"], 1.0);
             assert_eq!(answer["matched_by"], "query");
         });
+    }
+
+    /// A prose search of another project nobody has open would have used
+    /// semantic results; the reply says once per session that semantic search
+    /// is off for it and how the user can turn it on, then stays quiet.
+    #[test]
+    fn search_of_a_project_nobody_opened_says_semantic_is_off_once_per_session() {
+        let session = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (_dir, root) = project();
+        git_init(&root);
+        let ctx = external_context(session.path(), storage.path(), false);
+        let query = "scheduler drains the work queue";
+        let notice_prefix = "semantic search is off for ";
+        let ask = |session_id: &str| {
+            search(
+                &ctx,
+                serde_json::json!({"query": query, "path": root, "session_id": session_id}),
+            )
+        };
+
+        let first = ask("ses_notice_first");
+        assert_eq!(first["success"], true, "{first}");
+        let text = first["text"].as_str().unwrap();
+        let notices = text
+            .lines()
+            .filter(|line| line.starts_with(notice_prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1, "{text}");
+        let canonical = crate::path_identity::ProjectRootId::from_path(&root)
+            .unwrap()
+            .into_path_buf();
+        assert_eq!(
+            notices[0],
+            format!(
+                "semantic search is off for {}: it is not open in any session. Ask the user before enabling it; they can add {} to index.roots in ~/.config/cortexkit/aft.jsonc.",
+                canonical.file_name().unwrap().to_string_lossy(),
+                canonical.display()
+            )
+        );
+
+        let second = ask("ses_notice_first");
+        assert_eq!(second["success"], true, "{second}");
+        assert!(
+            !second["text"].as_str().unwrap().contains(notice_prefix),
+            "the same session is told only once: {second}"
+        );
+        assert!(second.get("semantic_notice").is_none(), "{second}");
+
+        // Once a session has the project open, nobody is told it is off.
+        crate::semantic_admission::note_opened("ses_notice_opener", &root);
+        let opened = ask("ses_notice_other");
+        crate::semantic_admission::note_closed("ses_notice_opener", &root);
+        assert!(
+            !opened["text"].as_str().unwrap().contains(notice_prefix),
+            "{opened}"
+        );
+    }
+
+    /// This session's own root, bound by a route that does not open it, has
+    /// no semantic index: the footer says `off (not opened)` and the first
+    /// prose search carries the notice.
+    #[test]
+    fn own_root_not_opened_reports_off_in_the_footer() {
+        let (_dir, root) = project();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = external_context(&root, storage.path(), false);
+        ctx.set_canonical_cache_root(root.clone());
+        *ctx.semantic_index_status().write().unwrap() =
+            SemanticIndexStatus::Failed(crate::semantic_admission::NOT_OPENED_STATUS.to_string());
+        let mut index = SearchIndex::build(&root);
+        index.ready = true;
+        *ctx.search_index().write().unwrap() = Some(index);
+
+        let ask = || {
+            search(
+                &ctx,
+                serde_json::json!({"query": "scheduler drains the work queue", "session_id": "ses_own_root"}),
+            )
+        };
+        let first = ask();
+        assert_eq!(first["success"], true, "{first}");
+        let text = first["text"].as_str().unwrap();
+        assert!(text.contains("\nsemantic: off (not opened)"), "{text}");
+        assert_eq!(
+            text.matches("semantic search is off for ").count(),
+            1,
+            "{text}"
+        );
+        let second = ask();
+        let text = second["text"].as_str().unwrap();
+        assert!(text.contains("\nsemantic: off (not opened)"), "{text}");
+        assert!(!text.contains("semantic search is off for "), "{text}");
     }
 
     #[test]

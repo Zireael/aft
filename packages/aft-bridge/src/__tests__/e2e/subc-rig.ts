@@ -1,10 +1,21 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { appendFileSync, constants } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 
 import { type CatalogEntry, SubcClient } from "@cortexkit/subc-client";
+import { isolatedAftEnvironment } from "../../test-child-environment.js";
 
 const AFT_BINARY_NAME = process.platform === "win32" ? "aft.exe" : "aft";
 const SUBC_BINARY_NAME = process.platform === "win32" ? "subc-core.exe" : "subc-core";
@@ -139,6 +150,9 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   const projectDir = join(tempDir, "project");
   const cacheDir = join(tempDir, "cache");
   const storageDir = join(tempDir, "aft-storage");
+  const childEnv = isolatedAftEnvironment(tempDir);
+  childEnv.AFT_STORAGE_DIR = storageDir;
+  await mkdir(storageDir, { recursive: true });
   const connectionFile = join(runtimeDir, "subc-connection.json");
   // Logs live outside the disposable fixture, including on startup failure.
   const logRoot = resolve(process.env.AFT_SUBC_E2E_LOG_DIR || join(tmpdir(), "aft-subc-e2e-logs"));
@@ -165,8 +179,7 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
     JSON.stringify(
       {
         storage_dir: storageDir,
-        search_index: true,
-        semantic_search: false,
+        indexes: { trigram: true, semantic: false },
         disabled_tools: [],
         experimental_bash_background: true,
         bash_permissions: false,
@@ -190,6 +203,7 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
             program: process.platform === "win32" ? prepared.aftBinaryPath : moduleWrapper,
             args: process.platform === "win32" ? [] : [moduleStderrPath, prepared.aftBinaryPath],
             env: {
+              ...childEnv,
               HOME: homeDir,
               XDG_CONFIG_HOME: configHome,
               XDG_DATA_HOME: dataHome,
@@ -218,9 +232,22 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   };
 
   let daemon: ChildProcessWithoutNullStreams | null = null;
+  let testExecutableDir: string | null = null;
+  let testDaemonPath: string;
   try {
-    daemon = await spawnReadyDaemon(prepared.subcCorePath, daemonDirs);
+    // Keep the executable in the cache tree so the orphan sweep can still
+    // identify and reap it if the test runner exits before cleanup.
+    await mkdir(FETCHED_SUBC_CORE_CACHE_ROOT, { recursive: true });
+    testExecutableDir = await mkdtemp(join(FETCHED_SUBC_CORE_CACHE_ROOT, ".rig-"));
+    testDaemonPath = join(
+      testExecutableDir,
+      `ckdev-subc${process.platform === "win32" ? ".exe" : ""}`,
+    );
+    await copyFile(prepared.subcCorePath, testDaemonPath);
+    if (process.platform !== "win32") await chmod(testDaemonPath, 0o755);
+    daemon = await spawnReadyDaemon(testDaemonPath, daemonDirs);
   } catch (err) {
+    if (testExecutableDir) await safeRemoveDir(testExecutableDir);
     await safeRemoveDir(tempDir);
     throw err;
   }
@@ -261,13 +288,14 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
     restartDaemon: async () => {
       if (cleaned) throw new Error("subc rig already cleaned up");
       await stopDaemon(daemon);
-      daemon = await spawnReadyDaemon(prepared.subcCorePath, daemonDirs);
+      daemon = await spawnReadyDaemon(testDaemonPath, daemonDirs);
     },
     cleanup: async () => {
       if (cleaned) return;
       cleaned = true;
       await stopDaemon(daemon);
       await safeRemoveDir(tempDir);
+      if (testExecutableDir) await safeRemoveDir(testExecutableDir);
     },
   };
 }
@@ -279,7 +307,7 @@ async function setupProjectFixture(
   await mkdir(join(projectDir, ".cortexkit"), { recursive: true });
   await writeFile(
     join(projectDir, ".cortexkit", "aft.jsonc"),
-    JSON.stringify({ search_index: false, semantic_search: false }, null, 2),
+    JSON.stringify({ indexes: { trigram: false, semantic: false } }, null, 2),
     "utf8",
   );
   await writeFile(join(projectDir, "seed.txt"), "seed\n", "utf8");
@@ -532,6 +560,7 @@ async function spawnReadyDaemon(
     const daemon = spawn(subcCorePath, [], {
       env: {
         ...process.env,
+        ...isolatedAftEnvironment(resolve(dirs.homeDir, "..")),
         HOME: dirs.homeDir,
         XDG_CONFIG_HOME: dirs.configHome,
         XDG_RUNTIME_DIR: dirs.runtimeDir,
@@ -727,9 +756,8 @@ async function findAftModuleProcess(
  *
  * A process qualifies only when both hold:
  *   - its executable lives under `cacheRoot` (the fetched test-binary cache).
- *     The name `ck-subc` is deliberately NOT part of the test: the production
- *     supervisor and other checkouts' supervisors share that name, and only the
- *     cache path distinguishes a daemon this test rig fetched and started.
+ *     The sweep does not match the `ckdev-subc` basename; the cache path and
+ *     ownership record distinguish daemons started by this rig.
  *   - its recorded runner is gone (including reuse of the runner pid). The
  *     parent may be a child subreaper rather than pid 1 on Linux. Only older
  *     daemons without ownership records use parent pid 1 as a fallback.

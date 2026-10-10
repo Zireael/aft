@@ -9,8 +9,10 @@
 # The pinned tree carries a report under .alfonso/ that quotes the concept
 # fixtures' queries. Indexed, it becomes a self-fulfilling exact hit for those
 # queries, the same answer-key problem this directory's .aftignore solves for
-# the fixture files. The repository's .gitignore would normally hide it, but
-# the copy has no .git directory, so AFT does not apply .gitignore there.
+# the fixture files. The repository's .gitignore would hide it in a checkout;
+# the copy has no .git, and run_real_query.py starts the copy's root .aftignore
+# with a whitelist so that no .gitignore rule changes the pool. The report has
+# to be excluded here, after that whitelist.
 #
 # The last entry keeps this file itself out of the index, so the only change
 # to the candidate pool is the removal of the report.

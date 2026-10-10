@@ -1,13 +1,15 @@
 //! The v1 catalog and admission boundary, separate from plugin tool forwarding.
 
-use std::collections::BTreeMap;
-use std::sync::{LazyLock, OnceLock};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use cortexkit_role_tool_provider::{
     call::{check_call, SchemaPin},
     catalog::{
-        composition_digest, schema_digest, CatalogAnswer, CatalogRequest, CatalogTool,
-        SystemTextAnswer,
+        composition_digest, schema_digest, system_text_digest, CatalogAnswer, CatalogRequest,
+        CatalogTool, SystemTextAnswer,
     },
     describe::{Major, RoleDescribe},
     errors,
@@ -104,7 +106,7 @@ pub(super) const METADATA: &[(&str, &str, bool)] = &[
 
 #[cfg(test)]
 pub(super) fn tools(disabled: &[String], powershell_available: bool) -> Vec<CatalogTool> {
-    tools_for(CatalogPreset::Head, disabled, powershell_available)
+    tools_for_session(CatalogPreset::Head, disabled, powershell_available, false)
 }
 
 /// The named catalog variants AFT serves. A consumer's plan item names one
@@ -175,10 +177,14 @@ pub(super) const PRESET_ONLY_METADATA: &[(&str, &str, bool)] =
 
 /// The catalog entries `preset` serves, in manifest order, with a worker-only
 /// tool placed after the head tool it accompanies.
-pub(super) fn tools_for(
+///
+/// A session that may run commands on the remote runner (`runon`) also sees
+/// bash's `runon` argument; no other session does.
+pub(super) fn tools_for_session(
     preset: CatalogPreset,
     disabled: &[String],
     powershell_available: bool,
+    runon: bool,
 ) -> Vec<CatalogTool> {
     served_tools(preset)
         .iter()
@@ -187,7 +193,10 @@ pub(super) fn tools_for(
         .filter(|tool| {
             tool.catalog.name != "bash_watch" || crate::tool_gate::catalog_keeps("bash", disabled)
         })
-        .map(|tool| tool.catalog.clone())
+        .map(|tool| match (&tool.with_runon, runon) {
+            (Some(with_runon), true) => with_runon.clone(),
+            _ => tool.catalog.clone(),
+        })
         .collect()
 }
 
@@ -196,6 +205,10 @@ pub(super) fn tools_for(
 // its schemas, so neither digests nor validators need request-scoped rebuilding.
 struct ServedTool {
     catalog: CatalogTool,
+    /// The same entry with bash's `runon` argument, served only to a session
+    /// that may run commands remotely. Admission validates every call against
+    /// it, so a call from either kind of session is checked the same way.
+    with_runon: Option<CatalogTool>,
     validator: OnceLock<jsonschema::Validator>,
 }
 
@@ -203,8 +216,9 @@ static SERVED_TOOLS: LazyLock<[Vec<ServedTool>; 3]> = LazyLock::new(|| {
     CatalogPreset::ALL.map(|preset| {
         build_tools(preset)
             .into_iter()
-            .map(|catalog| ServedTool {
+            .map(|(catalog, with_runon)| ServedTool {
                 catalog,
+                with_runon,
                 validator: OnceLock::new(),
             })
             .collect()
@@ -219,7 +233,7 @@ fn served_tools(preset: CatalogPreset) -> &'static [ServedTool] {
     }]
 }
 
-fn build_tools(preset: CatalogPreset) -> Vec<CatalogTool> {
+fn build_tools(preset: CatalogPreset) -> Vec<(CatalogTool, Option<CatalogTool>)> {
     #[cfg(test)]
     ADMISSION_WORK.with(|count| {
         let (catalogs, validators) = count.get();
@@ -266,26 +280,33 @@ fn build_tools(preset: CatalogPreset) -> Vec<CatalogTool> {
     }
     served
         .into_iter()
-        .map(|(name, mut schema, description)| {
+        .map(|(name, schema, description)| {
             let (_, tag, restrict_replace) = METADATA
                 .iter()
                 .chain(PRESET_ONLY_METADATA)
                 .find(|(known, _, _)| *known == name)
                 .expect("every served tool has v1 metadata");
-            schema
-                .as_object_mut()
-                .expect("tool schemas are objects")
-                .remove("description");
-            let digest = schema_digest(&schema).expect("embedded schema has a structural digest");
-            let mut entry = CatalogTool::new(name, digest, 1, schema);
-            if !tag.is_empty() {
-                entry.capabilities.push((*tag).into());
-            }
-            entry.description = description;
-            if *restrict_replace {
-                entry.result_ops = Some(vec!["prepend".into(), "append".into()]);
-            }
-            entry
+            let entry = |mut schema: Value, description: Option<String>| {
+                schema
+                    .as_object_mut()
+                    .expect("tool schemas are objects")
+                    .remove("description");
+                let digest =
+                    schema_digest(&schema).expect("embedded schema has a structural digest");
+                let mut entry = CatalogTool::new(name.clone(), digest, 1, schema);
+                if !tag.is_empty() {
+                    entry.capabilities.push((*tag).into());
+                }
+                entry.description = description;
+                if *restrict_replace {
+                    entry.result_ops = Some(vec!["prepend".into(), "append".into()]);
+                }
+                entry
+            };
+            let preset_name = (preset != CatalogPreset::Head).then(|| preset.name());
+            let with_runon = manifest::remote_tool(preset_name, &name)
+                .map(|(schema, description)| entry(schema, description));
+            (entry(schema, description), with_runon)
         })
         .collect()
 }
@@ -371,6 +392,17 @@ pub(super) fn catalog(
     disabled: &[String],
     powershell_available: bool,
 ) -> Result<Value, ErrorBody> {
+    catalog_for_session(body, disabled, powershell_available, false)
+}
+
+/// [`catalog`] for a session that may (`runon`) or may not run commands on
+/// the remote runner; only the first sees bash's `runon` argument.
+pub(super) fn catalog_for_session(
+    body: Value,
+    disabled: &[String],
+    powershell_available: bool,
+    runon: bool,
+) -> Result<Value, ErrorBody> {
     let request: CatalogRequest = serde_json::from_value(body)
         .map_err(|e| errors::invalid_request("arguments", e.to_string()))?;
     let preset = CatalogPreset::parse("preset", request.preset.as_deref())?;
@@ -380,8 +412,12 @@ pub(super) fn catalog(
             "unsupported catalog parameter",
         ));
     }
-    let mut answer =
-        CatalogAnswer::new("", "").with_tools(tools_for(preset, disabled, powershell_available));
+    let mut answer = CatalogAnswer::new("", "").with_tools(tools_for_session(
+        preset,
+        disabled,
+        powershell_available,
+        runon,
+    ));
     let composition = request.composition.as_ref().map(|composition| {
         composition_digest(&Value::Object(composition.clone())).expect("composition is JSON")
     });
@@ -420,11 +456,10 @@ pub(super) fn catalog(
             CatalogPreset::Reader => reader_text(&names),
         };
         // The item digest is the SHA-256 hex of the exact UTF-8 text returned,
-        // so a runner can check the text against it from this reply alone.
-        let digest = {
-            use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(text.as_bytes()))
-        };
+        // so a runner can check the text against it from this reply alone. The
+        // protocol crate owns that definition; the preflight digest reuses it
+        // because the text is the only input that changes the rendered item.
+        let digest = system_text_digest(&text);
         let mut rendered = SystemTextAnswer::new(&digest, &digest)
             .with_text(text)
             // The text is composed for exactly the tools served in this reply;
@@ -481,6 +516,804 @@ pub(super) fn admit(
     let role = resolve_caller_role(call.preset.as_deref(), scoped_route, false)?;
     admit_as(call, disabled, powershell_available, session, trusted, role)?;
     Ok(role)
+}
+
+const SCOPED_PRESET_REFUSAL_WINDOW: Duration = Duration::from_secs(60);
+const SCOPED_PRESET_REFUSAL_STATE_LIMIT: usize = 256;
+
+#[derive(Default)]
+struct RefusalLogState {
+    last_logged_at: Option<Instant>,
+    suppressed: u64,
+}
+
+static SCOPED_PRESET_REFUSALS: LazyLock<Mutex<HashMap<(String, String), RefusalLogState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static SCOPED_PRESET_REFUSAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Admit a provider call with the route identity available for refusal diagnostics.
+pub(super) fn admit_on_route(
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+    scoped_route: bool,
+    disabled: &[String],
+    powershell_available: bool,
+    session: &str,
+    trusted: bool,
+    root: &Path,
+    channel: u16,
+) -> Result<CallerRole, ErrorBody> {
+    admit_on_route_at(
+        call,
+        scoped_route,
+        disabled,
+        powershell_available,
+        session,
+        trusted,
+        root,
+        channel,
+        Instant::now(),
+    )
+}
+
+fn admit_on_route_at(
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+    scoped_route: bool,
+    disabled: &[String],
+    powershell_available: bool,
+    session: &str,
+    trusted: bool,
+    root: &Path,
+    channel: u16,
+    now: Instant,
+) -> Result<CallerRole, ErrorBody> {
+    let result = admit(
+        call,
+        scoped_route,
+        disabled,
+        powershell_available,
+        session,
+        trusted,
+    );
+    if scoped_route
+        && call.preset.is_none()
+        && result
+            .as_ref()
+            .err()
+            .is_some_and(|error| errors::invalid_request_field(error) == Some("preset"))
+    {
+        log_scoped_preset_refusal_at(session, root, channel, &call.name, now);
+    }
+    result
+}
+
+/// Log a scoped route's missing-preset refusal, keeping repeated broken calls quiet.
+pub(super) fn log_scoped_preset_refusal(session: &str, root: &Path, channel: u16, tool: &str) {
+    log_scoped_preset_refusal_at(session, root, channel, tool, Instant::now());
+}
+
+fn log_scoped_preset_refusal_at(
+    session: &str,
+    root: &Path,
+    channel: u16,
+    tool: &str,
+    now: Instant,
+) {
+    let root = root.display().to_string();
+    let key = (session.to_string(), root.clone());
+    let (should_log, suppressed) = {
+        let Ok(mut refusals) = SCOPED_PRESET_REFUSALS.lock() else {
+            return;
+        };
+        if !refusals.contains_key(&key) && refusals.len() >= SCOPED_PRESET_REFUSAL_STATE_LIMIT {
+            refusals.retain(|_, state| {
+                state.last_logged_at.is_some_and(|last| {
+                    now.checked_duration_since(last)
+                        .is_some_and(|elapsed| elapsed < SCOPED_PRESET_REFUSAL_WINDOW)
+                })
+            });
+            while refusals.len() >= SCOPED_PRESET_REFUSAL_STATE_LIMIT {
+                let oldest = refusals
+                    .iter()
+                    .min_by_key(|(_, state)| state.last_logged_at)
+                    .map(|(key, _)| key.clone());
+                let Some(oldest) = oldest else {
+                    break;
+                };
+                refusals.remove(&oldest);
+            }
+        }
+        let state = refusals.entry(key).or_default();
+        let elapsed = state
+            .last_logged_at
+            .and_then(|last| now.checked_duration_since(last))
+            .unwrap_or_default();
+        if state.last_logged_at.is_some() && elapsed < SCOPED_PRESET_REFUSAL_WINDOW {
+            state.suppressed = state.suppressed.saturating_add(1);
+            (false, 0)
+        } else {
+            let suppressed = std::mem::take(&mut state.suppressed);
+            state.last_logged_at = Some(now);
+            (true, suppressed)
+        }
+    };
+    if !should_log {
+        return;
+    }
+    if suppressed > 0 {
+        let line =
+            format!("tool call refusals suppressed={suppressed} session={session} root={root}");
+        crate::slog_warn!("{line}");
+    }
+    let line = format!(
+        "tool call refused: scoped route without preset tool={tool} session={session} root={root} channel={channel}"
+    );
+    crate::slog_warn!("{line}");
+}
+
+// A keyed shell may ask an untrusted consumer for permission, but the
+// consumer's elicitation capability does not authorize shell observation.
+pub(super) fn admission_trusted(
+    identity: &super::RouteIdentity,
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+) -> bool {
+    !matches!(identity.trust, super::BindTrust::Untrusted)
+        || (call.call_key.is_some()
+            && identity.consumer_elicitation_capable
+            && matches!(call.name.as_str(), "bash" | "powershell"))
+}
+
+pub(super) fn ledger_scope(
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> crate::db::call_ledger::ScopeIdentity {
+    crate::db::call_ledger::ScopeIdentity {
+        owner: super::principal_id(&Some(scope.owner.clone())).unwrap(),
+        scope_ref: scope.scope_ref.clone(),
+        scope_epoch: scope.scope_epoch,
+    }
+}
+
+pub(super) fn keyed_route_frame(
+    frame: &subc_protocol::Frame,
+    routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
+) -> bool {
+    routes
+        .get(&super::route_key(frame.header.channel, frame.header.epoch))
+        .is_some_and(|identity| identity.role == RouteRole::ToolProviderV1)
+        && serde_json::from_slice::<Value>(&frame.body)
+            .is_ok_and(|body| body.get("call_key").and_then(Value::as_str).is_some())
+}
+
+pub(super) fn note_native_outcome(
+    ctx: &crate::context::AppContext,
+    key: Option<&crate::db::call_ledger::Key>,
+    response: &crate::protocol::Response,
+) {
+    if let (Some(key), Some(db)) = (key, ctx.db()) {
+        if let Ok(conn) = db.lock() {
+            if let Err(error) = crate::db::call_ledger::note_native_outcome(&conn, key, response) {
+                log::warn!("call ledger outcome recording failed: {error}");
+            }
+        }
+    }
+}
+
+/// The edge parks admission replies outside the frame loop. The executor
+/// commits admission before returning a frame to dispatch; terminal frames
+/// pass through the same edge and are committed before reaching the socket.
+pub(super) struct LedgerEdge {
+    calls: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerCall>>,
+    waiting: std::sync::Mutex<
+        std::collections::HashMap<(super::RouteChannel, u64), super::PersistentCancelSignal>,
+    >,
+    ready: tokio::sync::mpsc::UnboundedSender<super::DecodedFrame>,
+}
+struct LedgerCall {
+    root: crate::path_identity::ProjectRootId,
+    key: crate::db::call_ledger::Key,
+    expires_at: std::time::Instant,
+}
+
+impl LedgerEdge {
+    pub(super) fn new() -> (
+        std::sync::Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<super::DecodedFrame>,
+    ) {
+        let _ = crate::db::call_ledger::provider_incarnation();
+        let (ready, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (
+            std::sync::Arc::new(Self {
+                calls: Default::default(),
+                waiting: Default::default(),
+                ready,
+            }),
+            receiver,
+        )
+    }
+
+    pub(super) fn key(
+        identity: &super::RouteIdentity,
+        call_key: &str,
+    ) -> crate::db::call_ledger::Key {
+        let carrier = match &identity.spawn_principal {
+            crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
+                principal_id.clone().unwrap_or_else(|| "absent".into())
+            }
+            _ => "first-party".into(),
+        };
+        crate::db::call_ledger::Key {
+            carrier,
+            call_key: call_key.into(),
+        }
+    }
+
+    /// Returns the frame unchanged for keyless, legacy and refused calls.
+    /// A refused admission never consumes a key or writes a row.
+    pub(super) fn defer(
+        self: &std::sync::Arc<Self>,
+        decoded: super::DecodedFrame,
+        routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
+        executor: &std::sync::Arc<crate::executor::Executor>,
+        writer: &super::WriterSender,
+        metrics: &std::sync::Arc<super::DispatchPathMetrics>,
+    ) -> Result<(), super::DecodedFrame> {
+        use super::*;
+        use crate::db::call_ledger::{self as ledger, Admission, State};
+        let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        let Some(identity) = routes
+            .get(&route)
+            .filter(|i| i.role == RouteRole::ToolProviderV1)
+            .cloned()
+        else {
+            return Err(decoded);
+        };
+        let Ok(body) = serde_json::from_slice::<Value>(&decoded.frame.body) else {
+            return Err(decoded);
+        };
+        if body
+            .get("op")
+            .and_then(Value::as_str)
+            .is_some_and(|op| op != "tool.call")
+            || body
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(recognized_operation)
+        {
+            return Err(decoded);
+        }
+        let Ok(call) =
+            serde_json::from_value::<cortexkit_role_tool_provider::call::ToolCallRequest>(body)
+        else {
+            return Err(decoded);
+        };
+        let Some(call_key) = call.call_key.as_deref() else {
+            return Err(decoded);
+        };
+        if admit(
+            &call,
+            identity.scope.is_some(),
+            &identity.disabled_tools,
+            crate::bash_background::powershell_available(),
+            &identity.session,
+            admission_trusted(&identity, &call),
+        )
+        .is_err()
+        {
+            return Err(decoded);
+        };
+        let held = matches!(identity.trust, BindTrust::Untrusted)
+            && matches!(call.name.as_str(), "bash" | "powershell");
+        let mut plan_args = call.arguments.clone();
+        if held {
+            if !identity.consumer_elicitation_capable
+                || plan_args.get("sandbox").and_then(Value::as_str) == Some("host")
+            {
+                return Err(decoded);
+            };
+            if call.name == "powershell" {
+                plan_args
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("shell".into(), json!("powershell"));
+            }
+            if bash::prepare_bash_elicitation_plan(&plan_args, &identity.project_root).is_err() {
+                return Err(decoded);
+            };
+        }
+        let key = Self::key(&identity, call_key);
+        if let Some(response) = executor
+            .actor_context(&identity.root)
+            .and_then(|ctx| ctx.database_runtime_refusal("ledger-admission", "bash"))
+        {
+            let writer = writer.clone();
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                let context = crate::subc_format::FormatContext::from_tool_call(
+                    &call.name,
+                    &call.arguments,
+                    &identity.project_root,
+                );
+                let result = ToolCallResult {
+                    text: crate::subc_format::format_response_with_context(
+                        &call.name, &response, &context,
+                    ),
+                    response,
+                };
+                if let Ok(frame) = build_tool_response_frame(
+                    decoded.frame.header.ver,
+                    route,
+                    decoded.frame.header.corr,
+                    decoded.frame.header.flags,
+                    &result,
+                    identity.trust,
+                ) {
+                    let _ = send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
+                        .await;
+                }
+            });
+            return Ok(());
+        }
+        let scope = identity.scope.as_ref().map(ledger_scope);
+        // composition_digest is the role crate's SHA-256 over JCS, without
+        // schema-description projection. Hash before server shell injections.
+        let digest = composition_digest(
+            &json!({"name":call.name,"schema_pin":call.schema_pin,"arguments":call.arguments}),
+        )
+        .expect("admitted JSON has canonical bytes");
+        let edge = self.clone();
+        let repeat_executor = executor.clone();
+        let writer = writer.clone();
+        let metrics = metrics.clone();
+        let root = identity.root.clone();
+        let request_id = format!("ledger-{}-{}", route.channel, decoded.frame.header.corr);
+        let response_key = key.clone();
+        let cancel = PersistentCancelSignal::new();
+        self.waiting
+            .lock()
+            .unwrap()
+            .insert((route, decoded.frame.header.corr), cancel.clone());
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let rx = executor.submit_async(
+            root.clone(),
+            crate::executor::Lane::Mutating,
+            request_id.clone(),
+            Box::new(move |ctx| {
+                let result = (|| {
+                    // Use the database-dependent gate for every keyed tool, even a
+                    // read. Keyless reads continue through their existing gate.
+                    if let Some(refusal) = ctx.database_runtime_refusal(&request_id, "bash") {
+                        return Err(refusal);
+                    }
+                    let Some(db) = ctx.db() else {
+                        return Err(crate::protocol::Response::error_with_data(
+                            &request_id,
+                            "database_unavailable",
+                            "Call ledger is unavailable; no tool operation was performed.",
+                            json!({"retryable":false}),
+                        ));
+                    };
+                    let conn = db.lock().map_err(|_| {
+                        crate::protocol::Response::error(
+                            &request_id,
+                            "database_unavailable",
+                            "Call ledger database mutex is poisoned",
+                        )
+                    })?;
+                    ledger::sweep(&conn, ledger::now_ms())
+                        .and_then(|_| {
+                            ledger::reduce_expired(&conn, &key, ledger::now_ms())?;
+                            ledger::admit(
+                                &conn,
+                                &key,
+                                &digest,
+                                scope.as_ref(),
+                                if held {
+                                    State::Prepared
+                                } else {
+                                    State::DispatchStarted
+                                },
+                            )
+                        })
+                        .map_err(|error| {
+                            crate::protocol::Response::error_with_data(
+                                &request_id,
+                                "database_unavailable",
+                                error.to_string(),
+                                json!({"retryable":false}),
+                            )
+                        })
+                })();
+                let _ = result_tx.send(result);
+                crate::protocol::Response::success(request_id, json!({}))
+            }),
+        );
+        tokio::spawn(async move {
+            let response = await_executor_response(rx, "ledger-admission".into()).await;
+            let result = result_rx.await.unwrap_or(Err(response));
+            match result {
+                Ok(Admission::New) => {
+                    edge.calls.lock().unwrap().insert(
+                        (route, decoded.frame.header.corr),
+                        LedgerCall {
+                            root,
+                            key: response_key,
+                            expires_at: std::time::Instant::now() + bash_elicitation_timeout(),
+                        },
+                    );
+                    let _ = edge.ready.send(decoded);
+                }
+                Ok(Admission::Repeat(row)) if row.state != State::Settled => {
+                    // Repeats observe the same durable execution, including a
+                    // shell recovered after restart. They never dispatch again.
+                    loop {
+                        if cancel.is_cancelled() {
+                            let frame = Self::cancelled_frame(&decoded.frame).unwrap();
+                            edge.finish_waiting(&decoded.frame);
+                            let _ = send_reliable_writer_frame(
+                                &writer,
+                                &metrics,
+                                frame,
+                                "cancelled ledger attachment",
+                            )
+                            .await;
+                            break;
+                        }
+                        let key = response_key.clone();
+                        let (row_tx, row_rx) = oneshot::channel();
+                        let rx = repeat_executor.submit_async(
+                            root.clone(),
+                            Lane::Mutating,
+                            "ledger-attach".into(),
+                            Box::new(move |ctx| {
+                                let row = ctx.db().and_then(|db| {
+                                    db.lock()
+                                        .ok()
+                                        .and_then(|conn| ledger::get(&conn, &key).ok().flatten())
+                                });
+                                let _ = row_tx.send(row);
+                                Response::success("ledger-attach", json!({}))
+                            }),
+                        );
+                        tokio::select! {
+                            _ = await_executor_response(rx, "ledger-attach".into()) => {},
+                            _ = cancel.cancelled() => continue,
+                        }
+                        if let Ok(Some(row)) = row_rx.await {
+                            if row.state == State::Settled {
+                                if let Some(recorded) = row.frame {
+                                    if let Ok(frame) = edge.finish_replay(&decoded.frame, &recorded)
+                                    {
+                                        let _ = send_reliable_writer_frame(
+                                            &writer,
+                                            &metrics,
+                                            frame,
+                                            "attached ledger result",
+                                        )
+                                        .await;
+                                    }
+                                }
+                                break;
+                            }
+                        } else {
+                            edge.finish_waiting(&decoded.frame);
+                            let _ = send_provider_error(
+                                &writer,
+                                &metrics,
+                                &decoded.frame,
+                                ErrorBody::new(
+                                    "database_unavailable",
+                                    "call ledger attachment is unavailable",
+                                )
+                                .with_detail(json!({"retryable":false})),
+                            )
+                            .await;
+                            break;
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+                            _ = cancel.cancelled() => {},
+                        }
+                    }
+                }
+                Ok(Admission::Repeat(row)) => {
+                    if let Some(recorded) = row.frame {
+                        if let Ok(frame) = edge.finish_replay(&decoded.frame, &recorded) {
+                            let _ = send_reliable_writer_frame(
+                                &writer,
+                                &metrics,
+                                frame,
+                                "ledger replay",
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Ok(Admission::Conflict) => {
+                    let error = errors::invalid_request(
+                        "call_key",
+                        "key already names different content or scope",
+                    );
+                    let recorded = ledger::RecordedFrame {
+                        ty: FrameType::Error,
+                        body: serde_json::to_vec(&error).unwrap(),
+                    };
+                    if let Ok(frame) = edge.finish_replay(&decoded.frame, &recorded) {
+                        let _ =
+                            send_reliable_writer_frame(&writer, &metrics, frame, "ledger conflict")
+                                .await;
+                    }
+                }
+                Err(response) => {
+                    let context = crate::subc_format::FormatContext::from_tool_call(
+                        "read",
+                        &json!({}),
+                        &identity.project_root,
+                    );
+                    let result = ToolCallResult {
+                        text: crate::subc_format::format_response_with_context(
+                            "read", &response, &context,
+                        ),
+                        response,
+                    };
+                    if let Ok(mut frame) = build_tool_response_frame(
+                        decoded.frame.header.ver,
+                        route,
+                        decoded.frame.header.corr,
+                        decoded.frame.header.flags,
+                        &result,
+                        identity.trust,
+                    ) {
+                        if edge.finish_waiting(&decoded.frame) {
+                            frame = Self::cancelled_frame(&decoded.frame).unwrap();
+                        }
+                        let _ =
+                            send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
+                                .await;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn replay(
+        request: &subc_protocol::Frame,
+        recorded: &crate::db::call_ledger::RecordedFrame,
+    ) -> Result<subc_protocol::Frame, subc_protocol::FrameBuildError> {
+        subc_protocol::Frame::build_with_version(
+            request.header.ver,
+            recorded.ty,
+            request.header.flags,
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            recorded.body.clone(),
+        )
+    }
+
+    /// Pending admission and attached repeats do not belong to the tool's
+    /// executor job. Cancelling one attachment must not settle the shared row.
+    pub(super) fn cancel(&self, route: super::RouteChannel, corr: u64) -> bool {
+        let waiting = self.waiting.lock().unwrap();
+        if let Some(signal) = waiting.get(&(route, corr)) {
+            signal.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn close(&self) {
+        for signal in self.waiting.lock().unwrap().values() {
+            signal.cancel();
+        }
+    }
+
+    pub(super) fn finish_waiting(&self, request: &subc_protocol::Frame) -> bool {
+        self.waiting
+            .lock()
+            .unwrap()
+            .remove(&(
+                super::route_key(request.header.channel, request.header.epoch),
+                request.header.corr,
+            ))
+            .is_some_and(|signal| signal.is_cancelled())
+    }
+
+    fn cancelled_frame(
+        request: &subc_protocol::Frame,
+    ) -> Result<subc_protocol::Frame, super::SubcError> {
+        super::build_error_frame(
+            request.header.ver,
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            request.header.flags,
+            "cancelled",
+            "request cancelled",
+        )
+    }
+
+    fn finish_replay(
+        &self,
+        request: &subc_protocol::Frame,
+        recorded: &crate::db::call_ledger::RecordedFrame,
+    ) -> Result<subc_protocol::Frame, super::SubcError> {
+        if self.finish_waiting(request) {
+            Self::cancelled_frame(request)
+        } else {
+            Self::replay(request, recorded).map_err(super::SubcError::FrameBuild)
+        }
+    }
+
+    pub(super) fn authorize(
+        self: &std::sync::Arc<Self>,
+        decoded: super::DecodedFrame,
+        asks: &std::collections::HashMap<super::ReverseCorrKey, super::PendingBashAsk>,
+        executor: &std::sync::Arc<crate::executor::Executor>,
+    ) -> Result<(), super::DecodedFrame> {
+        use super::*;
+        use crate::db::call_ledger::{self as ledger, State};
+        let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        if decoded.frame.header.ty != FrameType::Response
+            || !bash_elicitation_reply_is_allow(&decoded.frame.body)
+        {
+            return Err(decoded);
+        };
+        let Some(ask) = asks.get(&ReverseCorrKey {
+            route,
+            corr: decoded.frame.header.corr,
+        }) else {
+            return Err(decoded);
+        };
+        let (root, key) = {
+            let calls = self.calls.lock().unwrap();
+            let Some(call) = calls.get(&(route, ask.tool_corr)) else {
+                return Err(decoded);
+            };
+            (call.root.clone(), call.key.clone())
+        };
+        let edge = self.clone();
+        let rx = executor.submit_async(
+            root,
+            Lane::Mutating,
+            "ledger-authorize".into(),
+            Box::new(move |ctx| {
+                let allowed = ctx
+                    .db()
+                    .and_then(|db| {
+                        db.lock().ok().map(|conn| {
+                            ledger::transition(&conn, &key, State::Prepared, State::Authorized)
+                                .and_then(|authorized| {
+                                    if authorized {
+                                        ledger::transition(
+                                            &conn,
+                                            &key,
+                                            State::Authorized,
+                                            State::DispatchStarted,
+                                        )
+                                    } else {
+                                        Ok(false)
+                                    }
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                Response::success("ledger-authorize", json!({"allowed":allowed}))
+            }),
+        );
+        tokio::spawn(async move {
+            let response = await_executor_response(rx, "ledger-authorize".into()).await;
+            if response.data["allowed"] == true {
+                let _ = edge.ready.send(decoded);
+            }
+        });
+        Ok(())
+    }
+
+    pub(super) fn proxy(
+        self: &std::sync::Arc<Self>,
+        actual: super::WriterSender,
+        executor: std::sync::Arc<crate::executor::Executor>,
+        metrics: std::sync::Arc<super::DispatchPathMetrics>,
+    ) -> (super::WriterSender, tokio::task::JoinHandle<()>) {
+        use super::*;
+        use crate::db::call_ledger::{self as ledger, RecordedFrame, State};
+        let (sender, mut receiver) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
+        let edge = self.clone();
+        let task = tokio::spawn(async move {
+            while let Some(outgoing) = receiver.recv().await {
+                let route = route_key(outgoing.header.channel, outgoing.header.epoch);
+                let terminal = matches!(
+                    outgoing.header.ty,
+                    FrameType::Response | FrameType::Error | FrameType::StreamEnd
+                );
+                let call = if terminal {
+                    edge.calls
+                        .lock()
+                        .unwrap()
+                        .remove(&(route, outgoing.header.corr))
+                } else {
+                    None
+                };
+                let Some(call) = call else {
+                    if actual.send(outgoing).await.is_err() {
+                        break;
+                    }
+                    continue;
+                };
+                let actual = actual.clone();
+                let metrics = metrics.clone();
+                let recorded = RecordedFrame {
+                    ty: outgoing.header.ty,
+                    body: outgoing.body.clone(),
+                };
+                let record_for_job = recorded.clone();
+                let rx = executor.submit_async(
+                    call.root.clone(),
+                    Lane::Mutating,
+                    "ledger-settle".into(),
+                    Box::new(move |ctx| {
+                        if let Some(db) = ctx.db() {
+                            if let Ok(conn) = db.lock() {
+                                let row = ledger::get(&conn, &call.key).ok().flatten();
+                                let reason = row
+                                    .as_ref()
+                                    .filter(|row| row.state == State::Prepared)
+                                    .map(|_| {
+                                        if std::time::Instant::now() >= call.expires_at {
+                                            "expired"
+                                        } else {
+                                            "denied"
+                                        }
+                                    });
+                                let inferred = ledger::outcome(&record_for_job);
+                                let outcome = if reason.is_some() {
+                                    "bash_denied_untrusted".into()
+                                } else if record_for_job.ty == FrameType::Response
+                                    && inferred == "unknown"
+                                {
+                                    row.and_then(|row| row.outcome)
+                                        .filter(|outcome| outcome != "ok")
+                                        .unwrap_or(inferred)
+                                } else {
+                                    inferred
+                                };
+                                if let Err(error) = ledger::settle(
+                                    &conn,
+                                    &call.key,
+                                    &record_for_job,
+                                    &outcome,
+                                    reason,
+                                    ledger::now_ms(),
+                                ) {
+                                    return Response::error(
+                                        "ledger-settle",
+                                        "database_unavailable",
+                                        error.to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        Response::success("ledger-settle", json!({}))
+                    }),
+                );
+                tokio::spawn(async move {
+                    let settled = await_executor_response(rx, "ledger-settle".into()).await;
+                    if !settled.success {
+                        decrement_counted_channel(&metrics.writer_queued);
+                        return;
+                    }
+                    if actual.send(outgoing).await.is_err() {
+                        return;
+                    }
+                });
+            }
+        });
+        (sender, task)
+    }
 }
 
 /// [`admit`] for a call whose role is already resolved.
@@ -541,11 +1374,15 @@ fn admit_as(
         .iter()
         .find(|tool| tool.catalog.name == call.name)
         .expect("admitted tool has a schema");
-    let tool = &served.catalog;
+    // A bash call is checked against the schema with `runon`: whether the
+    // session may run remotely is decided when the call runs, by name.
+    let tool = served.with_runon.as_ref().unwrap_or(&served.catalog);
     if let Some(encoded) = &call.schema_pin {
         let pin = SchemaPin::parse(encoded)
             .map_err(|error| errors::invalid_request("schema_pin", error.to_string()))?;
-        if pin.schema_digest != tool.schema_digest {
+        if pin.schema_digest != tool.schema_digest
+            && pin.schema_digest != served.catalog.schema_digest
+        {
             return Err(ErrorBody::new(errors::TOOL_SCHEMA_CHANGED, "schema pin is stale").with_detail(json!({"tool": call.name, "expected": pin.schema_digest, "current": tool.schema_digest})));
         }
         if pin.semantics != tool.semantics {
@@ -675,6 +1512,34 @@ pub(super) fn resolve_caller_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_scope_owner_and_route_principal_have_identical_canonical_bytes() {
+        for principal in [
+            subc_protocol::Principal::Direct,
+            subc_protocol::Principal::Reserved {
+                module_id: "agent".into(),
+            },
+            subc_protocol::Principal::Unverified,
+        ] {
+            let stamp = subc_protocol::scope::ScopeStamp {
+                owner: principal.clone(),
+                scope_ref: "scope".into(),
+                scope_epoch: 7,
+                kind: subc_protocol::scope::ScopeKind::Head,
+                parent: None,
+                parent_state: None,
+                attributes: Default::default(),
+                owner_authorized: true,
+            };
+            assert_eq!(
+                ledger_scope(&stamp).owner.as_bytes(),
+                super::super::principal_id(&Some(principal))
+                    .unwrap()
+                    .as_bytes()
+            );
+        }
+    }
     use cortexkit_role_tool_provider::catalog::{check_flat_schema, structural_schema};
     use std::collections::BTreeSet;
 
@@ -959,10 +1824,11 @@ mod tests {
             for fixture in fixtures.as_array_mut().unwrap() {
                 let disabled: Vec<String> =
                     serde_json::from_value(fixture["disabled_tools"].clone()).unwrap();
-                fixture["reply"] = catalog(
+                fixture["reply"] = catalog_for_session(
                     fixture["request"].clone(),
                     &disabled,
                     fixture["powershell_available"].as_bool().unwrap(),
+                    remote_runs(fixture),
                 )
                 .unwrap();
             }
@@ -996,12 +1862,40 @@ mod tests {
         assert_eq!(presets_seen, every, "every preset has a golden");
     }
 
+    /// Whether a golden is for a session that may run commands remotely
+    /// (absent means it may not).
+    fn remote_runs(fixture: &Value) -> bool {
+        fixture["remote_runs"].as_bool().unwrap_or(false)
+    }
+
     fn check_catalog_golden(fixture: &Value) {
         let disabled: Vec<String> =
             serde_json::from_value(fixture["disabled_tools"].clone()).unwrap();
         let available = fixture["powershell_available"].as_bool().unwrap();
+        let runon = remote_runs(fixture);
+        let catalog = |request: Value, disabled: &[String], available: bool| {
+            catalog_for_session(request, disabled, available, runon)
+        };
         let request = fixture["request"].clone();
         let actual = catalog(request.clone(), &disabled, available).unwrap();
+        // `runon` is in bash's schema exactly when the session may run remotely.
+        let bash_has_runon = actual["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| tool["name"] == "bash")
+            .any(|tool| tool["input_schema"]["properties"].get("runon").is_some());
+        assert_eq!(
+            bash_has_runon,
+            runon
+                && actual["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["name"] == "bash"),
+            "{}",
+            fixture["name"]
+        );
         assert!(
             serde_json::to_vec(&actual).unwrap() == serde_json::to_vec(&fixture["reply"]).unwrap(),
             "full catalog bytes differ for {}; regenerate with: {}",
@@ -1049,6 +1943,16 @@ mod tests {
                     format!("{:x}", Sha256::digest(text.as_bytes()))
                 );
             }
+            // The preflight digest and the protocol crate's helper agree with
+            // the independently computed item digest.
+            assert_eq!(
+                answer["system_text"]["preflight_digest"],
+                answer["system_text"]["item_digest"]
+            );
+            assert_eq!(
+                answer["system_text"]["item_digest"].as_str().unwrap(),
+                system_text_digest(text)
+            );
             assert!(!text.contains("bash_watch"));
             assert!(!text.contains("Long-running-commands"));
             assert_eq!(text.contains("wait: true"), disabled.is_empty());
@@ -1197,6 +2101,16 @@ mod tests {
                     format!("{:x}", Sha256::digest(text.as_bytes()))
                 );
             }
+            // The preflight digest and the protocol crate's helper agree with
+            // the independently computed item digest.
+            assert_eq!(
+                worker["system_text"]["preflight_digest"],
+                worker["system_text"]["item_digest"]
+            );
+            assert_eq!(
+                worker["system_text"]["item_digest"].as_str().unwrap(),
+                system_text_digest(text)
+            );
             assert!(text.contains("bash_watch"), "{text}");
             assert!(text.contains("`bash.worker_wait_max_ms`, 30 minutes by default"));
             for phrase in HEAD_ONLY_WORDING {
@@ -1443,6 +2357,86 @@ mod tests {
             let role = CallerRole::from_preset(preset);
             assert_eq!(role.is_worker(), preset == CatalogPreset::Worker);
         }
+    }
+
+    #[test]
+    fn log_capture_scoped_presetless_call_and_suppression() {
+        let _serial = SCOPED_PRESET_REFUSAL_TEST_LOCK.lock().unwrap();
+        let call = call("status", json!({}));
+        let session = format!("preset-refusal-test-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("preset-refusal-test-{}", std::process::id()));
+        let channel = 42;
+        let start = Instant::now();
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            for second in 0..5 {
+                let error = admit_on_route_at(
+                    &call,
+                    true,
+                    &[],
+                    true,
+                    &session,
+                    true,
+                    &root,
+                    channel,
+                    start + Duration::from_secs(second),
+                )
+                .unwrap_err();
+                assert_eq!(errors::invalid_request_field(&error), Some("preset"));
+            }
+            let error = admit_on_route_at(
+                &call,
+                true,
+                &[],
+                true,
+                &session,
+                true,
+                &root,
+                channel,
+                start + SCOPED_PRESET_REFUSAL_WINDOW,
+            )
+            .unwrap_err();
+            assert_eq!(errors::invalid_request_field(&error), Some("preset"));
+        });
+
+        let root = root.display().to_string();
+        assert_eq!(lines.len(), 3, "captured warning lines: {lines:?}");
+        let refusal = format!(
+            "tool call refused: scoped route without preset tool=status session={session} root={root} channel={channel}"
+        );
+        assert!(lines[0].ends_with(&refusal), "{}", lines[0]);
+        assert!(
+            lines[1].ends_with(&format!(
+                "tool call refusals suppressed=4 session={session} root={root}"
+            )),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[2].ends_with(&refusal), "{}", lines[2]);
+    }
+
+    #[test]
+    fn scoped_preset_refusal_state_stays_bounded_for_distinct_sessions() {
+        let _serial = SCOPED_PRESET_REFUSAL_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("preset-refusal-cap-{}", std::process::id()));
+        let now = Instant::now();
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            for index in 0..(SCOPED_PRESET_REFUSAL_STATE_LIMIT + 100) {
+                log_scoped_preset_refusal_at(
+                    &format!("preset-refusal-cap-{index}"),
+                    &root,
+                    42,
+                    "status",
+                    now,
+                );
+            }
+        });
+        assert_eq!(lines.len(), SCOPED_PRESET_REFUSAL_STATE_LIMIT + 100);
+        let refusals = SCOPED_PRESET_REFUSALS.lock().unwrap();
+        assert!(
+            refusals.len() <= SCOPED_PRESET_REFUSAL_STATE_LIMIT,
+            "refusal log state grew to {} entries",
+            refusals.len()
+        );
     }
 
     #[test]
@@ -1830,8 +2824,6 @@ mod route_tests {
         let (_dir, root) = test_support::test_root("tool-provider-admission");
         let ctx = test_support::test_ctx();
         ctx.mark_database_runtime_initializing_for_test();
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), ctx));
         let identity = RouteIdentity(Arc::new(RouteIdentityData {
             root: root.clone(),
             project_root: root.as_path().into(),
@@ -1845,6 +2837,30 @@ mod route_tests {
             scope,
             made_tool_call: AtomicBool::new(false),
         }));
+        exchange_with_actor(body, identity, ctx, metrics, |request, _| {
+            ACTIONS.fetch_add(1, Ordering::SeqCst);
+            if request.worker_session() {
+                WORKER_ACTIONS.fetch_add(1, Ordering::SeqCst);
+            }
+            *LAST_DISPATCH.lock().unwrap() = Some(json!({
+                "command": request.command,
+                "session_id": request.session_id,
+                "params": request.params,
+            }));
+            Response::success(request.id, json!({}))
+        })
+        .await
+    }
+
+    async fn exchange_with_actor(
+        body: Value,
+        identity: RouteIdentity,
+        ctx: Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+        dispatch: DispatchFn,
+    ) -> WriterFrame {
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(identity.root.clone(), ctx));
         let routes = HashMap::from([(route_key(41, 1), identity)]);
         let frame = Frame::build(
             FrameType::Request,
@@ -1886,18 +2902,7 @@ mod route_tests {
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),
-            |request, _| {
-                ACTIONS.fetch_add(1, Ordering::SeqCst);
-                if request.worker_session() {
-                    WORKER_ACTIONS.fetch_add(1, Ordering::SeqCst);
-                }
-                *LAST_DISPATCH.lock().unwrap() = Some(json!({
-                    "command": request.command,
-                    "session_id": request.session_id,
-                    "params": request.params,
-                }));
-                Response::success(request.id, json!({}))
-            },
+            dispatch,
             &deferred_tx,
             false,
             1024 * 1024,
@@ -1919,6 +2924,279 @@ mod route_tests {
                 .is_err()
         );
         reply
+    }
+
+    #[cfg(unix)]
+    fn runner_restore_context(root: &std::path::Path) -> Arc<AppContext> {
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.join("project")),
+                storage_dir: Some(root.join("storage")),
+                harness: Some(crate::harness::Harness::Runner),
+                experimental_bash_background: true,
+                ..crate::config::Config::default()
+            },
+        ));
+        ctx.update_config(|config| config.sandbox.enabled = false);
+        ctx.bash_background()
+            .set_harness(crate::harness::Harness::Runner);
+        ctx.bash_background()
+            .set_db_pool(Arc::new(std::sync::Mutex::new(
+                crate::db::open(&root.join("storage/aft.db")).unwrap(),
+            )));
+        ctx
+    }
+
+    #[cfg(unix)]
+    fn runner_restore_principal(project: &std::path::Path) -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::FirstParty,
+            route_channel: 41,
+            route_epoch: 1,
+            project_root: project.into(),
+            harness: "runner".into(),
+            session_id: "runner-restore".into(),
+            principal_id: Some("reserved:broca".into()),
+        }
+    }
+
+    /// Invoked in a separate libtest process by the restore regression. A
+    /// normal test run does nothing; only the explicit fixture directory can
+    /// create storage or a child, never the operator's storage root.
+    #[cfg(unix)]
+    #[test]
+    fn runner_restore_process_fixture() {
+        let Some(root) = std::env::var_os("AFT_TEST_RUNNER_RESTORE_DIR") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let ctx = runner_restore_context(&root);
+        let request: crate::protocol::RawRequest = serde_json::from_value(json!({
+            "id": "runner-start", "command": "bash", "session_id": "runner-restore",
+            "params": { "command": "printf 'stdout before restart\\n'; printf 'stderr before restart\\n' >&2; while [ ! -f release ]; do sleep 0.05; done; printf 'stdout after restart\\n'; printf 'stderr after restart\\n' >&2; while [ ! -f finish ]; do sleep 0.05; done",
+                "background": true, "compressed": true },
+        })).unwrap();
+        let response = crate::sandbox_spawn::with_authenticated_principal(
+            runner_restore_principal(&root.join("project")),
+            || crate::commands::bash::handle(&request, &ctx),
+        );
+        assert!(response.success, "{:?}", response.data);
+        let task_id = response.data["task_id"].as_str().unwrap();
+        let paths = crate::bash_background::persistence::resolve_task(
+            &root.join("storage/runner"),
+            "runner-restore",
+            task_id,
+        )
+        .unwrap()
+        .paths;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&paths.stderr)
+            .unwrap()
+            .contains("stderr before restart")
+        {
+            assert!(Instant::now() < deadline, "fixture produced no output");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let request: crate::protocol::RawRequest = serde_json::from_value(json!({
+            "id": "runner-initial-output", "command": "bash_status", "session_id": "runner-restore",
+            "params": { "task_id": task_id, "output_offset": 0, "stderr_offset": 0 },
+        }))
+        .unwrap();
+        let initial = crate::commands::bash_status::handle(&request, &ctx);
+        assert!(initial.success, "{:?}", initial.data);
+        std::fs::write(
+            root.join("initial-status.json"),
+            serde_json::to_vec(&initial.data).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("task-id"), task_id).unwrap();
+        ctx.bash_background().detach();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_tool_provider_restore_preserves_minted_task_output_across_processes() {
+        use crate::bash_background::persistence::{read_exit_marker, read_task, resolve_task};
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "subc::tool_provider::route_tests::runner_restore_process_fixture",
+                "--nocapture",
+            ])
+            .env("AFT_TEST_RUNNER_RESTORE_DIR", &root)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let task_id = std::fs::read_to_string(root.join("task-id")).unwrap();
+        let initial: Value =
+            serde_json::from_slice(&std::fs::read(root.join("initial-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(initial["status"], "running");
+        for stream in ["stdout", "stderr"] {
+            assert!(
+                initial["output_preview"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("{stream} before restart")),
+                "{initial}"
+            );
+        }
+        let mut offsets = [0, 0];
+        let task_storage = root.join("storage/runner");
+        let task = resolve_task(&task_storage, "runner-restore", &task_id).unwrap();
+        let metadata = read_task(&task.paths.json).unwrap();
+        let key = metadata.call_key.as_ref().unwrap();
+        assert_eq!(key.requester, "reserved:broca");
+        assert_eq!(key.key, task_id);
+        assert!(key.minted);
+        assert!(!metadata.sandbox_native);
+        assert!(task.paths.sandbox_unavailable.exists());
+
+        // Ensure cleanup even when an output assertion fails, and never leave
+        // a detached fixture command running past this test.
+        struct StopChild(i32);
+        impl Drop for StopChild {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::killpg(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _stop = StopChild(metadata.pgid.unwrap());
+        let ctx = runner_restore_context(&root);
+        let project_id = ProjectRootId::from_path(&project).unwrap();
+        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            root: project_id,
+            project_root: project.clone(),
+            harness: "runner".into(),
+            session: "runner-restore".into(),
+            role: RouteRole::ToolProviderV1,
+            trust: BindTrust::FirstParty,
+            spawn_principal: runner_restore_principal(&project),
+            consumer_elicitation_capable: false,
+            disabled_tools: Arc::default(),
+            scope: None,
+            made_tool_call: AtomicBool::new(false),
+        }));
+        // Wait on filesystem evidence, not on the command's completion. The
+        // old AFT process has exited while the detached shell keeps writing.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&task.paths.stderr)
+            .unwrap()
+            .contains("stderr before restart")
+        {
+            assert!(Instant::now() < deadline, "fixture produced no output");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for phase in ["before", "after"] {
+            if phase == "after" {
+                std::fs::write(project.join("release"), "go").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !std::fs::read_to_string(&task.paths.stderr)
+                    .unwrap()
+                    .contains("stderr after restart")
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture stopped writing after restart"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            let reply = exchange_with_actor(
+                json!({"name": "bash_status", "arguments": {"taskId": task_id}, "preset": "worker"}),
+                identity.clone(), ctx.clone(), &Arc::new(DispatchPathMetrics::new()),
+                |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+            ).await;
+            let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply["structuredContent"]["status"], "running", "{reply}");
+            let output = reply["structuredContent"]["output_preview"]
+                .as_str()
+                .unwrap();
+            for stream in ["stdout", "stderr"] {
+                let expected = format!("{stream} {phase} restart");
+                assert!(output.contains(&expected), "{reply}");
+            }
+            // Piped status text deliberately hides running previews to avoid
+            // encouraging polling. The structured reply still retains them.
+            assert_eq!(
+                reply["content"][0]["text"],
+                format!("Task {task_id}: running\nTo wait for it, call bash_watch; don't poll.")
+            );
+            // Range reads are native protocol fields, not tool-provider
+            // catalog arguments. Verify that cursors acquired by the old
+            // process can resume exactly at the new bytes after adoption.
+            let request: crate::protocol::RawRequest = serde_json::from_value(json!({
+                "id": "runner-resumed-output", "command": "bash_status", "session_id": "runner-restore",
+                "params": { "task_id": task_id, "output_offset": offsets[0], "stderr_offset": offsets[1] },
+            })).unwrap();
+            let resumed = crate::commands::bash_status::handle(&request, &ctx);
+            assert!(resumed.success, "{:?}", resumed.data);
+            for (index, (stream, chunk, cursor)) in [
+                ("stdout", "output_chunk_base64", "output_next_offset"),
+                ("stderr", "stderr_chunk_base64", "stderr_next_offset"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(resumed.data[chunk].as_str().unwrap())
+                    .unwrap();
+                assert_eq!(bytes, format!("{stream} {phase} restart\n").as_bytes());
+                let next = resumed.data[cursor].as_u64().unwrap();
+                assert_eq!(next, offsets[index] + bytes.len() as u64);
+                if phase == "before" {
+                    assert_eq!(resumed.data[chunk], initial[chunk]);
+                    assert_eq!(resumed.data[cursor], initial[cursor]);
+                }
+                offsets[index] = next;
+            }
+        }
+        std::fs::write(project.join("finish"), "go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read_exit_marker(&task.paths).unwrap().is_none() {
+            assert!(Instant::now() < deadline, "fixture did not complete");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let reply = exchange_with_actor(
+            json!({"name": "bash_status", "arguments": {"taskId": task_id}, "preset": "worker"}),
+            identity,
+            ctx.clone(),
+            &Arc::new(DispatchPathMetrics::new()),
+            |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+        )
+        .await;
+        let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(reply["structuredContent"]["status"], "completed", "{reply}");
+        let text = reply["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(&format!("Task {task_id}: completed (exit 0)")),
+            "{text}"
+        );
+        for stream in ["stdout", "stderr"] {
+            for phase in ["before", "after"] {
+                let expected = format!("{stream} {phase} restart");
+                assert!(
+                    reply["structuredContent"]["output_preview"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&expected),
+                    "{reply}"
+                );
+                assert!(text.contains(&expected), "{text}");
+            }
+        }
+        ctx.bash_background().detach();
     }
 
     #[test]

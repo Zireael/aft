@@ -7,5 +7,10 @@
     "workloads": {
       "mason": "broca"
     }
+  },
+  // Masons may run build and test command lines on the Linux build server by
+  // passing runon: "linux" to bash. Lines that need macOS stay local.
+  "remote_exec": {
+    "enabled": true
   }
 }

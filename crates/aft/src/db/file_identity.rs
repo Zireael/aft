@@ -266,7 +266,9 @@ pub(crate) struct IdentityConnection {
 
 impl IdentityConnection {
     pub(crate) fn open(path: impl AsRef<Path>, seam: &'static str) -> rusqlite::Result<Self> {
+        super::lifecycle::production_write_gate(path.as_ref())?;
         let _guard = filesystem_guard();
+        crate::private_storage::prepare_sqlite(path.as_ref(), rusqlite::OpenFlags::default())?;
         Ok(Self::new(rusqlite::Connection::open(path)?, seam))
     }
 
@@ -275,7 +277,11 @@ impl IdentityConnection {
         flags: rusqlite::OpenFlags,
         seam: &'static str,
     ) -> rusqlite::Result<Self> {
+        if !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            super::lifecycle::production_write_gate(path.as_ref())?;
+        }
         let _guard = filesystem_guard();
+        crate::private_storage::prepare_sqlite(path.as_ref(), flags)?;
         Ok(Self::new(
             rusqlite::Connection::open_with_flags(path, flags)?,
             seam,
@@ -408,6 +414,18 @@ pub fn open_connections(path: &Path) -> usize {
                 .count()
         })
         .sum()
+}
+
+/// Called under the filesystem gate before unlinking a whole cache directory.
+/// Consult the registry, not a pre-gate directory inventory: another opener may
+/// have created a new database after that inventory was collected.
+pub(crate) fn has_open_connections_under(path: &Path) -> bool {
+    let key = registry_key(path);
+    open_databases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|(path, database)| path.starts_with(&key) && !database.openers.is_empty())
 }
 
 /// Report `action` if it is about to delete, rename, or replace the database

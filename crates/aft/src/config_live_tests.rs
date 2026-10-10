@@ -76,6 +76,50 @@ fn write(path: &Path, text: &str) {
     std::fs::write(path, text).expect("write config");
 }
 
+#[test]
+fn inspect_categories_and_lsp_idle_reload_without_restart() {
+    let fixture = Fixture::new(r#"{"lsp":{"idle_minutes":60}}"#, None);
+    write(
+        &fixture.user_path,
+        r#"{"lsp":{"idle_minutes":"never"},"inspect":{"categories":{"dead_code":false,"todos":false}}}"#,
+    );
+    let outcome = fixture.reload();
+    assert!(applied(&outcome).contains(&"lsp.idle_minutes"));
+    assert!(applied(&outcome).contains(&"inspect.categories"));
+    assert!(deferred(&outcome).is_empty());
+    assert_eq!(
+        fixture.ctx.config().lsp_idle_minutes,
+        crate::config::LspIdleMinutes::Never
+    );
+    assert!(!fixture
+        .ctx
+        .automatic_tier2_refresh_categories_for_test()
+        .contains(&crate::inspect::InspectCategory::DeadCode));
+    fixture
+        .ctx
+        .update_status_bar_tier2(Some(99), Some(2), Some(3), Some(4), false);
+    let counts = fixture.ctx.status_bar_count_values();
+    assert!(counts.disabled_categories.contains(&"dead_code"));
+    assert_eq!(counts.dead_code, None);
+    assert_eq!(counts.todos, None);
+    write(
+        &fixture.user_path,
+        r#"{"lsp":{"idle_minutes":5},"inspect":{"categories":{"dead_code":true}}}"#,
+    );
+    let outcome = fixture.reload();
+    assert!(applied(&outcome).contains(&"lsp.idle_minutes"));
+    assert_eq!(
+        fixture.ctx.config().lsp_idle_minutes,
+        crate::config::LspIdleMinutes::Minutes(5)
+    );
+    assert!(fixture.ctx.config().inspect.categories.dead_code);
+    assert!(!fixture
+        .ctx
+        .status_bar_count_values()
+        .disabled_categories
+        .contains(&"dead_code"));
+}
+
 fn applied(outcome: &ReloadOutcome) -> Vec<&'static str> {
     match outcome {
         ReloadOutcome::Reloaded { applied, .. } => applied.clone(),
@@ -195,7 +239,6 @@ fn invalid_edits_keep_the_last_good_config() {
     for (label, text) in [
         ("truncated JSONC", r#"{ "bash": { "enabled": true "#),
         ("not an object", "[1, 2]"),
-        ("retired key", r#"{ "gh_read": true }"#),
         (
             "one bad value next to good ones",
             r#"{ "bash": { "enabled": "nope" }, "format_on_edit": false }"#,
@@ -624,6 +667,28 @@ fn project_edit_cannot_turn_off_a_sandbox_the_project_turned_on() {
 
     assert_eq!(held(&outcome), vec!["sandbox.enabled"]);
     assert!(fixture.ctx.config().sandbox.enabled);
+}
+
+#[test]
+fn privacy_disclaim_is_live_and_project_removal_cannot_loosen_it() {
+    let fixture = Fixture::new("{}", Some("{}"));
+    write(
+        &fixture.project_path,
+        r#"{"bash":{"disclaim_privacy":true}}"#,
+    );
+    assert_eq!(applied(&fixture.reload()), vec!["bash.disclaim_privacy"]);
+    assert!(fixture.ctx.config().bash.disclaim_privacy);
+    write(&fixture.project_path, "{}");
+    assert_eq!(held(&fixture.reload()), vec!["bash.disclaim_privacy"]);
+    assert!(fixture.ctx.config().bash.disclaim_privacy);
+}
+
+#[test]
+fn user_can_live_reload_privacy_disclaim_off() {
+    let fixture = Fixture::new(r#"{"bash":{"disclaim_privacy":true}}"#, Some("{}"));
+    write(&fixture.user_path, r#"{"bash":{"disclaim_privacy":false}}"#);
+    assert_eq!(applied(&fixture.reload()), vec!["bash.disclaim_privacy"]);
+    assert!(!fixture.ctx.config().bash.disclaim_privacy);
 }
 
 #[test]

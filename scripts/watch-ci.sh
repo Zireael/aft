@@ -58,8 +58,15 @@ BRANCH="${WATCH_CI_BRANCH:-}"
 RESOLVE_ATTEMPTS="${WATCH_CI_RESOLVE_ATTEMPTS:-40}"
 RESOLVE_SLEEP="${WATCH_CI_RESOLVE_SLEEP:-15}"
 POLL_SLEEP="${WATCH_CI_POLL_SLEEP:-45}"
+POLL_MAX_SLEEP="${WATCH_CI_POLL_MAX_SLEEP:-900}"
 HEARTBEAT="${WATCH_CI_HEARTBEAT:-}"
 WATCH_ATTEMPT="${WATCH_CI_ATTEMPT:-}"
+if ! [[ "$POLL_SLEEP" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+  ! [[ "$POLL_MAX_SLEEP" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+  [ "$(awk -v value="$POLL_MAX_SLEEP" 'BEGIN { print (value > 0) ? 1 : 0 }')" != 1 ]; then
+  echo "watch-ci: poll sleep values must be non-negative numbers and the maximum must be positive" >&2
+  exit 2
+fi
 if [ -n "$WATCH_ATTEMPT" ]; then
   if ! [[ "$WATCH_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
     echo "watch-ci: WATCH_CI_ATTEMPT must be a positive integer" >&2
@@ -114,6 +121,31 @@ watch_run_view() {
   else
     "$OPERATOR_GH" run view "$@"
   fi
+}
+
+poll_delay_cap() {
+  awk -v delay="$1" -v maximum="$POLL_MAX_SLEEP" \
+    'BEGIN { if (delay > maximum) delay = maximum; printf "%.3f", delay }'
+}
+
+poll_delay_double() {
+  awk -v delay="$1" -v maximum="$POLL_MAX_SLEEP" \
+    'BEGIN { delay *= 2; if (delay > maximum) delay = maximum; printf "%.3f", delay }'
+}
+
+POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
+
+# API errors do not mean a run is green or even complete. Retry on the normal
+# polling cadence, doubling the delay after each consecutive error; a valid
+# response resets it so a transient outage does not slow later observations.
+poll_error_wait() {
+  watch_sleep "$POLL_DELAY"
+  POLL_DELAY="$(poll_delay_double "$POLL_DELAY")"
+}
+
+undetermined() {
+  echo "CI_UNDETERMINED run=$RID reason='$1'${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}" >&2
+  exit 3
 }
 
 ARG="${1:-}"
@@ -178,23 +210,62 @@ if [ -z "$RID" ]; then
 fi
 echo "watching run $RID (fail-fast)"
 
-# Print the URL on a machine-greppable line: callers that wrap this watch
-# (train-push.sh) report the run to the operator without a second gh query.
-RUN_URL=$(watch_run_view "$RID" --repo "$REPO" --json url --jq '.url' 2>/dev/null || echo "")
-if [ -n "$RUN_URL" ] && [ "$RUN_URL" != "null" ]; then
-  echo "CI_RUN_URL $RUN_URL"
-fi
-
+RUN_URL_PRINTED=0
 while true; do
   write_heartbeat
-  STATUS=$(watch_run_view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)
+  # Keep all fields needed for this tick in one response. Besides reducing API
+  # traffic, this prevents status, jobs, and conclusion from describing
+  # different moments of the run.
+  if ! RUN_VIEW=$(watch_run_view "$RID" --repo "$REPO" \
+    --json status,conclusion,jobs,url 2>/dev/null); then
+    poll_error_wait
+    continue
+  fi
+  if ! STATUS=$(jq -er '.status | select(type == "string" and length > 0)' \
+    <<< "$RUN_VIEW" 2>/dev/null); then
+    poll_error_wait
+    continue
+  fi
+  if ! jq -e '(.jobs | type) == "array"' <<< "$RUN_VIEW" >/dev/null 2>&1; then
+    if [ "$STATUS" = "completed" ]; then
+      undetermined "could not list the run's jobs"
+    fi
+    poll_error_wait
+    continue
+  fi
+  POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
+  if [ "$RUN_URL_PRINTED" -eq 0 ]; then
+    RUN_URL=$(jq -r 'if (.url | type) == "string" then .url else "" end' \
+      <<< "$RUN_VIEW" 2>/dev/null || echo "")
+    if [ -n "$RUN_URL" ] && [ "$RUN_URL" != "null" ]; then
+      echo "CI_RUN_URL $RUN_URL"
+    fi
+    RUN_URL_PRINTED=1
+  fi
   # Every failing job fails the train, including 'Bash permission e2e
   # (Windows)'. That job is continue-on-error in PR mode (_unit-suite.yml
   # strict=false), but it is a required check on main, so a red there makes
   # the landing refuse; treating it as advisory only hid the failure until
   # the end of the run.
-  FAILED_JOB=$(watch_run_view "$RID" --repo "$REPO" --json jobs \
-    --jq '[.jobs[] | select(.conclusion=="failure")][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
+  if ! FAILED_JOB_RESULT=$(jq -er '[.jobs[] | select(.conclusion == "failure")][0] | if . == null then "none=" else "failed=" + ((.name // "<unnamed>") | tostring) + "|" + ((.databaseId // "") | tostring) end' \
+    <<< "$RUN_VIEW" 2>/dev/null); then
+    if [ "$STATUS" = "completed" ]; then
+      undetermined "could not read job conclusions"
+    fi
+    poll_error_wait
+    continue
+  fi
+  case "$FAILED_JOB_RESULT" in
+    none=) FAILED_JOB="" ;;
+    failed=*) FAILED_JOB="${FAILED_JOB_RESULT#failed=}" ;;
+    *)
+      if [ "$STATUS" = "completed" ]; then
+        undetermined "could not read job conclusions"
+      fi
+      poll_error_wait
+      continue
+      ;;
+  esac
 
   if [ -n "$FAILED_JOB" ] && [ "$FAILED_JOB" != "null" ]; then
     NAME="${FAILED_JOB%%|*}"; JID="${FAILED_JOB##*|}"
@@ -203,8 +274,18 @@ while true; do
       | grep -aE "FAIL \[|panicked at|error\[|bash startup failure" | head -8
     if [ "${WATCH_CI_SETTLE:-0}" = "1" ]; then
       echo "settling: waiting for run completion so a rerun is accepted"
-      while [ "$(watch_run_view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)" != "completed" ]; do
+      while true; do
         write_heartbeat
+        if ! RUN_VIEW=$(watch_run_view "$RID" --repo "$REPO" \
+          --json status,conclusion,jobs,url 2>/dev/null) ||
+          ! STATUS=$(jq -er '.status | select(type == "string" and length > 0)' \
+            <<< "$RUN_VIEW" 2>/dev/null) ||
+          ! jq -e '(.jobs | type) == "array"' <<< "$RUN_VIEW" >/dev/null 2>&1; then
+          poll_error_wait
+          continue
+        fi
+        POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
+        [ "$STATUS" = "completed" ] && break
         watch_sleep "$POLL_SLEEP"
       done
     fi
@@ -212,15 +293,26 @@ while true; do
   fi
 
   if [ "$STATUS" = "completed" ]; then
-    CONC=$(watch_run_view "$RID" --repo "$REPO" --json conclusion --jq '.conclusion')
+    if ! CONC=$(jq -er 'if (.conclusion | type) == "string" then .conclusion else empty end | select(length > 0)' \
+      <<< "$RUN_VIEW" 2>/dev/null); then
+      undetermined "could not read the run conclusion"
+    fi
+    if ! JOB_COUNT=$(jq -er '.jobs | length' <<< "$RUN_VIEW" 2>/dev/null) \
+      || ! [[ "$JOB_COUNT" =~ ^[0-9]+$ ]] || [ "$JOB_COUNT" -eq 0 ]; then
+      undetermined "could not list the run's jobs (conclusion=$CONC)"
+    fi
     if [ "$CONC" = "success" ]; then
       echo "CI_DONE run=$RID conclusion=$CONC${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}"
       exit 0
     fi
-    # The run's summary conclusion can read non-success while every job
-    # passed or was skipped; judge the jobs, which are what main requires.
-    GATING_BAD=$(watch_run_view "$RID" --repo "$REPO" --json jobs \
-      --jq '[.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | .name] | join("; ")')
+    if ! GATING_BAD_RESULT=$(jq -er '"bad=" + ([.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | ((.name // "<unnamed>") | tostring)] | join("; "))' \
+      <<< "$RUN_VIEW" 2>/dev/null); then
+      undetermined "could not read job conclusions (conclusion=$CONC)"
+    fi
+    case "$GATING_BAD_RESULT" in
+      bad=*) GATING_BAD="${GATING_BAD_RESULT#bad=}" ;;
+      *) undetermined "could not read job conclusions (conclusion=$CONC)" ;;
+    esac
     if [ -z "$GATING_BAD" ]; then
       echo "CI_DONE run=$RID conclusion=$CONC jobs_all_passed=1${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}"
       exit 0

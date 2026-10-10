@@ -751,9 +751,7 @@ fn repeat_breaker_ndjson_tool_call_steers_a_rewritten_bash_grep() {
             "project_root": project.path(),
             "config": crate::test_helpers::user_config(json!({
                 "bash": { "rewrite": true },
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),
         })
         .to_string(),
@@ -808,9 +806,7 @@ fn repeat_breaker_standalone_raw_bash_steers_on_every_answer_path() {
             "project_root": project.path(),
             "config": crate::test_helpers::user_config(json!({
                 "bash": { "rewrite": true },
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),
         })
         .to_string(),

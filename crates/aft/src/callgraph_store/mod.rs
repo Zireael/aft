@@ -64,11 +64,6 @@ const MIGRATION_BACKUP_PAGES_PER_STEP: i32 = 128;
 const MIGRATION_BACKUP_RETRY_BUDGET: usize = 25;
 const MIGRATION_BACKUP_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(10);
 const SQLITE_FILE_SET_SUFFIXES: &[&str] = &["", "-wal", "-shm", "-journal"];
-/// Marker-protected generations older than this absolute age are reclaimed even
-/// if a stale reader marker remains. Current and newest-previous generations are
-/// always retained, bounding the root-keyed callgraph store to roughly two or
-/// three large generations without adding user-visible configuration.
-const MARKED_GENERATION_RETENTION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const REFRESH_WORKER_WARN_AFTER: Duration = Duration::from_secs(5);
 const REFRESH_WORKER_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET: Duration = Duration::from_millis(100);
@@ -164,6 +159,7 @@ pub(crate) mod work_counts {
 
     static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static CONFIG_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static STAGING_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
     fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
         *map.get_or_init(Default::default)
@@ -198,6 +194,14 @@ pub(crate) mod work_counts {
         note(&CONFIG_READS, path);
     }
 
+    pub(crate) fn note_staging_read(path: &Path) {
+        note(&STAGING_READS, path);
+    }
+
+    pub(crate) fn staging_reads_under(root: &Path) -> usize {
+        under(&STAGING_READS, root, None)
+    }
+
     pub(crate) fn parses_under(root: &Path) -> usize {
         under(&PARSES, root, None)
     }
@@ -220,7 +224,7 @@ pub(crate) mod work_counts {
     }
 
     pub(crate) fn reset_under(root: &Path) {
-        for map in [&PARSES, &CONFIG_READS] {
+        for map in [&PARSES, &CONFIG_READS, &STAGING_READS] {
             map.get_or_init(Default::default)
                 .lock()
                 .expect("work counter mutex poisoned")
@@ -622,7 +626,10 @@ mod write_amplification_tests {
             .expect("reader setup must not read a schema held by a writer");
         let error = database_ready(&reader).unwrap_err();
         assert!(error.is_transient_lock_contention(), "{error}");
-        assert!(started.elapsed() < Duration::from_millis(250));
+        // Request readers use an expired busy deadline, so they must not wait
+        // for the writer. A regression would wait for a 5 s busy timeout; 2 s
+        // tells that apart from a slow open on a loaded CI runner.
+        assert!(started.elapsed() < Duration::from_secs(2));
         writer.execute_batch("ROLLBACK").unwrap();
     }
 
@@ -718,7 +725,10 @@ mod write_amplification_tests {
         assert!(CallGraphStore::open_readonly(store_dir, root)
             .unwrap()
             .is_none());
-        assert!(started.elapsed() < Duration::from_millis(250));
+        // Request readers use an expired busy deadline, so they must not wait
+        // for the writer. A regression would wait for a 5 s busy timeout; 2 s
+        // tells that apart from a slow open on a loaded CI runner.
+        assert!(started.elapsed() < Duration::from_secs(2));
         writer.execute_batch("ROLLBACK").unwrap();
     }
 
@@ -4108,7 +4118,7 @@ impl CallGraphStore {
             ));
         };
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        std::fs::create_dir_all(&callgraph_dir)?;
+        crate::private_storage::create_dir_all(&callgraph_dir)?;
         // Resolve the current generation via the pointer (falling back to the
         // legacy single-file DB). If nothing is published yet, open the legacy
         // path so a brand-new store still gets a writable DB + schema.
@@ -4141,6 +4151,7 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<ReadonlyCallGraphStore>> {
+        crate::private_storage::tighten_keyed_dir(&callgraph_dir, "callgraph");
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         // A generation written by a newer build is refused by name rather than
         // reported as not built (which would send callers to a cold build) or
@@ -4329,7 +4340,7 @@ impl CallGraphStore {
             )));
         };
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        std::fs::create_dir_all(&callgraph_dir)?;
+        crate::private_storage::create_dir_all(&callgraph_dir)?;
         let (stats, generation) = Self::cold_build_publish_locked(
             &callgraph_dir,
             &project_root,
@@ -4370,7 +4381,7 @@ impl CallGraphStore {
             ));
         };
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        std::fs::create_dir_all(&callgraph_dir)?;
+        crate::private_storage::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
         // Another process may have published a ready generation while we waited
         // for the lock — open it instead of rebuilding. If that generation is
@@ -4457,7 +4468,7 @@ impl CallGraphStore {
             return Ok(None);
         };
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        std::fs::create_dir_all(&callgraph_dir)?;
+        crate::private_storage::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
 
         // Another writer may have completed the migration while this worker was
@@ -4542,6 +4553,24 @@ impl CallGraphStore {
             remove_sqlite_file_set(&temp_path);
         }
 
+        let _progress = crate::cold_build_limiter::progress::start(
+            project_root,
+            "callgraph build",
+            if files.is_empty() {
+                None
+            } else {
+                Some(files.len())
+            },
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
+        crate::cold_build_limiter::progress::phase(
+            "enumerating",
+            if files.is_empty() {
+                None
+            } else {
+                Some(files.len())
+            },
+        );
         let scope = crate::logging::IndexBuildScope::new(
             crate::logging::IndexPlane::Callgraph,
             project_root,
@@ -4627,6 +4656,10 @@ impl CallGraphStore {
         notify_cold_build_before_publish_observer();
         let publication = publish_if_current(|| {
             verify_writer_lease(&writer_lease)?;
+            let _publication_gc = crate::fs_lock::try_acquire(
+                &publication_gc_lock(callgraph_dir, project_key),
+                Duration::from_secs(5),
+            )?;
             let _files = crate::db::file_identity::filesystem_guard();
             ensure_sqlite_files_closed(&temp_path)?;
             ensure_sqlite_files_closed(&gen_path)?;
@@ -4657,19 +4690,14 @@ impl CallGraphStore {
             // Atomically publish the new generation, then best-effort GC old ones.
             verify_writer_lease(&writer_lease)?;
             publish_pointer(callgraph_dir, project_key, &generation)?;
-            gc_old_generations(callgraph_dir, project_key, &generation);
+            gc_old_generations_locked(callgraph_dir, project_key, &generation);
             // Store-wide orphan sweep on the same cadence: reclaims aged build
             // temps for roots that no longer build here, which the per-root GC
             // above never reaches.
             sweep_orphaned_build_temps_store_wide(callgraph_dir);
-            sweep_orphaned_callgraph_root_dirs(callgraph_dir);
+            // Storage-wide retention is scheduled independently of cold builds;
+            // payload age alone is not proof that a checkout has been abandoned.
             crate::search_index::sweep_transient_search_cache_dirs();
-            if let Some(storage_root) = root_storage_dir(callgraph_dir) {
-                let inspect_root =
-                    storage_root.join(crate::root_cache::RootCacheDomain::Inspect.as_str());
-                let live_scope_keys = crate::root_cache::live_scope_keys_for_storage(&storage_root);
-                crate::inspect::cache::sweep_inspect_scope_dirs(&inspect_root, &live_scope_keys);
-            }
             Ok(())
         });
         // A superseded generation remains a valid resumable staging artifact.
@@ -4795,7 +4823,7 @@ impl CallGraphStore {
             verify_writer_lease(lease)?;
         }
         if let Some(parent) = sqlite_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::private_storage::create_dir_all(parent)?;
         }
         let store = if use_wal {
             SqliteStore::CallgraphGeneration
@@ -5027,6 +5055,24 @@ impl CallGraphStore {
         files: &[PathBuf],
         chunk_size: usize,
     ) -> Result<ColdBuildStats> {
+        let _progress = crate::cold_build_limiter::progress::start(
+            &self.project_root,
+            "callgraph build",
+            if files.is_empty() {
+                None
+            } else {
+                Some(files.len())
+            },
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
+        crate::cold_build_limiter::progress::phase(
+            "enumerating",
+            if files.is_empty() {
+                None
+            } else {
+                Some(files.len())
+            },
+        );
         let corpus_fingerprint = self.stage_cold_build_file_inventory(files)?;
         self.cold_build_chunked_from_staged_inventory(chunk_size, &corpus_fingerprint)
     }
@@ -5064,11 +5110,13 @@ impl CallGraphStore {
             batch.push((rel_path, size));
             if batch.len() == COLD_BUILD_EXTRACT_BATCH_FILES {
                 self.insert_staged_file_inventory_batch(&mut conn, &batch)?;
+                crate::cold_build_limiter::progress::advance(batch.len());
                 batch.clear();
             }
         }
         if !batch.is_empty() {
             self.insert_staged_file_inventory_batch(&mut conn, &batch)?;
+            crate::cold_build_limiter::progress::advance(batch.len());
         }
 
         staged_corpus_fingerprint(&conn, &self.project_root)
@@ -5213,6 +5261,7 @@ impl CallGraphStore {
 
             let total_files =
                 query_count(&conn, "SELECT COUNT(*) FROM staging_file_inventory")? as usize;
+            crate::cold_build_limiter::progress::phase("extracting", Some(total_files));
             let mut completed_files = 0usize;
             ensure_cold_build_current("extraction", completed_files, total_files)?;
             let mut after_path = String::new();
@@ -5238,6 +5287,7 @@ impl CallGraphStore {
                 }
                 if needs_extract.is_empty() {
                     completed_files = completed_files.saturating_add(batch_files);
+                    crate::cold_build_limiter::progress::completed(completed_files);
                     ensure_cold_build_current("extraction", completed_files, total_files)?;
                     continue;
                 }
@@ -5303,6 +5353,7 @@ impl CallGraphStore {
                 // no second fd is ever opened on the live staging file set.
                 conn.sample_write_pages();
                 completed_files = completed_files.saturating_add(batch_files);
+                crate::cold_build_limiter::progress::completed(completed_files);
                 ensure_cold_build_current("extraction", completed_files, total_files)?;
             }
 
@@ -5320,6 +5371,7 @@ impl CallGraphStore {
         // durable, so pass 1 remains bulk-load shaped and pass 2 sees a complete
         // corpus-wide symbol/export table.
         note_cold_build_phase("symbol_export_index");
+        crate::cold_build_limiter::progress::phase("symbol export index", None);
         if phase.as_deref() == Some("indexing") {
             ensure_cold_build_current("symbol-export-index", 0, 1)?;
             self.verify_writer_lease()?;
@@ -5333,6 +5385,9 @@ impl CallGraphStore {
         }
 
         note_cold_build_phase("resolution");
+        // Resolution is paged by references, not files. Do not label those
+        // counts as files or extrapolate its duration from extraction's rate.
+        crate::cold_build_limiter::progress::phase("resolving", None);
         let workspace_crate_prefixes = WorkspaceCratePrefixCache::default();
         // Resolver lookups are shared by every caller and window: their inputs
         // are final once extraction ends (see `DiskProjectIndex`).
@@ -5414,6 +5469,7 @@ impl CallGraphStore {
 
         ensure_cold_build_current("resolution", resolved_refs, total_refs)?;
         note_cold_build_phase("publication");
+        crate::cold_build_limiter::progress::phase("publishing", None);
         self.verify_writer_lease()?;
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
@@ -5469,6 +5525,13 @@ impl CallGraphStore {
         changed_files: &[PathBuf],
         workspace_crate_prefixes: WorkspaceCratePrefixCache,
     ) -> Result<(IncrementalStats, RefreshFilesProfile)> {
+        let _progress = crate::cold_build_limiter::progress::start(
+            &self.project_root,
+            "callgraph refresh",
+            Some(changed_files.len()),
+            crate::cold_build_limiter::progress::StartLog::Quiet,
+        );
+        crate::cold_build_limiter::progress::phase("checking", Some(changed_files.len()));
         let _io = crate::views::io::Window::event("legacy_callgraph_refresh", &self.project_root);
         let total_started = Instant::now();
         let mut profile = RefreshFilesProfile::default();
@@ -5555,6 +5618,7 @@ impl CallGraphStore {
         // Inputs whose content changed, in input order, for the parallel parse.
         let mut to_parse: Vec<(PathBuf, String, Option<FileRow>)> = Vec::new();
         for input in changed_files {
+            crate::cold_build_limiter::progress::advance(1);
             let (abs_path, rel_path) = match normalize_project_file_path(&self.project_root, input)
             {
                 Ok(path) => path,
@@ -5646,6 +5710,7 @@ impl CallGraphStore {
         }
 
         // Parse the changed inputs with the connection released.
+        crate::cold_build_limiter::progress::phase("extracting", Some(to_parse.len()));
         drop(conn);
         let started = Instant::now();
         let parse_paths = to_parse
@@ -5658,6 +5723,7 @@ impl CallGraphStore {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
         for ((abs_path, rel_path, old_row), extract) in to_parse.into_iter().zip(parsed) {
+            crate::cold_build_limiter::progress::advance(1);
             let extract = match extract {
                 Ok(extract) => extract,
                 // One file that is not UTF-8 must not fail the whole batch.
@@ -5825,6 +5891,7 @@ impl CallGraphStore {
 
         // Dependents are parsed in parallel with the connection released, then
         // taken in caller order so the first failure is the one reported.
+        crate::cold_build_limiter::progress::phase("dependency selection", None);
         let mut dependents = Vec::new();
         for rel_path in &touched_callers {
             if deleted.contains(rel_path) || changed_extracts.contains_key(rel_path) {
@@ -5842,6 +5909,10 @@ impl CallGraphStore {
             .map(|(_, abs_path)| abs_path.clone())
             .collect::<Vec<_>>();
         let parsed_dependents = pool.parse_files(&self.project_root, &dependent_paths, &memo);
+        crate::cold_build_limiter::progress::phase(
+            "resolving dependents",
+            Some(dependent_paths.len()),
+        );
         profile.dependent_parse += started.elapsed();
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
@@ -5854,6 +5925,7 @@ impl CallGraphStore {
             }
         }
         for ((rel_path, _), extract) in dependents.into_iter().zip(parsed_dependents) {
+            crate::cold_build_limiter::progress::advance(1);
             match extract {
                 Ok(extract) => {
                     caller_extracts.insert(rel_path, extract);
@@ -5895,6 +5967,7 @@ impl CallGraphStore {
             );
         }
 
+        crate::cold_build_limiter::progress::phase("publishing", None);
         let tx = conn.transaction()?;
         for update in &resolution_updates {
             store_resolution_config_fields(&tx, &update.rel_path, update.fields.as_deref())?;
@@ -6248,6 +6321,21 @@ impl CallGraphStore {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
         indexed_file_count(&conn)
+    }
+
+    /// Whether this generation indexed a file, including files with no symbols.
+    /// A missing symbol is meaningful only after this keyed inventory lookup.
+    pub fn is_file_indexed(&self, file: &Path) -> Result<bool> {
+        self.refresh_read_marker()?;
+        let abs_path = normalize_file_path(&self.project_root, file)?;
+        let rel_path = relative_path(&self.project_root, &abs_path);
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)",
+            params![rel_path],
+            |row| row.get(0),
+        )?)
     }
 
     /// Size and content hash of every stored file, keyed by root-relative
@@ -6941,6 +7029,10 @@ impl ReadonlyCallGraphStore {
 
     pub fn indexed_file_count(&self) -> Result<usize> {
         self.inner.indexed_file_count()
+    }
+
+    pub fn is_file_indexed(&self, file: &Path) -> Result<bool> {
+        self.inner.is_file_indexed(file)
     }
 
     /// This reader's stored file identities; see
@@ -9037,6 +9129,10 @@ fn publish_migrated_generation(
     checkpoint_sqlite_before_publication(temp_path);
     let publication = publish_if_current(|| {
         verify_writer_lease(&writer_lease)?;
+        let _publication_gc = crate::fs_lock::try_acquire(
+            &publication_gc_lock(callgraph_dir, project_key),
+            Duration::from_secs(5),
+        )?;
         remove_sqlite_file_set(&gen_path);
         rename_sqlite_file_set(temp_path, &gen_path)?;
         // A backup copy is written in rollback mode; switch it while no
@@ -9062,7 +9158,7 @@ fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
     let _files = crate::db::file_identity::filesystem_guard();
     ensure_sqlite_files_closed(source)?;
     if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::private_storage::create_dir_all(parent)?;
     }
     for suffix in SQLITE_FILE_SET_SUFFIXES {
         let source_path = sqlite_file_set_path(source, suffix);
@@ -9070,7 +9166,7 @@ fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
             continue;
         }
         let destination_path = sqlite_file_set_path(destination, suffix);
-        std::fs::copy(&source_path, &destination_path)?;
+        crate::private_storage::copy(&source_path, &destination_path)?;
     }
     Ok(())
 }
@@ -9194,7 +9290,7 @@ fn write_migration_manifest(
     });
     {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(&temp_path)?;
+        let mut file = crate::private_storage::create(&temp_path)?;
         file.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
         file.write_all(b"\n")?;
     }
@@ -9324,6 +9420,7 @@ fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
 }
 
 fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<TrackedConnection> {
+    crate::private_storage::prepare_sqlite(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let uri = sqlite_readonly_uri(path);
     let conn = TrackedConnection::open_with_flags(
         &uri,
@@ -9925,18 +10022,25 @@ fn increment_staged_extracted_bytes(tx: &Transaction<'_>, bytes: u64) -> Result<
 }
 
 fn staged_content_matches(conn: &Connection, project_root: &Path, path: &Path) -> Result<bool> {
+    let rel_path = relative_path(project_root, path);
+    let staged_hash = conn
+        .prepare_cached("SELECT content_hash FROM files WHERE path = ?1")?
+        .query_row(params![rel_path], |row| row.get::<_, String>(0))
+        .optional()?;
+    // Fresh staging has no row to match. Reading and hashing those sources here
+    // duplicates the extraction pass's I/O; only adopted committed rows need it.
+    let Some(staged_hash) = staged_hash else {
+        return Ok(false);
+    };
+    #[cfg(test)]
+    work_counts::note_staging_read(path);
     let Ok(source) = std::fs::read_to_string(path) else {
         return Ok(false);
     };
     let Ok(freshness) = collect_source_freshness(path, &source) else {
         return Ok(false);
     };
-    let rel_path = relative_path(project_root, path);
-    let staged_hash = conn
-        .prepare_cached("SELECT content_hash FROM files WHERE path = ?1")?
-        .query_row(params![rel_path], |row| row.get::<_, String>(0))
-        .optional()?;
-    Ok(staged_hash.as_deref() == Some(hash_to_hex(freshness.content_hash).as_str()))
+    Ok(staged_hash == hash_to_hex(freshness.content_hash))
 }
 
 fn delete_staged_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
@@ -10535,7 +10639,7 @@ fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) ->
     ));
     {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = crate::private_storage::create(&tmp)?;
         file.write_all(generation.as_bytes())?;
         file.write_all(b"\n")?;
         // Generations rebuild from source. Atomic replacement is sufficient
@@ -10552,15 +10656,25 @@ fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) ->
 struct GenerationGcCandidate {
     name: String,
     path: PathBuf,
-    modified: SystemTime,
 }
 
-/// Best-effort GC of superseded generation files. The current pointer target and
-/// newest previous generation are always retained. Older generations are removed
-/// when they have no protected read marker, or after the absolute retention TTL
-/// even if an ultra-stale marker remains. Stale marker files are reclaimed during
-/// every sweep so dead-PID and expired cross-host readers do not pin disk forever.
-fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
+/// Superseded generations are rebuildable, not a rollback archive. Only the
+/// current pointer and live readers retain them; age never overrides a reader.
+fn publication_gc_lock(callgraph_dir: &Path, project_key: &str) -> PathBuf {
+    callgraph_dir.join(format!("{project_key}.publication.lock"))
+}
+
+pub(crate) fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) -> usize {
+    let Ok(_publication) = crate::fs_lock::try_acquire(
+        &publication_gc_lock(callgraph_dir, project_key),
+        Duration::ZERO,
+    ) else {
+        return 0;
+    };
+    gc_old_generations_locked(callgraph_dir, project_key, current)
+}
+
+fn gc_old_generations_locked(callgraph_dir: &Path, project_key: &str, current: &str) -> usize {
     let temp_grace = Duration::from_secs(60);
     let now = SystemTime::now();
     let pointer_current =
@@ -10572,10 +10686,10 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
         format!("{project_key}.sqlite.tmp."), // legacy-scheme build temps
     ];
     let Ok(entries) = std::fs::read_dir(callgraph_dir) else {
-        return;
+        return 0;
     };
     let mut gens: Vec<GenerationGcCandidate> = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries.take(4096).flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy().to_string();
         let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(now);
@@ -10607,45 +10721,31 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
             gens.push(GenerationGcCandidate {
                 name,
                 path: entry.path(),
-                modified: mtime,
             });
         }
     }
 
-    let mut superseded = gens
-        .iter()
-        .filter(|generation| generation.name != pointer_current)
-        .collect::<Vec<_>>();
-    superseded.sort_by(|left, right| {
-        right
-            .modified
-            .cmp(&left.modified)
-            .then_with(|| right.name.cmp(&left.name))
-    });
-    let previous = superseded.first().map(|generation| generation.name.clone());
-
+    let mut removed = 0;
     for generation in gens {
         let sweep = crate::root_cache::sweep_read_markers(callgraph_dir, &generation.name);
-        if generation.name == pointer_current
-            || Some(generation.name.as_str()) == previous.as_deref()
-        {
+        if generation.name == pointer_current {
             continue;
         }
-
-        let age = now
-            .duration_since(generation.modified)
-            .unwrap_or(Duration::ZERO);
-        if sweep.protected && age < MARKED_GENERATION_RETENTION_TTL {
+        if sweep.protected {
             continue;
         }
-
         remove_sqlite_file_set(&generation.path);
+        if generation.path.exists() {
+            continue; // An in-process connection kept the file set open.
+        }
+        removed += 1;
         let _ = std::fs::remove_file(migration_manifest_path(callgraph_dir, &generation.name));
         let _ = std::fs::remove_dir_all(crate::root_cache::read_marker_dir(
             callgraph_dir,
             &generation.name,
         ));
     }
+    removed
 }
 
 fn ensure_sqlite_files_closed(path: &Path) -> Result<()> {
@@ -10729,6 +10829,9 @@ enum CallgraphRootCandidate {
 /// writer lease before mutating it. A current memo entry remains eligible only for
 /// superseded-generation GC; an absent entry is eligible for whole-directory
 /// deletion after the conservative age threshold.
+// Retained for the isolated age-policy fixtures. Production scheduling uses
+// storage_retention, which requires durable bind history and root absence.
+#[allow(dead_code)]
 fn sweep_orphaned_callgraph_root_dirs(callgraph_dir: &Path) {
     let Some(storage_root) = root_storage_dir(callgraph_dir) else {
         return;
@@ -20771,8 +20874,11 @@ mod refresh_worker_tests {
             );
         }
 
+        // A positive wait: two seamed batches (150 ms each) plus real refreshes
+        // can exceed 2 s on a loaded Windows runner. Coalescing is proven by
+        // the call count below, not by how fast the flush returns.
         assert!(flush_callgraph_store_refreshes_with_budget(
-            Duration::from_secs(2)
+            Duration::from_secs(30)
         ));
         assert_eq!(callgraph_refresh_worker_test_counts(&root).0, 2);
         assert!(pending.lock().is_empty());
@@ -20861,8 +20967,9 @@ mod refresh_worker_tests {
         set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, true);
 
         enqueue_callgraph_store_refresh(callgraph_dir.clone(), root.clone(), vec![source], pending);
+        // Positive wait; the outcome is checked by the counts below.
         assert!(flush_callgraph_store_refreshes_with_budget(
-            Duration::from_secs(2)
+            Duration::from_secs(30)
         ));
 
         assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 1));
@@ -21152,6 +21259,48 @@ mod cold_build_insert_tests {
     }
 
     #[test]
+    fn storage_retention_serializes_with_callgraph_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "project";
+        let current = write_generation_with_age(dir.path(), key, 2, Duration::ZERO);
+        let previous = write_generation_with_age(dir.path(), key, 1, Duration::from_secs(1));
+        let publication =
+            crate::fs_lock::try_acquire(&publication_gc_lock(dir.path(), key), Duration::ZERO)
+                .unwrap();
+        assert_eq!(gc_old_generations(dir.path(), key, &current), 0);
+        assert!(dir.path().join(&previous).exists());
+        drop(publication);
+        assert_eq!(gc_old_generations(dir.path(), key, &current), 1);
+        assert!(!dir.path().join(previous).exists());
+    }
+
+    #[test]
+    fn storage_retention_removes_unheld_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "project";
+        let current = write_generation_with_age(dir.path(), key, 2, Duration::ZERO);
+        let previous = write_generation_with_age(dir.path(), key, 1, Duration::from_secs(1));
+        gc_old_generations(dir.path(), key, &current);
+        assert!(dir.path().join(current).exists());
+        assert!(!dir.path().join(previous).exists());
+    }
+
+    #[test]
+    fn storage_retention_live_reader_has_no_absolute_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "project";
+        let current = write_generation_with_age(dir.path(), key, 3, Duration::ZERO);
+        write_generation_with_age(dir.path(), key, 2, Duration::from_secs(1));
+        let old = write_generation_with_age(dir.path(), key, 1, Duration::from_secs(86400));
+        let marker = crate::root_cache::ReadMarker::create(dir.path(), &old).unwrap();
+        gc_old_generations(dir.path(), key, &current);
+        assert!(dir.path().join(&old).exists());
+        drop(marker);
+        gc_old_generations(dir.path(), key, &current);
+        assert!(!dir.path().join(old).exists());
+    }
+
+    #[test]
     fn gc_old_generations_preserves_live_reader_until_marker_drops() {
         let dir = tempfile::tempdir().unwrap();
         let project_key = "project";
@@ -21164,13 +21313,13 @@ mod cold_build_insert_tests {
 
         gc_old_generations(dir.path(), project_key, &current);
 
-        assert!(dir.path().join(&previous).is_file());
+        assert!(!dir.path().join(&previous).exists());
         assert!(dir.path().join(&pinned).is_file());
 
         drop(marker);
         gc_old_generations(dir.path(), project_key, &current);
 
-        assert!(dir.path().join(&previous).is_file());
+        assert!(!dir.path().join(&previous).exists());
         assert!(!dir.path().join(&pinned).exists());
     }
 
@@ -21192,10 +21341,10 @@ mod cold_build_insert_tests {
     }
 
     #[test]
-    fn gc_old_generations_applies_retention_ttl_to_marked_old_generations() {
+    fn gc_old_generations_retains_old_live_markers_without_an_age_override() {
         let dir = tempfile::tempdir().unwrap();
         let project_key = "project";
-        let expired = MARKED_GENERATION_RETENTION_TTL + Duration::from_secs(60);
+        let expired = Duration::from_secs(24 * 60 * 60);
         let current = write_generation_with_age(dir.path(), project_key, 400, Duration::ZERO);
         let previous = write_generation_with_age(dir.path(), project_key, 300, expired);
         let old = write_generation_with_age(
@@ -21209,8 +21358,8 @@ mod cold_build_insert_tests {
         gc_old_generations(dir.path(), project_key, &current);
 
         assert!(dir.path().join(&current).is_file());
-        assert!(dir.path().join(&previous).is_file());
-        assert!(!dir.path().join(&old).exists());
+        assert!(!dir.path().join(&previous).exists());
+        assert!(dir.path().join(&old).exists());
     }
 
     fn write_aged_callgraph_root(callgraph_root: &Path, key: &str) -> PathBuf {
@@ -21512,7 +21661,7 @@ mod cold_build_insert_tests {
 
         assert_eq!(summary.generation_gc, 1);
         assert!(cache_dir.join(&current).is_file());
-        assert!(cache_dir.join(&previous).is_file());
+        assert!(!cache_dir.join(&previous).exists());
         assert!(
             !cache_dir.join(&obsolete).exists(),
             "the store-wide sweep must collect an inactive live root's obsolete generation"

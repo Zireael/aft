@@ -8,7 +8,9 @@ use crate::executor::Executor;
 use crate::run_tool_call::{ToolCallPhaseDurations, WaitingOn};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -246,6 +248,99 @@ static INDEX_EVENT_CAPTURE: LazyLock<Mutex<Option<Vec<String>>>> =
     LazyLock::new(|| Mutex::new(None));
 #[cfg(test)]
 static INDEX_EVENT_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static LOG_LINE_CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn capture_log_lines<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    // Keep the test representative of a libtest process where another test
+    // may already have installed the global logger.
+    let _ = env_logger::builder().is_test(true).try_init();
+    LOG_LINE_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let lines = LOG_LINE_CAPTURE.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+    (result, lines)
+}
+
+#[cfg(test)]
+fn capture_log_line(level: log::Level, line: &str) {
+    LOG_LINE_CAPTURE.with(|slot| {
+        if let Some(lines) = slot.borrow_mut().as_mut() {
+            lines.push(format!("{level} {line}"));
+        }
+    });
+}
+
+/// Whether this thread is collecting slog records for a unit test.
+#[doc(hidden)]
+#[cfg(test)]
+#[inline]
+pub fn capture_active() -> bool {
+    LOG_LINE_CAPTURE.with(|slot| slot.borrow().is_some())
+}
+
+/// Production builds never capture log lines in memory.
+#[doc(hidden)]
+#[cfg(not(test))]
+#[inline]
+pub fn capture_active() -> bool {
+    false
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn slog_info_enabled(target: &'static str) -> bool {
+    log::log_enabled!(target: target, log::Level::Info) || capture_active()
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn slog_warn_enabled(target: &'static str) -> bool {
+    log::log_enabled!(target: target, log::Level::Warn) || capture_active()
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn slog_error_enabled(target: &'static str) -> bool {
+    log::log_enabled!(target: target, log::Level::Error) || capture_active()
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn slog_debug_enabled(target: &'static str) -> bool {
+    log::log_enabled!(target: target, log::Level::Debug) || capture_active()
+}
+
+// Exported slog macros expand outside this module, so their entry points must
+// be public even though callers should use the macros instead.
+#[doc(hidden)]
+pub fn emit_slog_info(target: &'static str, message: String) {
+    emit_slog(target, log::Level::Info, message);
+}
+
+#[doc(hidden)]
+pub fn emit_slog_warn(target: &'static str, message: String) {
+    emit_slog(target, log::Level::Warn, message);
+}
+
+#[doc(hidden)]
+pub fn emit_slog_error(target: &'static str, message: String) {
+    emit_slog(target, log::Level::Error, message);
+}
+
+#[doc(hidden)]
+pub fn emit_slog_debug(target: &'static str, message: String) {
+    emit_slog(target, log::Level::Debug, message);
+}
+
+fn emit_slog(target: &'static str, level: log::Level, message: String) {
+    #[cfg(test)]
+    capture_log_line(level, &message);
+    log::log!(target: target, level, "{message}");
+}
 
 /// Mint a stable per-attempt id (`b-<pid>-<n>`) at `build_started`.
 pub(crate) fn mint_index_build_id() -> String {
@@ -1444,42 +1539,20 @@ fn rotated_path(base: &Path, generation: usize) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Log lines can quote paths, commands and server output, so on Unix the log
-/// directory is owner-only. Windows keeps its inherited ACLs; AFT has no ACL
-/// helper to tighten them with.
-#[cfg(unix)]
-const LOG_DIR_MODE: u32 = 0o700;
 /// Owner read/write only for every log file AFT creates.
 #[cfg(unix)]
-const LOG_FILE_MODE: u32 = 0o600;
+const LOG_FILE_MODE: u32 = crate::private_storage::FILE_MODE;
 
 /// Create the log directory owner-only, and tighten one left over from before
-/// logs were private. Parent directories keep their default mode.
+/// logs were private. Only the storage root and its log directory are tightened.
 fn create_private_log_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        if let Some(parent) = dir.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match fs::DirBuilder::new().mode(LOG_DIR_MODE).create(dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {}
-            Err(error) => return Err(error),
-        }
-        tighten_if_owned(dir, LOG_DIR_MODE);
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(dir)
-    }
+    crate::private_storage::open_dir(dir.parent().unwrap_or(dir), dir)
 }
 
 /// Open a log file for appending (or truncate it, for a fresh generation after
 /// rotation). A newly created file is owner read/write only on Unix.
 fn open_private_log_file(path: &Path, truncate: bool) -> io::Result<File> {
-    let mut options = OpenOptions::new();
+    let mut options = crate::private_storage::options();
     options.create(true);
     if truncate {
         options.write(true).truncate(true);
@@ -1494,13 +1567,37 @@ fn open_private_log_file(path: &Path, truncate: bool) -> io::Result<File> {
     options.open(path)
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn write_storage_permission_fixture(dir: &Path) {
+    create_private_log_dir(dir).unwrap();
+    open_private_log_file(&dir.join("test.log"), false)
+        .unwrap()
+        .write_all(b"private log\n")
+        .unwrap();
+}
+
 /// Drop group/other permission bits from `path` when the current user owns it.
 /// Best effort: a path owned by someone else (a shared storage root) or one
 /// that cannot be changed is left as it is rather than failing log setup.
 #[cfg(unix)]
 fn tighten_if_owned(path: &Path, mode: u32) {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let Ok(metadata) = fs::metadata(path) else {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    if path
+        .parent()
+        .into_iter()
+        .chain(path.parent().and_then(Path::parent))
+        .any(|dir| fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_symlink()))
+    {
+        return;
+    }
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
         return;
     };
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -1508,7 +1605,7 @@ fn tighten_if_owned(path: &Path, mode: u32) {
     if metadata.uid() != euid || metadata.mode() & 0o777 & !mode == 0 {
         return;
     }
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    let _ = file.set_permissions(fs::Permissions::from_mode(mode));
 }
 
 fn remove_file_if_present(path: &Path) -> io::Result<()> {

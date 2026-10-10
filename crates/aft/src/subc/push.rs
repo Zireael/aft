@@ -1617,14 +1617,19 @@ mod tests {
             root.clone(),
         );
 
-        let started = Instant::now();
-        sender(status_frame(1));
-        sender(status_frame(2));
-        sender(completion_frame("reliable-after-lossy-full"));
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "saturated push sender must return immediately"
-        );
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            sender(status_frame(1));
+            sender(status_frame(2));
+            sender(completion_frame("reliable-after-lossy-full"));
+            returned_tx.send(()).expect("announce sender returned");
+        });
+        // Neither receiver is drained until the producer returns. A blocking
+        // send cannot satisfy this ordering, regardless of scheduler latency.
+        returned_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("sender returned with saturated lossy queue still undrained");
+        producer.join().expect("push producer");
 
         let (_, received_root, received_frame) =
             lossy_rx.try_recv().expect("first lossy frame queued");
@@ -1665,19 +1670,24 @@ mod tests {
         root_channels.insert(root.clone(), HashSet::from([route_key(7, 1)]));
 
         let routes = HashMap::new();
-        let started = Instant::now();
-        let result = fan_out_lossy_push_frame(
-            &writer_tx,
-            &metrics,
-            &routes,
-            &root_channels,
-            &root,
-            &status_frame(1),
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "saturated writer fan-out must return immediately"
-        );
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            let result = fan_out_lossy_push_frame(
+                &writer_tx,
+                &metrics,
+                &routes,
+                &root_channels,
+                &root,
+                &status_frame(1),
+            );
+            returned_tx.send(result).expect("announce fan-out returned");
+        });
+        // Hold the queued frame until fan-out returns; this observes dropped
+        // backpressure directly rather than using 50 ms as a proxy.
+        let result = returned_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("fan-out returned with full writer queue still undrained");
+        producer.join().expect("fan-out producer");
         assert_eq!(
             result,
             FanOutResult {

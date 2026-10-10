@@ -2,8 +2,9 @@
  * Feature-based configuration policy shared by the OpenCode and Pi plugins.
  *
  * Mirrors `crates/aft/src/feature_config.rs`: the literal tool inventory, the
- * one-release migration policy for retired keys, the per-block translation of
- * those keys into canonical `disabled_tools` / `indexes` / `github` leaves,
+ * table of retired keys, the per-block translation of those keys into
+ * canonical `disabled_tools` / `indexes` / `github` / `lsp` leaves (retired
+ * keys are never refused),
  * validation of a resolved configuration, and the migration-notice projection
  * digest. The config parity fixtures and the shared notice-projection fixture
  * (`crates/aft/tests/fixtures/feature_config/notice_projection.json`) keep the
@@ -55,7 +56,7 @@ export const HOST_TOOL_NAMES = [
 /** Disables applied when the user base makes no registration choice. */
 export const DEFAULT_DISABLED_TOOLS = ["aft_delete", "aft_move"] as const;
 
-/** Historical prefixed tool names accepted in disabled lists during the window. */
+/** Historical prefixed tool names that disabled lists may still contain. */
 export const LEGACY_TOOL_ALIASES: Readonly<Record<string, string>> = {
   aft_read: "read",
   aft_write: "write",
@@ -77,9 +78,8 @@ export const BASH_GATE_DISABLES = [
 
 export const MIGRATION_POLICY_ID = "feature-config-v1";
 export const POLICY_INTRODUCED_MINOR: readonly [number, number] = [0, 58];
-export const POLICY_REJECT_FROM_MINOR: readonly [number, number] = [0, 59];
 
-/** Retired config paths and the replacement named in their rejection. */
+/** Retired config paths and their replacement. */
 export const RETIRED_PATHS: ReadonlyArray<readonly [string, string]> = [
   ["tool_surface", "disabled_tools"],
   ["hoist_builtin_tools", "disabled_tools"],
@@ -138,43 +138,28 @@ export function surfaceDisables(surface: unknown): string[] | undefined {
   }
 }
 
-export type PolicyPhase = "window" | "rejecting";
-
-function parseMinor(version: string): [number, number] | undefined {
-  const match = /^v?(\d+)\.(\d+)/.exec(version.trim());
-  if (!match) return undefined;
-  return [Number(match[1]), Number(match[2])];
-}
-
-/** Policy phase for a package version (major/minor only; patch ignored). */
-export function policyPhaseForVersion(version: string): PolicyPhase {
-  const minor = parseMinor(version);
-  if (!minor) return "window";
-  const [major, min] = minor;
-  const [rejectMajor, rejectMinor] = POLICY_REJECT_FROM_MINOR;
-  return major > rejectMajor || (major === rejectMajor && min >= rejectMinor)
-    ? "rejecting"
-    : "window";
-}
-
 export interface TranslationWarning {
   code: string;
   key: string;
   message: string;
   /**
    * Deliver through the once-per-identity migration notice channel instead of
-   * warning on every load. Set for notes about files that are already fixed
-   * and only keep a retained runtime gate, which would otherwise repeat forever.
+   * warning on every load. Set for notes about files that are already fixed,
+   * which would otherwise repeat forever.
    */
   once?: boolean;
 }
 
 export interface DocumentTranslation {
-  /** Rejection diagnostics; any entry aborts the whole candidate load. */
-  errors: string[];
   warnings: TranslationWarning[];
   /** True when a retired key or alias was supplied (a migration notice applies). */
   legacyInput: boolean;
+  /**
+   * Every retired key the document supplied, sorted and de-duplicated. A key
+   * inside a harness block carries its `harnesses.<id>.` prefix; a prefixed
+   * tool name inside `disabled_tools` is listed by that name.
+   */
+  retiredKeys: string[];
   /**
    * True when some block set the retired top-level `enabled: false`. It is
    * translated into a disabled_tools list only, so indexes keep building;
@@ -187,10 +172,6 @@ type JsonRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function removed(old: string, replacement: string): string {
-  return `removed_config_key:${old}:use:${replacement}`;
 }
 
 function hasPath(map: JsonRecord, path: string): boolean {
@@ -213,19 +194,144 @@ export function sortedUnique(names: Iterable<string>): string[] {
   return [...new Set(names)].sort();
 }
 
+/** `lsp.idle_minutes` default and range; mirrors `crates/aft/src/config.rs`. */
+export const LSP_IDLE_MINUTES_DEFAULT = 60;
+export const LSP_IDLE_MINUTES_MIN = 5;
+export const LSP_IDLE_MINUTES_MAX = 1440;
+
+function recordRetired(out: DocumentTranslation, prefix: string, key: string): void {
+  out.legacyInput = true;
+  out.retiredKeys.push(`${prefix}${key}`);
+}
+
+function superseded(out: DocumentTranslation, key: string, message: string): void {
+  out.warnings.push({ code: "superseded_legacy_config", key, message });
+}
+
+function nestedBool(map: JsonRecord, container: string, leaf: string): boolean | undefined {
+  const inner = map[container];
+  return isRecord(inner) && typeof inner[leaf] === "boolean" ? (inner[leaf] as boolean) : undefined;
+}
+
+/**
+ * Translate the GitHub enable aliases (`gh_read.enabled`, `gh_shim.enabled`)
+ * of one block into `github.read` / `github.shim`, exactly as `doctor --fix`
+ * rewrites them. Precedence: the canonical leaf, then the `false` that a
+ * `github.enabled: false` in the same block sets for every leaf, then the
+ * alias. The aliases are removed; `gh_shim.binary_path` is kept.
+ */
+function translateGithubAliases(map: JsonRecord, prefix: string, out: DocumentTranslation): void {
+  const masterOff = nestedBool(map, "github", "enabled") === false;
+  for (const [alias, leaf, retiredKey] of [
+    ["gh_read", "read", "gh_read"],
+    ["gh_shim", "shim", "gh_shim.enabled"],
+  ] as const) {
+    const aliasBlock = map[alias];
+    const supplied =
+      alias === "gh_read"
+        ? Object.hasOwn(map, alias)
+        : isRecord(aliasBlock) && Object.hasOwn(aliasBlock, "enabled");
+    if (!supplied) continue;
+    recordRetired(out, prefix, retiredKey);
+    const aliasValue =
+      isRecord(aliasBlock) && typeof aliasBlock.enabled === "boolean"
+        ? aliasBlock.enabled
+        : undefined;
+    if (aliasValue !== undefined) {
+      const canonical = nestedBool(map, "github", leaf);
+      if (canonical !== undefined) {
+        if (canonical !== aliasValue) {
+          superseded(
+            out,
+            `${prefix}${retiredKey}`,
+            `${alias}.enabled=${aliasValue} is ignored because github.${leaf}=${canonical} is set`,
+          );
+        }
+      } else if (masterOff) {
+        if (aliasValue) {
+          superseded(
+            out,
+            `${prefix}${retiredKey}`,
+            `${alias}.enabled=true is ignored because github.enabled=false switches github.${leaf} off`,
+          );
+        }
+      } else {
+        if (!Object.hasOwn(map, "github")) map.github = {};
+        if (isRecord(map.github)) map.github[leaf] = aliasValue;
+      }
+    }
+    if (alias === "gh_read") {
+      delete map.gh_read;
+    } else if (isRecord(aliasBlock)) {
+      delete aliasBlock.enabled;
+      if (Object.keys(aliasBlock).length === 0) delete map.gh_shim;
+    }
+  }
+}
+
+/** Remove `container.leaf` when present, dropping the container if that left it empty. */
+function takeNested(
+  map: JsonRecord,
+  container: string,
+  leaf: string,
+): { found: boolean; value?: unknown } {
+  const inner = map[container];
+  if (!isRecord(inner) || !Object.hasOwn(inner, leaf)) return { found: false };
+  const value = inner[leaf];
+  delete inner[leaf];
+  if (Object.keys(inner).length === 0) delete map[container];
+  return { found: true, value };
+}
+
+/**
+ * Translate the retired inspect/LSP keys of one block, exactly as
+ * `doctor --fix` rewrites them: `idle.lsp_ttl_minutes` becomes
+ * `lsp.idle_minutes` (clamped to its range) unless that is already set, and
+ * the two inspect keys that never had an effect are dropped.
+ */
+function translateInspectLspPaths(map: JsonRecord, prefix: string, out: DocumentTranslation): void {
+  const ttl = takeNested(map, "idle", "lsp_ttl_minutes");
+  if (ttl.found) {
+    recordRetired(out, prefix, "idle.lsp_ttl_minutes");
+    if (isRecord(map.lsp) && map.lsp.idle_minutes !== undefined) {
+      superseded(
+        out,
+        `${prefix}idle.lsp_ttl_minutes`,
+        "idle.lsp_ttl_minutes is ignored because lsp.idle_minutes is set",
+      );
+    } else {
+      const raw =
+        typeof ttl.value === "number" && Number.isSafeInteger(ttl.value)
+          ? ttl.value
+          : LSP_IDLE_MINUTES_DEFAULT;
+      const minutes = Math.min(LSP_IDLE_MINUTES_MAX, Math.max(LSP_IDLE_MINUTES_MIN, raw));
+      if (!Object.hasOwn(map, "lsp")) map.lsp = {};
+      if (isRecord(map.lsp)) map.lsp.idle_minutes = minutes;
+    }
+  }
+  for (const leaf of ["tier2_soft_deadline_ms", "max_drill_down_items"]) {
+    if (takeNested(map, "inspect", leaf).found) recordRetired(out, prefix, `inspect.${leaf}`);
+  }
+}
+
+/**
+ * Translate the retired keys of one tier/harness block in place.
+ *
+ * The false runtime gates (`backup.enabled`, `inspect.enabled`, `bash`,
+ * `bash.enabled`) are current keys and only switch their behaviour off; they
+ * never remove a tool registration. Only `disabled_tools` does that.
+ */
 function translateBlock(
   map: JsonRecord,
   // True only for the user file's base block, the one place the absent-base
   // default disables may be added.
   userBase: boolean,
-  phase: PolicyPhase,
   blockLabel: string,
   out: DocumentTranslation,
 ): void {
-  if (Object.hasOwn(map, "gh_read")) out.errors.push(removed("gh_read", "github.read"));
-  if (isRecord(map.gh_shim) && Object.hasOwn(map.gh_shim, "enabled")) {
-    out.errors.push(removed("gh_shim", "github.shim"));
-  }
+  const prefix = blockLabel === "base" ? "" : `${blockLabel}.`;
+  translateGithubAliases(map, prefix, out);
+  translateInspectLspPaths(map, prefix, out);
 
   let explicitList: string[] | undefined;
   const rawList = map.disabled_tools;
@@ -233,30 +339,15 @@ function translateBlock(
     explicitList = (rawList as string[]).map((name) => {
       const host = LEGACY_TOOL_ALIASES[name];
       if (host === undefined) return name;
-      out.legacyInput = true;
-      if (phase === "rejecting") out.errors.push(removed(name, host));
+      recordRetired(out, prefix, name);
       return host;
     });
   }
 
-  const suppliedPaths = RETIRED_PATHS.map(([path]) => path).filter((path) => hasPath(map, path));
-  if (suppliedPaths.length > 0) out.legacyInput = true;
-  const gates = falseRuntimeGates(map);
-
-  if (phase === "rejecting") {
-    for (const path of suppliedPaths) {
-      const replacement = RETIRED_PATHS.find(([old]) => old === path)?.[1] ?? "disabled_tools";
-      out.errors.push(removed(path, replacement));
-    }
-    if (gates.length > 0 && explicitList === undefined) {
-      out.warnings.push({
-        code: "legacy_runtime_gate_runtime_only",
-        key: blockLabel,
-        message: `${gates.join(", ")} now restricts runtime behavior only and no longer removes tool registrations; list tools in disabled_tools to unregister them`,
-      });
-    }
-    return;
+  for (const [path] of RETIRED_PATHS) {
+    if (hasPath(map, path)) recordRetired(out, prefix, path);
   }
+  const gates = falseRuntimeGates(map);
 
   if (explicitList !== undefined) map.disabled_tools = explicitList;
 
@@ -284,19 +375,19 @@ function translateBlock(
       }
       if (canonical !== undefined) {
         if (canonical !== value) {
-          out.warnings.push({
-            code: "superseded_legacy_config",
+          superseded(
+            out,
             key,
-            message: `${key}=${value} is ignored because indexes.${leaf}=${canonical} is set`,
-          });
+            `${key}=${value} is ignored because indexes.${leaf}=${canonical} is set`,
+          );
         }
       } else if (chosen !== undefined) {
         if (chosen !== value) {
-          out.warnings.push({
-            code: "superseded_legacy_config",
+          superseded(
+            out,
             key,
-            message: `${key}=${value} is ignored because ${legacy}=${chosen} takes precedence`,
-          });
+            `${key}=${value} is ignored because ${legacy}=${chosen} takes precedence`,
+          );
         }
       } else {
         chosen = value;
@@ -316,11 +407,11 @@ function translateBlock(
       for (const leaf of ["read", "write", "shim"]) {
         if (!Object.hasOwn(github, leaf)) github[leaf] = false;
         else if (github[leaf] === true) {
-          out.warnings.push({
-            code: "superseded_legacy_config",
-            key: "github.enabled",
-            message: `github.enabled=false is ignored for github.${leaf} because github.${leaf}=true is set`,
-          });
+          superseded(
+            out,
+            "github.enabled",
+            `github.enabled=false is ignored for github.${leaf} because github.${leaf}=true is set`,
+          );
         }
       }
     }
@@ -358,10 +449,13 @@ function translateBlock(
       message: RETIRED_ENABLED_FALSE_INDEXES_NOTE,
     });
   }
-  for (const gate of gates) {
-    if (gate === "backup.enabled") generated.add("aft_safety");
-    else if (gate === "inspect.enabled") generated.add("aft_inspect");
-    else for (const name of BASH_GATE_DISABLES) generated.add(name);
+
+  if (gates.length > 0 && explicitList === undefined) {
+    out.warnings.push({
+      code: "legacy_runtime_gate_runtime_only",
+      key: blockLabel,
+      message: `${gates.join(", ")} now restricts runtime behavior only and no longer removes tool registrations; list tools in disabled_tools to unregister them`,
+    });
   }
 
   if (explicitList !== undefined) {
@@ -370,7 +464,7 @@ function translateBlock(
         code: "superseded_legacy_config",
         key: blockLabel,
         message:
-          "disabled_tools is set explicitly, so legacy tool_surface/hoist_builtin_tools/enabled and runtime gates do not change registration",
+          "disabled_tools is set explicitly, so legacy tool_surface/hoist_builtin_tools/enabled do not change registration",
         once: true,
       });
     }
@@ -385,13 +479,6 @@ function translateBlock(
     list = sortedUnique(generated);
   }
   if (list !== undefined) map.disabled_tools = list;
-  if (gates.length > 0) {
-    out.warnings.push({
-      code: "legacy_runtime_gate_requires_fix",
-      key: blockLabel,
-      message: `${gates.join(", ")} still removes tool registrations during this release only; run \`npx @cortexkit/aft doctor --fix\` to record the choice in disabled_tools`,
-    });
-  }
 }
 
 /**
@@ -402,17 +489,25 @@ function translateBlock(
 export const RETIRED_ENABLED_FALSE_INDEXES_NOTE =
   "enabled: false no longer turns AFT off: it is translated to disabling every tool, but the trigram, semantic and callgraph indexes still build. To keep AFT from indexing this repository, also set indexes.trigram, indexes.semantic and indexes.callgraph to false.";
 
-/** The once-per-identity migration notice for a config file that used retired keys. */
+/**
+ * The once-per-identity notice for a project config file whose retired keys
+ * were translated in memory. The file itself is never written: it is shared
+ * through its repository. Mirrors `project_retired_keys_notice` in
+ * `crates/aft/src/feature_config.rs`.
+ */
 export function legacyConfigNoticeMessage(
   configPath: string,
-  translation: Pick<DocumentTranslation, "retiredEnabledFalse">,
+  translation: Pick<DocumentTranslation, "retiredEnabledFalse" | "retiredKeys">,
 ): string {
-  const base = `AFT config ${configPath} uses retired keys (tool_surface, hoist_builtin_tools, enabled, search_index, semantic_search, callgraph_store, github.enabled or aft_-prefixed tool names). They are translated for this release and rejected from v0.59; run \`npx @cortexkit/aft doctor --fix\` to migrate.`;
+  const base = `${configPath} uses retired keys (${translation.retiredKeys.join(", ")}); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`;
   return translation.retiredEnabledFalse ? `${base} ${RETIRED_ENABLED_FALSE_INDEXES_NOTE}` : base;
 }
 
 /**
- * Translate or reject every block (base plus each `harnesses.<id>`) in place.
+ * Translate every block (base plus each `harnesses.<id>`) in place. Retired
+ * keys are never refused: their current equivalents then pass through the
+ * normal user/project trust rules, exactly as if the file had spelled them
+ * out.
  *
  * Only the user file's base block receives the absent-base default
  * (`aft_move`/`aft_delete`) when its legacy keys generate disables: that
@@ -422,22 +517,21 @@ export function legacyConfigNoticeMessage(
  */
 export function translateConfigDocument(
   map: JsonRecord,
-  phase: PolicyPhase,
   tier: "user" | "project",
 ): DocumentTranslation {
   const out: DocumentTranslation = {
-    errors: [],
     warnings: [],
     legacyInput: false,
+    retiredKeys: [],
     retiredEnabledFalse: false,
   };
-  translateBlock(map, tier === "user", phase, "base", out);
+  translateBlock(map, tier === "user", "base", out);
   if (isRecord(map.harnesses)) {
     for (const [name, block] of Object.entries(map.harnesses)) {
-      if (isRecord(block)) translateBlock(block, false, phase, `harnesses.${name}`, out);
+      if (isRecord(block)) translateBlock(block, false, `harnesses.${name}`, out);
     }
   }
-  out.errors = sortedUnique(out.errors);
+  out.retiredKeys = sortedUnique(out.retiredKeys);
   return out;
 }
 
@@ -585,7 +679,7 @@ export function noticeDigest(projection: unknown): string {
  * plugin, with no `aft` command on their PATH.
  */
 export const SEMANTIC_COST_NOTICE =
-  "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run npx @cortexkit/aft setup to change indexes.semantic; if legacy configuration is rejected, run npx @cortexkit/aft doctor --fix first.";
+  "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run npx @cortexkit/aft setup to change indexes.semantic.";
 
 /**
  * Identity of the semantic cost notice. It is a constant rather than a digest
@@ -668,14 +762,15 @@ export const DEFAULT_INDEXES: ResolvedIndexesConfig = {
   callgraph: true,
 };
 
-/** Whole-load rejection: the candidate config must not be used at all. */
+/**
+ * Whole-load rejection: the candidate config must not be used at all. Raised
+ * when a resolved configuration lacks its registration list or an index
+ * switch; retired keys are translated and never raise it.
+ */
 export class ConfigRejectedError extends Error {
   readonly errors: string[];
   constructor(errors: string[], source?: string) {
-    super(
-      `AFT configuration${source ? ` at ${source}` : ""} was rejected: ${errors.join(", ")}. ` +
-        "Run `npx @cortexkit/aft doctor --fix` to migrate removed keys.",
-    );
+    super(`AFT configuration${source ? ` at ${source}` : ""} was rejected: ${errors.join(", ")}.`);
     this.name = "ConfigRejectedError";
     this.errors = errors;
   }

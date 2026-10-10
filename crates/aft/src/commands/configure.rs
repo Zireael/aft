@@ -962,11 +962,16 @@ fn spawn_semantic_refresh_worker(
     limiter: SemanticRefreshLimiter,
     session_id: Option<String>,
     worker_memory: Arc<AtomicU64>,
+    admission: crate::semantic_admission::LiveAdmission,
 ) -> thread::JoinHandle<()> {
     let mut index_memory = SemanticWorkerMemory::new(worker_memory, &index);
     thread::spawn(move || {
         log_ctx::with_session(session_id, || {
             let semantic_blob_store = open_semantic_view_blob_store(view_blob_source);
+            // Work held back while no session had the root open; the first
+            // batch after it is opened again folds it back in.
+            let mut held_paths = BTreeSet::new();
+            let mut held_corpus = false;
             while let Ok(first_request) = request_rx.recv() {
                 let mut paths = BTreeSet::new();
                 let mut corpus_requested = false;
@@ -1030,6 +1035,25 @@ fn spawn_semantic_refresh_worker(
                         || generation_flag.load(Ordering::SeqCst) != generation)
                 {
                     return;
+                }
+
+                // A root that is no longer open in any session keeps the index
+                // it has but embeds nothing more (see `semantic_admission`).
+                if !admission.admits() {
+                    held_corpus |= corpus_requested;
+                    held_paths.extend(std::mem::take(&mut paths));
+                    continue;
+                }
+                if held_corpus {
+                    held_corpus = false;
+                    held_paths.clear();
+                    paths.clear();
+                    corpus_requested = true;
+                } else if !held_paths.is_empty() {
+                    if !corpus_requested {
+                        paths.extend(std::mem::take(&mut held_paths));
+                    }
+                    held_paths.clear();
                 }
 
                 // Corpus catch-up and watcher batches share both the quiet window
@@ -1342,6 +1366,13 @@ pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
     let Some(project_root) = ctx.canonical_cache_root_opt() else {
         return false;
     };
+    let admission = crate::semantic_admission::LiveAdmission::for_root(
+        &project_root,
+        &ctx.config().index.roots,
+    );
+    if !admission.admits() {
+        return false;
+    }
     let Some(index) = ctx
         .semantic_index()
         .write()
@@ -1405,6 +1436,7 @@ pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
         SemanticRefreshLimiter(ctx.cold_build_limiter()),
         log_ctx::current_session(),
         ctx.semantic_worker_bytes(),
+        admission,
     );
     if let Ok(mut slot) = worker_slot.lock() {
         *slot = Some(handle);
@@ -1578,14 +1610,10 @@ fn only_lsp_process_state_changed(previous: &Config, next: &Config) -> bool {
     configs_equal_including_runtime_only_fields(previous, &without_lsp_process_state)
 }
 
-/// The equivalent-configure and attach fast paths skip every probe and load the
-/// full path would run, so they are admissible only while nothing the full path
-/// would re-establish has been lost: the worktree topology memo still holds
-/// under the root's current `.git` marker (a stat, no git spawn), and each
-/// configured artifact plane is resident or already loading, and the watcher is
-/// live. An idle-evicted plane, a loader cleared by an unbind, a stopped
-/// watcher, or a changed `.git` marker takes the full path, which is what
-/// schedules the reload, re-verifies, or re-probes topology.
+/// An equivalent bind may skip topology probes only while the topology memo and
+/// watcher remain live. Missing trigram/semantic artifacts do not change the
+/// root configuration: the bind admits their reload and queues its start after
+/// acknowledgement, without requiring exclusive use beside existing readers.
 fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config) -> bool {
     if ctx.subc_unbound_quiesced() || ctx.database_runtime_failed() {
         return false;
@@ -1600,24 +1628,6 @@ fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config
     if !ctx.watcher_runtime_active() {
         return false;
     }
-    let search_ready = !config.indexes.trigram
-        || ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-        || ctx
-            .search_index_rx()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
-    let semantic_ready = !config.indexes.semantic
-        || ctx
-            .semantic_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-        || ctx.semantic_index_rx().lock().is_some();
     let callgraph_ready = !config.indexes.callgraph
         || ctx
             .callgraph_store()
@@ -1625,7 +1635,7 @@ fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
         || ctx.callgraph_store_rx().lock().is_some();
-    search_ready && semantic_ready && callgraph_ready
+    callgraph_ready
 }
 
 #[cfg(test)]
@@ -2516,16 +2526,25 @@ fn find_config_tier(
     tiers.iter().find(|tier| tier.tier == tier_name).cloned()
 }
 
+/// The tiers for one configure, plus what the automatic migration of the user
+/// file did while reading it (reported back as a configure warning).
 fn resolve_config_tiers_for_configure(
     params: &serde_json::Value,
     project_root: &Path,
-) -> Result<Vec<crate::config_resolve::ConfigTier>, String> {
+) -> Result<
+    (
+        Vec<crate::config_resolve::ConfigTier>,
+        Option<crate::config_fix::UserConfigMigration>,
+    ),
+    String,
+> {
     let wire_tiers = parse_config_tiers(params).unwrap_or_default();
     let user_config_path = parse_cortexkit_user_config_path(params)?;
-    let file_tiers = crate::subc_config::read_local_cortexkit_config_tiers(
-        user_config_path.as_deref(),
-        project_root,
-    );
+    let (file_tiers, migration) =
+        crate::subc_config::read_local_cortexkit_config_tiers_with_migration(
+            user_config_path.as_deref(),
+            project_root,
+        );
 
     let mut tiers = Vec::new();
     for tier_name in ["user", "project"] {
@@ -2535,7 +2554,7 @@ fn resolve_config_tiers_for_configure(
             tiers.push(tier);
         }
     }
-    Ok(tiers)
+    Ok((tiers, migration))
 }
 
 fn configure_fingerprint(
@@ -2860,10 +2879,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
-    let tiers = match resolve_config_tiers_for_configure(params, &root_path) {
-        Ok(tiers) => tiers,
-        Err(error) => return Response::error(&req.id, "invalid_request", error),
-    };
+    let (tiers, user_config_migration) =
+        match resolve_config_tiers_for_configure(params, &root_path) {
+            Ok(read) => read,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
     let config_diagnostics =
         crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
             &tiers,
@@ -2878,7 +2898,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             &req.id,
             "config_rejected",
             format!(
-                "configure: configuration rejected: {}. Run `aft doctor --fix` to migrate removed keys.",
+                "configure: configuration rejected: {}",
                 config_diagnostics.errors.join(", ")
             ),
         );
@@ -2902,6 +2922,21 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             })
         })
         .collect::<Vec<_>>();
+    // The automatic rewrite of the user file is reported once, by the
+    // configure that performed (or failed) it. `kind`/`hint` is the shape the
+    // host plugins deliver to the user.
+    if let Some(migration) = &user_config_migration {
+        configure_warnings.push(json!({
+            "kind": "config_migrated",
+            "code": match migration {
+                crate::config_fix::UserConfigMigration::Migrated { .. } => "user_config_migrated",
+                crate::config_fix::UserConfigMigration::NotMigrated { .. } => "user_config_not_migrated",
+            },
+            "tier": "user",
+            "hint": migration.notice(),
+            "message": migration.notice(),
+        }));
+    }
 
     // NO configure-time SSRF guard on semantic.base_url — deliberate (config
     // relocation posture). The original guard existed to stop UNTRUSTED *project*
@@ -2983,6 +3018,12 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // gives every artifact lane one concrete absolute root.
     let resolved_storage_dir =
         crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    if let Err(error) = crate::private_storage::open_root(&resolved_storage_dir) {
+        log::warn!(
+            "could not open private storage {}: {error}",
+            resolved_storage_dir.display()
+        );
+    }
     // Check the reader floor (and write today's formats as its baseline)
     // before this configure reads or writes anything under the storage root,
     // so a build below the floor refuses the affected components by name.
@@ -3023,7 +3064,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let session_already_bound =
             ctx.has_configure_session_binding(canonical_root, req.session());
         if configs_equal_including_runtime_only_fields(&previous_config, &next_config) {
-            if !session_already_bound && !ctx.configure_maintenance_has_capacity() {
+            let missing = missing_artifact_loads(ctx);
+            let repair_artifacts = missing.search || missing.semantic;
+            if (!session_already_bound || repair_artifacts)
+                && !ctx.configure_maintenance_has_capacity()
+            {
                 return configure_maintenance_backpressure(&req.id);
             }
             if let Some(token) = crate::executor::current_job_cancellation() {
@@ -3044,12 +3089,13 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 edit_slot_survives,
                 &mut configure_warnings,
             );
-            if !session_already_bound {
-                let first_session_bind = ctx.note_configure_session_binding(
-                    canonical_root.clone(),
-                    req.session().to_string(),
-                );
-                debug_assert!(first_session_bind);
+            if !session_already_bound || repair_artifacts {
+                let first_session_bind = !session_already_bound
+                    && ctx.note_configure_session_binding(
+                        canonical_root.clone(),
+                        req.session().to_string(),
+                    );
+                let starts = schedule_missing_artifact_loads(ctx, missing.search, missing.semantic);
                 let storage_root =
                     crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
                 let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
@@ -3062,7 +3108,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     session_id: req.session().to_string(),
                     home_match: ctx.is_home_root(),
                     format_tool_cache_clear_needed: false,
-                    run_bash_replay: true,
+                    run_bash_replay: first_session_bind,
                     configure_database_runtime: false,
                     refresh_project_runtime: false,
                     sync_bash_compress_flag: false,
@@ -3072,16 +3118,18 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     supersede_search_artifact_persistence: false,
                     supersede_callgraph_artifact_persistence: false,
                     supersede_semantic_artifact_persistence: false,
-                    search_artifact_load_start: None,
-                    semantic_artifact_load_start: None,
+                    search_artifact_load_start: starts.0,
+                    semantic_artifact_load_start: starts.1,
                 });
                 if enqueue_result.is_err() {
-                    ctx.forget_configure_session_binding(canonical_root, req.session());
+                    if first_session_bind {
+                        ctx.forget_configure_session_binding(canonical_root, req.session());
+                    }
                     return configure_maintenance_backpressure(&req.id);
                 }
                 slog_debug!(
-                    "equivalent configure registered session {} for generation {}",
-                    req.session(),
+                    "equivalent configure queued session {} replay={} artifact_reload={} for generation {}",
+                    req.session(), first_session_bind, repair_artifacts,
                     ctx.configure_generation()
                 );
             }
@@ -3278,10 +3326,6 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         && ctx.configure_warm_key_matches(&preflight_warm_key)
         && ctx.is_worktree_bridge() == is_worktree_bridge
         && ctx.git_common_dir() == git_common_dir
-        && {
-            let missing = missing_artifact_loads(ctx);
-            !missing.search && !missing.semantic
-        }
     {
         // Equivalent-configure fast path: same commit boundary as the full
         // path — session binding registration is a state mutation. The seal
@@ -3305,7 +3349,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         let needs_session_maintenance =
             !ctx.has_configure_session_binding(&canonical_cache_root, req.session());
-        if needs_session_maintenance && !ctx.configure_maintenance_has_capacity() {
+        let missing = missing_artifact_loads(ctx);
+        let repair_artifacts = missing.search || missing.semantic;
+        if (needs_session_maintenance || repair_artifacts)
+            && !ctx.configure_maintenance_has_capacity()
+        {
             return configure_maintenance_backpressure(&req.id);
         }
         if let Some(token) = crate::executor::current_job_cancellation() {
@@ -3333,7 +3381,8 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         );
         debug_assert!(ctx.has_configure_session_binding(&canonical_cache_root, req.session()));
         let generation = ctx.configure_generation();
-        if first_session_bind {
+        if first_session_bind || repair_artifacts {
+            let starts = schedule_missing_artifact_loads(ctx, missing.search, missing.semantic);
             let storage_root =
                 crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
             let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
@@ -3346,7 +3395,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 session_id: req.session().to_string(),
                 home_match,
                 format_tool_cache_clear_needed: false,
-                run_bash_replay: true,
+                run_bash_replay: first_session_bind,
                 configure_database_runtime: false,
                 refresh_project_runtime: false,
                 sync_bash_compress_flag: false,
@@ -3356,16 +3405,18 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 supersede_search_artifact_persistence: false,
                 supersede_callgraph_artifact_persistence: false,
                 supersede_semantic_artifact_persistence: false,
-                search_artifact_load_start: None,
-                semantic_artifact_load_start: None,
+                search_artifact_load_start: starts.0,
+                semantic_artifact_load_start: starts.1,
             });
             if enqueue_result.is_err() {
-                ctx.forget_configure_session_binding(&canonical_cache_root, req.session());
+                if first_session_bind {
+                    ctx.forget_configure_session_binding(&canonical_cache_root, req.session());
+                }
                 return configure_maintenance_backpressure(&req.id);
             }
             slog_debug!(
-                "equivalent configure registered session {} for generation {}",
-                req.session(),
+                "equivalent configure queued session {} replay={} artifact_reload={} for generation {}",
+                req.session(), first_session_bind, repair_artifacts,
                 generation
             );
         } else {
@@ -3497,6 +3548,17 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         None => None,
     };
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
+    if let Err(error) = crate::storage_retention::record_bind(
+        &storage_root,
+        &canonical_cache_root,
+        project_key.as_deref().unwrap_or_default(),
+    ) {
+        return Response::error(
+            &req.id,
+            "retention_binding_unavailable",
+            format!("cannot protect checkout cache binding: {error}"),
+        );
+    }
     if let Some(project_key) = project_key.as_ref() {
         // Read only the version headers of this project's shared artifacts
         // before any loader, builder or owner claim touches them, so a format
@@ -3718,15 +3780,32 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         !equivalent_warm_config && semantic_build_in_progress && !semantic_build_inputs_changed;
     let first_session_bind =
         ctx.note_configure_session_binding(canonical_cache_root.clone(), req.session().to_string());
+    // An interactive session binding this root opens it for semantic indexing
+    // before the artifact scheduling below consults that (see
+    // `semantic_admission`). Route teardown closes it again.
+    if crate::semantic_admission::opens_root(&harness) {
+        crate::semantic_admission::note_opened(req.session(), &canonical_cache_root);
+    }
+    let semantic_admitted =
+        crate::semantic_admission::admission(&canonical_cache_root, &next_config.index.roots)
+            .admits();
     if !equivalent_warm_config {
         ctx.reset_tier2_refresh_scheduler();
         if !semantic_build_adopted {
             ctx.reset_semantic_cold_seed_gate_for_configure();
-            if next_config.indexes.semantic && !ctx.shared_artifacts_read_only() && !home_match {
+            // The cold-seed gate holds Tier-2 work until a semantic build
+            // finishes; a root that will not build must not hold it.
+            if next_config.indexes.semantic
+                && !ctx.shared_artifacts_read_only()
+                && !home_match
+                && semantic_admitted
+            {
                 ctx.schedule_semantic_cold_seed_gate_for_configure();
             }
         }
-    } else if previous_config.inspect.enabled != next_config.inspect.enabled {
+    } else if previous_config.inspect.enabled != next_config.inspect.enabled
+        || previous_config.inspect.categories != next_config.inspect.categories
+    {
         // `inspect.enabled` is not part of the warm key (it selects no
         // artifact), but turning it on or off still restarts Tier-2 timing.
         ctx.reset_tier2_refresh_scheduler();
@@ -4135,11 +4214,33 @@ fn release_callgraph_start_waiters_for_generation_change(
     }
 }
 
+/// Whether this root may build or refresh its own semantic index (see
+/// `semantic_admission`). A root that may not still reads a saved index.
+fn semantic_work_admitted(ctx: &AppContext) -> bool {
+    ctx.canonical_cache_root_opt().is_some_and(|root| {
+        crate::semantic_admission::admission(&root, &ctx.config().index.roots).admits()
+    })
+}
+
+/// Whether the semantic status records that the root is not opened and has
+/// no saved index to read, so there is nothing to load until it is opened.
+fn semantic_status_is_not_opened(ctx: &AppContext) -> bool {
+    matches!(
+        &*ctx
+            .semantic_index_status()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        SemanticIndexStatus::Failed(message)
+            if crate::semantic_admission::is_not_opened_status(message)
+    )
+}
+
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     let config = ctx.config();
     let search_enabled = config.indexes.trigram;
     let semantic_enabled = config.indexes.semantic;
     drop(config);
+    let semantic_admitted = semantic_enabled && semantic_work_admitted(ctx);
 
     let search_index_missing = ctx
         .search_index()
@@ -4176,7 +4277,13 @@ fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
         // A started views-on lane owns semantic search for this root in every
         // state, including a named failure: nothing retries it per query.
         && !ctx.checkout_semantic().active()
-        && (semantic_index_missing || semantic_refresh_missing);
+        && if semantic_admitted {
+            semantic_index_missing || semantic_refresh_missing
+        } else {
+            // A root nobody has open only ever reads a saved index, once; it
+            // never gets a refresh worker.
+            semantic_index_missing && !semantic_status_is_not_opened(ctx)
+        };
 
     ArtifactLoadNeeds {
         search: search_missing,
@@ -4525,7 +4632,15 @@ fn schedule_artifact_loads_admitted(
     let search_index_max_file_size = config.search_index_max_file_size;
     let semantic_config = config.semantic.clone();
     let views_enabled = config.views.enabled;
+    let semantic_live_admission = crate::semantic_admission::LiveAdmission::for_root(
+        &canonical_cache_root,
+        &config.index.roots,
+    );
     drop(config);
+    // A root no session has open never starts a semantic build, a view fill
+    // or a refresh; it takes the read-only arm below, which reads a saved
+    // index if there is one.
+    let semantic_admitted = !load_semantic || semantic_live_admission.admits();
     let semantic_view_blob_source = views_enabled
         .then(|| {
             ctx.view_runtime_snapshot()
@@ -4885,22 +5000,25 @@ fn schedule_artifact_loads_admitted(
     // With views enabled, this checkout's own view serves semantic search
     // (see `views::semantic_runtime`); the legacy index is not built, so
     // identical content in sibling worktrees is embedded once per family.
-    let load_semantic = if load_semantic && views_enabled && semantic_view_work_allowed {
-        semantic_artifact_load_start = Some(start_checkout_semantic_lane(
-            ctx,
-            &canonical_cache_root,
-            &project_key,
-            storage_dir.as_deref(),
-            semantic_config.clone(),
-        ));
-        false
-    } else {
-        load_semantic
-    };
+    let load_semantic =
+        if load_semantic && views_enabled && semantic_view_work_allowed && semantic_admitted {
+            semantic_artifact_load_start = Some(start_checkout_semantic_lane(
+                ctx,
+                &canonical_cache_root,
+                &project_key,
+                storage_dir.as_deref(),
+                semantic_config.clone(),
+            ));
+            false
+        } else {
+            load_semantic
+        };
 
     // The read-only semantic arm has the same bounded-open shape as search and
     // likewise never enters the owner refresh/rebuild path below.
-    if load_semantic && (is_worktree_bridge || ctx.shared_artifacts_read_only()) {
+    if load_semantic
+        && (is_worktree_bridge || ctx.shared_artifacts_read_only() || !semantic_admitted)
+    {
         if ctx
             .semantic_index()
             .read()
@@ -4970,6 +5088,11 @@ fn schedule_artifact_loads_admitted(
                     crate::readonly_artifacts::ReadOnlyArtifact::Cancelled => {
                         SemanticIndexEvent::Failed(
                             "read-only semantic index load was cancelled".to_string(),
+                        )
+                    }
+                    crate::readonly_artifacts::ReadOnlyArtifact::Absent if !semantic_admitted => {
+                        SemanticIndexEvent::Failed(
+                            crate::semantic_admission::NOT_OPENED_STATUS.to_string(),
                         )
                     }
                     crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
@@ -5869,6 +5992,7 @@ fn schedule_artifact_loads_admitted(
                                     )),
                                     log_ctx::current_session(),
                                     Arc::clone(&semantic_worker_memory),
+                                    semantic_live_admission,
                                 );
                                 if let Ok(mut slot) = refresh_worker_slot.lock() {
                                     *slot = Some(worker_handle);
@@ -6068,16 +6192,18 @@ pub(crate) fn open_database_runtime(
     // before a read-write connection, PRAGMA or migration touches it.
     let floor_started = Instant::now();
     let schema = ctx.app().database_schema_version(&db_path, mode);
-    let gate = crate::persisted_format::gate(
-        crate::persisted_format::PersistedStore::AftDb,
-        &db_path,
-        &db_path,
-        schema
-            .as_ref()
-            .ok()
-            .and_then(|(version, _)| *version)
-            .map(u64::from),
-    );
+    // A busy resident handle is not evidence that its schema became readable.
+    // Retain any recorded refusal until a successful version read revalidates
+    // it; in particular never peek through a second fd to bypass contention.
+    let gate = match &schema {
+        Ok((version, _)) => crate::persisted_format::gate(
+            crate::persisted_format::PersistedStore::AftDb,
+            &db_path,
+            &db_path,
+            version.map(u64::from),
+        ),
+        Err(_) => Ok(()),
+    };
     let floor_check = floor_started.elapsed();
     if let Err(refusal) = gate {
         let published = ctx.publish_database_open(epoch, |slot| {
@@ -6628,6 +6754,11 @@ fn import_legacy_view_once(
 }
 
 fn run_configure_view_sweep(view: &ViewRuntimeSnapshot) {
+    if !crate::storage_retention::startup_sweeps_ready(&view.storage) {
+        return;
+    }
+    #[cfg(test)]
+    crate::storage_retention::test_hook(&view.storage, "configure-view-sweep-start");
     #[cfg(any(test, feature = "test-timing-hooks"))]
     crate::views::semantic_runtime::delay_startup_io_for_test("VIEW_SWEEP");
     if let Ok(store) = crate::views::ViewStore::open(&view.storage, &view.scope) {
@@ -6923,7 +7054,7 @@ fn run_configure_maintenance_unit_inner(
                 crate::format::clear_tool_cache_for_root(Some(&job.root_path));
             }
             if let Some(storage_dir) = ctx.config().storage_dir.clone() {
-                if let Err(err) = fs::create_dir_all(&storage_dir) {
+                if let Err(err) = crate::private_storage::open_root(&storage_dir) {
                     slog_warn!(
                         "failed to create storage directory {}: {}",
                         storage_dir.display(),
@@ -7046,6 +7177,12 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
         }
         ConfigureMaintenanceStage::StorageSweeps => {
+            crate::storage_retention::schedule(
+                job.storage_root.clone(),
+                ctx.subc_lifecycle_admission(),
+                ctx.configure_generation_flag(),
+                job.generation,
+            );
             if detach_storage_sweeps {
                 spawn_configure_storage_sweeps(&job.storage_root, job.harness.clone());
             } else {
@@ -7452,13 +7589,9 @@ fn run_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
         ),
         Err(err) => slog_warn!("filesystem lock reclaim-token cleanup failed: {}", err),
     }
-    crate::search_index::sweep_orphaned_index_dirs(storage_root);
     // Throttled per storage root inside; most configure tails return at once.
     let _ = crate::artifact_owner::sweep_orphaned_owner_manifests(storage_root);
     crate::search_index::sweep_transient_search_cache_dirs();
-    let inspect_root = storage_root.join(crate::root_cache::RootCacheDomain::Inspect.as_str());
-    let live_scope_keys = crate::root_cache::live_scope_keys_for_storage(storage_root);
-    crate::inspect::cache::sweep_inspect_scope_dirs(&inspect_root, &live_scope_keys);
     match crate::migrate_storage::cleanup_staging_dirs(storage_root, harness) {
         Ok(0) => {}
         Ok(n) => slog_info!(
@@ -7601,6 +7734,115 @@ mod tests {
     fn handle_configure_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         super::handle_configure(req, ctx)
+    }
+
+    fn identical_bind_repairs_evicted_artifact_beside_reader(early_fast_path: bool) {
+        use crate::executor::{Executor, ExecutorConfig, Lane};
+        use crate::path_identity::ProjectRootId;
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config::default(),
+        ));
+        let request = configure_request_with_params(json!({
+            "project_root": project.path(), "storage_dir": storage.path(), "harness": "opencode",
+            "config": [user_tier(json!({"indexes": {"trigram": true, "semantic": false, "callgraph": false}}))],
+        }));
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        if early_fast_path {
+            // Retain the event sender as the fake backend, so its filter thread
+            // stays alive without depending on the OS file watcher service.
+            install_project_watcher_with(&ctx, project.path(), Vec::new(), |_, _, tx| {
+                Ok::<_, &'static str>(tx)
+            });
+            assert!(ctx.watcher_runtime_active());
+        } else {
+            ctx.stop_watcher_runtime();
+        }
+        let generation = ctx.configure_generation();
+        let config = serde_json::to_value(ctx.config().as_ref()).unwrap();
+        let attempts = configure_artifact_load_attempts_for_root_for_test(project.path());
+        *ctx.search_index().write().unwrap() = None;
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+        let executor = Executor::with_config(ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 2,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let root = ProjectRootId::from_path(project.path()).unwrap();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let reader = executor.submit(
+            root.clone(),
+            Lane::PureRead,
+            "held-reader".into(),
+            Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Response::success("held-reader", json!({}))
+            }),
+        );
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (bind, _token) = executor.submit_bind_cancellable_async(
+            root,
+            "subc-bind-identical-evicted".into(),
+            Arc::new(move |ctx| handle_configure(&request, ctx)),
+        );
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || tx.send(bind.blocking_recv().unwrap()).unwrap());
+        let beside_reader = rx.recv_timeout(Duration::from_secs(2));
+        // Always release the held reader, even when the regression is present.
+        release_tx.send(()).unwrap();
+        assert!(
+            reader
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .success
+        );
+        waiter.join().unwrap();
+        let response =
+            beside_reader.expect("identical-config artifact repair waited for a root reader");
+        assert!(response.success, "{}", response.data);
+        assert_eq!(
+            ctx.configure_generation(),
+            generation,
+            "artifact repair must not reconfigure the root"
+        );
+        assert_eq!(serde_json::to_value(ctx.config().as_ref()).unwrap(), config);
+        assert!(
+            ctx.search_index_rx().read().unwrap().is_some(),
+            "the missing artifact must be admitted for reload"
+        );
+        assert_eq!(
+            configure_artifact_load_attempts_for_root_for_test(project.path()),
+            attempts,
+            "artifact disk work must wait for post-ack maintenance"
+        );
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert!(configure_artifact_load_attempts_for_root_for_test(project.path()) > attempts);
+        let grep = crate::commands::grep::handle_grep(&grep_request("tracked"), &ctx);
+        assert!(grep.success && grep.data["total_matches"].as_u64().unwrap() > 0);
+        ctx.stop_watcher_runtime();
+    }
+
+    #[test]
+    fn identical_bind_repairs_evicted_artifact_beside_reader_fast_path() {
+        identical_bind_repairs_evicted_artifact_beside_reader(true);
+    }
+
+    #[test]
+    fn identical_bind_repairs_evicted_artifact_beside_reader_preflight_path() {
+        identical_bind_repairs_evicted_artifact_beside_reader(false);
     }
 
     fn symbol_cache_prewarm_test_mutex() -> &'static Mutex<()> {
@@ -7936,8 +8178,7 @@ mod tests {
             "harness": "opencode",
             "config": [project_tier(json!({
                 "edit_mode": "hashline",
-                "search_index": false,
-                "semantic_search": false
+                "indexes": { "trigram": false, "semantic": false }
             }))]
         });
         let mut downgraded_params = base_params.clone();
@@ -8058,9 +8299,7 @@ mod tests {
                 "storage_dir": storage.path(),
                 "harness": "opencode",
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             })),
             &ctx,
@@ -8134,9 +8373,7 @@ mod tests {
                 "storage_dir": storage.path(),
                 "harness": "opencode",
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             })),
             &ctx,
@@ -8229,9 +8466,7 @@ mod tests {
             "storage_dir": storage.path(),
             "harness": "opencode",
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         }));
         let (locked_tx, locked_rx) = mpsc::channel();
@@ -8306,9 +8541,7 @@ mod tests {
                 "storage_dir": storage.path(),
                 "harness": "opencode",
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             })),
             &ctx,
@@ -8380,9 +8613,7 @@ mod tests {
                     "harness": "opencode",
                     "search_index_max_file_size": max_file_size,
                     "config": [user_tier(json!({
-                        "search_index": false,
-                        "semantic_search": false,
-                        "callgraph_store": false
+                        "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                     }))]
                 })),
                 &ctx,
@@ -8447,7 +8678,7 @@ mod tests {
         let params = json!({
             "project_root": project.path(), "storage_dir": storage.path(), "harness": "opencode",
             "config": [user_tier(json!({ "views": { "enabled": true },
-                "search_index": false, "semantic_search": false, "callgraph_store": true }))]
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
         });
         let root = project.path().canonicalize().unwrap();
         let scope = crate::path_identity::project_scope_key(&root);
@@ -8610,7 +8841,7 @@ mod tests {
             json!({
                 "project_root": root, "storage_dir": storage, "harness": "opencode",
                 "config": [user_tier(json!({ "views": { "enabled": true },
-                    "search_index": false, "semantic_search": false, "callgraph_store": true }))]
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
             })
         };
         let owner = test_context();
@@ -8757,9 +8988,7 @@ mod tests {
                 "harness": "opencode",
                 "config": [user_tier(json!({
                     "views": { "enabled": true },
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": true
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
                 }))]
             })),
             &ctx,
@@ -9080,9 +9309,7 @@ mod tests {
             "harness": "opencode",
             "config": [user_tier(json!({
                 "views": { "enabled": true },
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         });
 
@@ -9146,9 +9373,7 @@ mod tests {
             "project_root": temp.path(),
             "harness": "opencode",
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))],
         }));
         let response = handle_configure_for_test(&req, &ctx);
@@ -9201,7 +9426,7 @@ mod tests {
             "project_root": root,
             "harness": "opencode",
             "storage_dir": storage,
-            "config": [user_tier(json!({ "search_index": true, "semantic_search": false }))],
+            "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": false } }))],
         }))
     }
 
@@ -9216,9 +9441,7 @@ mod tests {
             "storage_dir": storage,
             "search_index_max_file_size": max_file_size,
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))],
         }))
     }
@@ -9245,9 +9468,11 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": semantic_search,
-                "callgraph_store": callgraph_store,
+                "indexes": {
+                    "trigram": false,
+                    "semantic": semantic_search,
+                    "callgraph": callgraph_store,
+                },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
@@ -9271,9 +9496,7 @@ mod tests {
             "storage_dir": storage,
             "config": [user_tier(json!({
                 "views": { "enabled": true },
-                "search_index": false,
-                "semantic_search": true,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": true, "callgraph": false },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
@@ -9414,6 +9637,7 @@ mod tests {
                     super::SemanticRefreshLimiter(crate::cold_build_limiter::test_limiter(1)),
                     None,
                     ctx.semantic_worker_bytes(),
+                    crate::semantic_admission::LiveAdmission::always(),
                 );
                 request_tx.send(SemanticRefreshRequest::Corpus).unwrap();
                 // A normally completed worker must also terminate so a missed
@@ -9518,6 +9742,7 @@ mod tests {
             limiter,
             None,
             ctx.semantic_worker_bytes(),
+            crate::semantic_admission::LiveAdmission::always(),
         );
         (ctx, request_tx, event_rx, worker)
     }
@@ -9935,6 +10160,7 @@ mod tests {
             super::SemanticRefreshLimiter(ctx.cold_build_limiter()),
             None,
             ctx.semantic_worker_bytes(),
+            crate::semantic_admission::LiveAdmission::always(),
         );
         *slot.lock().unwrap() = Some(worker);
 
@@ -10212,6 +10438,60 @@ mod tests {
         assert_eq!(ctx.config().callgraph_chunk_size, 3);
     }
 
+    /// Configure migrates a user file that uses retired keys and reports it
+    /// once; a project file with retired keys is translated in memory and its
+    /// bytes are never touched. Neither refuses the configure.
+    #[test]
+    fn configure_migrates_the_user_file_and_translates_the_project_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        let user_path = temp.path().join("xdg/cortexkit/aft.jsonc");
+        let project_path = temp.path().join(".cortexkit/aft.jsonc");
+        let project_text = r#"{ "semantic_search": false, "gh_read": { "enabled": true } }"#;
+        write_config(&user_path, r#"{ "search_index": false }"#);
+        write_config(&project_path, project_text);
+        let request = || {
+            configure_request_with_params(json!({
+                "project_root": temp.path(),
+                "harness": "opencode",
+                "cortexkit_user_config_path": user_path,
+            }))
+        };
+
+        let response = handle_configure_for_test(&request(), &ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+        assert!(!ctx.config().indexes.trigram);
+        assert!(!ctx.config().indexes.semantic);
+        assert!(
+            !ctx.config().github.read,
+            "a project cannot enable GitHub reads"
+        );
+        let migrated: Vec<&Value> = response.data["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .filter(|warning| warning["kind"] == "config_migrated")
+            .collect();
+        assert_eq!(migrated.len(), 1, "{:?}", response.data["warnings"]);
+        assert_eq!(migrated[0]["code"], "user_config_migrated");
+        assert!(migrated[0]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("retired keys (search_index)"));
+        let user_text = fs::read_to_string(&user_path).unwrap();
+        assert!(!user_text.contains("search_index"), "{user_text}");
+        assert_eq!(fs::read_to_string(&project_path).unwrap(), project_text);
+
+        let again = handle_configure_for_test(&request(), &ctx);
+        assert!(again.success, "configure failed: {:?}", again.data);
+        assert!(!again.data["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings
+                .iter()
+                .any(|warning| warning["kind"] == "config_migrated")));
+        assert_eq!(fs::read_to_string(&project_path).unwrap(), project_text);
+    }
+
     #[test]
     fn configure_project_file_wins_user_wire_falls_back_per_tier() {
         let temp = tempfile::tempdir().unwrap();
@@ -10315,7 +10595,7 @@ mod tests {
             "harness": "opencode",
             "config": [
                 { "tier": "user", "source": "/u/aft.jsonc",
-                  "doc": "{ \"restrict_to_project_root\": true, \"search_index\": true, \"backup\": { \"enabled\": false, \"max_depth\": 7 }, \"disabled_tools\": [\"aft_safety\"] }" },
+                  "doc": "{ \"restrict_to_project_root\": true, \"indexes\": { \"trigram\": true }, \"backup\": { \"enabled\": false, \"max_depth\": 7 }, \"disabled_tools\": [\"aft_safety\"] }" },
                 { "tier": "project", "source": "/p/.opencode/aft.jsonc",
                   "doc": "{ \"restrict_to_project_root\": false, \"semantic\": { \"api_key_env\": \"EVIL\" }, \"backup\": { \"enabled\": true, \"max_depth\": 1 }, \"disabled_tools\": [\"aft_safety\"] }" }
             ]
@@ -10324,7 +10604,7 @@ mod tests {
         let response = handle_configure_for_test(&req, &ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
 
-        // Core-resolved field applied: user search_index=true survived.
+        // Core-resolved field applied: the user trigram setting survived.
         assert!(ctx.config().indexes.trigram);
         // Trust boundary: project tried restrict=false over user restrict=true →
         // user value wins.
@@ -10438,9 +10718,7 @@ mod tests {
                 "harness": "opencode",
                 "config": [user_tier(json!({
                     "restrict_to_project_root": true,
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             }))
         };
@@ -10486,9 +10764,7 @@ mod tests {
                 "harness": "opencode",
                 "config": [user_tier(json!({
                     "restrict_to_project_root": true,
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             }))
         };
@@ -10528,9 +10804,7 @@ mod tests {
                 "harness": "opencode",
                 "storage_dir": storage.clone(),
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false,
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 }))],
             }))
         };
@@ -10597,9 +10871,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
             }))],
         }));
         let request_id = request.id.clone();
@@ -10670,9 +10942,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.clone(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
             }))],
         }));
 
@@ -11600,6 +11870,472 @@ mod tests {
         );
     }
 
+    /// A semantic configure as a route under `harness` and `session` would send
+    /// it, with optional user-tier `index.roots`.
+    fn configure_semantic_bind(
+        root: &Path,
+        storage: &Path,
+        base_url: &str,
+        harness: &str,
+        session: &str,
+        index_roots: Option<serde_json::Value>,
+    ) -> RawRequest {
+        let mut user = json!({
+            "indexes": { "trigram": false, "semantic": true, "callgraph": false },
+            "semantic": {
+                "backend": "openai_compatible",
+                "model": "counting-test-embedding",
+                "base_url": base_url,
+                "timeout_ms": 5_000,
+                "max_batch_size": 64,
+                "max_files": 1_000
+            }
+        });
+        if let Some(roots) = index_roots {
+            user["index"] = json!({ "roots": roots });
+        }
+        configure_request_with_session(
+            json!({
+                "project_root": root,
+                "harness": harness,
+                "storage_dir": storage,
+                "config": [user_tier(user)],
+            }),
+            session,
+        )
+    }
+
+    fn semantic_admission_project(parent: &Path) -> PathBuf {
+        let project = parent.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        for index in 0..3 {
+            std::fs::write(
+                project.join("src").join(format!("opened_{index}.rs")),
+                format!("pub fn opened_symbol_{index}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        project
+    }
+
+    /// Run the configure tail and wait until the semantic lane settles on
+    /// "not opened": the read-only arm looked for a saved index, found none,
+    /// and nothing else is loading.
+    fn wait_for_semantic_not_opened(ctx: &AppContext, timeout: Duration) {
+        super::drain_deferred_configure_maintenance(ctx);
+        let deadline = Instant::now() + timeout;
+        loop {
+            crate::runtime_drain::drain_build_completions(ctx);
+            if super::semantic_status_is_not_opened(ctx) && ctx.semantic_index_rx().lock().is_none()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "semantic lane never settled on not opened: {:?}",
+                ctx.semantic_index_status().read().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn total_embedding_requests(server: &CountingEmbeddingServer) -> usize {
+        server
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    #[test]
+    fn sidekick_bind_of_a_fresh_repo_starts_no_embedding() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let project = semantic_admission_project(temp.path());
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        let request = configure_semantic_bind(
+            &project,
+            &storage,
+            &server.base_url,
+            "runner",
+            "alfonso:sidekick-00000000-0000-4001-98dd-383a2dbeca78",
+            None,
+        );
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        wait_for_semantic_not_opened(&ctx, Duration::from_secs(5));
+        // Give a wrongly started build time to reach the backend.
+        std::thread::sleep(Duration::from_millis(300));
+        crate::runtime_drain::drain_build_completions(&ctx);
+
+        assert_eq!(
+            total_embedding_requests(&server),
+            0,
+            "a root no interactive session has open must never reach the embedding backend"
+        );
+        assert!(ctx.semantic_index().read().unwrap().is_none());
+        assert!(ctx.semantic_refresh_sender().is_none());
+        let health = ctx.try_health_snapshot(&project);
+        assert_eq!(
+            health
+                .semantic_index
+                .expect("semantic health component")
+                .status,
+            "off (not opened)"
+        );
+        assert_eq!(
+            ctx.build_status_snapshot()["semantic_index"]["status"],
+            "off (not opened)"
+        );
+    }
+
+    #[test]
+    fn opencode_bind_of_a_fresh_repo_starts_embedding() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let project = semantic_admission_project(temp.path());
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        let request = configure_semantic_bind(
+            &project,
+            &storage,
+            &server.base_url,
+            "opencode",
+            "ses_opencode_fresh_repo",
+            None,
+        );
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        assert!(
+            server.non_probe_input_count() > 0,
+            "an OpenCode session's root is embedded"
+        );
+        crate::semantic_admission::note_closed("ses_opencode_fresh_repo", &project);
+    }
+
+    #[test]
+    fn a_root_opened_after_a_sidekick_bind_starts_its_index() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let project = semantic_admission_project(temp.path());
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        let sidekick = configure_semantic_bind(
+            &project,
+            &storage,
+            &server.base_url,
+            "runner",
+            "alfonso:sidekick-opened-later",
+            None,
+        );
+        assert!(handle_configure_for_test(&sidekick, &ctx).success);
+        wait_for_semantic_not_opened(&ctx, Duration::from_secs(5));
+        assert_eq!(total_embedding_requests(&server), 0);
+
+        let opencode = configure_semantic_bind(
+            &project,
+            &storage,
+            &server.base_url,
+            "opencode",
+            "ses_opened_later",
+            None,
+        );
+        assert!(handle_configure_for_test(&opencode, &ctx).success);
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        assert!(
+            server.non_probe_input_count() > 0,
+            "opening the root later starts its semantic index"
+        );
+        crate::semantic_admission::note_closed("ses_opened_later", &project);
+    }
+
+    /// The search-quality real-query runner configures its evidence tree over
+    /// stdio as `harness: "opencode"` with no session id
+    /// (benchmarks/aft-search/run_real_query.py `configure`). That root must
+    /// stay admitted, or every semantic benchmark row would move.
+    #[test]
+    fn real_query_benchmark_configure_shape_opens_its_root() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let project = semantic_admission_project(temp.path());
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        let request = configure_request_with_params(json!({
+            "project_root": project,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [{
+                "tier": "user",
+                "source": "<aft-search-real-query>",
+                "doc": json!({
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false }
+                }).to_string()
+            }],
+        }));
+        assert!(request.session_id.is_none());
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        assert_eq!(
+            crate::semantic_admission::admission(&ctx.canonical_cache_root(), &[]),
+            crate::semantic_admission::SemanticAdmission::InteractiveSession
+        );
+        crate::semantic_admission::note_closed(request.session(), &project);
+    }
+
+    #[test]
+    fn index_roots_entry_selecting_semantic_admits_a_runner_bind() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let clones = temp.path().join("clones");
+        let project = semantic_admission_project(&clones);
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        let request = configure_semantic_bind(
+            &project,
+            &storage,
+            &server.base_url,
+            "runner",
+            "alfonso:sidekick-standing-root",
+            Some(json!([{ "path": clones, "indexes": ["semantic"] }])),
+        );
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        assert!(
+            server.non_probe_input_count() > 0,
+            "a standing root the user listed is embedded whoever binds it"
+        );
+    }
+
+    /// A linked worktree of `main` borrowing the resident semantic base of
+    /// `main`'s context, which was bound under `owner_harness`. Returns the
+    /// worktree's context after a `runner` bind, as a delegated worker binds.
+    fn worker_worktree_bind(
+        owner_harness: &str,
+        owner_session: &str,
+        server: &CountingEmbeddingServer,
+        temp: &Path,
+    ) -> (Arc<AppContext>, Arc<AppContext>, PathBuf) {
+        let storage = temp.join("storage");
+        let main = temp.join("main");
+        init_git_fixture(&main);
+        let worktree = temp.join("worktree");
+        let mut worktree_command = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&main))
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let canonical_main = crate::inspect::job::canonicalize_normalized(&main);
+        let canonical_worktree = crate::inspect::job::canonicalize_normalized(&worktree);
+        let app = App::default_shared();
+        let executor = crate::executor::Executor::new();
+        let owner_ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        ));
+        let owner_root = crate::path_identity::ProjectRootId::from_path(&canonical_main).unwrap();
+        assert!(executor.register_actor(owner_root, Arc::clone(&owner_ctx)));
+        let owner_request = configure_semantic_bind(
+            &canonical_main,
+            &storage,
+            &server.base_url,
+            owner_harness,
+            owner_session,
+            None,
+        );
+        assert!(handle_configure_for_test(&owner_request, &owner_ctx).success);
+        // Install an empty resident base instead of building the main
+        // checkout, so every embedding the backend sees comes from the worktree.
+        owner_ctx.retire_semantic_index_rx("test replaces the configure load");
+        let mut owner_index = SemanticIndex::new(canonical_main.clone(), 3);
+        owner_index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(
+            &owner_ctx.config().semantic,
+            3,
+        ));
+        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
+        owner_ctx.install_semantic_index_rx(ready_rx, owner_ctx.configure_generation());
+        ready_tx
+            .send(crate::context::SemanticIndexEvent::Ready(owner_index))
+            .expect("queue resident semantic index");
+        crate::runtime_drain::drain_semantic_index_events(&owner_ctx);
+
+        let borrower_ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        ));
+        let borrower_root =
+            crate::path_identity::ProjectRootId::from_path(&canonical_worktree).unwrap();
+        assert!(executor.register_actor(borrower_root, Arc::clone(&borrower_ctx)));
+        let borrower_request = configure_semantic_bind(
+            &canonical_worktree,
+            &storage,
+            &server.base_url,
+            "runner",
+            "alfonso:bg_worker_worktree",
+            None,
+        );
+        assert!(handle_configure_for_test(&borrower_request, &borrower_ctx).success);
+        assert_eq!(borrower_ctx.cache_role(), "worktree");
+        (owner_ctx, borrower_ctx, canonical_main)
+    }
+
+    #[test]
+    fn worker_worktree_of_an_opened_repository_embeds() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _quiet_window = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "50");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let (_owner, borrower, main) = worker_worktree_bind(
+            "opencode",
+            "ses_worker_worktree_owner",
+            &server,
+            temp.path(),
+        );
+        let sender = borrower
+            .semantic_refresh_sender()
+            .expect("a worktree of a repository the user has open keeps a refresh worker");
+        // The worker edits a file; the watcher hands it to the refresh worker.
+        let edited = borrower.canonical_cache_root().join("worker_edit.rs");
+        std::fs::write(&edited, "pub fn worker_edit() {}\n").unwrap();
+        sender
+            .send(SemanticRefreshRequest::Files {
+                paths: vec![edited],
+            })
+            .unwrap();
+        assert!(
+            server.wait_for_non_probe_input(Duration::from_secs(10)),
+            "the worker worktree embeds the files its checkout changed"
+        );
+        crate::semantic_admission::note_closed("ses_worker_worktree_owner", &main);
+    }
+
+    #[test]
+    fn worker_worktree_of_a_repository_nobody_opened_embeds_nothing() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let (_owner, borrower, _main) =
+            worker_worktree_bind("runner", "alfonso:sidekick-owner", &server, temp.path());
+        assert!(borrower.semantic_refresh_sender().is_none());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(server.non_probe_input_count(), 0);
+    }
+
+    #[test]
+    fn refresh_worker_holds_edits_while_its_root_is_closed_and_catches_up_on_reopen() {
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let source = root.join("held.rs");
+        std::fs::write(&source, "pub fn held_symbol() {}\n").unwrap();
+        let config = semantic_refresh_test_config(&server.base_url);
+        let index = SemanticIndex::new(root.clone(), 3);
+        let ctx = test_context();
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        crate::semantic_admission::note_opened("ses_refresh_reopen", &root);
+        let worker = super::spawn_semantic_refresh_worker(
+            root.clone(),
+            index,
+            crate::semantic_index::EmbeddingModel::from_config(&config)
+                .expect("construct refresh model"),
+            config.max_batch_size,
+            config.max_files,
+            Duration::from_millis(20),
+            true,
+            None,
+            request_rx,
+            event_tx,
+            ctx.subc_lifecycle_admission(),
+            ctx.configure_generation_flag(),
+            ctx.configure_generation(),
+            super::SemanticRefreshLimiter(crate::cold_build_limiter::test_limiter(1)),
+            None,
+            ctx.semantic_worker_bytes(),
+            crate::semantic_admission::LiveAdmission::for_root(&root, &[]),
+        );
+
+        // The session leaves: an edit is held, not embedded.
+        crate::semantic_admission::note_closed("ses_refresh_reopen", &root);
+        request_tx
+            .send(SemanticRefreshRequest::Files {
+                paths: vec![source.clone()],
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            server.non_probe_input_count(),
+            0,
+            "a root no session has open stops refreshing"
+        );
+
+        // Opened again: the next batch carries the held edit with it.
+        crate::semantic_admission::note_opened("ses_refresh_reopen", &root);
+        let other = root.join("other.rs");
+        std::fs::write(&other, "pub fn other_symbol() {}\n").unwrap();
+        request_tx
+            .send(SemanticRefreshRequest::Files {
+                paths: vec![other.clone()],
+            })
+            .unwrap();
+        assert!(server.wait_for_non_probe_input(Duration::from_secs(10)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let embedded = loop {
+            let inputs = non_probe_inputs(&server);
+            if inputs.iter().any(|text| text.contains("held_symbol"))
+                && inputs.iter().any(|text| text.contains("other_symbol"))
+            {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            embedded,
+            "the held edit is embedded once the root reopens: {:?}",
+            non_probe_inputs(&server)
+        );
+        crate::semantic_admission::note_closed("ses_refresh_reopen", &root);
+        drop(request_tx);
+        drop(event_rx);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn superseded_semantic_build_stops_after_its_current_batch() {
         let _artifact_guard = artifact_owner_test_lock();
@@ -11793,6 +12529,7 @@ mod tests {
             super::SemanticRefreshLimiter(crate::cold_build_limiter::test_limiter(1)),
             None,
             ctx.semantic_worker_bytes(),
+            crate::semantic_admission::LiveAdmission::always(),
         );
 
         std::fs::write(&source, "pub fn unstable_content() -> bool { false }\n")
@@ -12183,6 +12920,9 @@ mod tests {
         let ctx = std::sync::Arc::new(AppContext::from_app(App::default_shared(), config));
         ctx.set_canonical_cache_root(root.path().to_path_buf());
         ctx.set_heavy_root_work_allowed(true);
+        // The fixture stands for a root an interactive session has open; only
+        // such a root starts a semantic view fill (see `semantic_admission`).
+        crate::semantic_admission::note_opened("ses_evicted_view_reload", root.path());
         *ctx.semantic_index().write().unwrap() =
             Some(SemanticIndex::new(root.path().to_path_buf(), 3));
         *ctx.semantic_index_status().write().unwrap() =
@@ -12332,9 +13072,7 @@ mod tests {
                 "harness": "opencode",
                 "storage_dir": storage,
                 "config": [user_tier(json!({
-                    "search_index": true,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": true, "semantic": false, "callgraph": false }
                 }))]
             })),
             &ctx,
@@ -12409,9 +13147,7 @@ mod tests {
             "project_root": worktree,
             "harness": "opencode",
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": true,
-                "callgraph_store": true
+                "indexes": { "trigram": true, "semantic": true, "callgraph": true }
             }))]
         }));
 
@@ -12503,9 +13239,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
                 "worktree": { "ram_overlay": true }
             }))]
         }))
@@ -12870,9 +13604,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
                 "worktree": { "ram_overlay": false }
             }))]
         }))
@@ -13488,6 +14220,9 @@ mod tests {
             config.indexes.semantic = true;
         });
         ctx.set_canonical_cache_root(root.path().to_path_buf());
+        // The fixture stands for a root an interactive session has open; only
+        // such a root gets a refresh worker back (see `semantic_admission`).
+        crate::semantic_admission::note_opened("ses_refresh_disconnect", root.path());
         set_configure_artifact_post_gate_delay_for_test(500);
         struct DelayReset;
         impl Drop for DelayReset {
@@ -13544,9 +14279,7 @@ mod tests {
             "project_root": temp.path(),
             "harness": "opencode",
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         }));
 
@@ -13618,9 +14351,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         reset_configure_artifact_load_attempts_for_test();
@@ -13676,9 +14407,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         }));
         let response = handle_configure_for_test(&req, &ctx);
@@ -13965,9 +14694,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": true,
-                "callgraph_store": true,
+                "indexes": { "trigram": true, "semantic": true, "callgraph": true },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
@@ -14319,9 +15046,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         }));
         assert!(handle_configure_for_test(&request, &ctx).success);
@@ -14386,9 +15111,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": suspended_storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         }));
         assert!(handle_configure_for_test(&suspended_request, &suspended_ctx).success);
@@ -14464,9 +15187,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         reset_configure_artifact_load_attempts_for_test();
@@ -14528,9 +15249,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         let ctx = Arc::new(test_context());
@@ -14592,9 +15311,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         let ctx = Arc::new(test_context());
@@ -14649,9 +15366,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         reset_configure_artifact_load_attempts_for_test();
@@ -14699,9 +15414,7 @@ mod tests {
         init_git_fixture(second_root.path());
         let ctx = test_context();
         let config = [user_tier(json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false }
         }))];
         let first = configure_request_with_params(json!({
             "project_root": first_root.path(),
@@ -14760,9 +15473,7 @@ mod tests {
                 "storage_dir": storage.path(),
                 "search_index_max_file_size": max_file_size,
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": true
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": true }
                 }))]
             }))
         };
@@ -14841,9 +15552,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         }));
         assert!(handle_configure_for_test(&disabled, &ctx).success);
@@ -14863,9 +15572,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         }));
         assert!(handle_configure_for_test(&enabled, &ctx).success);
@@ -14911,9 +15618,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "experimental": { "bash": { "compress": true } }
             }))]
         }));
@@ -14933,9 +15638,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage,
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": true
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             }))]
         }))
     }
@@ -15162,9 +15865,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         }));
 
@@ -15227,9 +15928,7 @@ mod tests {
             "project_root": temp.path(),
             "harness": "opencode",
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))]
         }));
         let response = handle_configure_for_test(&changed, &ctx);
@@ -15265,9 +15964,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         });
 
@@ -15362,6 +16059,24 @@ mod tests {
 
         std::fs::write(temp.path().join("src/second.rs"), "pub fn two() {}\n").unwrap();
         assert!(super::walk_semantic_project_files_bounded(temp.path(), 1).is_err());
+    }
+
+    #[test]
+    fn semantic_collector_honours_gitignore_in_non_git_root_like_git_root() {
+        use crate::context::ignore_rules_fixture as fixture;
+        let plain = tempfile::tempdir().unwrap();
+        let git = tempfile::tempdir().unwrap();
+        fixture::write(plain.path(), false);
+        fixture::write(git.path(), true);
+        let collected = |root: &std::path::Path| {
+            let files = super::walk_semantic_project_files_bounded(root, 1000)
+                .expect("fixture is within the semantic file cap");
+            fixture::relative_set(root, &files)
+        };
+
+        let plain_files = collected(plain.path());
+        fixture::assert_honours_ignore_rules(&plain_files, "non-git semantic collector");
+        assert_eq!(plain_files, collected(git.path()));
     }
 
     #[test]
@@ -15554,7 +16269,7 @@ mod tests {
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
-            "config": [user_tier(json!({ "search_index": true, "semantic_search": true }))],
+            "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": true } }))],
         }));
         let response = handle_configure_for_test(&req, &ctx);
 
@@ -15622,9 +16337,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": temp.path().join("storage"),
             "config": [user_tier(json!({
-                "search_index": true,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
             }))],
         }));
         let response = handle_configure_for_test(&req, &ctx);
@@ -16363,9 +17076,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         });
         let initial = configure_request_with_session(base_params.clone(), "session-a");
@@ -16425,9 +17136,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "lsp": {"servers": {"pushed-path": {
                     "extensions": ["pushedpath"],
                     "binary": binary_name,
@@ -16479,9 +17188,7 @@ mod tests {
                 "harness": "opencode",
                 "storage_dir": storage.path(),
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             });
             let initial = configure_request_with_session(base.clone(), "session-a");
@@ -16504,9 +17211,7 @@ mod tests {
         assert_full_path(
             "semantic",
             json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "reconfigure-test-model",
@@ -16520,9 +17225,7 @@ mod tests {
         assert_full_path(
             "sandbox",
             json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "sandbox": {"enabled": true}
             }),
         );
@@ -16539,9 +17242,7 @@ mod tests {
                 "harness": "opencode",
                 "storage_dir": storage.path(),
                 "config": [user_tier(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))]
             })
         };
@@ -16584,9 +17285,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         });
         let first = configure_request_with_session(params.clone(), "session-a");
@@ -16644,9 +17343,7 @@ mod tests {
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             }))]
         });
         let initial = configure_request_with_session(base.clone(), "session-a");
@@ -16678,9 +17375,7 @@ mod tests {
 
         let mut changed = base;
         changed["config"] = json!([user_tier(json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "semantic": {
                 "backend": "openai_compatible",
                 "model": "watcher-reconfigure-test",
@@ -16799,9 +17494,7 @@ mod tests {
                 "validate_on_edit": "syntax",
                 "formatter": {"typescript": "biome", "rust": "rustfmt"},
                 "checker": {"typescript": "biome", "rust": "cargo"},
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "inspect": {
                     "enabled": false,
                     "duplicates": {
@@ -16947,9 +17640,10 @@ mod inspect_orphan_sweep_tests {
     use super::*;
 
     #[test]
-    fn configure_storage_sweep_removes_old_unbound_inspect_scope() {
+    fn configure_scheduled_storage_sweep_reaps_dead_inspect_scope_after_grace() {
         let storage = tempfile::tempdir().expect("storage");
-        let scope = storage.path().join("inspect").join("orphan-scope");
+        let key = "0123456789abcdef";
+        let scope = storage.path().join("inspect").join(key);
         fs::create_dir_all(&scope).expect("scope directory");
         let cache = scope.join("cache.sqlite");
         fs::write(&cache, vec![0_u8; 4096]).expect("cache fixture");
@@ -16962,10 +17656,106 @@ mod inspect_orphan_sweep_tests {
         .expect("age cache fixture");
 
         run_configure_storage_sweeps(storage.path(), Harness::Opencode);
-
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let run_scheduled_pass = || {
+            // Advance the startup clock explicitly; this fixture checks the
+            // separate durable observation grace, not daemon warm-up admission.
+            crate::storage_retention::allow_next_scheduled_pass_for_test(storage.path());
+            crate::storage_retention::schedule(
+                storage.path().to_path_buf(),
+                ctx.subc_lifecycle_admission(),
+                ctx.configure_generation_flag(),
+                ctx.configure_generation(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !crate::storage_retention::scheduled_pass_finished_for_test(storage.path()) {
+                assert!(
+                    Instant::now() < deadline,
+                    "scheduled retention did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        run_scheduled_pass();
+        assert!(
+            scope.exists(),
+            "an unknown inspect scope needs observation grace"
+        );
+        let observed = storage.path().join(format!("retention/unknown/{key}.json"));
+        assert!(
+            observed.is_file(),
+            "scheduled retention must observe the unknown key"
+        );
+        // Age the durable first-observed clock instead of sleeping for a week.
+        fs::write(observed, "0\n").unwrap();
+        crate::storage_retention::allow_next_scheduled_pass_for_test(storage.path());
+        run_scheduled_pass();
         assert!(
             !scope.exists(),
-            "old scope without a live route must be reaped"
+            "a dead inspect scope must be reaped once observation grace expires"
+        );
+        assert_eq!(
+            crate::storage_retention::snapshot(storage.path())
+                .unwrap()
+                .removed_roots,
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_view_sweep_tests {
+    use super::*;
+
+    #[test]
+    fn startup_view_sweep_waits_for_the_storage_grace() {
+        let storage = tempfile::tempdir().unwrap();
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = starts.clone();
+        let _observer = crate::storage_retention::observe_test_hook(
+            storage.path(),
+            Arc::new(move |step| {
+                if step == "configure-view-sweep-start" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+        let scope = "0123456789abcdef";
+        let view = ViewRuntimeSnapshot {
+            query_pin: None,
+            storage: storage.path().to_path_buf(),
+            family: "startup-sweep-fixture".to_owned(),
+            scope: scope.to_owned(),
+            view_dir: storage.path().join("views").join(scope),
+            generation: None,
+            manifest: Some(crate::views::Manifest::new(Vec::new()).unwrap()),
+            head_fingerprint: String::new(),
+            head_metadata: crate::alias::GitHeadMetadata {
+                head_path: PathBuf::new(),
+                head_mtime: None,
+                resolved_ref_path: None,
+                resolved_ref_mtime: None,
+            },
+            pending_paths: BTreeSet::new(),
+        };
+        run_configure_view_sweep(&view);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            0,
+            "view/blob GC started during startup warm-up"
+        );
+        crate::storage_retention::allow_next_scheduled_pass_for_test(storage.path());
+        run_configure_view_sweep(&view);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "view/blob GC never became eligible after startup grace"
         );
     }
 }

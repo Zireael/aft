@@ -383,12 +383,12 @@ function parseFailure(dependencies: BridgeBootstrapDependencies): string | null 
 
 /**
  * Load the config for `directory`, migrating legacy config file locations
- * first. Migration notices for retired keys that are still translated are
+ * first. Notices for a project file whose retired keys were translated are
  * delivered through `notify`, once per notice identity.
  *
- * A configuration that is rejected (a retired key after its migration window,
- * an already retired GitHub alias), that does not parse, or whose load throws
- * for any other reason yields the config error state with the default tool
+ * A configuration that is rejected (an incomplete resolved configuration),
+ * that does not parse, or whose load throws for any other reason yields the
+ * config error state with the default tool
  * surface; migration is skipped then. Nothing falls back to defaults.
  */
 export function loadBootstrapConfig(

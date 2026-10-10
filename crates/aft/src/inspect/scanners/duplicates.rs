@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
@@ -12,6 +11,7 @@ use serde_json::{json, Value};
 use tree_sitter::{Node, Parser, Tree};
 
 use super::duplicates_classifier::{is_anonymizable, node_cost, AnonymizeAs};
+use super::source_text::{read_source_text, write_skipped_files, SourceText, NOT_VALID_UTF8};
 use crate::cache_freshness;
 use crate::inspect::entry_points::TOP_PREVIEW_ITEMS;
 use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
@@ -61,6 +61,9 @@ struct FileScan {
     path: PathBuf,
     display_path: String,
     language_skipped: Option<&'static str>,
+    /// Set when the file could not be analyzed at all (its bytes are not
+    /// valid UTF-8). The aggregate names it in `skipped_files`.
+    skipped_reason: Option<&'static str>,
     freshness: cache_freshness::FileFreshness,
     line_count: u32,
     expected_duplicate: bool,
@@ -139,6 +142,7 @@ struct DuplicateContributionRef<'a> {
     line_count: u32,
     expected_duplicate: bool,
     generated: bool,
+    skipped_reason: Option<&'a str>,
     fragments: &'a [Value],
 }
 
@@ -177,14 +181,26 @@ pub fn run_duplicates_scan(job: &InspectJob) -> InspectResult {
         .collect::<Result<Vec<_>, _>>();
 
     let file_scans = match file_scans {
-        Ok(file_scans) => file_scans,
+        // A file that vanished mid-scan yields no scan, as if it was deleted.
+        Ok(file_scans) => file_scans.into_iter().flatten().collect::<Vec<_>>(),
         Err(message) => return InspectResult::failed(job, message, started.elapsed()),
     };
 
-    let aggregate = aggregate_file_scans(
+    let mut aggregate = aggregate_file_scans(
         &file_scans,
         skipped_languages_from_file_scans(&file_scans),
         &job.config.inspect.duplicates.expected_mirrors,
+    );
+    write_skipped_files(
+        &mut aggregate,
+        file_scans
+            .iter()
+            .filter_map(|scan| {
+                scan.skipped_reason
+                    .map(|reason| (scan.display_path.clone(), reason.to_string()))
+            })
+            .collect(),
+        Some(MAX_GROUP_ITEMS),
     );
     let contributions = file_scans
         .iter()
@@ -203,38 +219,62 @@ pub fn run_duplicates_scan(job: &InspectJob) -> InspectResult {
     InspectResult::success(job, success, started.elapsed())
 }
 
-fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
+/// Scan one scope file. `Ok(None)` means the file vanished between the walk
+/// and this scan and is treated as deleted. A file that is not valid UTF-8 is
+/// a per-file skip; other read failures keep failing the scan as before.
+fn scan_file(job: &InspectJob, path: &Path) -> Result<Option<FileScan>, String> {
     let display_path = display_path(&job.project_root, path);
-    let freshness = cache_freshness::collect(path)
-        .map_err(|error| format!("freshness failed for {}: {error}", path.display()))?;
+    let freshness = match cache_freshness::collect(path) {
+        Ok(freshness) => freshness,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("freshness failed for {}: {error}", path.display())),
+    };
     let Some(lang) = detect_language(path) else {
-        return Ok(FileScan {
+        return Ok(Some(FileScan {
             path: path.to_path_buf(),
             display_path,
             language_skipped: Some("unknown"),
+            skipped_reason: None,
             freshness,
             line_count: 0,
             expected_duplicate: false,
             generated: crate::inspect::generated::is_generated_file(&job.project_root, path),
             fragments: Vec::new(),
-        });
+        }));
     };
 
     if !is_supported_language(lang) {
-        return Ok(FileScan {
+        return Ok(Some(FileScan {
             path: path.to_path_buf(),
             display_path,
             language_skipped: Some(language_name(lang)),
+            skipped_reason: None,
             freshness,
             line_count: 0,
             expected_duplicate: false,
             generated: crate::inspect::generated::is_generated_file(&job.project_root, path),
             fragments: Vec::new(),
-        });
+        }));
     }
 
-    let source = fs::read_to_string(path)
-        .map_err(|error| format!("read failed for {}: {error}", path.display()))?;
+    let source = match read_source_text(path) {
+        Ok(SourceText::Text(source)) => source,
+        Ok(SourceText::NotUtf8) => {
+            return Ok(Some(FileScan {
+                path: path.to_path_buf(),
+                display_path,
+                language_skipped: None,
+                skipped_reason: Some(NOT_VALID_UTF8),
+                freshness,
+                line_count: 0,
+                expected_duplicate: false,
+                generated: crate::inspect::generated::is_generated_file(&job.project_root, path),
+                fragments: Vec::new(),
+            }));
+        }
+        Ok(SourceText::Vanished) => return Ok(None),
+        Err(error) => return Err(format!("read failed for {}: {error}", path.display())),
+    };
     let line_count = source_line_count(&source);
     let expected_duplicate = source.contains(EXPECTED_DUPLICATE_MARKER);
     let generated =
@@ -257,16 +297,17 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
             .then(left.hash.cmp(&right.hash))
     });
 
-    Ok(FileScan {
+    Ok(Some(FileScan {
         path: path.to_path_buf(),
         display_path,
         language_skipped: None,
+        skipped_reason: None,
         freshness,
         line_count,
         expected_duplicate,
         generated,
         fragments,
-    })
+    }))
 }
 
 fn parse_source(path: &Path, lang: LangId, source: &str) -> Result<Tree, String> {
@@ -478,6 +519,9 @@ fn file_scan_to_contribution(scan: &FileScan) -> FileContribution {
     if scan.generated {
         contribution["generated"] = json!(true);
     }
+    if let Some(reason) = scan.skipped_reason {
+        contribution["skipped_reason"] = json!(reason);
+    }
     FileContribution::new(
         InspectCategory::Duplicates,
         scan.path.clone(),
@@ -554,7 +598,14 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
         }
     }
 
-    aggregate_duplicate_occurrences(
+    let skipped = parsed
+        .iter()
+        .filter_map(|scan| {
+            scan.skipped_reason
+                .map(|reason| (scan.file.to_string(), reason.to_string()))
+        })
+        .collect();
+    let mut aggregate = aggregate_duplicate_occurrences(
         by_hash,
         parsed.len(),
         line_counts.values().copied().map(u64::from).sum(),
@@ -562,7 +613,9 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
         languages_skipped,
         drill_down_limit,
         expected_mirrors,
-    )
+    );
+    write_skipped_files(&mut aggregate, skipped, drill_down_limit);
+    aggregate
 }
 
 fn duplicate_contribution_ref(value: &Value) -> Option<DuplicateContributionRef<'_>> {
@@ -579,6 +632,7 @@ fn duplicate_contribution_ref(value: &Value) -> Option<DuplicateContributionRef<
         line_count: optional_u32(object.get("line_count"))?,
         expected_duplicate: optional_bool(object.get("expected_duplicate"))?,
         generated: optional_bool(object.get("generated"))?,
+        skipped_reason: object.get("skipped_reason").and_then(Value::as_str),
         fragments,
     })
 }

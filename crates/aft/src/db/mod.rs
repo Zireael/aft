@@ -9,13 +9,13 @@ pub use lifecycle::{
     connection_snapshot, SqliteConnectionSnapshot, SqliteStore, SqliteStoreCount, TrackedConnection,
 };
 use std::fmt;
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
 pub mod backups;
 pub mod bash_tasks;
 pub mod bash_watches;
+pub mod call_ledger;
 pub mod compression_events;
 pub mod github_read_cache;
 pub mod remote_exec;
@@ -29,9 +29,9 @@ pub mod state;
 #[cfg(test)]
 mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_SCHEMA_VERSION: u32 = 15;
 
-const MIGRATION_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+const MIGRATION_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 const MIGRATION_V14: &str = r#"
 CREATE TABLE IF NOT EXISTS remote_exec_policies (
@@ -497,7 +497,15 @@ pub(crate) fn maintenance_write<T>(
                 drop(conn);
                 match result {
                     Ok(value) => return Ok(value),
-                    Err(error) if is_busy_error(&error) => last_busy = Some(error),
+                    Err(error) if is_busy_error(&error) => {
+                        if last_busy.is_none() {
+                            // A test can hold this retry phase open to prove reads
+                            // finish before maintenance resumes, not just eventually.
+                            #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+                            maintenance_retry_checkpoint();
+                        }
+                        last_busy = Some(error);
+                    }
                     Err(error) => return Err(MaintenanceWriteError::Failed(error)),
                 }
             }
@@ -521,6 +529,35 @@ pub(crate) fn maintenance_write<T>(
         std::thread::sleep(sleep.min(deadline - now));
         sleep = (sleep * 2).min(LONGEST_RETRY_SLEEP);
     }
+}
+
+/// Pause after a real SQLite BUSY result, with the connection mutex released.
+/// Release builds without timing hooks do not expose this checkpoint. The
+/// long timeout only bounds an abandoned test fixture and must outlast its
+/// request hang ceiling.
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+fn maintenance_retry_checkpoint() {
+    let Some(directory) = std::env::var_os("AFT_TEST_MAINTENANCE_RETRY_GATE") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let paused = directory.join("paused");
+    let released = directory.join("release");
+    crate::slog_debug!(
+        "maintenance write busy retry paused: gate={}",
+        directory.display()
+    );
+    std::fs::write(&paused, b"sqlite busy retry in progress")
+        .expect("publish maintenance retry gate");
+    let ceiling = std::time::Instant::now() + Duration::from_secs(120);
+    while !released.exists() && std::time::Instant::now() < ceiling {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::remove_file(&paused).ok();
+    crate::slog_debug!(
+        "maintenance write busy retry resumed: gate={}",
+        directory.display()
+    );
 }
 
 /// Run `work` on a connection with a different busy wait, restoring the steady
@@ -585,9 +622,17 @@ pub(crate) enum OpenMode {
 pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, OpenError> {
     #[cfg(test)]
     crate::test_storage::assert_database(path);
+    // Decide before mkdir, journal PRAGMAs, or a writable SQLite open. A dev
+    // reader can inspect a matching schema, but cannot create even one record.
+    if crate::production_storage::protected(path) {
+        if peek_schema_version(path) == Some(CURRENT_SCHEMA_VERSION) {
+            return open_readonly(path);
+        }
+        crate::production_storage::refuse_write(path)?;
+    }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
+            crate::private_storage::open_root(parent)?;
         }
     }
     // Refuse a newer schema before the PRAGMAs below, which would otherwise
@@ -732,6 +777,16 @@ fn apply_pragmas_with_timeout(
 /// Returns the post-migration schema version. Refuses to open databases created
 /// by newer AFT versions.
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
+    // Also fence callers that supply their own connection. Read the version
+    // on that connection, never a second descriptor while it is live.
+    if let Some(path) = conn.path().filter(|path| !path.is_empty()) {
+        if crate::production_storage::protected(Path::new(path)) {
+            if current_schema_version(conn).ok() == Some(CURRENT_SCHEMA_VERSION) {
+                return Ok(CURRENT_SCHEMA_VERSION);
+            }
+            crate::production_storage::refuse_write(Path::new(path))?;
+        }
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL PRIMARY KEY);",
     )?;
@@ -894,6 +949,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         12 => conn.execute_batch(MIGRATION_V12),
         13 => conn.execute_batch(MIGRATION_V13),
         14 => conn.execute_batch(MIGRATION_V14),
+        15 => conn.execute_batch(call_ledger::MIGRATION),
         _ => Ok(()),
     }
 }
@@ -1188,12 +1244,66 @@ mod tests {
     }
 
     #[test]
+    fn migration_v15_installs_call_ledger_from_v13() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY);")
+            .unwrap();
+        for version in 1..=13 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        assert_eq!(schema_version(&conn), 13);
+        assert_eq!(run_migrations(&mut conn).unwrap(), 15);
+        assert!(sqlite_names(&conn, "table").contains(&"call_ledger".to_string()));
+    }
+
+    #[test]
+    fn migration_v15_preserves_v14_remote_exec_policies() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY);")
+            .unwrap();
+        for version in 1..=14 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        assert_eq!(schema_version(&conn), 14);
+        assert!(!sqlite_names(&conn, "table").contains(&"call_ledger".to_string()));
+        conn.execute_batch(
+            "INSERT INTO remote_exec_policies VALUES (
+              'project', 'harness', 'session', 'principal', 'owner', 'scope',
+              'epoch', 'preset', '{\"mode\":\"remote\"}', 123
+            );",
+        )
+        .unwrap();
+
+        assert_eq!(run_migrations(&mut conn).unwrap(), 15);
+        assert_eq!(schema_version(&conn), 15);
+        assert!(sqlite_names(&conn, "table").contains(&"call_ledger".to_string()));
+        assert!(sqlite_names(&conn, "index").contains(&"idx_remote_exec_policies_used".to_string()));
+        let policy: (String, i64) = conn
+            .query_row(
+                "SELECT params, last_used FROM remote_exec_policies",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(policy, ("{\"mode\":\"remote\"}".to_string(), 123));
+        let count: u32 = conn
+            .query_row("SELECT COUNT(*) FROM remote_exec_policies", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn downgrade_refused() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("aft.db");
         let conn = open(&path).unwrap();
-        conn.execute("INSERT OR REPLACE INTO schema_version VALUES (999)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_version VALUES (?1)",
+            [CURRENT_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
         drop(conn);
 
         match open(&path).unwrap_err() {
@@ -1201,11 +1311,16 @@ mod tests {
                 db_version,
                 supported,
             } => {
-                assert_eq!(db_version, 999);
-                assert_eq!(supported, CURRENT_SCHEMA_VERSION);
+                assert_eq!(db_version, CURRENT_SCHEMA_VERSION + 1);
+                assert_eq!(supported, 15);
             }
             error => panic!("expected downgrade refusal, got {error:?}"),
         }
+        let mut conn = Connection::open(&path).unwrap();
+        assert!(matches!(
+            run_migrations(&mut conn),
+            Err(OpenError::DowngradeRefused { supported: 15, .. })
+        ));
     }
 
     #[test]

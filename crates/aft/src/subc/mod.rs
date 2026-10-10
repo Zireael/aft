@@ -416,6 +416,7 @@ struct PendingSubcResponse {
     format_context: crate::subc_format::FormatContext,
     bind_trust: BindTrust,
     pending: PendingResponse,
+    ledger_key: Option<crate::db::call_ledger::Key>,
     surface_downgraded: bool,
     phase_trace: PhaseTrace,
     /// When the deferred response was handed to the module loop.
@@ -530,6 +531,14 @@ impl PendingSubcResponses {
         self.entries.retain(|entry| {
             let keep = entry.route != route || entry.corr != corr;
             if !keep {
+                // An incremental delete owes the caller its partial progress,
+                // not a generic cancellation frame that discards that progress.
+                if entry.bare_name == "delete" {
+                    if let Some(cancellation) = &entry.pending.cancellation {
+                        cancellation.request_cancel();
+                    }
+                    return true;
+                }
                 cancelled = true;
                 if let Some(cancellation) = &entry.pending.cancellation {
                     cancellation.request_cancel();
@@ -581,8 +590,9 @@ impl PendingSubcResponses {
     /// Answers every waiting deferred response at once because the module is
     /// draining: each gets its own shutdown terminal, or a retryable
     /// `module_reloading` error when it has none, and its background work is
-    /// cancelled. Deferred responses are read-only (`inspect`, LSP navigation),
-    /// so the caller can retry on the restarted module.
+    /// cancelled. Read-only responses (`inspect`, LSP navigation) can be retried
+    /// on the restarted module. Incremental deletes stop at a checkpoint and
+    /// log their partial progress when their detailed terminal cannot be sent.
     fn drain_for_module_drain(&mut self, executor: &Executor) -> Vec<ResolvedSubcResponse> {
         let mut resolved = Vec::with_capacity(self.entries.len());
         for mut entry in self.entries.drain(..) {
@@ -742,7 +752,8 @@ fn active_tool_call_is_registered(
 /// metadata when the caller now owns the call's terminal frame: the call's own
 /// response task will find it gone and send nothing. Returns `None` when the
 /// call is not tracked, or when its response task has already claimed it and
-/// will answer it itself.
+/// will answer it itself. Incremental deletes also answer themselves after
+/// cancellation, with the removed counts and remaining tree location.
 fn cancel_active_tool_call(
     active: &ActiveToolCalls,
     executor: &Executor,
@@ -755,6 +766,15 @@ fn cancel_active_tool_call(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if calls.get(&(route, corr)).is_none_or(|call| call.answering) {
+            return None;
+        }
+        if let Some(call) = calls
+            .get(&(route, corr))
+            .filter(|call| call.tool == "delete")
+        {
+            // Keep both the active call and its deferred response tracked. The
+            // next delete checkpoint returns the detailed cancellation result.
+            executor.cancel_job(&call.root_id, &call.cancellation);
             return None;
         }
         calls.remove(&(route, corr))?
@@ -991,6 +1011,64 @@ fn principal_label(principal: &Option<Principal>) -> String {
     principal_id(principal).unwrap_or_else(|| "absent".to_string())
 }
 
+/// Reconstruct a recovered shell's terminal result using the foreground
+/// formatter, rather than replacing its output with a task-status summary.
+/// The vanished route's trust facts cannot be recovered from a principal, so
+/// use the standard MCP text projection and never expose structured sidecars.
+pub(crate) fn recovered_bash_frame(
+    snapshot: crate::bash_background::registry::BgTaskSnapshot,
+    key: &crate::db::call_ledger::Key,
+    project_root: &Path,
+) -> Option<(crate::db::call_ledger::RecordedFrame, String)> {
+    if snapshot.info.status == crate::bash_background::BgTaskStatus::FateUnknown {
+        return Some((
+            crate::db::call_ledger::not_retained(key, "unknown"),
+            "unknown".into(),
+        ));
+    }
+    let now = Instant::now();
+    let crate::commands::bash_orchestrate::BashStep::Done(response) =
+        crate::commands::bash_orchestrate::decide_bash_step(
+            snapshot,
+            now,
+            true,
+            false,
+            now,
+            &key.call_key,
+        )
+    else {
+        return None;
+    };
+    let outcome = if response.success {
+        "ok"
+    } else {
+        response.data["code"].as_str().unwrap_or("unknown")
+    }
+    .to_string();
+    let context =
+        crate::subc_format::FormatContext::from_tool_call("bash", &json!({}), project_root);
+    let result = ToolCallResult {
+        text: crate::subc_format::format_response_with_context("bash", &response, &context),
+        response,
+    };
+    let frame = build_tool_response_frame(
+        PROTOCOL_VERSION,
+        route_key(1, 1),
+        1,
+        control_flags(),
+        &result,
+        BindTrust::Untrusted,
+    )
+    .ok()?;
+    Some((
+        crate::db::call_ledger::RecordedFrame {
+            ty: frame.header.ty,
+            body: frame.body,
+        },
+        outcome,
+    ))
+}
+
 #[derive(Debug)]
 /// Per-root route metadata owned by the subc loop. The `active_bash_waits` field
 /// counts detached bash processes that are still being observed for this root.
@@ -1208,6 +1286,8 @@ struct PendingBashAsk {
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     /// The caller is a delegated worker session (the call body's flag).
     worker_session: bool,
+    /// The call selected the catalog's worker preset rather than a plugin flag.
+    worker_preset: bool,
     asked_at: Instant,
     expires_at: Instant,
 }
@@ -2894,8 +2974,14 @@ async fn handle_bash_elicitation_reply(
                 Some(pending.grants),
                 pending.repeat,
                 pending.worker_session,
-                false,
-                None,
+                pending.worker_preset,
+                routes.get(&key.route).is_some_and(|identity| {
+                    identity.role == tool_provider::RouteRole::ToolProviderV1
+                }),
+                // A call admitted through a permission prompt runs on a bind
+                // without first-party trust; remote runs are not offered there.
+                remote_policy::RemoteSource::None,
+                Instant::now(),
             );
             return Ok(());
         }
@@ -2977,8 +3063,25 @@ fn remove_route_channel(
     let removed = routes.remove(&channel);
     if let Some(identity) = &removed {
         remove_root_channel(root_channels, &identity.root, channel);
+        release_semantic_opener_if_unrouted(routes, identity);
     }
     removed
+}
+
+/// Keeps semantic admission (see `semantic_admission`) in step with the
+/// installed routes: a session whose last route on a root is gone no longer
+/// holds that root open. Configure records the opening, before the route is
+/// installed, so a bind that never installs must release it here too.
+fn release_semantic_opener_if_unrouted(
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    identity: &RouteIdentity,
+) {
+    let still_routed = routes
+        .values()
+        .any(|route| route.root == identity.root && route.session == identity.session);
+    if !still_routed {
+        crate::semantic_admission::note_closed(&identity.session, identity.root.as_path());
+    }
 }
 
 fn insert_route_channel(
@@ -2987,8 +3090,12 @@ fn insert_route_channel(
     channel: RouteChannel,
     identity: RouteIdentity,
 ) {
+    if crate::semantic_admission::harness_opens_root(&identity.harness) {
+        crate::semantic_admission::note_opened(&identity.session, identity.root.as_path());
+    }
     if let Some(previous) = routes.insert(channel, identity.clone()) {
         remove_root_channel(root_channels, &previous.root, channel);
+        release_semantic_opener_if_unrouted(routes, &previous);
     }
     root_channels
         .entry(identity.root.clone())
@@ -3463,6 +3570,8 @@ fn run_subc_mode_inner(
             tool_response_body_limit,
             lifecycle_probe,
             &storage_dir,
+            #[cfg(test)]
+            None,
             #[cfg(test)]
             None,
         )
@@ -4139,6 +4248,7 @@ async fn run_module_loop<R, W>(
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
+    #[cfg(test)] mut watchdog_test: Option<stall_watchdog::FrameLoopTestHooks>,
 ) -> Result<ModuleLoopExit, SubcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -4200,11 +4310,31 @@ where
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
     shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
+    #[cfg(test)]
+    let dispatch_path_metrics = watchdog_test
+        .as_ref()
+        .map(|hooks| Arc::clone(&hooks.metrics))
+        .unwrap_or(dispatch_path_metrics);
     // Lives until this function returns, i.e. for the whole attached session,
     // including teardown. Dropping it stops the thread.
-    let _stall_watchdog = spawn_stall_watchdog(&dispatch_path_metrics, &executor, storage_dir);
+    #[cfg(test)]
+    let watchdog_config = watchdog_test.as_mut().and_then(|hooks| hooks.config.take());
+    #[cfg(not(test))]
+    let watchdog_config = None;
+    let _stall_watchdog = spawn_stall_watchdog(
+        &dispatch_path_metrics,
+        &executor,
+        storage_dir,
+        watchdog_config,
+    );
     let (writer_tx, writer_rx) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
     let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&dispatch_path_metrics));
+    let (ledger_edge, mut ledger_ready_rx) = tool_provider::LedgerEdge::new();
+    let (writer_tx, mut ledger_writer_task) = ledger_edge.proxy(
+        writer_tx,
+        Arc::clone(&executor),
+        Arc::clone(&dispatch_path_metrics),
+    );
     let control_replies = readiness::PendingControlReplies::default();
     let readiness_task = spawn_readiness(
         hello_ack,
@@ -4222,7 +4352,7 @@ where
     // dedicated reader task owns the socket, reads whole frames sequentially, and
     // forwards them over a channel; the loop selects on the cancel-safe `recv()`.
     let (reader_tx, mut reader_rx) = mpsc::channel::<Result<DecodedFrame, SubcError>>(256);
-    let reader_task = spawn_reader_task(read, reader_tx);
+    let reader_task = spawn_reader_task(read, reader_tx, Arc::clone(&dispatch_path_metrics));
     let shutdown = Arc::new(Notify::new());
     // Drain-tick deadline is tracked manually and checked at the TOP of every
     // loop turn rather than as an Interval select arm: the select below is
@@ -4319,10 +4449,13 @@ where
         Arc::clone(&shared_app),
     );
 
+    // Arm the existing promised-wake marker before the first turn too: a lock
+    // taken before the first select must be just as recoverable as a later one.
+    dispatch_path_metrics.publish_frame_loop_wake_deadline(DRAIN_TICK_PERIOD);
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
+        dispatch_path_metrics.mark_frame_loop_tick();
         shared_app.set_open_route_count(routes.len() + management_routes.len());
         crate::logging::perf_tick(Some(&executor));
-        dispatch_path_metrics.mark_frame_loop_tick();
         let ready_inspects = pending_responses.poll_if_woken(executor.as_ref(), &deferred_wake);
         for resolved in ready_inspects {
             if let Err(error) = deliver_resolved_subc_response(
@@ -4545,10 +4678,11 @@ where
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
-            (maybe_frame, database_waited) = async {
+            (maybe_frame, database_waited, ledger_waited) = async {
                 tokio::select! {
-                    frame = reader_rx.recv() => (frame, false),
-                    frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true),
+                    frame = reader_rx.recv() => (frame, false, false),
+                    frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true, false),
+                    frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true),
                 }
             } => {
                 let frame = match maybe_frame {
@@ -4563,6 +4697,11 @@ where
                 };
                 let phase_trace = frame.phase_trace;
                 let frame = frame.frame;
+                dispatch_path_metrics.mark_frame_loop_frame(&frame);
+                #[cfg(test)]
+                if let Some(hooks) = watchdog_test.as_ref() {
+                    (hooks.before_frame)();
+                }
 
                 if !ingress_route_should_be_processed(
                     &installed_route_epochs,
@@ -4634,6 +4773,14 @@ where
                         }
                     }
                     FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
+                        let decoded = DecodedFrame {frame, phase_trace};
+                        let decoded = if !ledger_waited {
+                            match ledger_edge.authorize(decoded, &pending_bash_asks, &executor) {
+                                Ok(()) => continue,
+                                Err(decoded) => decoded,
+                            }
+                        } else {decoded};
+                        let frame = decoded.frame;
                         if let Err(error) = handle_bash_elicitation_reply(
                             &writer_tx,
                             &frame,
@@ -4703,7 +4850,7 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace };
-                        let decoded = if !database_waited && !management_routes.contains(&route) {
+                        let decoded = if !database_waited && !management_routes.contains(&route) && !tool_provider::keyed_route_frame(&decoded.frame, &routes) {
                             match database_waits.defer(decoded, &routes, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -4711,8 +4858,22 @@ where
                         } else {
                             decoded
                         };
+                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                            match ledger_edge.defer(decoded, &routes, &executor, &writer_tx, &dispatch_path_metrics) {
+                                Ok(()) => continue,
+                                Err(decoded) => decoded,
+                            }
+                        } else {decoded};
                         let frame = decoded.frame;
                         let phase_trace = decoded.phase_trace;
+                        if ledger_waited && ledger_edge.finish_waiting(&frame) {
+                            let cancelled = build_error_frame(frame.header.ver,
+                                route.channel, route.epoch, frame.header.corr,
+                                frame.header.flags, "cancelled", "request cancelled")?;
+                            send_reliable_writer_frame(&writer_tx, &dispatch_path_metrics,
+                                cancelled, "cancelled ledger admission").await?;
+                            continue;
+                        }
                         let result = if management_routes.contains(&route)
                             && gh_relay_operation(&frame).is_some()
                         {
@@ -4779,6 +4940,9 @@ where
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         let corr = frame.header.corr;
+                        if ledger_edge.cancel(channel, corr) {
+                            continue;
+                        }
                         // The daemon frees a request's credit only on the
                         // module's terminal frame, never on the client's Cancel.
                         // A call this Cancel stops tracking will never answer
@@ -5304,6 +5468,7 @@ where
     }
 
     connection_cancel.cancel();
+    ledger_edge.close();
     cancel_all_active_tool_calls(&active_tool_calls, executor.as_ref(), "connection teardown");
     let setup_drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while pending_deferred_setups.load(Ordering::SeqCst) != 0
@@ -5379,6 +5544,12 @@ where
     // the connection) and flush the writer.
     reader_task.abort();
     drop(writer_tx);
+    if tokio::time::timeout(Duration::from_secs(5), &mut ledger_writer_task)
+        .await
+        .is_err()
+    {
+        ledger_writer_task.abort();
+    }
     let writer_result = finish_writer_task(writer_task).await;
     log::info!(
         "subc exit phase=loop_teardown elapsed_ms={}",
@@ -5430,6 +5601,7 @@ fn spawn_stall_watchdog(
     dispatch_path_metrics: &Arc<DispatchPathMetrics>,
     executor: &Executor,
     storage_dir: &Path,
+    config_override: Option<stall_watchdog::StallWatchdogConfig>,
 ) -> Option<stall_watchdog::StallWatchdog> {
     let markers: Vec<Box<dyn stall_watchdog::LivenessMarker>> = vec![
         Box::new(stall_watchdog::FrameLoopMarker(Arc::clone(
@@ -5442,7 +5614,8 @@ fn spawn_stall_watchdog(
     match stall_watchdog::StallWatchdog::spawn(
         markers,
         Arc::clone(&dispatch_path_metrics.stall_stats),
-        stall_watchdog::StallWatchdogConfig::production(storage_dir),
+        config_override
+            .unwrap_or_else(|| stall_watchdog::StallWatchdogConfig::production(storage_dir)),
     ) {
         Ok(watchdog) => Some(watchdog),
         Err(error) => {
@@ -5477,6 +5650,7 @@ where
             .await;
             metrics.writer_active.store(false, Ordering::Relaxed);
             let write_timing = write_timing?;
+            metrics.tool_replied(queued.frame());
 
             if let (Some(trace), Some(dequeued), Some(write_timing)) =
                 (queued.tool_response_trace.take(), dequeued, write_timing)
@@ -5550,6 +5724,7 @@ where
 fn spawn_reader_task<R>(
     mut read: R,
     tx: mpsc::Sender<Result<DecodedFrame, SubcError>>,
+    metrics: Arc<DispatchPathMetrics>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -5558,12 +5733,16 @@ where
         loop {
             match read_frame(&mut read).await {
                 Ok(Some(frame)) => {
+                    let received_at = Instant::now();
+                    if frame.header.ty == FrameType::Request && frame.header.channel != 0 {
+                        metrics.tool_received(&frame, received_at);
+                    }
                     #[cfg(any(test, feature = "test-timing-hooks"))]
                     let delay_after_ping =
                         frame.header.ty == FrameType::Ping && frame.header.corr == 124;
                     let decoded = DecodedFrame {
                         frame,
-                        phase_trace: PhaseTrace::new(Instant::now()),
+                        phase_trace: PhaseTrace::new(received_at),
                     };
                     if tx.send(Ok(decoded)).await.is_err() {
                         return;
@@ -5774,6 +5953,7 @@ async fn handle_route_bind_completion(
             "subc attach: dropping RouteBind completion for non-pending route {}",
             completion.route
         );
+        release_semantic_opener_if_unrouted(routes, &completion.identity);
         rollback_pending_bind_actor(
             executor,
             live_roots,
@@ -5811,6 +5991,7 @@ async fn handle_route_bind_completion(
         metrics.record_bind_ack(pending.started_at.elapsed());
     }
     if pending.cancelled {
+        release_semantic_opener_if_unrouted(routes, &completion.identity);
         rollback_pending_bind_actor(
             executor,
             live_roots,
@@ -5847,6 +6028,7 @@ async fn handle_route_bind_completion(
     };
 
     if let Some((response, fallback)) = failure {
+        release_semantic_opener_if_unrouted(routes, &completion.identity);
         rollback_pending_bind_actor(
             executor,
             live_roots,
@@ -6758,13 +6940,8 @@ fn memory_census_with_lifecycle(
                     "lsp_idle_ttl_ms".to_string(),
                     json!(executor
                         .actor_context(root_id)
-                        .map(|ctx| ctx
-                            .config()
-                            .idle
-                            .lsp_ttl()
-                            .as_millis()
-                            .min(u128::from(u64::MAX)) as u64)
-                        .unwrap_or(0)),
+                        .and_then(|ctx| ctx.config().lsp_idle_minutes.ttl())
+                        .map(|ttl| ttl.as_millis().min(u128::from(u64::MAX)) as u64)),
                 );
                 row.insert(
                     "evictable_in_ms".to_string(),
@@ -7418,13 +7595,15 @@ async fn handle_tool_call(
                 .await
             }
         };
-        let role = match tool_provider::admit(
+        let role = match tool_provider::admit_on_route(
             &call,
             identity.scope.is_some(),
             &identity.disabled_tools,
             crate::bash_background::powershell_available(),
             &identity.session,
-            !matches!(identity.trust, BindTrust::Untrusted),
+            tool_provider::admission_trusted(&identity, &call),
+            &identity.project_root,
+            frame.header.channel,
         ) {
             Ok(role) => role,
             Err(error) => return send_provider_error(tx, metrics, frame, error).await,
@@ -7551,8 +7730,19 @@ async fn handle_tool_call(
     // same error frame a v1 refusal gets.
     let role = match call.caller_role(scoped_route && agent_tool) {
         Ok(role) => role,
-        Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+        Err(error) => {
+            if scoped_route && agent_tool && call.preset.is_none() {
+                tool_provider::log_scoped_preset_refusal(
+                    &identity.session,
+                    &identity.project_root,
+                    frame.header.channel,
+                    &call.name,
+                );
+            }
+            return send_provider_error(tx, metrics, frame, error).await;
+        }
     };
+    let worker_preset = role.is_worker() && call.preset.as_deref() == Some("worker");
     if agent_tool && call.preset.is_none() && !scoped_route {
         metrics.record_presetless_tool_call(&identity.harness);
     }
@@ -7575,6 +7765,10 @@ async fn handle_tool_call(
         log::debug!("subc tool call {}: schema_pin={pin}", call.name);
     }
     let call_key = call.call_key;
+    let ledger_key = call_key
+        .as_deref()
+        .filter(|_| identity.role == tool_provider::RouteRole::ToolProviderV1)
+        .map(|key| tool_provider::LedgerEdge::key(&identity, key));
     let bare_name = call.name;
     let arguments = strip_agent_preview_arg_owned(call.arguments);
     // Decided before the arguments move into the job: slow-call logging needs
@@ -7853,6 +8047,7 @@ async fn handle_tool_call(
                     grants: plan.grants,
                     repeat,
                     worker_session: role.is_worker(),
+                    worker_preset,
                     asked_at: Instant::now(),
                     expires_at: Instant::now() + bash_elicitation_timeout(),
                 },
@@ -7905,8 +8100,10 @@ async fn handle_tool_call(
             None,
             repeat,
             role.is_worker(),
+            worker_preset,
             identity.role == tool_provider::RouteRole::ToolProviderV1,
-            remote_policy::key(&identity, call.preset.as_deref()),
+            remote_policy::source(&identity, call.preset.as_deref()),
+            phase_trace.received_at(),
         );
         return Ok(());
     }
@@ -7927,6 +8124,7 @@ async fn handle_tool_call(
 
     let uses_deferred_response_seam = bare_name == "inspect"
         || bare_name == "bash_watch"
+        || bare_name == "delete"
         || crate::commands::lsp_navigation::is_lsp_navigation_command(&bare_name);
     if uses_deferred_response_seam {
         let Some(deferred_ctx) = executor.actor_context(&identity.root) else {
@@ -7956,6 +8154,7 @@ async fn handle_tool_call(
         let request_id_for_force = request_id.clone();
         let format_context_for_run = format_context.clone();
         let bare_name_for_run = bare_name.clone();
+        let ledger_key_for_setup = ledger_key.clone();
         let (setup_tx, setup_rx) = oneshot::channel::<DeferredSetupOutcome>();
         let completion_wake = deferred_response_tx.wake.clone();
         phase_trace.mark_executor_submitted();
@@ -7975,6 +8174,11 @@ async fn handle_tool_call(
                     Some(&mut phase_trace),
                 ) {
                     Err(result) => {
+                        tool_provider::note_native_outcome(
+                            ctx,
+                            ledger_key_for_setup.as_ref(),
+                            &result.response,
+                        );
                         let response = result.response;
                         let _ = setup_tx.send(DeferredSetupOutcome::Immediate {
                             text: result.text,
@@ -7985,6 +8189,12 @@ async fn handle_tool_call(
                     Ok(prepared) => {
                         let outcome = if bare_name_for_run == "inspect" {
                             crate::commands::inspect::handle_inspect_deferred_with_restriction(
+                                &prepared.request,
+                                Arc::clone(&deferred_ctx),
+                                matches!(bind_trust, BindTrust::Untrusted),
+                            )
+                        } else if bare_name_for_run == "delete" {
+                            crate::commands::delete_file::handle_delete_deferred_with_restriction(
                                 &prepared.request,
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
@@ -8033,6 +8243,11 @@ async fn handle_tool_call(
                                     Some(&finalizer),
                                     Some(&mut phase_trace),
                                 );
+                                tool_provider::note_native_outcome(
+                                    ctx,
+                                    ledger_key_for_setup.as_ref(),
+                                    &result.response,
+                                );
                                 let response = result.response;
                                 let _ = setup_tx.send(DeferredSetupOutcome::Immediate {
                                     text: result.text,
@@ -8043,11 +8258,20 @@ async fn handle_tool_call(
                         }
                     }
                 };
-                if matches!(bind_trust, BindTrust::Untrusted) {
-                    ctx.with_force_restrict(&request_id_for_force, run)
-                } else {
-                    run()
-                }
+                // Deferred bash watches must use the same durable namespace as
+                // the route that spawned the task, not the last route to
+                // configure this shared root. The handler captures this scope
+                // for its off-executor recovery and wait thread.
+                crate::sandbox_spawn::with_authenticated_principal(
+                    identity_for_run.spawn_principal.clone(),
+                    || {
+                        if matches!(bind_trust, BindTrust::Untrusted) {
+                            ctx.with_force_restrict(&request_id_for_force, run)
+                        } else {
+                            run()
+                        }
+                    },
+                )
             })
         });
         let deferred_setup_guard =
@@ -8101,6 +8325,7 @@ async fn handle_tool_call(
                         format_context,
                         bind_trust,
                         pending,
+                        ledger_key,
                         surface_downgraded,
                         phase_trace,
                         held_since: Instant::now(),
@@ -8236,6 +8461,11 @@ async fn handle_tool_call(
                     Some(&mut phase_trace),
                 ) {
                     ToolCallOutcome::Unary(result) => {
+                        tool_provider::note_native_outcome(
+                            ctx,
+                            ledger_key.as_ref(),
+                            &result.response,
+                        );
                         let response = result.response;
                         let _ = tool_call_tx.send(ToolCallCompletion {
                             text: result.text,
@@ -8245,8 +8475,8 @@ async fn handle_tool_call(
                     }
                 }
             };
-            // Undo history belongs to the route that made the edit, not to
-            // whichever harness configured this shared root last.
+            // Undo history and named checkpoints belong to the issuing route,
+            // not to whichever harness configured this shared root last.
             let harness = identity_for_run.harness.clone();
             crate::backup::with_request_harness(&harness, || {
                 if matches!(bind_trust, BindTrust::Untrusted) {
@@ -8574,6 +8804,32 @@ async fn deliver_resolved_subc_response(
         Some(&finalizer),
         Some(&mut entry.phase_trace),
     );
+    if let Some(key) = entry.ledger_key.clone() {
+        let outcome = if result.response.success {
+            "ok".to_string()
+        } else {
+            result.response.data["code"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        // Queue before terminal settlement on the same actor. The frame loop
+        // never locks or writes SQLite, including for deferred responses.
+        drop(executor.submit_async(
+            entry.root.clone(),
+            Lane::Mutating,
+            "ledger-deferred-outcome".into(),
+            Box::new(move |ctx| {
+                let response = if outcome == "ok" {
+                    Response::success("ledger-deferred-outcome", json!({}))
+                } else {
+                    Response::error("ledger-deferred-outcome", &outcome, "")
+                };
+                tool_provider::note_native_outcome(ctx, Some(&key), &response);
+                Response::success("ledger-deferred-outcome", json!({}))
+            }),
+        ));
+    }
     let fatal = note_fatal_panic_response(&result.response);
     let response_frame = build_tool_response_frame_with_limit(
         entry.ver,
@@ -9230,6 +9486,7 @@ pub(crate) mod test_support {
             root: root.clone(),
             session_id: "navigation-cancel-session".to_string(),
             bare_name: "lsp_hover".to_string(),
+            ledger_key: None,
             format_context: crate::subc_format::FormatContext::from_tool_call(
                 "lsp_hover",
                 &json!({}),
@@ -9394,6 +9651,197 @@ pub(crate) mod test_support {
     }
 
     #[tokio::test]
+    async fn scoped_worker_watch_recovers_under_route_harness_before_replay() {
+        use crate::bash_background::persistence::{
+            create_task_layout, write_task_at, PersistedTask,
+        };
+        let (dir, root) = test_root("scoped-watch-restart");
+        let storage = dir.path().join("storage");
+        let session = "alfonso:scoped-watch-worker";
+        let task_id = "bash-0123456789abcdef";
+        let task = create_task_layout(&storage.join("runner"), session, task_id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.into(),
+            session.into(),
+            "exit 1".into(),
+            root.as_path().into(),
+            Some(root.as_path().into()),
+            None,
+            false,
+            false,
+        );
+        metadata.harness = Some("runner".into());
+        metadata.mark_terminal(crate::bash_background::BgTaskStatus::Failed, Some(1), None);
+        write_task_at(&task, &metadata).unwrap();
+        std::fs::write(&task.paths.stdout, "scoped durable output\n").unwrap();
+        std::fs::write(&task.paths.stderr, "").unwrap();
+        std::fs::write(&task.paths.exit, "1\n").unwrap();
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(storage),
+                // A different harness owns the root's latest config snapshot.
+                harness: Some(crate::harness::Harness::Opencode),
+                ..Config::default()
+            },
+        ));
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            root: root.clone(),
+            project_root: root.as_path().into(),
+            harness: "runner".into(),
+            session: session.into(),
+            role: tool_provider::RouteRole::Legacy,
+            trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::RouteBind {
+                trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+                route_channel: 41,
+                route_epoch: 1,
+                project_root: root.as_path().into(),
+                harness: "runner".into(),
+                session_id: session.into(),
+                principal_id: Some("reserved:broca".into()),
+            },
+            consumer_elicitation_capable: false,
+            disabled_tools: Arc::new(vec![]),
+            scope: Some(
+                serde_json::from_value(json!({
+                    "owner": {"kind": "direct"}, "ref": "worker-scope", "scope_epoch": 1,
+                    "kind": "worker", "owner_authorized": true,
+                }))
+                .unwrap(),
+            ),
+            made_tool_call: AtomicBool::new(false),
+        }));
+        let routes = HashMap::from([(route_key(41, 1), identity)]);
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            41,
+            1,
+            7,
+            serde_json::to_vec(&json!({
+                "name": "bash_watch", "preset": "worker",
+                "arguments": {"taskId": task_id, "timeoutMs": 1_800_000},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (writer, mut replies) = mpsc::channel(8);
+        let (bash_tx, _bash_rx) = mpsc::channel(8);
+        let (touch_tx, _touch_rx) = mpsc::channel(8);
+        let (entries, mut deferred_rx) = mpsc::unbounded_channel();
+        let deferred_tx = DeferredResponseSender {
+            entries,
+            wake: crate::response_finalize::DeferredResponseWake::default(),
+        };
+        handle_tool_call(
+            &writer,
+            &frame,
+            PhaseTrace::new(Instant::now()),
+            &routes,
+            &HashMap::new(),
+            &ReclaimedRoutes::default(),
+            &mut HashMap::new(),
+            &executor,
+            &Arc::default(),
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(Notify::new()),
+            &PersistentCancelSignal::new(),
+            &bash_tx,
+            &touch_tx,
+            &Arc::new(DispatchPathMetrics::new()),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut 1,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |_, _| panic!("watch must use the deferred seam"),
+            &deferred_tx,
+            false,
+            1024 * 1024,
+            &drain::ModuleDrainWindow::default(),
+        )
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                entry = deferred_rx.recv() => {
+                    let mut entry = entry.expect("deferred watch setup");
+                    deferred_tx.wake.notified().await;
+                    (entry.pending.poll)(&ctx).expect("watch terminal queued before wake")
+                }
+                reply = replies.recv() => panic!("watch should recover, not refuse: {}", String::from_utf8_lossy(&reply.unwrap().frame.body)),
+            }
+        }).await.expect("scoped watch must recover before its 30-minute window");
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "failed");
+        assert_eq!(response.data["exit_code"], 1);
+        assert_eq!(response.data["waited"]["reason"], "exited");
+        assert!(response.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("scoped durable output"));
+    }
+
+    #[test]
+    fn draining_worker_watch_reports_restart_not_record_loss() {
+        let executor = Executor::new();
+        let (dir, root) = test_root("watch-drain-wording");
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(dir.path().join("storage")),
+                ..Config::default()
+            },
+        ));
+        executor.register_actor(root.clone(), ctx);
+        let cancellation = JobCancellation::new();
+        let pending = PendingResponse::polling(
+            "draining-watch".into(),
+            "worker".into(),
+            "bash_watch".into(),
+            Box::new(|_| None),
+        )
+        .with_cancellation(cancellation.clone());
+        let mut registry = PendingSubcResponses::default();
+        registry.register(PendingSubcResponse {
+            route: route_key(41, 1),
+            corr: 7,
+            flags: control_flags(),
+            ver: PROTOCOL_VERSION,
+            root,
+            session_id: "worker".into(),
+            bare_name: "bash_watch".into(),
+            ledger_key: None,
+            format_context: crate::subc_format::FormatContext::from_tool_call(
+                "bash_watch",
+                &json!({}),
+                dir.path(),
+            ),
+            bind_trust: BindTrust::FirstParty,
+            pending,
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
+        });
+        let drained = registry.drain_for_module_drain(&executor);
+        assert_eq!(drained.len(), 1);
+        assert!(cancellation.cancel_already_requested());
+        assert_eq!(drained[0].response.data["code"], "module_reloading");
+        assert_eq!(drained[0].response.data["retryable"], true);
+        assert_eq!(
+            drained[0].response.data["message"],
+            "bash_watch was not completed because AFT is restarting; retry the call"
+        );
+    }
+
+    #[tokio::test]
     async fn deferred_registry_idle_turns_do_not_repoll_and_completion_wakes() {
         let executor = Executor::new();
         let (dir, root) = test_root("deferred-wake-counter");
@@ -9421,6 +9869,7 @@ pub(crate) mod test_support {
             root,
             session_id: "session".into(),
             bare_name: "inspect".into(),
+            ledger_key: None,
             format_context: crate::subc_format::FormatContext::from_tool_call(
                 "inspect",
                 &json!({}),
@@ -9540,6 +9989,7 @@ pub(crate) mod test_support {
             root,
             session_id: "polled-bash-session".into(),
             bare_name: "bash".into(),
+            ledger_key: None,
             format_context: crate::subc_format::FormatContext::from_tool_call(
                 "bash",
                 &json!({}),
@@ -9663,6 +10113,106 @@ pub(crate) mod test_support {
             crate::commands::inspect::deferred_inspect_root_count_for_test(),
             0
         );
+    }
+
+    #[test]
+    fn cancelled_external_delete_keeps_its_partial_terminal() {
+        let executor = Executor::new();
+        let (project, root) = test_root("cancelled-external-delete");
+        let external = tempfile::tempdir().unwrap();
+        let tree = std::fs::canonicalize(external.path()).unwrap();
+        std::fs::write(tree.join("leaf"), "fixture").unwrap();
+        let ctx = inspect_context(project.path());
+        ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
+            enabled: false,
+            ..Default::default()
+        });
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": "delete-cancel", "command": "delete_file", "file": tree, "recursive": true
+        }))
+        .unwrap();
+        let route = RouteChannel {
+            channel: 7,
+            epoch: 1,
+        };
+        let active: ActiveToolCalls = Arc::default();
+        let (started, release) = crate::commands::delete_file::install_delete_gate_for_test(&tree);
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_ctx = Arc::clone(&ctx);
+        let setup = submit_active_tool_call(
+            &executor,
+            &active,
+            route,
+            41,
+            root.clone(),
+            Lane::Mutating,
+            "delete-cancel".into(),
+            RouteDetachPolicy::CancelOnDetach,
+            "delete",
+            test_request_meta(),
+            Box::new(move |_| {
+                let DispatchOutcome::Deferred(pending) =
+                    crate::commands::delete_file::handle_delete_deferred_with_restriction(
+                        &request, worker_ctx, false,
+                    )
+                else {
+                    panic!("external unbacked delete must defer")
+                };
+                pending_tx.send(pending).unwrap();
+                Response::success("delete-cancel", json!({}))
+            }),
+        );
+        let pending = pending_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        setup.blocking_recv().unwrap();
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut responses = PendingSubcResponses::default();
+        responses.register(PendingSubcResponse {
+            route,
+            corr: 41,
+            flags: Flags::new(false, Priority::Passive, false),
+            ver: PROTOCOL_VERSION,
+            root,
+            session_id: "test".into(),
+            bare_name: "delete".into(),
+            ledger_key: None,
+            format_context: crate::subc_format::FormatContext::default(),
+            bind_trust: BindTrust::FirstParty,
+            pending,
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
+        });
+        let terminal_owner = cancel_active_tool_call(&active, &executor, route, 41, "Cancel frame");
+        let dropped = responses.cancel_request(route, 41);
+        release.send(()).unwrap();
+        assert!(
+            terminal_owner.is_none(),
+            "delete worker must own its detailed terminal"
+        );
+        assert!(
+            !dropped,
+            "Cancel must retain the pending partial-delete response"
+        );
+        assert!(active_tool_call_is_registered(&active, route, 41));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let mut ready = responses.poll_ready(&executor);
+            if let Some(resolved) = ready.pop() {
+                assert_eq!(resolved.response.data["code"], "request_cancelled");
+                assert_eq!(resolved.response.data["files_deleted"], 0);
+                assert_eq!(resolved.response.data["remaining_entries"], 2);
+                assert!(tree.join("leaf").exists());
+                assert!(claim_active_tool_call(&active, route, 41));
+                finish_active_tool_call(&active, route, 41);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled delete must return a terminal"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -9952,6 +10502,7 @@ pub(crate) mod test_support {
             root: root.clone(),
             session_id: "shutdown-session".to_string(),
             bare_name: "inspect".to_string(),
+            ledger_key: None,
             format_context: crate::subc_format::FormatContext::from_tool_call(
                 "inspect",
                 &json!({}),
@@ -10041,6 +10592,7 @@ pub(crate) mod test_support {
         let entry =
             |corr: u64, root: &ProjectRootId, name: &str, dir: &Path, pending: PendingResponse| {
                 PendingSubcResponse {
+                    ledger_key: None,
                     route,
                     corr,
                     flags: Flags::new(false, Priority::Passive, false),
@@ -10297,10 +10849,19 @@ pub(crate) mod test_support {
         session_id: &str,
         trust: BindTrust,
     ) -> RouteIdentity {
+        route_identity_with_harness(root, session_id, trust, "opencode")
+    }
+
+    pub(super) fn route_identity_with_harness(
+        root: &ProjectRootId,
+        session_id: &str,
+        trust: BindTrust,
+        harness: &str,
+    ) -> RouteIdentity {
         RouteIdentity(Arc::new(RouteIdentityData {
             root: root.clone(),
             project_root: root.as_path().to_path_buf(),
-            harness: "opencode".to_string(),
+            harness: harness.to_string(),
             session: session_id.to_string(),
             role: tool_provider::RouteRole::Legacy,
             trust,
@@ -10438,6 +10999,7 @@ mod tests {
                 None,
                 &fixture_path.join("storage"),
                 Some(actor),
+                None,
             ))
         });
         let bind_result: Result<(), String> = async {
@@ -10589,6 +11151,7 @@ mod tests {
                 None,
                 &fixture_path.join("storage"),
                 Some(actor),
+                None,
             ))
         });
         let while_held: Result<(), String> = async {
@@ -12256,6 +12819,7 @@ mod tests {
                     grants: Vec::new(),
                     repeat: None,
                     worker_session: false,
+                    worker_preset: false,
                     asked_at: Instant::now(),
                     expires_at: Instant::now() + Duration::from_secs(60),
                 },
@@ -14412,6 +14976,66 @@ mod tests {
     /// principal entirely for non-fed harnesses would satisfy both. Pin the
     /// delegation itself: on a normal harness the verdict must still come from
     /// the principal, in both directions.
+    /// Installed routes drive semantic admission: an OpenCode route opens its
+    /// root until the session's last route on it is removed, and a runner
+    /// (sidekick) route never opens one.
+    #[test]
+    fn installed_interactive_routes_open_their_root_until_the_last_one_leaves() {
+        use crate::semantic_admission::{admission, SemanticAdmission};
+        let (_opened_dir, opened) = test_root("semantic-opened-route");
+        let (_sidekick_dir, sidekick) = test_root("semantic-sidekick-route");
+        let mut routes = HashMap::new();
+        let mut root_channels = HashMap::new();
+        let first = route_key(41, 1);
+        let second = route_key(42, 1);
+        let runner = route_key(43, 1);
+        insert_route_channel(
+            &mut routes,
+            &mut root_channels,
+            first,
+            test_support::route_identity(&opened, "ses_semantic_route"),
+        );
+        insert_route_channel(
+            &mut routes,
+            &mut root_channels,
+            second,
+            test_support::route_identity(&opened, "ses_semantic_route"),
+        );
+        insert_route_channel(
+            &mut routes,
+            &mut root_channels,
+            runner,
+            test_support::route_identity_with_harness(
+                &sidekick,
+                "alfonso:sidekick-route",
+                BindTrust::FirstParty,
+                "runner",
+            ),
+        );
+        assert_eq!(
+            admission(opened.as_path(), &[]),
+            SemanticAdmission::InteractiveSession
+        );
+        assert_eq!(
+            admission(sidekick.as_path(), &[]),
+            SemanticAdmission::NotOpened
+        );
+
+        remove_route_channel(&mut routes, &mut root_channels, first);
+        assert_eq!(
+            admission(opened.as_path(), &[]),
+            SemanticAdmission::InteractiveSession,
+            "the session still has a route on the root"
+        );
+        remove_route_channel(&mut routes, &mut root_channels, second);
+        assert_eq!(
+            admission(opened.as_path(), &[]),
+            SemanticAdmission::NotOpened,
+            "the session's last route on the root is gone"
+        );
+        remove_route_channel(&mut routes, &mut root_channels, runner);
+    }
+
     #[test]
     fn trust_for_bind_delegates_to_the_principal_on_ordinary_harnesses() {
         for harness in ["opencode", "pi", "runner", "mcp:claude"] {
@@ -14925,7 +15549,7 @@ mod tests {
             "project_root": root.as_path(), "storage_dir": root.as_path().join("storage"),
             "harness": "opencode", "session_id": "frozen-bind",
             "config": [{"tier": "user", "source": "/user/aft.jsonc", "doc": json!({
-                "search_index": false, "semantic_search": false, "callgraph_store": false,
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             }).to_string()}],
         }))
         .unwrap();
@@ -15404,7 +16028,7 @@ mod tests {
                 "config": [{
                     "tier": "user",
                     "source": "/u/aft.jsonc",
-                    "doc": json!({ "semantic_search": false }).to_string(),
+                    "doc": json!({ "indexes": { "semantic": false }, }).to_string(),
                 }],
             }))
             .unwrap();
@@ -15596,7 +16220,7 @@ mod tests {
                 "config": [{
                     "tier": "user",
                     "source": "/u/aft.jsonc",
-                    "doc": json!({ "semantic_search": false }).to_string(),
+                    "doc": json!({ "indexes": { "semantic": false }, }).to_string(),
                 }],
             }))
             .unwrap()
@@ -16325,7 +16949,7 @@ mod tests {
         // directory keeps the database ready.
         let mut same = fixture.bind_request(1, "opencode");
         same.params["config"][0]["doc"] = json!(json!({
-            "semantic_search": false,
+            "indexes": { "semantic": false },
             "restrict_to_project_root": true,
         })
         .to_string());

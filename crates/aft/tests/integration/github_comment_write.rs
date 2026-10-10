@@ -82,6 +82,25 @@ struct Fixture {
 impl Fixture {
     fn new(github: serde_json::Value) -> Self {
         let root = tempfile::tempdir().expect("create GitHub write fixture");
+        let github = if github.get("enabled").is_some() {
+            // Write the resolved `github.read`, `github.write` and `github.shim`
+            // values instead of the retired `github.enabled`, so the child reads
+            // a current config file and does not rewrite it.
+            let tier = aft::config_resolve::ConfigTier {
+                tier: "user".to_string(),
+                source: "fixture".to_string(),
+                doc: json!({ "github": github }).to_string(),
+            };
+            let resolved = aft::config_resolve::resolve_config_for_harness(&[tier], None);
+            assert!(
+                resolved.errors.is_empty(),
+                "legacy GitHub config: {:?}",
+                resolved.errors
+            );
+            serde_json::to_value(resolved.config.github).expect("serialize resolved GitHub config")
+        } else {
+            github
+        };
         let project = root.path().join("project");
         let bin = root.path().join("bin");
         let fake_gh = bin.join("fake-aft-shim");

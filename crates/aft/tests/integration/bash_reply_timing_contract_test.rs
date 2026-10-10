@@ -955,9 +955,7 @@ fn write_user_config(config_home: &Path) {
         config_dir.join("aft.jsonc"),
         serde_json::to_string(&json!({
             "bash": { "background": true },
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }))
         .expect("serialize user config"),
     )
@@ -965,6 +963,13 @@ fn write_user_config(config_home: &Path) {
 }
 
 async fn write_connection_file(conn_dir: &Path) -> TcpListener {
+    // The connection-file contract rejects writable shared parents, even
+    // when a permissive runner umask gives its temporary directories 0775.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(conn_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
     std_listener
         .set_nonblocking(true)
@@ -1107,9 +1112,7 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
     std::fs::write(
         &project_cfg,
         serde_json::to_string(&json!({
-            "callgraph_store": false,
-            "search_index": false,
-            "semantic_search": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }))
         .expect("serialize project config"),
     )

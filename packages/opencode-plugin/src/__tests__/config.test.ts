@@ -42,16 +42,20 @@ function createConfigFixture() {
   };
 }
 
-function runConfigLoader(projectDirectory: string, env: Record<string, string>) {
+function spawnConfigLoader(projectDirectory: string, env: Record<string, string>) {
   const script = `
     import { loadAftConfig } from "./src/config.ts";
     console.log(JSON.stringify(loadAftConfig(process.env.PROJECT_DIR!)));
   `;
-  const result = spawnSync(process.execPath, ["-e", script], {
+  return spawnSync(process.execPath, ["-e", script], {
     cwd: packageRoot,
     env: { ...process.env, AFT_LOG_STDERR: "1", ...env, PROJECT_DIR: projectDirectory },
     encoding: "utf8",
   });
+}
+
+function runConfigLoader(projectDirectory: string, env: Record<string, string>) {
+  const result = spawnConfigLoader(projectDirectory, env);
 
   expect(result.error).toBeUndefined();
   expect(result.status).toBe(0);
@@ -70,6 +74,76 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("retired keys in either file load, translated, and are never refused", () => {
+    const fixture = createConfigFixture();
+    const userText = JSON.stringify({
+      tool_surface: "all",
+      search_index: true,
+      experimental_search_index: false,
+      semantic_search: false,
+      experimental_semantic_search: true,
+      callgraph_store: false,
+      idle: { lsp_ttl_minutes: 20 },
+    });
+    const projectText = JSON.stringify({
+      search_index: false,
+      inspect: { tier2_soft_deadline_ms: 50 },
+      idle: { lsp_ttl_minutes: 10 },
+    });
+    writeFileSync(fixture.userConfigPath, userText);
+    writeFileSync(fixture.projectConfigPath, projectText);
+    const merged = JSON.parse(
+      runConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      }).stdout,
+    );
+    expect(merged.disabled_tools).toEqual([]);
+    expect(merged.indexes).toEqual({ trigram: false, semantic: false, callgraph: false });
+    expect(merged.lsp.idle_minutes).toBe(10);
+    // Loading never writes either file for retired keys.
+    expect(readFileSync(fixture.userConfigPath, "utf8")).toBe(userText);
+    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(projectText);
+  });
+
+  test("inspect and LSP resource settings are tighten-only", () => {
+    const fixture = createConfigFixture();
+    const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
+    mkdirSync(env.HOME, { recursive: true });
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ lsp: { idle_minutes: 30 }, inspect: { categories: { dead_code: false } } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({
+        lsp: { idle_minutes: "never" },
+        inspect: { categories: { dead_code: true, todos: false } },
+      }),
+    );
+    const merged = JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout);
+    expect(merged.lsp.idle_minutes).toBe(30);
+    expect(merged.inspect.categories).toEqual({ dead_code: false, todos: false });
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ lsp: { idle_minutes: "never" } }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ lsp: { idle_minutes: 5 } }));
+    expect(JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).lsp.idle_minutes).toBe(
+      5,
+    );
+  });
+
+  test("inspect categories use exact boolean keys and idle minutes clamp the new range", () => {
+    expect(AftConfigSchema.parse({ lsp: { idle_minutes: 0 } }).lsp?.idle_minutes).toBe(5);
+    expect(AftConfigSchema.parse({ lsp: { idle_minutes: 2000 } }).lsp?.idle_minutes).toBe(1440);
+    expect(AftConfigSchema.parse({ lsp: { idle_minutes: "never" } }).lsp?.idle_minutes).toBe(
+      "never",
+    );
+    expect(AftConfigSchema.safeParse({ inspect: { categories: { metrics: false } } }).success).toBe(
+      false,
+    );
+    expect(
+      AftConfigSchema.safeParse({ inspect: { categories: { dead_code: "false" } } }).success,
+    ).toBe(false);
+  });
   test("no config resolves the default disables and default-on indexes", () => {
     const fixture = createConfigFixture();
     const result = runConfigLoader(fixture.projectDirectory, {
@@ -119,35 +193,23 @@ describe("loadAftConfig", () => {
     expect(enabled.stderr).toContain("Ignoring github from project config");
   });
 
-  test("retired GitHub aliases reject the whole load even beside canonical leaves", () => {
+  test("retired GitHub aliases translate, and a canonical leaf beside them wins", () => {
     const fixture = createConfigFixture();
     const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
-    const script = `
-      import { loadAftConfig } from "./src/config.ts";
-      try {
-        loadAftConfig(process.env.PROJECT_DIR!);
-        console.log("loaded");
-      } catch (err) {
-        console.log(JSON.stringify(err.errors));
-      }
-    `;
-    const run = () =>
-      spawnSync(process.execPath, ["-e", script], {
-        cwd: packageRoot,
-        env: { ...process.env, ...env, PROJECT_DIR: fixture.projectDirectory },
-        encoding: "utf8",
-      }).stdout.trim();
+    const github = () => JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).github;
 
     writeFileSync(
       fixture.userConfigPath,
       JSON.stringify({ github: { read: false }, gh_read: { enabled: true } }),
     );
-    expect(JSON.parse(run())).toEqual(["removed_config_key:gh_read:use:github.read"]);
+    expect(github()).toMatchObject({ read: false });
     writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_shim: { enabled: false } }));
-    expect(JSON.parse(run())).toEqual(["removed_config_key:gh_shim:use:github.shim"]);
-    // The supported binary override alone loads.
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_shim: { binary_path: "/opt/aft" } }));
-    expect(run()).toBe("loaded");
+    expect(github()).toMatchObject({ shim: false });
+    // A project may not set github.read, so a project's gh_read alias, once
+    // translated to github.read, is ignored and the user's value stays.
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ github: { read: false } }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
+    expect(github()).toMatchObject({ read: false });
   });
 
   test("edit_mode uses ordinary project-over-user precedence", () => {

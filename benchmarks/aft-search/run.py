@@ -90,8 +90,10 @@ class AftClient:
                         "doc": json.dumps(
                             bench_rerank.apply_to_config(
                                 {
-                                    "search_index": True,
-                                    "semantic_search": self.semantic_search_enabled,
+                                    "indexes": {
+                                        "trigram": True,
+                                        "semantic": self.semantic_search_enabled,
+                                    },
                                 }
                             )
                         ),

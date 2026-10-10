@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["ci-watch-fail-closed"],
+  "note": "Release scripts only: the CI watcher fails closed with exit 3 when a completed run's conclusion or job list cannot be read, instead of reading an empty answer as all jobs passed. No changed path matches RANKING_FENCE_PREFIXES."
+}

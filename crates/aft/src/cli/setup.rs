@@ -8,8 +8,9 @@
 //!
 //! The plan goes to stdout as one JSON document; warnings go to stderr so the
 //! plan stays machine-readable. Any configuration that ordinary loading would
-//! reject (removed keys, already-retired GitHub aliases) fails every mode
-//! before anything is printed or written, and points at `aft doctor --fix`.
+//! reject (a file that is not a JSON object) fails every mode before anything
+//! is printed or written. Retired keys are translated like ordinary loading
+//! translates them, so they never fail setup.
 //! Writes touch only the user file `~/.config/cortexkit/aft.jsonc`.
 
 use std::ffi::OsString;
@@ -17,7 +18,6 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use aft::feature_config::{self, PolicyPhase};
 use aft::setup_plan::{
     derive_plan, parse_answers, read_inputs, render_setup, unknown_disabled_warning,
     FeatureObserver, NoRuntimeObservation, SetupHarness, SetupSelections, PLAN_VERSION,
@@ -164,7 +164,6 @@ pub fn run(args: Vec<OsString>) -> Result<(), SetupError> {
         std::env::var(SETUP_HARNESS_ENV).ok(),
         &paths,
         &NoRuntimeObservation,
-        feature_config::current_policy_phase(),
         &mut io::stdin().lock(),
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
@@ -191,7 +190,6 @@ fn run_with(
     env_harness: Option<String>,
     paths: &SetupPaths,
     observer: &dyn FeatureObserver,
-    phase: PolicyPhase,
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -207,9 +205,9 @@ fn run_with(
 
     let inputs =
         read_inputs(paths.user_config_path.as_deref(), &paths.cwd).map_err(SetupError::failed)?;
-    let outcome = derive_plan(&inputs, args.harness, observer, phase).map_err(|errors| {
+    let outcome = derive_plan(&inputs, args.harness, observer).map_err(|errors| {
         SetupError::failed(format!(
-            "{}\nAFT cannot load this configuration. Run `aft doctor --fix` to migrate it, then rerun setup.",
+            "{}\nAFT cannot load this configuration. Fix the file, then rerun setup.",
             errors.join("\n")
         ))
     })?;
@@ -311,7 +309,6 @@ mod tests {
             env_harness.map(str::to_string),
             &fixture.paths,
             observer,
-            PolicyPhase::Window,
             &mut stdin.as_bytes(),
             &mut stdout,
             &mut stderr,
@@ -411,7 +408,7 @@ mod tests {
 
     #[test]
     fn rejected_configuration_fails_every_mode_without_output_or_writes() {
-        let original = r#"{"gh_shim": {"enabled": false}}"#;
+        let original = "[1]";
         let fixture = fixture(Some(original));
         for args in [vec!["--plan"], vec!["--yes"], vec!["--answers", "-"]] {
             let (result, stdout, _) = invoke(
@@ -421,11 +418,11 @@ mod tests {
                 r#"{"plan_version": 1, "selections": {"aft_move": true}}"#,
             );
             let error = result.unwrap_err().to_string();
+            assert!(error.contains("invalid_config:"), "{error}");
             assert!(
-                error.contains("removed_config_key:gh_shim:use:github.shim"),
+                error.contains("AFT cannot load this configuration"),
                 "{error}"
             );
-            assert!(error.contains("aft doctor --fix"), "{error}");
             assert!(stdout.is_empty());
             assert_eq!(user_text(&fixture).as_deref(), Some(original));
         }

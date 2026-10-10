@@ -51,15 +51,17 @@ For every cloned repository the runner writes `.cortexkit/aft.jsonc` with:
 
 ```jsonc
 {
-  "semantic_search": false,
-  "search_index": false,
-  "callgraph_store": true,
+  "indexes": {
+    "semantic": false,
+    "trigram": false,
+    "callgraph": true
+  },
   "inspect": { "enabled": true }
 }
 ```
 
-`semantic_search` is the project-config knob that disables semantic/embedding
-indexing; embeddings are irrelevant to inspect correctness.
+The index settings disable semantic/embedding and trigram indexing while keeping
+the callgraph available; embeddings are irrelevant to inspect correctness.
 
 ## NDJSON protocol note
 

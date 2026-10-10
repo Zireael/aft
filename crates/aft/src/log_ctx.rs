@@ -113,7 +113,12 @@ pub fn session_prefix() -> String {
 #[macro_export]
 macro_rules! slog_info {
     ($($arg:tt)*) => {
-        log::info!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*))
+        if $crate::logging::slog_info_enabled(module_path!()) {
+            $crate::logging::emit_slog_info(
+                module_path!(),
+                format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+            )
+        }
     };
 }
 
@@ -123,7 +128,12 @@ macro_rules! slog_info {
 #[macro_export]
 macro_rules! slog_warn {
     ($($arg:tt)*) => {
-        log::warn!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*))
+        if $crate::logging::slog_warn_enabled(module_path!()) {
+            $crate::logging::emit_slog_warn(
+                module_path!(),
+                format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+            )
+        }
     };
 }
 
@@ -133,7 +143,12 @@ macro_rules! slog_warn {
 #[macro_export]
 macro_rules! slog_error {
     ($($arg:tt)*) => {
-        log::error!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*))
+        if $crate::logging::slog_error_enabled(module_path!()) {
+            $crate::logging::emit_slog_error(
+                module_path!(),
+                format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+            )
+        }
     };
 }
 
@@ -146,13 +161,45 @@ macro_rules! slog_error {
 #[macro_export]
 macro_rules! slog_debug {
     ($($arg:tt)*) => {
-        log::debug!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*))
+        if $crate::logging::slog_debug_enabled(module_path!()) {
+            $crate::logging::emit_slog_debug(
+                module_path!(),
+                format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+            )
+        }
     };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::fmt;
+
+    struct LogMaxLevelGuard(log::LevelFilter);
+
+    impl LogMaxLevelGuard {
+        fn set(level: log::LevelFilter) -> Self {
+            let previous = log::max_level();
+            log::set_max_level(level);
+            Self(previous)
+        }
+    }
+
+    impl Drop for LogMaxLevelGuard {
+        fn drop(&mut self) {
+            log::set_max_level(self.0);
+        }
+    }
+
+    struct CountingDisplay<'a>(&'a Cell<usize>);
+
+    impl fmt::Display for CountingDisplay<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.set(self.0.get() + 1);
+            formatter.write_str("counted")
+        }
+    }
 
     /// Reset both thread-locals so each test starts from a clean slate.
     /// Rust runs tests on a thread pool — without this helper a previous
@@ -271,6 +318,20 @@ mod tests {
         with_session(Some("ses_second".to_string()), || {});
         // Newer session wins as the fallback.
         assert_eq!(session_prefix(), "[ses_second] ");
+    }
+
+    #[test]
+    fn disabled_debug_log_does_not_format_arguments() {
+        let _max_level = LogMaxLevelGuard::set(log::LevelFilter::Warn);
+        let formatted = Cell::new(0);
+
+        crate::slog_debug!("debug argument: {}", CountingDisplay(&formatted));
+
+        assert_eq!(
+            formatted.get(),
+            0,
+            "disabled debug arguments must stay lazy"
+        );
     }
 
     #[test]

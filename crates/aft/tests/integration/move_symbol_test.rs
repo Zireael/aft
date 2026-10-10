@@ -68,6 +68,305 @@ fn configure_with_backup_disabled(aft: &mut AftProcess, root: &str) {
     );
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ValidationChecker {
+    Real,
+    ProjectState,
+}
+
+/// Both checkers observe the project at invocation time. The deterministic
+/// checker models the fixture's imports and number-to-string mismatch without
+/// needing Node or an installed TypeScript compiler on the Unix CI legs.
+#[cfg(unix)]
+fn full_validation_case(
+    command: &str,
+    broken: bool,
+    fail: bool,
+    checker: ValidationChecker,
+) -> (tempfile::TempDir, serde_json::Value) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(
+        &root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"strict":true,"noEmit":true,"target":"ES2020","module":"ESNext"},"include":["*.ts"]}"#,
+    );
+    let source =
+        "export function moved(n: number): number { return n + 1; }\nexport const kept = 1;\n";
+    let consumer = if broken {
+        "import { moved } from './source';\nexport const result: string = moved(1);\n"
+    } else {
+        "import { moved } from './source';\nexport const result = moved(1);\n"
+    };
+    write_file(&root.join("source.ts"), source);
+    write_file(&root.join("consumer.ts"), consumer);
+    write_file(&root.join("dest.ts"), "export const existing = 1;\n");
+    if fail {
+        write_file(&root.join("dest.js"), "export const existing = 1;\n");
+    }
+    let stub = root.join("node_modules/.bin/tsc");
+    match checker {
+        ValidationChecker::Real => {
+            let tsc = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../node_modules/typescript/bin/tsc")
+                .canonicalize()
+                .expect("bun install before the real-compiler checks");
+            write_file(&stub, &format!(
+            "#!/bin/sh\nprintf 'run\\n' >> '{0}/checker-count'\nout='{0}/checker-output-'$(wc -l < '{0}/checker-count' | tr -d ' ')\nnode '{1}' \"$@\" > \"$out\" 2>&1\ncode=$?\ncat \"$out\"\nexit $code\n",
+            root.display(), tsc.display()));
+        }
+        ValidationChecker::ProjectState => write_file(
+            &stub,
+            r#"#!/bin/sh
+set -eu
+count=0
+if [ -f checker-count ]; then
+    while IFS= read -r run; do
+        count=$((count + 1))
+    done < checker-count
+fi
+printf 'run\n' >> checker-count
+out=checker-output-$((count + 1))
+status=0
+{
+    for name in moved renamed; do
+        if grep -F -q "import { $name } from './source';" consumer.ts &&
+           ! grep -F -q "export function $name(" source.ts; then
+            printf "consumer.ts(1,10): error TS2305: Module './source' has no exported member '%s'.\n" "$name"
+            status=1
+        fi
+    done
+    if grep -F -q -e ': string = renamed(1)' -e ': string = moved(1)' consumer.ts; then
+        printf "consumer.ts(2,14): error TS2322: Type 'number' is not assignable to type 'string'.\n"
+        status=1
+    fi
+} > "$out"
+while IFS= read -r line; do
+    printf '%s\n' "$line"
+done < "$out"
+exit "$status"
+"#,
+        ),
+    }
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut aft = AftProcess::spawn();
+    let cfg = aft.send(&json!({"id":"cfg-count", "command":"configure", "harness":"opencode", "project_root":root,
+            "config":user_config(json!({"format_on_edit":false, "validate_on_edit":"full", "checker":{"typescript":"tsc"}, "lsp":{"enabled":false}}))}).to_string());
+    assert_eq!(cfg["success"], true, "{cfg}");
+    let request = if command == "move_symbol" {
+        json!({"id":"count", "command":command, "file":root.join("source.ts"), "symbol":"moved", "destination":root.join(if fail { "dest.js" } else { "dest.ts" })})
+    } else {
+        let annotation = if broken { ": string" } else { "" };
+        let failure_hunk = if fail {
+            "*** Update File: missing.ts\n@@\n-old\n+new\n"
+        } else {
+            ""
+        };
+        let patch = format!("*** Begin Patch\n*** Update File: {0}/source.ts\n@@\n-export function moved(n: number): number {{ return n + 1; }}\n+export function renamed(n: number): number {{ return n + 1; }}\n*** Update File: {0}/consumer.ts\n@@\n-import {{ moved }} from './source';\n-export const result{annotation} = moved(1);\n+import {{ renamed }} from './source';\n+export const result{annotation} = renamed(1);\n*** Update File: {0}/dest.ts\n@@\n-export const existing = 1;\n+export const existing = 2;\n{failure_hunk}*** End Patch", root.display());
+        json!({"id":"count", "command":command, "patch_text":patch})
+    };
+    let response = aft.send(&request.to_string());
+    if fail {
+        if command == "apply_patch" {
+            assert_eq!(response["complete"], false, "{response}");
+            assert_eq!(response["partial"], true, "{response}");
+        } else {
+            assert_eq!(response["success"], false, "{response}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("source.ts")).unwrap(),
+                source
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("dest.js")).unwrap(),
+                "export const existing = 1;\n"
+            );
+        }
+    } else {
+        assert_eq!(response["success"], true, "{command}: {response}");
+    }
+    assert!(aft.shutdown().success());
+    (dir, response)
+}
+
+#[cfg(unix)]
+fn validation_entries<'a>(
+    command: &str,
+    response: &'a serde_json::Value,
+) -> &'a [serde_json::Value] {
+    let entries = if command == "apply_patch" {
+        &response["metadata"]["files"]
+    } else {
+        &response["results"]
+    };
+    entries.as_array().expect("existing per-file entries")
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the repository's installed TypeScript compiler"]
+fn multi_file_full_validation_runs_once_per_checker() {
+    assert_full_validation_runs_once_per_checker(ValidationChecker::Real);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_file_full_validation_ci_runs_once_per_checker() {
+    assert_full_validation_runs_once_per_checker(ValidationChecker::ProjectState);
+}
+
+#[cfg(unix)]
+fn assert_full_validation_runs_once_per_checker(checker: ValidationChecker) {
+    for command in ["apply_patch", "move_symbol"] {
+        let (dir, _response) = full_validation_case(command, false, false, checker);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("checker-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "{command} checker runs"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the repository's installed TypeScript compiler"]
+fn multi_file_full_validation_reports_real_error_in_touched_file() {
+    assert_full_validation_reports_error_in_touched_file(ValidationChecker::Real);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_file_full_validation_ci_reports_error_in_touched_file() {
+    assert_full_validation_reports_error_in_touched_file(ValidationChecker::ProjectState);
+}
+
+#[cfg(unix)]
+fn assert_full_validation_reports_error_in_touched_file(checker: ValidationChecker) {
+    for command in ["apply_patch", "move_symbol"] {
+        let (_dir, response) = full_validation_case(command, true, false, checker);
+        let entries = validation_entries(command, &response);
+        assert_eq!(entries.len(), 3, "{response}");
+        for entry in entries {
+            let path = entry[if command == "apply_patch" {
+                "filePath"
+            } else {
+                "file"
+            }]
+            .as_str()
+            .unwrap();
+            let errors = entry["validation_errors"]
+                .as_array()
+                .expect("per-file checker output");
+            if path.ends_with("consumer.ts") {
+                assert_eq!(errors.len(), 1, "{response}");
+                assert!(
+                    errors[0]["message"].as_str().unwrap().contains("TS2322"),
+                    "{response}"
+                );
+                assert_eq!(errors[0]["line"], 2);
+                assert_eq!(errors[0]["severity"], "error");
+                assert!(errors[0]["file"].as_str().unwrap().ends_with("consumer.ts"));
+            } else {
+                assert!(errors.is_empty(), "{response}");
+                assert!(entry.get("validate_skipped_reason").is_none(), "{response}");
+            }
+        }
+        assert!(
+            response.get("validation_errors").is_none(),
+            "no aggregate list: {response}"
+        );
+        assert!(
+            response["output"]
+                .as_str()
+                .unwrap()
+                .contains("type check: 1 error in 1 of 3 files (tsc)"),
+            "{response}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the repository's installed TypeScript compiler"]
+fn multi_file_full_validation_ignores_intermediate_only_errors() {
+    assert_full_validation_ignores_intermediate_only_errors(ValidationChecker::Real);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_file_full_validation_ci_ignores_intermediate_only_errors() {
+    assert_full_validation_ignores_intermediate_only_errors(ValidationChecker::ProjectState);
+}
+
+#[cfg(unix)]
+fn assert_full_validation_ignores_intermediate_only_errors(checker: ValidationChecker) {
+    for command in ["apply_patch", "move_symbol"] {
+        let (dir, response) = full_validation_case(command, false, false, checker);
+        // Inspect every invocation's checker output as well as the response:
+        // merely dropping intermediate diagnostics must not make this test pass.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("checker-output-")
+            {
+                let output = std::fs::read_to_string(path).unwrap();
+                assert!(
+                    output.is_empty(),
+                    "{command} checked an incomplete project: {output}"
+                );
+            }
+        }
+        for entry in validation_entries(command, &response) {
+            assert_eq!(entry["validation_errors"], json!([]), "{response}");
+            assert!(entry.get("validate_skipped_reason").is_none(), "{response}");
+        }
+        assert!(
+            response["output"]
+                .as_str()
+                .unwrap()
+                .contains("type check: 0 errors in 0 of 3 files (tsc)"),
+            "{response}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the repository's installed TypeScript compiler"]
+fn multi_file_full_validation_does_not_run_on_failure_or_rollback() {
+    assert_full_validation_does_not_run_on_failure_or_rollback(ValidationChecker::Real);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_file_full_validation_ci_does_not_run_on_failure_or_rollback() {
+    assert_full_validation_does_not_run_on_failure_or_rollback(ValidationChecker::ProjectState);
+}
+
+#[cfg(unix)]
+fn assert_full_validation_does_not_run_on_failure_or_rollback(checker: ValidationChecker) {
+    for command in ["apply_patch", "move_symbol"] {
+        let (dir, response) = full_validation_case(command, false, true, checker);
+        assert!(
+            !dir.path().join("checker-count").exists(),
+            "{command} ran a checker: {response}"
+        );
+        assert!(
+            !response["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("type check:"),
+            "{response}"
+        );
+    }
+}
+
 fn write_file(path: &std::path::Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).expect("create parent");
     std::fs::write(path, content).expect("write file");
@@ -417,7 +716,7 @@ fn move_symbol_configured_without_store_still_rewrites_ts_consumers() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({ "callgraph_store": false }))
+            "config": user_config(json!({ "indexes": { "callgraph": false } }))
         })
         .to_string(),
     );
@@ -487,7 +786,7 @@ fn move_symbol_large_project_has_no_legacy_file_cap() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({ "callgraph_store": false }))
+            "config": user_config(json!({ "indexes": { "callgraph": false } }))
         })
         .to_string(),
     );

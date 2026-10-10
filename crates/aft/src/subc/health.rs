@@ -5,9 +5,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    json, Arc, AtomicBool, AtomicU64, AtomicUsize, BgSubsBySession, Duration, Executor, HashMap,
-    HealthReport, HealthStatus, Instant, Ordering, PendingBind, ProjectRootId, RootHealthSnapshot,
-    RouteChannel, StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
+    json, Arc, AtomicBool, AtomicU64, AtomicUsize, BgSubsBySession, Duration, Executor, Frame,
+    HashMap, HealthReport, HealthStatus, Instant, Ordering, PendingBind, ProjectRootId,
+    RootHealthSnapshot, RouteChannel, StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER,
+    WRITER_QUEUE_CAPACITY,
 };
 use crate::context::{App, AppContext, ArtifactEvictionBlocker};
 use crate::executor::BindBlockerSnapshot;
@@ -503,11 +504,18 @@ impl BindAckLatencies {
 }
 
 pub(super) struct DispatchPathMetrics {
+    unanswered_tools: StdMutex<HashMap<(super::RouteChannel, u64), UnansweredTool>>,
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
     /// When the frame loop next promised to wake (its drain-tick timer), as
     /// milliseconds since `origin` plus one; `0` means no loop is running.
     frame_loop_wake_deadline_ms_plus_one: AtomicU64,
+    /// Diagnostic context only, not another progress signal. Zero means turn
+    /// work, one means select wait, and two means handling a received frame.
+    frame_loop_phase: AtomicUsize,
+    /// Best-effort header context; no locks are taken by the watchdog reader.
+    frame_loop_frame_header: AtomicU64,
+    frame_loop_frame_corr: AtomicU64,
     /// Stall counts published by the stall watchdog thread.
     pub(super) stall_stats: Arc<super::stall_watchdog::StallStats>,
     pub(super) writer_queued: AtomicUsize,
@@ -545,9 +553,13 @@ pub(super) struct DispatchPathMetrics {
 impl DispatchPathMetrics {
     pub(super) fn new() -> Self {
         Self {
+            unanswered_tools: StdMutex::new(HashMap::new()),
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
             frame_loop_wake_deadline_ms_plus_one: AtomicU64::new(0),
+            frame_loop_phase: AtomicUsize::new(0),
+            frame_loop_frame_header: AtomicU64::new(0),
+            frame_loop_frame_corr: AtomicU64::new(0),
             stall_stats: Arc::default(),
             writer_queued: AtomicUsize::new(0),
             writer_active: AtomicBool::new(false),
@@ -573,6 +585,78 @@ impl DispatchPathMetrics {
             bind_acks: StdMutex::new(BindAckLatencies::default()),
             presetless_tool_calls: StdMutex::new(BTreeMap::new()),
             scoped_routes_with_tool_calls: AtomicU64::new(0),
+        }
+    }
+
+    pub(super) fn tool_received(&self, frame: &super::Frame, received_at: Instant) {
+        let name = serde_json::from_slice::<Value>(&frame.body)
+            .ok()
+            .and_then(|body| {
+                body.get("name")
+                    .or_else(|| body.get("op"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "undecoded".into());
+        if let Ok(mut tools) = self.unanswered_tools.lock() {
+            tools.insert(
+                (
+                    super::route_key(frame.header.channel, frame.header.epoch),
+                    frame.header.corr,
+                ),
+                UnansweredTool {
+                    received_at,
+                    name,
+                    warned: false,
+                },
+            );
+        }
+    }
+
+    /// Called by the independent watchdog thread, not by an executor job or
+    /// the frame runtime. A call that never finishes must still leave evidence.
+    pub(super) fn warn_unanswered_tools(&self) {
+        self.warn_unanswered_tools_with(Instant::now(), &|line| log::warn!("{line}"));
+    }
+
+    fn warn_unanswered_tools_with(&self, now: Instant, log: &dyn Fn(&str)) {
+        let Ok(mut tools) = self.unanswered_tools.try_lock() else {
+            return;
+        };
+        for (&(route, corr), tool) in tools.iter_mut() {
+            if !tool.warned
+                && now.saturating_duration_since(tool.received_at) >= Duration::from_secs(25)
+            {
+                tool.warned = true;
+                log(&format!("tool_call unanswered past client deadline class name={} channel={} epoch={} corr={} elapsed_ms={} deadline_class_ms=25000", tool.name, route.channel, route.epoch, corr, now.saturating_duration_since(tool.received_at).as_millis()));
+            }
+        }
+    }
+
+    pub(super) fn tool_replied(&self, frame: &super::Frame) {
+        self.tool_replied_with(frame, Instant::now(), &|line| log::info!("{line}"));
+    }
+
+    fn tool_replied_with(&self, frame: &super::Frame, now: Instant, log: &dyn Fn(&str)) {
+        if matches!(
+            frame.header.ty,
+            super::FrameType::Response | super::FrameType::Error
+        ) {
+            if let Ok(mut tools) = self.unanswered_tools.lock() {
+                let key = (
+                    super::route_key(frame.header.channel, frame.header.epoch),
+                    frame.header.corr,
+                );
+                if let Some(tool) = tools.remove(&key) {
+                    // Bash does not travel through the ordinary phase tracer.
+                    // Record the actual socket handoff, not merely queueing a
+                    // completion, so a later client timeout can be localized to
+                    // AFT or to the daemon/consumer leg of the connection.
+                    if tool.name == "bash" || tool.name == "powershell" {
+                        log(&format!("tool_call reply written name={} channel={} epoch={} corr={} total_ms={} destination=subc_daemon", tool.name, key.0.channel, key.0.epoch, key.1, now.saturating_duration_since(tool.received_at).as_millis()));
+                    }
+                }
+            }
         }
     }
 
@@ -624,6 +708,7 @@ impl DispatchPathMetrics {
     }
 
     pub(super) fn mark_frame_loop_tick(&self) {
+        self.frame_loop_phase.store(0, Ordering::Relaxed);
         self.frame_loop_last_tick_ms
             .store(self.now_ms(), Ordering::Relaxed);
     }
@@ -631,6 +716,7 @@ impl DispatchPathMetrics {
     /// Records that the frame loop is about to park and will wake again within
     /// `within` because its drain-tick timer fires then.
     pub(super) fn publish_frame_loop_wake_deadline(&self, within: Duration) {
+        self.frame_loop_phase.store(1, Ordering::Relaxed);
         let deadline = self
             .now_ms()
             .saturating_add(duration_millis_u64(within))
@@ -646,7 +732,10 @@ impl DispatchPathMetrics {
             .store(0, Ordering::Relaxed);
     }
 
-    /// Time since the frame loop last started a turn.
+    /// Progress means starting a new loop turn, before taking any loop-owned
+    /// locks. Both received frames and idle drain-timer wakes start turns. A
+    /// burst's total duration is irrelevant as long as turns keep advancing;
+    /// publishing a future wake deadline alone is not progress.
     pub(super) fn frame_loop_progress_age(&self) -> Duration {
         let last = self.frame_loop_last_tick_ms.load(Ordering::Relaxed);
         Duration::from_millis(self.now_ms().saturating_sub(last))
@@ -661,6 +750,35 @@ impl DispatchPathMetrics {
             .frame_loop_wake_deadline_ms_plus_one
             .load(Ordering::Relaxed);
         deadline != 0 && self.now_ms() >= deadline
+    }
+
+    pub(super) fn mark_frame_loop_frame(&self, frame: &Frame) {
+        self.frame_loop_frame_header.store(
+            (frame.header.ty as u64)
+                | (u64::from(frame.header.channel) << 8)
+                | (u64::from(frame.header.epoch) << 24),
+            Ordering::Relaxed,
+        );
+        self.frame_loop_frame_corr
+            .store(frame.header.corr, Ordering::Relaxed);
+        self.frame_loop_phase.store(2, Ordering::Release);
+    }
+
+    pub(super) fn frame_loop_context(&self) -> String {
+        match self.frame_loop_phase.load(Ordering::Acquire) {
+            0 => "phase=turn_work frame=none".to_string(),
+            1 => "phase=select_wait frame=none".to_string(),
+            _ => {
+                let header = self.frame_loop_frame_header.load(Ordering::Relaxed);
+                format!(
+                    "phase=handle_frame frame_type={} channel={} epoch={} corr={}",
+                    header & 0xff,
+                    (header >> 8) & 0xffff,
+                    header >> 24,
+                    self.frame_loop_frame_corr.load(Ordering::Relaxed),
+                )
+            }
+        }
     }
 
     /// Returns whether the retained-roots summary changed since the last sweep.
@@ -967,6 +1085,12 @@ impl DispatchPathMetrics {
     }
 }
 
+struct UnansweredTool {
+    received_at: Instant,
+    name: String,
+    warned: bool,
+}
+
 pub(super) struct DeferredBashWaitGuard {
     metrics: Arc<DispatchPathMetrics>,
 }
@@ -1262,6 +1386,27 @@ fn compact_write_ledger_root_ids(metrics: &mut serde_json::Map<String, Value>) {
     }
 }
 
+fn retention_report_totals(
+    reports: &std::collections::BTreeMap<String, crate::storage_retention::SweepReport>,
+) -> Value {
+    let mut totals = serde_json::Map::from_iter([("reports".into(), json!(reports.len()))]);
+    for report in reports.values() {
+        for (field, value) in serde_json::to_value(report).unwrap().as_object().unwrap() {
+            let (key, count) = match value {
+                Value::Number(number) if field != "at_ms" => {
+                    (field.clone(), number.as_u64().unwrap_or(0))
+                }
+                Value::Bool(value) => (format!("{field}_reports"), u64::from(*value)),
+                Value::Array(errors) if field == "errors" => (field.clone(), errors.len() as u64),
+                _ => continue,
+            };
+            let total = totals.get(&key).and_then(Value::as_u64).unwrap_or(0);
+            totals.insert(key, json!(total.saturating_add(count)));
+        }
+    }
+    Value::Object(totals)
+}
+
 fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
     let mut ledger_compacted = false;
     loop {
@@ -1284,6 +1429,23 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
         if !ledger_compacted {
             compact_write_ledger_root_ids(metrics);
             ledger_compacted = true;
+            continue;
+        }
+        let retention_key = metrics
+            .get("storage_retention")
+            .and_then(Value::as_object)
+            .and_then(|reports| reports.keys().next_back().cloned());
+        if let Some(key) = retention_key {
+            metrics["storage_retention"]
+                .as_object_mut()
+                .unwrap()
+                .remove(&key);
+            let omitted = metrics
+                .get("storage_retention_reports_omitted")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1);
+            metrics.insert("storage_retention_reports_omitted".into(), json!(omitted));
             continue;
         }
         return;
@@ -1777,6 +1939,7 @@ fn build_health_diagnostic_rollup(
         // making dead-code findings disappear rather than raising an error.
         resident_callgraph_stale_backend_rows: Option<crate::callgraph_store::StalePathCensus>,
         watcher: Option<crate::context::WatcherCountersSnapshot>,
+        disclaim_privacy: Option<bool>,
         standing: Option<StandingHealthEntry>,
     }
 
@@ -1805,7 +1968,36 @@ fn build_health_diagnostic_rollup(
     let mut embedding_backend_available = true;
     let mut embedding_backend_last_error = None;
     let mut embedding_backend_since_ms = None;
+    let mut task_storage_roots = std::collections::HashSet::new();
+    let mut bash_task_refusals = Vec::new();
     for (root_id, ctx) in actor_entries {
+        let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+        if task_storage_roots.insert(storage.clone()) {
+            // Refused tasks are named health diagnostics, not a reason to
+            // disable shell execution for every route sharing this daemon.
+            bash_task_refusals.extend(
+                crate::persisted_format::refusals_under(&storage)
+                    .into_iter()
+                    .filter(|refusal| {
+                        refusal.store == crate::persisted_format::PersistedStore::BashTask
+                    })
+                    .map(|refusal| {
+                        json!({
+                            "code": crate::persisted_format::CODE,
+                            "path": refusal.path.display().to_string(),
+                            "found": refusal.found,
+                            "supported": refusal.supported,
+                            "message": refusal.to_string(),
+                        })
+                    }),
+            );
+        }
+        crate::storage_retention::schedule(
+            ctx.storage_dir(),
+            ctx.subc_lifecycle_admission(),
+            ctx.configure_generation_flag(),
+            ctx.configure_generation(),
+        );
         let root_label = root_id.as_path().display().to_string();
         let standing_index = standing_entries.iter().position(|entry| {
             entry
@@ -1889,6 +2081,7 @@ fn build_health_diagnostic_rollup(
             repair_entries_60s,
             resident_callgraph_stale_backend_rows,
             watcher: Some(ctx.watcher_counters().snapshot()),
+            disclaim_privacy: Some(ctx.config().bash.disclaim_privacy),
             standing,
         });
     }
@@ -1902,6 +2095,7 @@ fn build_health_diagnostic_rollup(
         let health = unhosted_standing_health_snapshot(&standing);
         candidates.push(RootCandidate {
             root_label: health.project_root.clone(),
+            disclaim_privacy: None,
             health,
             busy: false,
             fully_ready: false,
@@ -1980,6 +2174,22 @@ fn build_health_diagnostic_rollup(
                 );
             }
             if let Some(object) = value.as_object_mut() {
+                if let Some(configured) = candidate.disclaim_privacy {
+                    // The root snapshot may already carry a `bash` block with
+                    // background task counts; add the privacy fields to it
+                    // rather than replacing those counts.
+                    let bash = object.entry("bash".to_owned()).or_insert_with(|| json!({}));
+                    if !bash.is_object() {
+                        *bash = json!({});
+                    }
+                    if let Some(bash) = bash.as_object_mut() {
+                        bash.insert("disclaim_privacy".to_owned(), json!(configured));
+                        bash.insert(
+                            "privacy_disclaim_effective".to_owned(),
+                            json!(configured && cfg!(target_os = "macos")),
+                        );
+                    }
+                }
                 if let Some(census) = candidate.resident_callgraph_stale_backend_rows {
                     object.insert(
                         "resident_callgraph_stale_backend_rows".to_string(),
@@ -2037,9 +2247,19 @@ fn build_health_diagnostic_rollup(
         None
     };
 
+    let storage_retention = lifecycle_contexts
+        .iter()
+        .filter_map(|ctx| {
+            let storage = ctx.storage_dir();
+            crate::storage_retention::snapshot(&storage)
+                .map(|report| (storage.display().to_string(), report))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let storage_retention_totals = retention_report_totals(&storage_retention);
     let mut metrics = json!({
         "actor_count": actor_count,
         "root_count": root_count,
+        "warming_roots": warming_roots,
         "root_details_omitted": root_details_omitted,
         "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
         "callgraph_repair_roots_annotated": repair_roots_annotated,
@@ -2057,7 +2277,11 @@ fn build_health_diagnostic_rollup(
         },
         "memory": memory,
         "bash_task_retention": bash_task_retention_metrics(shared_app),
+        "storage_retention": storage_retention,
+        "storage_retention_totals": storage_retention_totals,
+        "storage_retention_reports_omitted": 0,
         "bash_db_schema_hints": bash_db_hint_metrics(),
+        "bash_task_refusals": bash_task_refusals,
         "mutating_lanes": mutating_lanes_metrics(executor),
         "process_io": crate::process_io::ProcessIoSnapshot::capture().to_value(),
         "roots": roots,
@@ -2101,6 +2325,24 @@ pub(super) fn build_health_report(
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     dispatch_path_metrics: &DispatchPathMetrics,
     shared_app: &App,
+) -> HealthReport {
+    build_health_report_with_indexing(
+        cache,
+        executor,
+        pending_binds,
+        dispatch_path_metrics,
+        shared_app,
+        crate::cold_build_limiter::progress::snapshot,
+    )
+}
+
+fn build_health_report_with_indexing(
+    cache: &HealthRollupCache,
+    executor: &Executor,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    dispatch_path_metrics: &DispatchPathMetrics,
+    shared_app: &App,
+    indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
 ) -> HealthReport {
     // The diagnostic payload is fixed-size and cached. Only probe-purpose
     // liveness signals are read fresh, using atomics or non-blocking snapshots.
@@ -2155,6 +2397,14 @@ pub(super) fn build_health_report(
         "cold_build_limiter".to_string(),
         render_cold_build_limiter_census(crate::cold_build_limiter::global_limiter().census()),
     );
+    let indexing = indexing_snapshot(
+        metrics
+            .get("warming_roots")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
+    let indexing_detail = indexing_detail(&indexing);
+    metrics.insert("indexing".to_string(), json!(indexing));
     metrics.insert(
         "dispatch_liveness".to_string(),
         dispatch_liveness_metrics(executor),
@@ -2176,26 +2426,167 @@ pub(super) fn build_health_report(
         "write_ledger_folds_deferred_total".to_string(),
         json!(crate::db::write_ledger::folds_deferred_total()),
     );
+    // ck's default health rendering displays top-level scalars. Selecting the
+    // nested indexing block must not hide any of those existing defaults.
+    let mut headline = vec![json!("indexing")];
+    headline.extend(
+        metrics
+            .iter()
+            .filter(|(_, value)| !value.is_object() && !value.is_array())
+            .map(|(key, _)| json!(key)),
+    );
+    // The budget adds this scalar after the headline has been selected.
+    headline.push(json!("metrics_bytes"));
+    metrics.insert("headline".to_string(), json!(headline));
     budget_health_metrics(&mut metrics);
 
     let scheduler_busy = executor.try_actor_count().is_none();
+    let warning = if scheduler_busy {
+        Some("executor scheduler state could not be snapshotted without contention".to_string())
+    } else {
+        rollup.detail.clone()
+    };
+    let detail = match (indexing_detail, warning) {
+        (Some(indexing), Some(warning)) if !warning.contains("warming background indexes") => {
+            Some(format!("{indexing}; {warning}"))
+        }
+        (Some(indexing), _) => Some(indexing),
+        (None, warning) => warning,
+    };
     HealthReport {
         status: if scheduler_busy {
             HealthStatus::Degraded
         } else {
             rollup.status.clone()
         },
-        detail: if scheduler_busy {
-            Some("executor scheduler state could not be snapshotted without contention".to_string())
-        } else {
-            rollup.detail.clone()
-        },
+        detail,
         metrics: Some(Value::Object(metrics)),
     }
 }
 
+fn grouped_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut result = String::new();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result
+}
+
+fn indexing_detail(indexing: &crate::cold_build_limiter::progress::Snapshot) -> Option<String> {
+    let running = indexing.running.len() + indexing.omitted.running;
+    let queued = indexing.queued.len() + indexing.omitted.queued;
+    if running == 0 && queued == 0 {
+        return None;
+    }
+    let mut detail = if let Some(job) = indexing.running.first() {
+        let total = job.total.map_or_else(|| "?".to_owned(), grouped_count);
+        let eta = job.eta_seconds.map_or_else(String::new, |seconds| {
+            if seconds >= 3600.0 {
+                format!(" (~{:.0} h)", seconds / 3600.0)
+            } else if seconds >= 60.0 {
+                format!(" (~{:.0} min)", seconds / 60.0)
+            } else {
+                format!(" (~{:.0} s)", seconds)
+            }
+        });
+        format!(
+            "indexing: {} {} {}/{} files{} [{}]",
+            job.kind,
+            job.root_label,
+            grouped_count(job.done),
+            total,
+            eta,
+            job.phase
+        )
+    } else {
+        "indexing:".to_owned()
+    };
+    if running > 1 {
+        detail.push_str(&format!(", {} other running", running - 1));
+    }
+    if queued > 0 {
+        detail.push_str(&format!(", {queued} queued"));
+    }
+    detail.push_str(&format!("; {} roots warming", indexing.warming_roots));
+    Some(detail)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bash_deadline_reply_log_proves_actual_daemon_handoff() {
+        use std::cell::RefCell;
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let mut frame = crate::subc::Frame::build_with_version(
+            crate::subc::PROTOCOL_VERSION,
+            crate::subc::FrameType::Request,
+            crate::subc::control_flags(),
+            1280,
+            1,
+            1335,
+            serde_json::to_vec(&serde_json::json!({"name":"bash"})).unwrap(),
+        )
+        .unwrap();
+        metrics.tool_received(&frame, now);
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.tool_replied_with(&frame, now, &sink);
+        assert!(
+            lines.borrow().is_empty(),
+            "ingress cannot stand in for actual egress"
+        );
+        frame.header.ty = crate::subc::FrameType::Response;
+        metrics.tool_replied_with(&frame, now + super::Duration::from_millis(12), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0]
+            .contains("channel=1280 epoch=1 corr=1335 total_ms=12 destination=subc_daemon"));
+        assert!(metrics.unanswered_tools.lock().unwrap().is_empty());
+        metrics.tool_replied_with(&frame, now, &sink);
+        assert_eq!(
+            lines.borrow().len(),
+            1,
+            "an untracked response is not a second handoff"
+        );
+    }
+    #[test]
+    fn bash_deadline_watchdog_logs_unanswered_calls_until_actual_write() {
+        use std::cell::RefCell;
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let request = crate::subc::Frame::build_with_version(
+            crate::subc::PROTOCOL_VERSION,
+            crate::subc::FrameType::Request,
+            crate::subc::control_flags(),
+            24,
+            1,
+            1188,
+            serde_json::to_vec(&serde_json::json!({"name":"bash"})).unwrap(),
+        )
+        .unwrap();
+        metrics.tool_received(&request, now);
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(24), &sink);
+        assert!(lines.borrow().is_empty());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(25), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0].contains("name=bash channel=24 epoch=1 corr=1188"));
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(30), &sink);
+        assert_eq!(
+            lines.borrow().len(),
+            1,
+            "warn only once per unanswered call"
+        );
+        let mut reply = request;
+        reply.header.ty = crate::subc::FrameType::Response;
+        metrics.tool_replied(&reply);
+        assert!(metrics.unanswered_tools.lock().unwrap().is_empty());
+    }
     use super::super::test_support::{test_ctx, test_root};
     use super::super::{Lane, Response};
     use super::*;
@@ -2214,7 +2605,132 @@ mod tests {
         } else {
             refresh_until_root_count(&cache, executor, app, root_count);
         }
-        build_health_report(&cache, executor, pending_binds, metrics, app)
+        // These tests own an executor, not the process-wide indexing work of
+        // other tests. Live indexing has its own root-scoped fixture below.
+        build_health_report_with_indexing(
+            &cache,
+            executor,
+            pending_binds,
+            metrics,
+            app,
+            |warming_roots| crate::cold_build_limiter::progress::Snapshot {
+                running: Vec::new(),
+                queued: Vec::new(),
+                warming_roots,
+                omitted: crate::cold_build_limiter::progress::Omitted {
+                    running: 0,
+                    queued: 0,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn health_reports_live_indexing_and_root_identity_headline() {
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let app = crate::context::App::default_shared();
+        let foreign_root = tempfile::tempdir().unwrap();
+        let _foreign = crate::cold_build_limiter::progress::start(
+            foreign_root.path(),
+            "unrelated work",
+            None,
+            crate::cold_build_limiter::progress::StartLog::Quiet,
+        );
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("openclaw");
+        let _fill = crate::cold_build_limiter::progress::start(
+            &root,
+            "semantic view fill",
+            Some(31_705),
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
+        crate::cold_build_limiter::progress::phase("embedding", Some(31_705));
+        crate::cold_build_limiter::progress::advance(1_280);
+        crate::cold_build_limiter::progress::embedded(9_000);
+        let _queued =
+            crate::cold_build_limiter::progress::queued(&root.to_string_lossy(), "semantic build");
+        let cache = HealthRollupCache::new();
+        cache.refresh(&executor, &app);
+        let report = build_health_report_with_indexing(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &metrics,
+            &app,
+            |warming_roots| {
+                crate::cold_build_limiter::progress::snapshot_for_root(&root, warming_roots)
+            },
+        );
+        let value = report.metrics.as_ref().unwrap();
+        let indexing = &value["indexing"];
+        let running = indexing["running"].as_array().expect("live indexing block");
+        let fill = running
+            .iter()
+            .find(|row| row["root"].as_str() == Some(root.to_string_lossy().as_ref()))
+            .unwrap();
+        assert_eq!(fill["done"], 1_280);
+        assert_eq!(fill["total"], 31_705);
+        assert_eq!(fill["chunks_embedded"], 9_000);
+        assert_eq!(fill["phase"], "embedding");
+        let headline = value["headline"]
+            .as_array()
+            .expect("CLI headline selection");
+        assert!(headline.contains(&json!("indexing")));
+        // Without an explicit headline ck displays top-level scalars. Retain
+        // all those existing defaults when opting into the indexing block.
+        for (key, scalar) in value.as_object().unwrap() {
+            if !scalar.is_object() && !scalar.is_array() {
+                assert!(
+                    headline.contains(&json!(key)),
+                    "missing default scalar {key}"
+                );
+            }
+        }
+        for row in running.iter().chain(indexing["queued"].as_array().unwrap()) {
+            let identity = ["project_root", "id", "name", "module_id", "path", "root"]
+                .into_iter()
+                .find(|key| row[*key].is_string());
+            assert_eq!(identity, Some("root"));
+        }
+        eprintln!("SAMPLE detail: {}", report.detail.unwrap());
+        eprintln!("SAMPLE indexing: {}", indexing);
+    }
+
+    #[test]
+    fn indexing_detail_renders_owned_snapshot_with_known_and_unknown_eta() {
+        use crate::cold_build_limiter::progress::{Omitted, Queued, Running, Snapshot};
+        let mut snapshot = Snapshot {
+            running: vec![Running {
+                root: "/fake/openclaw".to_owned(),
+                root_label: "openclaw".to_owned(),
+                kind: "semantic view fill".to_owned(),
+                phase: "embedding",
+                started_at_ms: 1,
+                done: 1_280,
+                total: Some(31_705),
+                chunks_embedded: Some(9_000),
+                rate_per_minute: Some(28.17),
+                eta_seconds: Some(64_800.0),
+                age_seconds: 60.0,
+            }],
+            queued: vec![Queued {
+                root: "/fake/hermes-agent".to_owned(),
+                kind: "semantic build".to_owned(),
+                waited_seconds: 5.0,
+            }],
+            warming_roots: 49,
+            omitted: Omitted {
+                running: 0,
+                queued: 2,
+            },
+        };
+        assert_eq!(indexing_detail(&snapshot).as_deref(), Some(
+            "indexing: semantic view fill openclaw 1,280/31,705 files (~18 h) [embedding], 3 queued; 49 roots warming"));
+        snapshot.running[0].total = None;
+        snapshot.running[0].eta_seconds = None;
+        assert_eq!(indexing_detail(&snapshot).as_deref(), Some(
+            "indexing: semantic view fill openclaw 1,280/? files [embedding], 3 queued; 49 roots warming"));
     }
 
     #[test]
@@ -2312,23 +2828,32 @@ mod tests {
         executor: &Executor,
         app: &App,
         expected: u64,
-    ) {
+    ) -> HealthReport {
         let metrics = DispatchPathMetrics::new();
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             cache.refresh(executor, app);
             let report = build_health_report(cache, executor, &HashMap::new(), &metrics, app);
+            // Both the rollup and the live probe can skip a contended scheduler.
+            // Wait for the roots, not the diagnostic values being asserted, so
+            // a missing diagnostic still fails after a completed refresh.
+            let scheduler_busy = report.detail.as_deref().is_some_and(|detail| {
+                detail.contains(
+                    "executor scheduler state could not be snapshotted without contention",
+                )
+            });
             if report
                 .metrics
                 .as_ref()
                 .and_then(|metrics| metrics["root_count"].as_u64())
                 == Some(expected)
+                && !scheduler_busy
             {
-                return;
+                return report;
             }
             assert!(
                 Instant::now() < deadline,
-                "health cache did not capture {expected} roots"
+                "health cache did not capture {expected} roots without contention: {report:?}"
             );
             std::thread::yield_now();
         }
@@ -2678,6 +3203,120 @@ mod tests {
     }
 
     #[test]
+    fn health_names_future_bash_tasks_without_global_shell_degradation() {
+        let (dir, root) = test_root("health-task-refusal");
+        let storage = dir.path().join("storage");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                project_root: Some(root.as_path().into()),
+                ..crate::config::Config::default()
+            },
+        ));
+        let harness_storage = storage.join("opencode");
+        let task = crate::bash_background::persistence::create_task_layout(
+            &harness_storage,
+            "session",
+            "bash-0000000000000001",
+        )
+        .unwrap();
+        std::fs::write(
+            &task.paths.json,
+            serde_json::to_vec(
+                &json!({"schema_version": crate::bash_background::persistence::SCHEMA_VERSION + 1}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        ctx.bash_background()
+            .maybe_gc_persisted(&harness_storage)
+            .unwrap();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, Arc::clone(&ctx)));
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        let report = refresh_until_root_count(&cache, &executor, &app, 1);
+        let metrics = report.metrics.unwrap();
+        let refusals = metrics["bash_task_refusals"].as_array().unwrap();
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(refusals[0]["path"], task.paths.json.display().to_string());
+        assert_eq!(refusals[0]["code"], crate::persisted_format::CODE);
+        assert_eq!(report.status, HealthStatus::Ok);
+        std::fs::remove_dir_all(&task.paths.session_dir).unwrap();
+        ctx.bash_background()
+            .maybe_gc_persisted(&harness_storage)
+            .unwrap();
+        let report = refresh_until_root_count(&cache, &executor, &app, 1);
+        assert!(report.metrics.unwrap()["bash_task_refusals"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn health_unavailable_rollup_reports_degraded_status_and_reason() {
+        let executor = Executor::new();
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        let detail = report.detail.unwrap();
+        assert!(
+            detail.contains("health diagnostic snapshot is being refreshed")
+                || detail.contains(
+                    "executor scheduler state could not be snapshotted without contention"
+                ),
+            "{detail}"
+        );
+
+        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert!(report
+            .detail
+            .unwrap()
+            .contains("executor scheduler state could not be snapshotted without contention"));
+    }
+
+    #[test]
+    fn health_wait_retries_an_unavailable_rollup() {
+        let (dir, root) = test_root("health-contended-rollup");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("storage")),
+                project_root: Some(root.as_path().into()),
+                ..crate::config::Config::default()
+            },
+        ));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, ctx));
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                executor.hold_state_lock_for_test(|| {
+                    locked_tx.send(()).unwrap();
+                    // Keep the first refresh unavailable regardless of scheduling
+                    // speed, then let the polling helper capture the actor.
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while cache.refresh_count_for_test() == 0 {
+                        assert!(Instant::now() < deadline, "health refresh never attempted");
+                        std::thread::yield_now();
+                    }
+                });
+            });
+            locked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            let report = refresh_until_root_count(&cache, &executor, &app, 1);
+            assert_eq!(report.metrics.unwrap()["root_count"], 1);
+            assert!(cache.refresh_count_for_test() >= 2);
+        });
+    }
+
+    #[test]
     fn rollup_reuses_breaker_connection_and_reopens_after_read_error() {
         let (storage, root) = test_root("health-breaker-cache");
         let mut config = crate::config::Config::default();
@@ -2948,6 +3587,56 @@ mod tests {
 
         ctx.inspect_manager()
             .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, false);
+    }
+
+    #[test]
+    fn health_exposes_the_live_privacy_disclaim_setting_per_root() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let (_dir, root) = test_root("health-privacy-disclaim");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().to_owned()),
+                ..Default::default()
+            },
+        ));
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        for enabled in [true, false] {
+            ctx.update_config(|config| config.bash.disclaim_privacy = enabled);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let report = test_health_report(
+                    &executor,
+                    &HashMap::new(),
+                    &DispatchPathMetrics::new(),
+                    &crate::context::App::default_shared(),
+                );
+                if let Some(roots) = report
+                    .metrics
+                    .as_ref()
+                    .and_then(|metrics| metrics["roots"].as_array())
+                {
+                    if let Some(snapshot) = roots.iter().find(|snapshot| {
+                        snapshot["project_root"].as_str() == root.as_path().to_str()
+                    }) {
+                        assert_eq!(snapshot["bash"]["disclaim_privacy"], enabled);
+                        assert_eq!(
+                            snapshot["bash"]["privacy_disclaim_effective"],
+                            enabled && cfg!(target_os = "macos")
+                        );
+                        break;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "{report:?}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 
     #[test]
@@ -3432,6 +4121,52 @@ mod tests {
             .expect("mutating lock holder completes");
 
         assert_eq!(report.status, HealthStatus::Degraded);
+    }
+
+    #[test]
+    fn health_retention_reports_fit_budget_with_exact_omissions_and_totals() {
+        let reports = (0..128)
+            .map(|index| {
+                (
+                    format!(
+                        "/storage/long-checkout-name-{index:04}/{}",
+                        "subdirectory/".repeat(12)
+                    ),
+                    crate::storage_retention::SweepReport {
+                        examined: 17,
+                        removed_roots: 3,
+                        removed_bytes: 4096,
+                        errors: vec!["example maintenance error".repeat(8)],
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let totals = retention_report_totals(&reports);
+        let mut metrics = json!({
+            "roots": [],
+            "storage_retention": reports,
+            "storage_retention_totals": totals,
+            "storage_retention_reports_omitted": 0,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        budget_health_metrics(&mut metrics);
+        let retained = metrics["storage_retention"].as_object().unwrap().len() as u64;
+        let omitted = metrics["storage_retention_reports_omitted"]
+            .as_u64()
+            .unwrap();
+        assert!(omitted > 0, "the fixture must exceed the detail budget");
+        assert_eq!(retained + omitted, 128);
+        assert_eq!(metrics["storage_retention_totals"]["reports"], 128);
+        assert_eq!(metrics["storage_retention_totals"]["examined"], 2176);
+        assert_eq!(metrics["storage_retention_totals"]["removed_roots"], 384);
+        assert_eq!(metrics["storage_retention_totals"]["removed_bytes"], 524288);
+        assert_eq!(metrics["storage_retention_totals"]["errors"], 128);
+        let encoded = serde_json::to_vec(&metrics).unwrap();
+        assert!(encoded.len() <= 12 * 1024);
+        assert_eq!(metrics["metrics_bytes"], encoded.len());
     }
 
     #[test]

@@ -727,17 +727,6 @@ fn real_background_completion_and_status_attach_compressor_counts() {
     let completion = wait_for_real_completion(&mut aft, task_id);
     assert_real_bash_envelope(&completion, "output_preview", 4000);
 
-    let snapshot = aft.send(
-        &serde_json::json!({
-            "id": "real-background-status",
-            "command": "bash_status",
-            "params": { "task_id": task_id }
-        })
-        .to_string(),
-    );
-    assert_eq!(snapshot["success"], true, "status failed: {snapshot:?}");
-    assert_real_bash_envelope(&snapshot, "output_preview", 4000);
-
     let drained = aft.send(
         &serde_json::json!({
             "id": "real-background-drain",
@@ -752,6 +741,19 @@ fn real_background_completion_and_status_attach_compressor_counts() {
         .find(|completion| completion["task_id"] == task_id)
         .unwrap_or_else(|| panic!("missing drained completion for {task_id}: {drained:?}"));
     assert_real_bash_envelope(drained_completion, "output_preview", 4000);
+
+    // A terminal status reply acknowledges delivery. Inspect the still-pending
+    // completion first so both output surfaces retain their envelope coverage.
+    let snapshot = aft.send(
+        &serde_json::json!({
+            "id": "real-background-status",
+            "command": "bash_status",
+            "params": { "task_id": task_id }
+        })
+        .to_string(),
+    );
+    assert_eq!(snapshot["success"], true, "status failed: {snapshot:?}");
+    assert_real_bash_envelope(&snapshot, "output_preview", 4000);
 
     let short_launch = aft.send(
         &serde_json::json!({

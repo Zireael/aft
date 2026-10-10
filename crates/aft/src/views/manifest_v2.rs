@@ -18,7 +18,7 @@
 //!   loser of the pointer race can recognize an equivalent winner.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -561,6 +561,8 @@ impl ViewStore {
 }
 
 fn write_bytes_once(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::production_storage::refuse_write(path)
+        .map_err(|error| ViewError::io_at("writing manifest", path, error))?;
     let parent = path.parent().ok_or_else(|| {
         ViewError::InvalidManifest("manifest path must have a parent directory".to_string())
     })?;
@@ -575,7 +577,7 @@ fn write_bytes_once(path: &Path, bytes: &[u8]) -> Result<()> {
         GENERATION_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
+        let mut file = crate::private_storage::options()
             .create_new(true)
             .write(true)
             .open(&temporary)

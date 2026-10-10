@@ -276,11 +276,11 @@ fn warmup_storage_dir() -> PathBuf {
 
 /// Build the `configure` params for a warmup run.
 ///
-/// P1 config relocation: core config (search_index/semantic_search) is now
-/// resolved exclusively from `config: [{tier, source, doc}]` tiers — the flat
-/// params are no longer read by handle_configure. A synthetic user-tier doc
-/// carries the two flags so warmup actually enables the requested systems
-/// (process-state params like storage_dir/_bypass_size_limits stay flat).
+/// Core config (which indexes to build) is resolved exclusively from
+/// `config: [{tier, source, doc}]` tiers: the flat params are no longer read by
+/// handle_configure. A synthetic user-tier doc carries the index switches so
+/// warmup actually enables the requested systems (process-state params like
+/// storage_dir/_bypass_size_limits stay flat).
 fn build_warmup_configure_params(
     root: &std::path::Path,
     storage_dir: &std::path::Path,
@@ -288,9 +288,11 @@ fn build_warmup_configure_params(
     force: bool,
 ) -> serde_json::Value {
     let warmup_config_doc = json!({
-        "search_index": areas.search,
-        "semantic_search": areas.semantic,
-        "callgraph_store": areas.callgraph,
+        "indexes": {
+            "trigram": areas.search,
+            "semantic": areas.semantic,
+            "callgraph": areas.callgraph,
+        },
     })
     .to_string();
     let mut params = json!({
@@ -1029,9 +1031,10 @@ mod tests {
         assert!(parsed.areas.search && parsed.areas.semantic && parsed.areas.callgraph);
     }
 
-    // P1 regression: after the configure flat-read deletion, warmup must carry
-    // search_index/semantic_search in a `config` tier doc (not flat params), or
-    // handle_configure resolves them as disabled and warmup no-ops.
+    // Regression: warmup must carry its index switches in a `config` tier doc
+    // (not flat params), or handle_configure resolves them as disabled and
+    // warmup no-ops. The doc uses the current `indexes` keys: the retired
+    // search_index/semantic_search/callgraph_store keys are rejected.
     #[test]
     fn warmup_configure_params_enable_requested_systems_via_tier_doc() {
         let root = std::path::Path::new("/tmp/proj");
@@ -1054,9 +1057,16 @@ mod tests {
         assert_eq!(tiers[0]["tier"], json!("user"));
         let doc: serde_json::Value =
             serde_json::from_str(tiers[0]["doc"].as_str().unwrap()).unwrap();
-        assert_eq!(doc["search_index"], json!(true));
-        assert_eq!(doc["semantic_search"], json!(true));
-        assert_eq!(doc["callgraph_store"], json!(true));
+        assert_eq!(
+            doc["indexes"],
+            json!({"trigram": true, "semantic": true, "callgraph": true})
+        );
+        for retired in ["search_index", "semantic_search", "callgraph_store"] {
+            assert!(
+                doc.get(retired).is_none(),
+                "warmup doc carries retired key {retired}"
+            );
+        }
 
         // --only search → semantic disabled in the doc.
         let search_only = build_warmup_configure_params(
@@ -1071,8 +1081,8 @@ mod tests {
         );
         let doc2: serde_json::Value =
             serde_json::from_str(search_only["config"][0]["doc"].as_str().unwrap()).unwrap();
-        assert_eq!(doc2["search_index"], json!(true));
-        assert_eq!(doc2["semantic_search"], json!(false));
+        assert_eq!(doc2["indexes"]["trigram"], json!(true));
+        assert_eq!(doc2["indexes"]["semantic"], json!(false));
         // force → internal bypass flag stays flat.
         assert_eq!(search_only["_bypass_size_limits"], json!(true));
     }
@@ -1135,9 +1145,9 @@ mod tests {
             .expect("warmup config doc should be a JSON string");
         let config_doc: serde_json::Value = serde_json::from_str(doc).expect("config doc parses");
 
-        assert_eq!(config_doc["semantic_search"], serde_json::json!(true));
-        assert_eq!(config_doc["search_index"], serde_json::json!(false));
-        assert_eq!(config_doc["callgraph_store"], serde_json::json!(false));
+        assert_eq!(config_doc["indexes"]["semantic"], serde_json::json!(true));
+        assert_eq!(config_doc["indexes"]["trigram"], serde_json::json!(false));
+        assert_eq!(config_doc["indexes"]["callgraph"], serde_json::json!(false));
     }
 
     #[test]

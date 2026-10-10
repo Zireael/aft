@@ -2148,6 +2148,39 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
     }
 }
 
+/// Do not turn missing coverage into a claim that a source symbol is absent.
+/// Check the generation's file inventory before any graph or parser lookup.
+pub fn ensure_target_indexed(
+    req_id: &str,
+    operation: &str,
+    ctx: &AppContext,
+    store: &crate::callgraph_store::ReadonlyCallGraphStore,
+    file: &Path,
+) -> Result<(), Response> {
+    match store.is_file_indexed(file) {
+        Ok(true) => return Ok(()),
+        Err(error) => return Err(store_error_response(req_id, operation, error)),
+        Ok(false) => {}
+    }
+    let path = absolute_file(store, file);
+    let ignored = ctx.gitignore().is_some_and(|matcher| {
+        matcher
+            .matched_path_or_any_parents(&path, false)
+            .is_ignore()
+    });
+    let (reason, detail) = if ignored {
+        ("ignored", "path is ignored by the project's ignore rules")
+    } else {
+        ("not_in_generation", "path is not part of this call graph generation (excluded, unsupported, or not yet indexed)")
+    };
+    Err(Response::error_with_data(
+        req_id,
+        "not_indexed",
+        format!("{operation}: not_indexed: {detail}: {}; use grep or aft_search with pattern to find references", path.display()),
+        serde_json::json!({ "reason": reason, "file": path, "results": serde_json::Value::Null }),
+    ))
+}
+
 #[cfg(test)]
 mod serialization_tests {
     use super::*;
@@ -2246,7 +2279,24 @@ pub fn index_refusal_response(
         CallgraphStoreAccess::Off => off_response(req_id, operation),
         CallgraphStoreAccess::Building => {
             note_callgraph_building(ctx, operation);
-            building_response(req_id, operation)
+            if ctx.config().views.enabled && ctx.is_worktree_bridge() {
+                let mut response = callgraph_index_refusal(
+                    req_id,
+                    "callgraph_building",
+                    format!("{operation}: call graph for this worktree is assembling or waiting for shared blobs; retry shortly; use grep or aft_search with pattern meanwhile"),
+                    IndexObservation::building(),
+                );
+                // Report the local view's phase and known pending count without
+                // opening a store or enumerating checkout files on the query.
+                let view = ctx.view_runtime_snapshot();
+                response.data["progress"] = serde_json::json!({
+                    "phase": if view.is_some() { "view_assembly" } else { "configure_maintenance" },
+                    "pending_paths": view.as_ref().map(|view| view.pending_paths.len()),
+                });
+                response
+            } else {
+                building_response(req_id, operation)
+            }
         }
         CallgraphStoreAccess::Suspended(suspension) => {
             suspended_response(req_id, operation, suspension)

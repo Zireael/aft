@@ -102,6 +102,8 @@ fn assert_case(dir: &Path) -> Option<String> {
     }
 
     let harness = read_harness(dir);
+    // The fixtures include retired keys such as `search_index`, `gh_read` and
+    // `idle.lsp_ttl_minutes`; both languages translate them in memory.
     let result = resolve_config_for_harness(&tiers, Some(&harness));
 
     let golden: Value = serde_json::from_str(

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   BASH_HOST_FALLBACK_BANNER,
+  BASH_RUNON_DESCRIPTION,
   type BridgePool,
   type BridgeRequestOptions,
   BridgeTransportUnavailableError,
@@ -165,7 +166,7 @@ function createHarness(
     config,
     storageDir: "/tmp/aft-test",
   };
-  return { calls, tool: createBashTool(ctx, aftSearchRegistered) };
+  return { calls, ctx, tool: createBashTool(ctx, aftSearchRegistered) };
 }
 
 function safeParse(schema: unknown, value: unknown): { success: boolean } {
@@ -173,6 +174,26 @@ function safeParse(schema: unknown, value: unknown): { success: boolean } {
 }
 
 describe("OpenCode bash adapter", () => {
+  test("live runon safety switch updates the schema and refuses a stale call", async () => {
+    const {
+      tool: bash,
+      ctx,
+      calls,
+    } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
+      subc: { connection_file: "/run/subc-connection.json" },
+      remote_exec: { enabled: true },
+    } as PluginContext["config"]);
+    expect(bash.args.runon).toBeUndefined();
+    ctx.config = { ...ctx.config, bash: { runon_enabled: true } };
+    expect(bash.args.runon).toBeDefined();
+    ctx.config = { ...ctx.config, bash: { runon_enabled: false } };
+    expect(bash.args.runon).toBeUndefined();
+    expect(bash.description).not.toContain("runon");
+    await expect(
+      bash.execute({ command: "echo never", runon: "linux" }, createMockSdkContext()),
+    ).rejects.toThrow("runon refused");
+    expect(calls).toHaveLength(0);
+  });
   test("schema accepts valid unified bash params and rejects invalid shapes", () => {
     // `sandbox` is only offered while the native sandbox is enabled.
     const { tool: bash } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
@@ -223,6 +244,134 @@ describe("OpenCode bash adapter", () => {
       };
       expect(jsonSchema.description?.length).toBeGreaterThan(20);
     }
+  });
+
+  test("bash runon schema and guidance are absent without available remote execution", () => {
+    for (const config of [
+      {},
+      { subc: { connection_file: "/run/subc-connection.json" } },
+      { remote_exec: { enabled: true } },
+      {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true, project_off: true },
+      },
+    ]) {
+      const bash = createHarness(() => ({ success: true, output: "" }), undefined, false, {
+        disabled_tools: [],
+        ...config,
+      } as PluginContext["config"]).tool;
+      expect(bash.args.runon).toBeUndefined();
+      expect(bash.description).not.toContain("runon");
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "bash runon schema and guidance are present with available remote execution",
+    () => {
+      const bash = createHarness(() => ({ success: true, output: "" }), undefined, false, {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      } as PluginContext["config"]).tool;
+      expect(bash.args.runon).toBeDefined();
+      expect(bash.description).toContain('When remote runs are available, put `runon: "linux"`');
+      expect(bash.description).toContain("including chains and pipes");
+      expect(bash.description).toContain(
+        "Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit)",
+      );
+      expect(bash.description).toContain(
+        "or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.",
+      );
+    },
+  );
+
+  // Remote task dispatch is Unix-only; a user switch cannot make it usable on Windows.
+  test.skipIf(process.platform !== "win32")(
+    "Windows bash omits runon even with daemon mode and enabled user config",
+    () => {
+      const bash = createHarness(() => ({ success: true, output: "" }), undefined, false, {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      } as PluginContext["config"]).tool;
+      expect(bash.args.runon).toBeUndefined();
+      expect(bash.description).not.toContain("runon");
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "runon is offered only in subc mode with remote runs enabled in the user config",
+    () => {
+      const offered = (config: Record<string, unknown>) =>
+        "runon" in
+        createHarness(() => ({ success: true, output: "" }), undefined, false, {
+          disabled_tools: [],
+          ...config,
+        } as PluginContext["config"]).tool.args;
+      const subc = {
+        subc: { connection_file: "/run/subc-connection.json" },
+        bash: { runon_enabled: true },
+      };
+      expect(offered({ ...subc, remote_exec: { enabled: true } })).toBe(true);
+      // No user-tier switch, or standalone transport: never offered.
+      expect(offered({ ...subc })).toBe(false);
+      expect(offered({ ...subc, remote_exec: { enabled: false } })).toBe(false);
+      expect(offered({ remote_exec: { enabled: true } })).toBe(false);
+      // The project turned remote runs off.
+      expect(offered({ ...subc, remote_exec: { enabled: false, project_off: true } })).toBe(false);
+      const { tool: bash } = createHarness(
+        () => ({ success: true, output: "" }),
+        undefined,
+        false,
+        {
+          ...subc,
+          remote_exec: { enabled: true },
+          bash: { runon_enabled: true },
+        } as PluginContext["config"],
+      );
+      expect(safeParse(bash.args.runon, "linux").success).toBe(true);
+      const jsonSchema = tool.schema.toJSONSchema(bash.args.runon as never, { io: "input" }) as {
+        description?: string;
+      };
+      expect(jsonSchema.description).toBe(BASH_RUNON_DESCRIPTION);
+    },
+  );
+
+  test("runon is forwarded to the engine and never becomes a host-fallback run", async () => {
+    const { calls, tool: bash } = createHarness(
+      () => ({ success: true, output: "ran remotely on ck-motor\nok", exit_code: 0 }),
+      undefined,
+      false,
+      {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      } as PluginContext["config"],
+    );
+    await bash.execute(
+      { command: "FOO=1 cargo test | tail -1", runon: "linux" },
+      createMockSdkContext({}),
+    );
+    expect(calls[0].params).toMatchObject({
+      command: "FOO=1 cargo test | tail -1",
+      runon: "linux",
+    });
+
+    const dead = createHarness(
+      () => {
+        throw new BridgeTransportUnavailableError("transport down");
+      },
+      undefined,
+      false,
+      {
+        bash: { host_fallback: true, runon_enabled: true },
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+      } as PluginContext["config"],
+    );
+    await expect(
+      dead.tool.execute({ command: "printf no", runon: "linux" }, createMockSdkContext({})),
+    ).rejects.toThrow("runon is unsupported, and the command was not run locally");
   });
 
   test("schema omits wait, background and PTY args when bash.background is disabled", () => {

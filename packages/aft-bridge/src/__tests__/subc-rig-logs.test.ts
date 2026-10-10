@@ -9,7 +9,7 @@ test.skipIf(process.platform === "win32")(
   async () => {
     const dir = await mkdtemp(join(tmpdir(), "subc-log-test-"));
     try {
-      const daemon = join(dir, "daemon");
+      const daemon = join(dir, "ck-subc");
       const module = join(dir, "module");
       const logs = join(dir, "logs");
       await writeFile(module, '#!/bin/sh\nprintf "module panic diagnostic\\n" >&2\n', {
@@ -24,6 +24,7 @@ const config = JSON.parse(readFileSync(process.env.XDG_CONFIG_HOME + "/cortexkit
 const mod = config.modules.aft;
 spawnSync(mod.program, mod.args, { env: { ...process.env, ...mod.env }, stdio: "inherit" });
 console.error("daemon startup diagnostic");
+console.error("daemon executable name: " + process.argv[1].split("/").pop());
 process.exit(1);
 `,
         { mode: 0o700 },
@@ -51,7 +52,10 @@ try {
         "module panic diagnostic\n".repeat(2),
       );
       expect(await readFile(join(logDir, "subc-core.stderr.log"), "utf8")).toBe(
-        "daemon startup diagnostic\n".repeat(2),
+        "daemon startup diagnostic\n" +
+          "daemon executable name: ckdev-subc\n" +
+          "daemon startup diagnostic\n" +
+          "daemon executable name: ckdev-subc\n",
       );
       expect(result.stdout).toContain(logDir);
     } finally {

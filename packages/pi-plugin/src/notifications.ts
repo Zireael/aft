@@ -14,7 +14,8 @@ export interface ConfigureWarning {
     | "checker_not_installed"
     | "lsp_binary_missing"
     | "config_parse_failed"
-    | "config_key_dropped";
+    | "config_key_dropped"
+    | "config_migrated";
   language?: string;
   server?: string;
   tool?: string;
@@ -148,11 +149,14 @@ function warningTitle(warning: ConfigureWarning): string {
       return "Config failed to parse";
     case "config_key_dropped":
       return "Config key ignored";
+    case "config_migrated":
+      return "Config updated";
   }
 }
 
 function formatConfigureWarning(warning: ConfigureWarning): string {
-  if (warning.kind === "config_key_dropped") return `${WARNING_MARKER} ${warning.hint}`;
+  if (warning.kind === "config_key_dropped" || warning.kind === "config_migrated")
+    return `${WARNING_MARKER} ${warning.hint}`;
 
   const details: string[] = [];
   if (warning.language) details.push(`language: ${warning.language}`);

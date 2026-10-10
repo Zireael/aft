@@ -111,7 +111,10 @@ pub fn claim_or_open_read_only(
     }
 
     let manifest_dir = resolve_manifest_dir(storage_dir, project_root, project_key);
-    fs::create_dir_all(&manifest_dir)?;
+    crate::private_storage::open_dir(
+        &crate::bash_background::storage_dir(storage_dir),
+        &manifest_dir,
+    )?;
     let path = manifest_dir.join("owner.json");
     let checkout_path = project_root.display().to_string();
     let git_common_dir = git_common_dir.map(|path| path.display().to_string());
@@ -138,7 +141,10 @@ pub fn claim_or_open_read_only(
                         // The orphaned-manifest sweep removed the key
                         // directory; recreate it and claim again.
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            fs::create_dir_all(&manifest_dir)?;
+                            crate::private_storage::open_dir(
+                                &crate::bash_background::storage_dir(storage_dir),
+                                &manifest_dir,
+                            )?;
                             continue;
                         }
                         result => return result,
@@ -179,7 +185,10 @@ pub fn claim_or_open_read_only(
                     // The orphaned-manifest sweep removes empty key
                     // directories; recreate it and try again.
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        fs::create_dir_all(&manifest_dir)?;
+                        crate::private_storage::open_dir(
+                            &crate::bash_background::storage_dir(storage_dir),
+                            &manifest_dir,
+                        )?;
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -483,7 +492,7 @@ fn heartbeat_manifest(
 fn replace_manifest_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = temp_path(path);
     let write_result = (|| -> io::Result<()> {
-        let mut file = File::create(&tmp)?;
+        let mut file = crate::private_storage::create(&tmp)?;
         fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
         write_manifest_bytes(&mut file, bytes)?;
         drop(file);
@@ -508,8 +517,12 @@ fn create_owner_manifest(
     checkout_path: &str,
     git_common_dir: Option<&str>,
 ) -> io::Result<ArtifactOwnerClaim> {
+    crate::production_storage::refuse_write(path)?;
     let manifest = new_manifest(project_scope_key, checkout_path, git_common_dir);
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut file = crate::private_storage::options()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
     write_manifest_to_file(&mut file, &manifest)?;
     Ok(owner_claim(path, project_key, manifest))
@@ -575,6 +588,17 @@ fn manifest_owner_alive(manifest: &ArtifactOwnerManifest) -> bool {
         return since_heartbeat <= fs_lock::STALE_HEARTBEAT_MS.saturating_mul(5);
     }
     process_alive(manifest.pid)
+}
+
+pub(crate) fn protected_for_retention(manifest: &ArtifactOwnerManifest) -> bool {
+    if manifest.hostname != current_hostname() {
+        return true;
+    }
+    if !process_alive(manifest.pid) {
+        return false;
+    }
+    crate::root_cache::process_start_time_ms(manifest.pid)
+        .is_none_or(|start| start <= manifest.created_at_ms.saturating_add(1000))
 }
 
 fn reclaim_manifest_if_unchanged(path: &Path, judged: &ArtifactOwnerManifest) -> io::Result<bool> {
@@ -657,9 +681,10 @@ pub(crate) fn check_manifest_format(
 }
 
 fn atomic_write_manifest(path: &Path, manifest: &ArtifactOwnerManifest) -> io::Result<()> {
+    crate::production_storage::refuse_write(path)?;
     let tmp = temp_path(path);
     let write_result = (|| -> io::Result<()> {
-        let mut file = File::create(&tmp)?;
+        let mut file = crate::private_storage::create(&tmp)?;
         fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
         write_manifest_to_file(&mut file, manifest)?;
         fs::rename(&tmp, path)?;
@@ -862,6 +887,7 @@ fn owner_manifest_is_orphaned(manifest: &ArtifactOwnerManifest, now: u64) -> boo
     !manifest.checkout_path.is_empty()
         && matches!(Path::new(&manifest.checkout_path).try_exists(), Ok(false))
         && now.saturating_sub(manifest.heartbeat_at_ms) > OWNER_REAP_MIN_HEARTBEAT_AGE_MS
+        && !protected_for_retention(manifest)
 }
 
 fn heartbeat_interval_ms() -> u64 {
@@ -1321,7 +1347,7 @@ mod tests {
             &path,
             checkout,
             key,
-            std::process::id(),
+            exited_owner_pid(),
             heartbeat_at_ms,
             None,
         );
@@ -1339,6 +1365,39 @@ mod tests {
                 summary
             })
             .collect()
+    }
+
+    #[test]
+    fn storage_retention_owner_reap_keeps_a_live_process_without_heartbeats() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("gone");
+        let path = owner_manifests_root(temp.path()).join("owner/owner.json");
+        write_synthetic_manifest_at_path_for_test(
+            &path,
+            &root,
+            "scope",
+            std::process::id(),
+            0,
+            None,
+        );
+        assert_eq!(
+            reap_owner_manifests_pass(temp.path(), 0, 512, now_ms()).removed,
+            0
+        );
+        assert!(path.exists());
+        write_synthetic_manifest_at_path_for_test(
+            &path,
+            &root,
+            "scope",
+            exited_owner_pid(),
+            0,
+            None,
+        );
+        assert_eq!(
+            reap_owner_manifests_pass(temp.path(), 0, 512, now_ms()).removed,
+            1
+        );
+        assert!(!path.exists());
     }
 
     #[test]

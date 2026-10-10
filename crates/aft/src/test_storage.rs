@@ -3,111 +3,15 @@ use crate::config::Config;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-// Resolve the longest existing ancestor too: the storage directory need not
-// exist yet, but its Windows profile ancestor may have an 8.3 alias.
-fn canonicalized_with(path: &Path, canonicalize: &impl Fn(&Path) -> Option<PathBuf>) -> PathBuf {
-    for ancestor in path.ancestors() {
-        if let Some(canonical) = canonicalize(ancestor) {
-            let tail = path.strip_prefix(ancestor).unwrap();
-            return if tail.as_os_str().is_empty() {
-                canonical
-            } else {
-                canonical.join(tail)
-            };
-        }
-    }
-    path.to_path_buf()
-}
+use crate::production_storage::{account_home, canonicalized_with, comparison_key, is_within};
 
-fn comparison_key(path: &Path, windows: bool) -> Vec<OsString> {
-    if windows {
-        crate::windows_path::normalize_windows_path(path)
-            .to_string_lossy()
-            .trim_end_matches('\\')
-            .split('\\')
-            .map(|part| OsString::from(part.to_lowercase()))
-            .collect()
-    } else {
-        path.components()
-            .map(|part| part.as_os_str().into())
-            .collect()
-    }
-}
-
-fn is_within(root: &Path, parent: &Path) -> bool {
-    let canonicalize = |path: &Path| path.canonicalize().ok();
-    let root = canonicalized_with(root, &canonicalize);
-    let parent = canonicalized_with(parent, &canonicalize);
-    comparison_key(&root, cfg!(windows)).starts_with(&comparison_key(&parent, cfg!(windows)))
-}
-
-#[cfg(unix)]
-fn account_home() -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    // Unlike std::env::home_dir, the account database does not read HOME.
-    let mut buffer = vec![0u8; 16384];
-    loop {
-        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
-        let mut result = std::ptr::null_mut();
-        // SAFETY: the entry and buffer are writable for the supplied sizes;
-        // result is inspected only after getpwuid_r reports success.
-        let error = unsafe {
-            libc::getpwuid_r(
-                libc::geteuid(),
-                entry.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
-        if error == libc::ERANGE {
-            buffer.resize(buffer.len() * 2, 0);
-            continue;
-        }
-        assert!(
-            error == 0 && !result.is_null(),
-            "cannot resolve account home for storage fence"
-        );
-        // SAFETY: a successful lookup supplies a NUL-terminated pw_dir in buffer.
-        let home = unsafe { std::ffi::CStr::from_ptr((*result).pw_dir) };
-        return PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes()));
-    }
-}
-
-#[cfg(windows)]
-fn account_folder(folder: u32) -> PathBuf {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::UI::Shell::{SHGetFolderPathW, SHGFP_TYPE_CURRENT};
-    let mut buffer = [0u16; 260];
-    // SAFETY: SHGetFolderPathW writes at most MAX_PATH UTF-16 code units.
-    let status = unsafe {
-        SHGetFolderPathW(
-            std::ptr::null_mut(),
-            folder as i32,
-            std::ptr::null_mut(),
-            SHGFP_TYPE_CURRENT as u32,
-            buffer.as_mut_ptr(),
-        )
-    };
-    assert!(
-        status >= 0,
-        "cannot resolve account folder for storage fence"
-    );
-    let len = buffer.iter().position(|unit| *unit == 0).unwrap();
-    PathBuf::from(OsString::from_wide(&buffer[..len]))
-}
-
-#[cfg(windows)]
-fn account_home() -> PathBuf {
-    account_folder(windows_sys::Win32::UI::Shell::CSIDL_PROFILE)
-}
-
-fn live_storage_roots() -> [PathBuf; 2] {
-    let home = account_home();
+fn live_storage_roots() -> Vec<PathBuf> {
+    let home = account_home().expect("test storage fence must resolve the account profile");
     #[cfg(windows)]
-    let local_data = Some(account_folder(
-        windows_sys::Win32::UI::Shell::CSIDL_LOCAL_APPDATA,
-    ));
+    let local_data = Some(
+        crate::production_storage::known_local_app_data()
+            .unwrap_or_else(|_| home.join("AppData/Local")),
+    );
     #[cfg(not(windows))]
     let local_data: Option<PathBuf> = None;
     let mut temporary = vec![std::env::temp_dir()];
@@ -122,7 +26,10 @@ fn live_storage_roots() -> [PathBuf; 2] {
     // Keep protecting the account default when a test replaces a real custom
     // XDG home. Environment mutation must not turn off the native-root fence.
     let account = live_storage_root_from(&home, local_data.as_deref(), &[], &|_| None);
-    [current, account]
+    let mut roots = crate::production_storage::account_storage_roots()
+        .expect("test storage fence must resolve a protected root");
+    roots.extend([current, account]);
+    roots
 }
 
 fn live_storage_root_from(
@@ -291,9 +198,9 @@ mod tests {
         // Derive the expected root independently of the guard's resolver. This
         // assertion performs no I/O even if the fence is accidentally removed.
         #[cfg(windows)]
-        let data = account_folder(windows_sys::Win32::UI::Shell::CSIDL_LOCAL_APPDATA);
+        let data = account_home().unwrap().join("AppData/Local");
         #[cfg(not(windows))]
-        let data = account_home().join(".local").join("share");
+        let data = account_home().unwrap().join(".local").join("share");
         with_temporary_xdg(|_| assert_root(&data.join("cortexkit").join("aft")));
     }
 

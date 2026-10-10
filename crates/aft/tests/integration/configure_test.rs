@@ -22,8 +22,7 @@ fn configure_with_search_index_and_storage(aft: &mut AftProcess, root: &Path, st
             "project_root": root,
             "storage_dir": storage,
             "config": user_config(serde_json::json!({
-                "search_index": true,
-                "semantic_search": false
+                "indexes": { "trigram": true, "semantic": false }
             })),
         })
         .to_string(),

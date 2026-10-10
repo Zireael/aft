@@ -183,12 +183,12 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "handle_grep, grep_result, grep_result_bytes, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "handle_grep, handle_grep_inner, grep_result, grep_result_bytes, walk_truncated, skipped_foreign_mounts",
             },
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "DEFAULT_MAX_RESULTS, GREP_MAX_OUTPUT_BYTES, MAX_DISPLAY_MATCHES_PER_FILE, handle_grep, format_grep_text, render_grep_page, rendered_grep_match_count",
+                predicate_name: "DEFAULT_MAX_RESULTS, GREP_MAX_OUTPUT_BYTES, MAX_DISPLAY_MATCHES_PER_FILE, handle_grep, handle_grep_inner, format_grep_text, render_grep_page, rendered_grep_match_count",
             },
         ],
     },
@@ -202,12 +202,12 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "GlobDiscovery, handle_glob, fallback_glob, glob_root, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, walk_truncated, skipped_foreign_mounts",
             },
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, format_glob_text, rendered_glob_file_count",
+                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, rendered_glob_file_count",
             },
         ],
     },
@@ -226,7 +226,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "OutlineFileDiscovery, discover_outline_files_with_options, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "OutlineFileDiscovery, discover_outline_files_with_options, discover_outline_files_unbounded, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
             },
         ],
     },
@@ -258,7 +258,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         reasons: &[ReasonEntry {
             reason: Reason::Cap,
             kind: ReasonKind::Selecting,
-            predicate_name: "details_for, generated_details_for, test_only_details_for, uncovered_files_details_for, topk_limiting",
+            predicate_name: "details_for, generated_details_for, test_only_details_for, uncovered_files_details_for, topk_limiting, write_skipped_files, filter_payload_for_scope, SKIPPED_FILES_LIMIT",
         }],
     },
     SurfaceEntry {
@@ -286,6 +286,30 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    ExclusionEntry {
+        file: "bash_background/registry.rs",
+        enclosing_item: "format_background_slot_refusal",
+        location_or_primitive: "SLOT_REFUSAL_MAX_ROWS / SLOT_REFUSAL_COMMAND_CHARS .take()",
+        reason: "a background-launch error previews at most eight of the caller's slot holders, counts omitted own holders and other sessions' holders, and shortens command labels with an ellipsis; this is actionable refusal context, not a paginated task-result list",
+    },
+    ExclusionEntry {
+        file: "subc/health.rs",
+        enclosing_item: "budget_health_metrics",
+        location_or_primitive: "storage_retention map removal under HEALTH_METRICS_BUDGET_BYTES",
+        reason: "management health detail, not an agent result list; omitted retention reports are counted exactly and aggregate retention counters remain present",
+    },
+    ExclusionEntry {
+        file: "bash_background/registry.rs",
+        enclosing_item: "cleanup_finished_at_with, gc_harness_stores",
+        location_or_primitive: "GC_ENTRY_BUDGET maintenance queue and namespace iterator",
+        reason: "internal housekeeping advances bounded round-robin queues and resumable directory iterators; retained work is revisited on later passes, not truncated from an agent-visible list",
+    },
+    ExclusionEntry {
+        file: "bash_background/gc_cursor.rs",
+        enclosing_item: "next_batch",
+        location_or_primitive: "GC_ENTRY_BUDGET directory iterator advancement",
+        reason: "internal persisted-task and quarantine retention scans resume the same iterator next pass; the cap bounds inspection work, not returned records",
+    },
     ExclusionEntry {
         file: "bash_background/remote.rs",
         enclosing_item: "append_executor_environment_disclosure",
@@ -323,6 +347,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "a last-resort byte cut on every tool's rendered text, not a list surface; emits a cut-at-N-of-M-bytes notice and a WARN naming the tool whose own cap failed",
     },
     ExclusionEntry {
+        file: "cold_build_limiter/progress.rs",
+        enclosing_item: "snapshot",
+        location_or_primitive: "take(LIST_CAP)",
+        reason: "management health telemetry, not an agent list; running and queued are bounded at their iterators and disclose exact omitted counts",
+    },
+    ExclusionEntry {
         file: "github_read/fetch.rs",
         enclosing_item: "read_capped",
         location_or_primitive: "bounded gh subprocess reader",
@@ -336,9 +366,51 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "grep_executor.rs",
-        enclosing_item: "diagnose_scope_counts, bounded_fallback_walk_files_with_limits_target",
+        enclosing_item: "diagnose_scope_counts, diagnose_scope_counts_unbounded, bounded_fallback_walk_files_with_limits_target, walk_files_unbounded, walk_each_file_unbounded",
         location_or_primitive: "MAX_FALLBACK_WALK_FILES / FALLBACK_WALK_BUDGET",
         reason: "bounded filesystem fallback and empty-scope exclusion probe; ignored directories are pruned and counted once, and an exhausted probe reports unknown/incomplete rather than claiming an empty filesystem",
+    },
+    ExclusionEntry {
+        file: "storage_retention.rs",
+        enclosing_item: "bounded_dirs, next_batch, tree_files, run_pass, prune_bindings",
+        location_or_primitive: "PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, take",
+        reason: "internal disk-maintenance walks, not tool-result lists; bounds apply before filtering and incomplete protection snapshots refuse deletion; health reports examined, removed and stopped-early counts",
+    },
+    ExclusionEntry {
+        file: "views/registry.rs",
+        enclosing_item: "members_bounded, read_members_limited",
+        location_or_primitive: "SQL LIMIT",
+        reason: "internal family membership census, not an agent-visible list; an incomplete membership snapshot aborts background marking rather than deleting unmarked content",
+    },
+    ExclusionEntry {
+        file: "views/generation.rs",
+        enclosing_item: "blob_references_by_generation, sweep_generations_locked, remove_generation_files",
+        location_or_primitive: "take(4097), take(65537), take(65536)",
+        reason: "internal generation/protection enumeration; ownership or blob-mark overflow aborts before deletion, while an incomplete temporary-file deletion pass only leaves garbage for a later pass",
+    },
+    ExclusionEntry {
+        file: "gc/mod.rs",
+        enclosing_item: "sweep_bounded, mark_live_assembly_pins, sweep_plane",
+        location_or_primitive: "take(8193), take(4097), LIMIT 4096",
+        reason: "internal mark-and-sweep budgets; incomplete marks refuse deletion and a SQL keyset cursor resumes bounded deletion; row/deletion counts and compaction deferrals are reported",
+    },
+    ExclusionEntry {
+        file: "root_cache.rs",
+        enclosing_item: "read_marker_protection",
+        location_or_primitive: "take(4097)",
+        reason: "internal reader-protection census; an unread marker or iterator overflow is protected, never permission to unlink a generation",
+    },
+    ExclusionEntry {
+        file: "callgraph_store/mod.rs",
+        enclosing_item: "gc_old_generations",
+        location_or_primitive: "take(4096)",
+        reason: "internal generation deletion batch, not a query result list; the current pointer and protected readers are checked independently for every candidate",
+    },
+    ExclusionEntry {
+        file: "lsp/completed_rust_check.rs",
+        enclosing_item: "sweep_records",
+        location_or_primitive: "RECORD_SCAN_LIMIT, MAX_RECORDS",
+        reason: "background disk-cache maintenance, not an agent-visible list; the scan counts directory entries inside the iterator loop and logs examined, removed and completion counts; a bounded scan refuses a new record until it can certify the 64-record cap",
     },
     ExclusionEntry {
         file: "logging.rs",

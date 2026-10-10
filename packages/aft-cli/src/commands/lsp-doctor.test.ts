@@ -140,4 +140,31 @@ describe("doctor lsp diagnostics completeness", () => {
     expect(rendered).toContain("Gap: python: pull_not_supported");
     expect(rendered).not.toContain("Diagnostics (0 found):");
   });
+
+  test("shows both Dockerfile server binaries and the selected server arguments", () => {
+    const rendered = renderLspInspection("Dockerfile", {
+      success: true,
+      matching_servers: [
+        {
+          id: "dockerfile",
+          name: "Dockerfile Language Server",
+          kind: "dockerfile",
+          extensions: ["dockerfile"],
+          root_markers: ["Dockerfile", "dockerfile", ".dockerignore"],
+          binary_name: "docker-langserver",
+          binary_names: ["docker-language-server", "docker-langserver"],
+          binary_path: "/opt/homebrew/bin/docker-language-server",
+          binary_source: "path",
+          workspace_root: "/project",
+          spawn_status: "ok",
+          args: ["start", "--stdio"],
+        },
+      ],
+      diagnostics: [],
+      diagnostics_count: 0,
+    });
+
+    expect(rendered).toContain("candidates: docker-language-server or docker-langserver");
+    expect(rendered).toContain('Args: ["start","--stdio"]');
+  });
 });

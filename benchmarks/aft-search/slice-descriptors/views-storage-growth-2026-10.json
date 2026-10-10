@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/view_assembly_wiring_test.rs",
+    "crates/aft/src/storage_retention.rs"
+  ],
+  "slices": [
+    "views-storage-growth-2026-10",
+    "retention-grace-restart",
+    "linked-worktree-one-day-retention"
+  ],
+  "note": "Derived against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py: no changed path matches. This policy update from 881a22e3ec5930e7ee6e2820cd61b04a9bbeb4b7 records verified linked Git topology in retention binding history and gives missing flagged roots a one-day age window; main, legacy and unknown cases retain seven days. All existing protection predicates remain intact, and approved same-root history reconciliation preserves every clock. The earlier slices investigate abandoned generations and prove persisted grace survives restart. No slice changes search ranking or routing; live measurements use only metadata/stat reads."
+}

@@ -142,7 +142,7 @@ export function loadFeaturePlan(harness: string | null, run: NativeRunner = runN
     return {
       ok: false,
       error: withCliCommands(error),
-      configRejected: result.status === 1 && error.includes("aft doctor --fix"),
+      configRejected: result.status === 1 && error.includes("AFT cannot load this configuration"),
       missingBinary: result.missingBinary === true,
     };
   }

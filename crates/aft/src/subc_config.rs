@@ -10,6 +10,7 @@
 //! (the user's own disk), while privileged fields from the untrusted in-repo
 //! project file, including its harness override, are dropped.
 
+use crate::config_fix::UserConfigMigration;
 use crate::config_resolve::ConfigTier;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -56,13 +57,28 @@ fn cortexkit_project_config_path(project_root: &Path) -> PathBuf {
     project_root.join(".cortexkit").join("aft.jsonc")
 }
 
+/// Rewrite the user file's retired keys before it is read (see
+/// [`crate::config_fix::auto_migrate_user_config`]) and log the outcome. A
+/// file that cannot be rewritten is still read as it is; the resolver
+/// translates its retired keys in memory.
+fn migrate_user_file(user_path: &Path) -> Option<UserConfigMigration> {
+    let outcome = crate::config_fix::auto_migrate_user_config(user_path)?;
+    crate::slog_warn!("config user: {}", outcome.notice());
+    Some(outcome)
+}
+
 /// Read the user + project config files into raw tiers. Pure over its path
 /// inputs (no env, no fixed locations) so it is directly testable. Mirrors the
 /// TS `readConfigTiers`: push `{tier, source, doc}` with the RAW file content as
 /// `doc` (the resolver's `parse_tier` strips JSONC), skipping any missing or
-/// unreadable file silently.
-fn read_tiers_from(user_config_path: Option<&Path>, project_config_path: &Path) -> Vec<ConfigTier> {
+/// unreadable file silently. The user file is first migrated off retired keys;
+/// the project file is never written.
+fn read_tiers_from(
+    user_config_path: Option<&Path>,
+    project_config_path: &Path,
+) -> (Vec<ConfigTier>, Option<UserConfigMigration>) {
     let mut tiers = Vec::new();
+    let mut migration = None;
 
     #[cfg(debug_assertions)]
     if let Some(delay_ms) = std::env::var("AFT_TEST_SUBC_CONFIG_READ_DELAY_MS")
@@ -73,6 +89,7 @@ fn read_tiers_from(user_config_path: Option<&Path>, project_config_path: &Path) 
     }
 
     if let Some(user_path) = user_config_path {
+        migration = migrate_user_file(user_path);
         if let Ok(doc) = std::fs::read_to_string(user_path) {
             tiers.push(ConfigTier {
                 tier: "user".to_string(),
@@ -90,7 +107,7 @@ fn read_tiers_from(user_config_path: Option<&Path>, project_config_path: &Path) 
         });
     }
 
-    tiers
+    (tiers, migration)
 }
 
 /// Read the CortexKit config home (user) + project config for a subc bind. These
@@ -101,6 +118,15 @@ pub fn read_local_cortexkit_config_tiers(
     user_config_path: Option<&Path>,
     project_root: &Path,
 ) -> Vec<ConfigTier> {
+    read_local_cortexkit_config_tiers_with_migration(user_config_path, project_root).0
+}
+
+/// [`read_local_cortexkit_config_tiers`], also returning what the automatic
+/// migration of the user file did, for callers that report it to the user.
+pub fn read_local_cortexkit_config_tiers_with_migration(
+    user_config_path: Option<&Path>,
+    project_root: &Path,
+) -> (Vec<ConfigTier>, Option<UserConfigMigration>) {
     read_tiers_from(
         user_config_path,
         &cortexkit_project_config_path(project_root),
@@ -115,6 +141,7 @@ pub fn read_local_cortexkit_config_tiers(
 pub fn catalog_disabled_tools(user_config_path: Option<&Path>) -> Vec<String> {
     let tiers: Vec<ConfigTier> = user_config_path
         .and_then(|path| {
+            migrate_user_file(path);
             let doc = std::fs::read_to_string(path).ok()?;
             Some(ConfigTier {
                 tier: "user".to_string(),
@@ -194,10 +221,10 @@ mod tests {
         let user = dir.path().join("user-aft.jsonc");
         let project = dir.path().join("project-aft.jsonc");
         // Comments preserved in the raw doc — the resolver strips JSONC.
-        std::fs::write(&user, "{\n  // user\n  \"search_index\": true\n}").unwrap();
-        std::fs::write(&project, "{ \"semantic_search\": false }").unwrap();
+        std::fs::write(&user, "{\n  // user\n  \"edit_mode\": \"hashline\"\n}").unwrap();
+        std::fs::write(&project, "{ \"indexes\": { \"semantic\": false } }").unwrap();
 
-        let tiers = read_tiers_from(Some(&user), &project);
+        let (tiers, _) = read_tiers_from(Some(&user), &project);
         assert_eq!(tiers.len(), 2);
         assert_eq!(tiers[0].tier, "user");
         assert!(tiers[0].doc.contains("// user"));
@@ -205,10 +232,51 @@ mod tests {
         assert_eq!(tiers[1].source, project.to_string_lossy());
     }
 
+    /// Reading migrates the user file off retired keys and reads the new text;
+    /// the project file is shared through its repository, so its bytes stay
+    /// exactly as they were and its retired keys are translated in memory.
+    #[test]
+    fn reading_migrates_the_user_file_and_never_writes_the_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user-aft.jsonc");
+        let project_root = dir.path().join("repo");
+        std::fs::create_dir_all(project_root.join(".cortexkit")).unwrap();
+        let project = project_root.join(".cortexkit").join("aft.jsonc");
+        let user_text = "{\n  // user\n  \"search_index\": false\n}\n";
+        let project_text = "{ \"semantic_search\": false, \"hoist_builtin_tools\": false }";
+        std::fs::write(&user, user_text).unwrap();
+        std::fs::write(&project, project_text).unwrap();
+
+        let (tiers, migration) =
+            read_local_cortexkit_config_tiers_with_migration(Some(&user), &project_root);
+        assert!(matches!(
+            migration,
+            Some(crate::config_fix::UserConfigMigration::Migrated { .. })
+        ));
+        assert_ne!(tiers[0].doc, user_text);
+        assert!(
+            tiers[0].doc.contains("\"trigram\": false"),
+            "{}",
+            tiers[0].doc
+        );
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), project_text);
+        assert_eq!(tiers[1].doc, project_text);
+
+        let resolved = crate::config_resolve::resolve_config(&tiers);
+        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+        assert!(!resolved.config.indexes.trigram);
+        assert!(!resolved.config.indexes.semantic);
+
+        let (_, again) =
+            read_local_cortexkit_config_tiers_with_migration(Some(&user), &project_root);
+        assert_eq!(again, None, "the second read finds nothing to migrate");
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), project_text);
+    }
+
     #[test]
     fn missing_files_yield_no_tiers() {
         let dir = tempfile::tempdir().unwrap();
-        let tiers = read_tiers_from(
+        let (tiers, _) = read_tiers_from(
             Some(&dir.path().join("nope-user.jsonc")),
             &dir.path().join("nope-project.jsonc"),
         );

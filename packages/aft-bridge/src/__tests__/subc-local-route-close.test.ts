@@ -1,11 +1,11 @@
 /**
  * The plugin closing one of its own routes while a call is in flight on it:
  * pool shutdown (which is also what host-process exit runs), session close,
- * project-root close, and a sibling call discarding the session's shared route.
+ * project-root close, and replacement of the session's shared route.
  *
  * Exercised through a REAL `SubcClient` over a real TCP socket against a small
  * in-process fake subc daemon. The daemon records every data-plane request it
- * receives and never answers it, so a call is provably in flight (its request
+ * receives and holds until explicitly released, so a call is provably in flight (its request
  * reached the daemon) when the close happens. A test double that resolved or
  * rejected requests by itself could not show that, and would hide whether the
  * real client's `closeRoute` rejection is what the caller sees.
@@ -47,7 +47,14 @@ import { TEST_INFLIGHT_ROOT, TEST_PROJECT_ROOT } from "./subc-test-roots.js";
 interface FakeDaemon {
   connectionFile: string;
   /** Data-plane request bodies the daemon received, in arrival order. */
-  readonly requests: Array<{ name?: string }>;
+  readonly requests: Array<{ name?: string; channel: number; epoch: number }>;
+  readonly closedRoutes: number[];
+  readonly catalogProbes: number;
+  readonly connections: number;
+  /** A terminal releases exactly one request credit, only on a still-live route. */
+  respond(index: number, body?: unknown): boolean;
+  fail(index: number, code: string, message: string): boolean;
+  loseConnections(): void;
   /** While true, route.open requests are held instead of answered. */
   holdRouteOpens: boolean;
   /** Route opens received while held. */
@@ -63,7 +70,11 @@ async function startFakeDaemon(): Promise<FakeDaemon> {
   const key = new Uint8Array(32).fill(7);
   const daemonId = new Uint8Array(16).fill(9);
   const sockets = new Set<Socket>();
-  const requests: Array<{ name?: string }> = [];
+  const requests: Array<{ name?: string; channel: number; epoch: number }> = [];
+  const terminals: Array<(ty: FrameType, body: unknown) => boolean> = [];
+  const closedRoutes: number[] = [];
+  let catalogProbes = 0;
+  let connections = 0;
   const heldOpens: Array<() => void> = [];
   let nextChannel = 1;
   const control = {
@@ -72,6 +83,7 @@ async function startFakeDaemon(): Promise<FakeDaemon> {
   };
 
   const server: Server = createServer((socket) => {
+    connections += 1;
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
     socket.on("error", () => undefined);
@@ -79,6 +91,10 @@ async function startFakeDaemon(): Promise<FakeDaemon> {
     // Handshake messages are 4-byte little-endian length + JSON; after the
     // client's auth message the stream switches to envelope frames.
     let phase: "hello" | "auth" | "frames" = "hello";
+    const routes = new Set<number>();
+    // Like the daemon, Cancel is not a terminal and cannot release a credit.
+    // GOODBYE destroys the route: a delayed provider cannot resurrect it.
+    const credits = new Set<string>();
 
     const writeAuthMessage = (value: unknown): void => {
       const json = Buffer.from(JSON.stringify(value), "utf8");
@@ -147,10 +163,20 @@ async function startFakeDaemon(): Promise<FakeDaemon> {
           send(FrameType.Pong, header.channel, header.epoch, header.corr, null);
           continue;
         }
+        if (header.ty === FrameType.Goodbye) {
+          routes.delete(header.channel);
+          closedRoutes.push(header.channel);
+          continue;
+        }
         if (header.ty !== FrameType.Request) continue;
 
         if (header.channel === 0) {
           const op = (JSON.parse(body.toString("utf8")) as { op?: string }).op;
+          if (op === "catalog.list") {
+            catalogProbes += 1;
+            send(FrameType.Response, 0, 0, header.corr, { modules: [] });
+            continue;
+          }
           if (op !== "route.open") {
             send(FrameType.Error, 0, 0, header.corr, {
               code: "unsupported",
@@ -158,20 +184,44 @@ async function startFakeDaemon(): Promise<FakeDaemon> {
             });
             continue;
           }
-          const accept = (): void =>
+          const accept = (): void => {
+            const channel = nextChannel++;
+            routes.add(channel);
             send(FrameType.Response, 0, 0, header.corr, {
               op: "route.open",
-              route_channel: nextChannel++,
+              route_channel: channel,
               route_epoch: 1,
             });
+          };
           if (control.holdRouteOpens) heldOpens.push(accept);
           else accept();
           continue;
         }
 
-        requests.push(JSON.parse(body.toString("utf8")) as { name?: string });
+        if (!routes.has(header.channel)) {
+          send(FrameType.Error, header.channel, header.epoch, header.corr, {
+            code: "unknown_channel",
+            message: "route is closed",
+          });
+          continue;
+        }
+        requests.push({
+          ...(JSON.parse(body.toString("utf8")) as { name?: string }),
+          channel: header.channel,
+          epoch: header.epoch,
+        });
+        const credit = `${header.channel}@${header.epoch}/${header.corr}`;
+        if (credits.has(credit)) throw new Error(`duplicate request credit ${credit}`);
+        credits.add(credit);
+        const terminal = (ty: FrameType, reply: unknown): boolean => {
+          if (socket.destroyed || !routes.has(header.channel) || !credits.delete(credit))
+            return false;
+          send(ty, header.channel, header.epoch, header.corr, reply);
+          return true;
+        };
+        terminals.push(terminal);
         if (control.reply !== null) {
-          send(FrameType.Response, header.channel, header.epoch, header.corr, control.reply);
+          terminal(FrameType.Response, control.reply);
         }
       }
     });
@@ -201,6 +251,22 @@ async function startFakeDaemon(): Promise<FakeDaemon> {
   return {
     connectionFile,
     requests,
+    closedRoutes,
+    get catalogProbes() {
+      return catalogProbes;
+    },
+    get connections() {
+      return connections;
+    },
+    respond(index, body = LIVE_REPLY) {
+      return terminals[index]?.(FrameType.Response, body) ?? false;
+    },
+    fail(index, code, message) {
+      return terminals[index]?.(FrameType.Error, { code, message }) ?? false;
+    },
+    loseConnections() {
+      for (const socket of sockets) socket.destroy();
+    },
     get holdRouteOpens() {
       return control.holdRouteOpens;
     },
@@ -348,7 +414,7 @@ describe("a route the plugin closes under an in-flight call (real SubcClient, fa
     expect((error as { subcTeardownReason?: string }).subcTeardownReason).toBe("root_reaped");
   });
 
-  test("a sibling call discarding the shared route reports the other in-flight call as outcome-unknown", async () => {
+  test("cancelling a sibling drains the old route while new calls use its replacement", async () => {
     const { pool, daemon } = await rig();
     const bridge = pool.getBridge(TEST_PROJECT_ROOT);
     // Open the session's route first so both calls share it.
@@ -365,11 +431,157 @@ describe("a route the plugin closes under an in-flight call (real SubcClient, fa
       .catch((error: unknown) => error);
     await waitFor(() => daemon.requests.length === 3, "both requests to reach the daemon");
 
-    // Cancelling one call discards the route it shares with the bash call.
+    const oldChannel = daemon.requests[1]!.channel;
+    expect(daemon.requests[2]!.channel).toBe(oldChannel);
     abort.abort();
 
     expect(((await cancelled) as Error).name).toBe("AbortError");
-    expectUnknownOutcomeForBash(await sibling, "route replaced");
+    daemon.reply = LIVE_REPLY;
+    expect(JSON.stringify(await bridge.send("read", { session_id: "shared" }))).toContain("live");
+    expect(daemon.requests[3]!.channel).not.toBe(oldChannel);
+    expect(daemon.closedRoutes).not.toContain(oldChannel);
+    // Host cancellation does not settle the client's pending unary request.
+    expect(daemon.respond(1)).toBe(true);
+    expect(daemon.closedRoutes).not.toContain(oldChannel);
+    expect(daemon.respond(2)).toBe(true);
+    expect(JSON.stringify(await sibling)).toContain("live");
+    await waitFor(() => daemon.closedRoutes.includes(oldChannel), "retired route to close");
+    expect(daemon.respond(2)).toBe(false);
+  });
+
+  test("unanswered calls on a slow live route do not replace it or cut a sibling", async () => {
+    const { pool, daemon } = await rig();
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    const sibling = bridge.send("bash", { session_id: "slow" }).catch((error: unknown) => error);
+    await waitFor(() => daemon.requests.length === 1, "slow bash request");
+    const channel = daemon.requests[0]!.channel;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const error = await bridge
+        .send("read", { session_id: "slow" }, { transportTimeoutMs: 60 })
+        .catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(SubcError);
+      expect((error as SubcError).code).toBe("request_deadline");
+    }
+    await waitFor(() => daemon.catalogProbes === 1, "liveness probe");
+    expect(daemon.requests.map((request) => request.channel)).toEqual([
+      channel,
+      channel,
+      channel,
+      channel,
+    ]);
+    expect(daemon.connections).toBe(1);
+    expect(daemon.closedRoutes).toEqual([]);
+    expect(daemon.respond(0)).toBe(true);
+    expect(JSON.stringify(await sibling)).toContain("live");
+    daemon.reply = LIVE_REPLY;
+    await bridge.send("read", { session_id: "slow" });
+    expect(daemon.requests.at(-1)!.channel).toBe(channel);
+  });
+
+  test("a reload refusal replaces the route without cutting a pending sibling", async () => {
+    const { pool, daemon } = await rig();
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    const sibling = bridge.send("bash", { session_id: "reload" }).catch((error: unknown) => error);
+    const refused = bridge.send("read", { session_id: "reload" });
+    await waitFor(() => daemon.requests.length === 2, "both reload requests");
+    const channel = daemon.requests[0]!.channel;
+    daemon.reply = LIVE_REPLY;
+    expect(
+      daemon.fail(
+        1,
+        "module_reloading",
+        `module endpoint for route channel ${channel} is reloading`,
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(await refused)).toContain("live");
+    expect(daemon.requests[2]!.channel).not.toBe(channel);
+    expect(daemon.closedRoutes).not.toContain(channel);
+    expect(daemon.respond(0)).toBe(true);
+    expect(JSON.stringify(await sibling)).toContain("live");
+    await waitFor(() => daemon.closedRoutes.includes(channel), "refused route to drain");
+  });
+
+  test("a cancelled request pins its retired carrier until its client deadline", async () => {
+    const { pool, daemon } = await rig();
+    pool.observeSessionStart(TEST_PROJECT_ROOT, "pin");
+    const abort = new AbortController();
+    const cancelled = pool
+      .getBridge(TEST_PROJECT_ROOT)
+      .send("read", { session_id: "pin" }, { abortSignal: abort.signal, transportTimeoutMs: 150 })
+      .catch((error: unknown) => error);
+    await waitFor(() => daemon.requests.length === 1, "pin request");
+    const channel = daemon.requests[0]!.channel;
+    abort.abort();
+    expect(((await cancelled) as Error).name).toBe("AbortError");
+    await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+    expect(pool.__retainedSessionCountsForTests().sessions).toBe(1);
+    expect(daemon.closedRoutes).not.toContain(channel);
+    await waitFor(() => daemon.closedRoutes.includes(channel), "cancelled client's deadline");
+    expect(pool.__retainedSessionCountsForTests().sessions).toBe(0);
+  });
+
+  test("a call on a retired route reports its own deadline, not route replacement", async () => {
+    const { pool, daemon } = await rig();
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    const abort = new AbortController();
+    const cancelled = bridge
+      .send(
+        "read",
+        { session_id: "expiry" },
+        { abortSignal: abort.signal, transportTimeoutMs: 2_000 },
+      )
+      .catch((error: unknown) => error);
+    const sibling = bridge
+      .send("bash", { session_id: "expiry" }, { transportTimeoutMs: 150 })
+      .catch((error: unknown) => error);
+    await waitFor(() => daemon.requests.length === 2, "both expiry requests");
+    const channel = daemon.requests[0]!.channel;
+    abort.abort();
+    expect(((await cancelled) as Error).name).toBe("AbortError");
+    const error = await sibling;
+    expect(error).toBeInstanceOf(SubcError);
+    expect((error as SubcError).code).toBe("request_deadline");
+    expect(error).not.toBeInstanceOf(SubcRouteClosedMidCallError);
+    expect(daemon.closedRoutes).not.toContain(channel);
+    expect(daemon.respond(0)).toBe(true);
+    await waitFor(() => daemon.closedRoutes.includes(channel), "retired route deadline cleanup");
+  });
+
+  test("connection loss on a retired route stays transport loss and reconnects promptly", async () => {
+    const { pool, daemon } = await rig();
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    const abort = new AbortController();
+    const cancelled = bridge
+      .send("read", { session_id: "lost" }, { abortSignal: abort.signal })
+      .catch((error: unknown) => error);
+    const sibling = bridge.send("bash", { session_id: "lost" }).catch((error: unknown) => error);
+    await waitFor(() => daemon.requests.length === 2, "both loss requests");
+    abort.abort();
+    expect(((await cancelled) as Error).name).toBe("AbortError");
+    daemon.loseConnections();
+    const error = await sibling;
+    expect(error).not.toBeInstanceOf(SubcRouteClosedMidCallError);
+    expect((error as SubcError).closeReason).toBe("connection_lost");
+    daemon.reply = LIVE_REPLY;
+    expect(JSON.stringify(await bridge.send("read", { session_id: "lost" }))).toContain("live");
+    expect(daemon.connections).toBe(2);
+  });
+
+  test("explicit session close still cuts calls on a retired route", async () => {
+    const { pool, daemon } = await rig();
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    const abort = new AbortController();
+    const cancelled = bridge
+      .send("read", { session_id: "retired-close" }, { abortSignal: abort.signal })
+      .catch((error: unknown) => error);
+    const sibling = bridge
+      .send("bash", { session_id: "retired-close" })
+      .catch((error: unknown) => error);
+    await waitFor(() => daemon.requests.length === 2, "both retired-close requests");
+    abort.abort();
+    await cancelled;
+    await pool.closeSession(TEST_PROJECT_ROOT, "retired-close");
+    expectUnknownOutcomeForBash(await sibling, "session closed");
   });
 
   for (const teardown of ["shutdown", "session close"] as const) {

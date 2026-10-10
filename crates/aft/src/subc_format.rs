@@ -619,23 +619,44 @@ fn format_import(data: &Value, ctx: &FormatContext) -> String {
         }
         Some("remove") => {
             let module = import_module_name(response, ctx);
-            let status = if response.get("removed").and_then(Value::as_bool) == Some(false) {
+            let removed = response.get("removed").and_then(Value::as_bool) != Some(false);
+            // Older producers have no remaining-binding metadata. Preserve their
+            // scope summary instead of inventing a zero remaining-name count.
+            if !response.contains_key("remaining_names") && !response.contains_key("only_name") {
+                let status = if removed { "removed" } else { "not present" };
+                let scope = ctx
+                    .import_remove_name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| format!("name {name}"))
+                    .unwrap_or_else(|| "scope entire import".to_string());
+                return [
+                    format!("{status} {module}"),
+                    format!("file {}", import_file_name(response, ctx)),
+                    scope,
+                ]
+                .join("\n");
+            }
+            let status = if !removed {
                 format!("not present {module}")
-            } else {
-                format!("removed {module}")
-            };
-            let scope = ctx
+            } else if let Some(name) = ctx
                 .import_remove_name
                 .as_deref()
                 .filter(|name| !name.is_empty())
-                .map(|name| format!("name {name}"))
-                .unwrap_or_else(|| "scope entire import".to_string());
-            [
-                status,
-                format!("file {}", import_file_name(response, ctx)),
-                scope,
-            ]
-            .join("\n")
+            {
+                if response.get("only_name").and_then(Value::as_bool) == Some(true) {
+                    format!("removed the {module} import (its only name)")
+                } else {
+                    let remaining = response
+                        .get("remaining_names")
+                        .and_then(import_number_value)
+                        .unwrap_or_else(|| "0".to_string());
+                    format!("removed {name} from the {module} import ({remaining} names remain)")
+                }
+            } else {
+                format!("removed the {module} import")
+            };
+            [status, format!("file {}", import_file_name(response, ctx))].join("\n")
         }
         _ => "No import result.".to_string(),
     }
@@ -2346,11 +2367,18 @@ fn format_zoom_text(target_label: &str, response: &Value) -> String {
     let calls_out = annotations
         .and_then(|annotations| annotations.get("calls_out"))
         .and_then(Value::as_array);
-    if let Some(calls_out) = calls_out.filter(|calls| !calls.is_empty()) {
+    let other_calls = annotations
+        .and_then(|annotations| annotations.get("other_calls"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if calls_out.is_some_and(|calls| !calls.is_empty()) || other_calls > 0 {
         out.push(String::new());
         out.push("──── calls_out".to_string());
-        for call in calls_out {
+        for call in calls_out.into_iter().flatten() {
             out.push(format_zoom_call_ref(call));
+        }
+        if other_calls > 0 {
+            out.push(format!("  +{other_calls} other calls"));
         }
     }
 
@@ -2382,6 +2410,31 @@ fn format_zoom_call_ref(call: &Value) -> String {
         .map(|count| format!(" +{count}"))
         .unwrap_or_default();
     format!("  {name} (line {line}){extra}")
+}
+
+#[cfg(test)]
+mod zoom_other_calls_tests {
+    use super::*;
+
+    #[test]
+    fn zoom_formats_other_calls_once_with_or_without_followable_calls() {
+        for calls in [
+            serde_json::json!([]),
+            serde_json::json!([{ "name": "lock", "line": 2 }]),
+        ] {
+            let response = serde_json::json!({
+                "name": "A", "kind": "function", "content": "body",
+                "annotations": { "calls_out": calls, "other_calls": 3 }
+            });
+            let text = format_zoom_text("fixture.ts", &response);
+            let expected_calls = if calls.as_array().unwrap().is_empty() {
+                ""
+            } else {
+                "  lock (line 2)\n"
+            };
+            assert_eq!(text, format!("fixture.ts:1-1 [function A]\n\n1: body\n\n──── calls_out\n{expected_calls}  +3 other calls"));
+        }
+    }
 }
 
 // Mirrors packages/opencode-plugin/src/tools/inspect.ts inspectTools.
@@ -4571,6 +4624,47 @@ mod inspect_header_tests {
         assert_eq!(
             format_inspect(&response),
             "PARTIAL — dead code still building; retry aft_inspect.\nbody"
+        );
+    }
+}
+
+#[cfg(test)]
+mod import_format_tests {
+    use super::{format_import, FormatContext};
+    use serde_json::json;
+
+    #[test]
+    fn remove_reply_names_the_removed_specifier_and_import_scope() {
+        let context = FormatContext {
+            import_op: Some("remove".to_string()),
+            import_remove_name: Some("linkSync".to_string()),
+            ..FormatContext::default()
+        };
+        assert_eq!(
+            format_import(
+                &json!({
+                    "removed": true,
+                    "module": "node:fs",
+                    "file": "source.ts",
+                    "remaining_names": 8,
+                    "only_name": false
+                }),
+                &context
+            ),
+            "removed linkSync from the node:fs import (8 names remain)\nfile source.ts"
+        );
+        assert_eq!(
+            format_import(
+                &json!({
+                    "removed": true,
+                    "module": "node:fs",
+                    "file": "source.ts",
+                    "remaining_names": 0,
+                    "only_name": true
+                }),
+                &context
+            ),
+            "removed the node:fs import (its only name)\nfile source.ts"
         );
     }
 }

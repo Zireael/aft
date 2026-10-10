@@ -196,8 +196,7 @@ fn standalone_tool_call_carries_hashline_registration_for_later_sessions() {
                 "source": root.join(".cortexkit/aft.jsonc"),
                 "doc": json!({
                     "edit_mode": "hashline",
-                    "search_index": false,
-                    "semantic_search": false
+                    "indexes": { "trigram": false, "semantic": false }
                 }).to_string()
             }]
         }),
@@ -286,8 +285,7 @@ fn hashline_tool_call_activates_read_edit_undo_and_seamless_default_rebind() {
                     "source": root.join(".cortexkit/aft.jsonc"),
                     "doc": json!({
                         "edit_mode": edit_mode,
-                        "search_index": false,
-                        "semantic_search": false
+                        "indexes": { "trigram": false, "semantic": false }
                     }).to_string()
                 }]
             }),
@@ -423,8 +421,7 @@ fn plugin_harness_without_edit_registration_fails_safe_to_default_once() {
                 "source": root.join(".cortexkit/aft.jsonc"),
                 "doc": json!({
                     "edit_mode": "hashline",
-                    "search_index": false,
-                    "semantic_search": false
+                    "indexes": { "trigram": false, "semantic": false }
                 }).to_string()
             }]
         }),
@@ -720,9 +717,7 @@ fn unsupported_translate_tools_still_raw_dispatch_native_commands() {
                 "project_root": project.path().to_string_lossy(),
                 "harness": "opencode",
                 "config": crate::helpers::user_config(json!({
-                    "search_index": false,
-                    "semantic_search": false,
-                    "callgraph_store": false
+                    "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))
             }
         }),
@@ -924,9 +919,7 @@ fn configure_project(aft: &mut AftProcess, root: &Path, id: &str) {
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
             "config": crate::helpers::user_config(json!({
-                "search_index": false,
-                "semantic_search": false,
-                "callgraph_store": false
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             })),
         }),
     );

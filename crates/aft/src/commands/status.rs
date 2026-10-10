@@ -237,6 +237,19 @@ impl AppContext {
                                         "model": config.semantic.model.as_str(),
                                     })
                                 }
+                                SemanticIndexStatus::Failed(error)
+                                    if crate::semantic_admission::is_not_opened_status(
+                                        error.as_str(),
+                                    ) =>
+                                {
+                                    serde_json::json!({
+                                        "status": crate::semantic_admission::NOT_OPENED_LABEL,
+                                        "state": crate::semantic_admission::NOT_OPENED_LABEL,
+                                        "refreshing_count": 0,
+                                        "backend": config.semantic_backend_label(),
+                                        "model": config.semantic.model.as_str(),
+                                    })
+                                }
                                 SemanticIndexStatus::Failed(error) => serde_json::json!({
                                     "status": "failed",
                                     "state": "failed",
@@ -380,6 +393,14 @@ impl AppContext {
         let storage_root = crate::bash_background::storage_dir(config.storage_dir.as_deref());
         let storage_refusals = crate::persisted_format::refusals_under(&storage_root);
         for refusal in &storage_refusals {
+            // A single unreadable task does not disable bash for any other
+            // task or session. Health still lists it by path below; a floor
+            // refusal remains a storage-wide degraded-mode reason.
+            if refusal.store == crate::persisted_format::PersistedStore::BashTask
+                && refusal.source == crate::persisted_format::RefusalSource::Artifact
+            {
+                continue;
+            }
             let reason = refusal.reason();
             if !degraded_reasons.contains(&reason) {
                 degraded_reasons.push(reason);
@@ -448,7 +469,8 @@ impl AppContext {
         } else {
             serde_json::Value::Null
         };
-        let status_bar_values = serde_json::json!({
+        let disabled_categories = status_bar_values.disabled_categories.clone();
+        let mut status_bar_values = serde_json::json!({
             "errors": status_bar_values.errors,
             "warnings": status_bar_values.warnings,
             "diagnostics": diagnostics_state,
@@ -458,6 +480,9 @@ impl AppContext {
             "todos": status_bar_values.todos,
             "tier2_stale": status_bar_values.tier2_stale,
         });
+        if !disabled_categories.is_empty() {
+            status_bar_values["disabled_categories"] = serde_json::json!(disabled_categories);
+        }
         let memory_root = self
             .canonical_cache_root_opt()
             .or_else(|| config.project_root.clone());
@@ -506,6 +531,7 @@ impl AppContext {
             "degraded": degraded,
             "degraded_reasons": degraded_reasons,
             "storage_refusals": storage_refusals,
+            "storage_retention": crate::storage_retention::snapshot(&storage_root),
             "git": crate::developer_tools::git_status_json(),
             "features": {
                 "format_on_edit": config.format_on_edit,

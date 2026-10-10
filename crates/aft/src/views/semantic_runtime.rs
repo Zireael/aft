@@ -225,6 +225,7 @@ impl CheckoutSemantic {
         }
         let caught_up = report.deferred == 0 || (report.installed == 0 && report.failed == 0);
         if caught_up && self.unfolded.swap(false, Ordering::SeqCst) {
+            crate::cold_build_limiter::progress::phase("publishing", None);
             let (snapshot, revision) = self.driver.installed_cut();
             if let Err(error) = self.loader.fold(&self.access, &snapshot, revision) {
                 self.unfolded.store(true, Ordering::SeqCst);
@@ -1189,6 +1190,7 @@ where
     F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
 {
     let mut progress = false;
+    let mut telemetry = None;
     loop {
         let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
             &schedule.limiter,
@@ -1198,6 +1200,15 @@ where
         ) else {
             return FillOutcome::Stop;
         };
+        if telemetry.is_none() {
+            telemetry = Some(crate::cold_build_limiter::progress::start(
+                &schedule.root,
+                LIMITER_KIND,
+                None,
+                crate::cold_build_limiter::progress::StartLog::Info,
+            ));
+            crate::cold_build_limiter::progress::phase("embedding", None);
+        }
         match runtime.refresh(budget, embed) {
             Ok(report) => {
                 if report.model_calls > 0
@@ -1206,11 +1217,13 @@ where
                     || !report.store_errors.is_empty()
                 {
                     crate::slog_info!(
-                        "semantic view fill root={} queued={} deferred={} embedded_keys={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={}",
+                        "semantic view fill root={} queued={} deferred={} embedded_keys={} chunks={} chunk_reused={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={}",
                         schedule.root.display(),
                         report.queued,
                         report.deferred,
                         report.embedded_keys,
+                        report.chunks,
+                        report.chunk_reused,
                         report.embedded_texts,
                         report.model_calls,
                         report.stored_hits,

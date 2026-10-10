@@ -213,8 +213,9 @@ jobs:
           # so use every core.
           NEXTEST_TEST_THREADS: "num-cpus"
           # The archive shards own the nextest integration inventory; keep the
-          # libtest and serialized watcher invocations byte-for-byte unchanged.
-          AFT_GATE_PHASES: lib,watcher
+          # libtest and serialized watcher invocations unchanged, and run the
+          # provider's durable crash hooks in the feature-enabled grouped suite.
+          AFT_GATE_PHASES: lib,watcher,conformance
           # The release-storm phase runs in its own parallel job
           # (unit-linux-storm) so its release-profile build is off this
           # job's critical path.
@@ -438,7 +439,10 @@ jobs:
   unit-linux-storm:
     name: Release storm (Linux)
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    # The storm runs a release-profile build first. With a cold compiler cache
+    # that build plus the storm takes about 23 minutes on a normal runner, and
+    # a slow runner crossed the old 25-minute cap mid-test.
+    timeout-minutes: 40
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -524,7 +528,9 @@ jobs:
   unit-macos-nextest-archive:
     name: Cargo test archive (macOS)
     runs-on: macos-26
-    timeout-minutes: 25
+    # A cold macOS build of the crate and its test binaries takes about 15
+    # minutes on these runners, leaving 25 minutes no room for the archive.
+    timeout-minutes: 40
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -580,7 +586,10 @@ jobs:
   unit-macos:
     name: Unit tests (macOS)
     runs-on: macos-26
-    timeout-minutes: 25
+    # Measured 2026-10-08: build ~15 min, lib suite ~5 min, watcher suite
+    # compile and run ~4 min, then conformance. 25 minutes cancelled the job
+    # mid-watcher three runs in a row while every test that ran passed.
+    timeout-minutes: 40
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -652,7 +661,7 @@ jobs:
           NEXTEST_TEST_THREADS: "num-cpus"
           # Archive shards own the integration inventory. These phases preserve
           # the isolated keychain probe and serialized watcher behavior.
-          AFT_GATE_PHASES: lib,watcher
+          AFT_GATE_PHASES: lib,watcher,conformance
           AFT_UNIT_TEST_RUNNER: nextest
           # The storm tests exercise no macOS-specific paths; the dedicated
           # unit-linux-storm job is the release-storm arbiter.
@@ -875,7 +884,7 @@ jobs:
         shell: bash
         env:
           AFT_TEST_DIAG: "1"
-          AFT_GATE_PHASES: lib,watcher
+          AFT_GATE_PHASES: lib,watcher,conformance
           AFT_GATE_SKIP_RELEASE_STORM: "1"
 
       - name: Upload Windows libtest output
@@ -960,6 +969,12 @@ jobs:
 
       - name: Cargo check (deny warnings)
         run: cargo check --workspace --all-targets
+        shell: pwsh
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Check feature-enabled provider conformance (deny warnings)
+        run: cargo check -p agent-file-tools --features test-timing-hooks --test rest
         shell: pwsh
         env:
           RUSTFLAGS: "-D warnings"

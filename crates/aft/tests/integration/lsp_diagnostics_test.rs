@@ -2805,9 +2805,7 @@ fn configured_rust_context_with_lsp(root: &std::path::Path, lsp: serde_json::Val
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
         "config": crate::helpers::user_config(serde_json::json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false,
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "lsp": lsp
         })),
     }))

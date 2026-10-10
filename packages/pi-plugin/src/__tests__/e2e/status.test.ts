@@ -7,7 +7,9 @@ describe("aft-status e2e", () => {
     const prep = await prepareBinary();
     if (!prep.binaryPath) return;
 
-    const harness = await createHarness(prep, { config: { search_index: false } });
+    const harness = await createHarness(prep, {
+      config: { indexes: { trigram: false, semantic: false } },
+    });
     try {
       let command: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
       registerStatusCommand(
@@ -18,7 +20,7 @@ describe("aft-status e2e", () => {
         } as never,
         {
           pool: harness.pool,
-          config: { tool_surface: "all", search_index: false, semantic_search: false },
+          config: { disabled_tools: [], indexes: { trigram: false, semantic: false } },
           storageDir: harness.path(".aft-storage"),
         } as never,
       );

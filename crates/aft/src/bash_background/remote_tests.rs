@@ -1,4 +1,5 @@
 use super::*;
+use crate::bash_background::persistence::{read_task, write_task};
 use crate::exec_remote::wire_tests::{daemon, id, Script};
 fn reattach_budgets() -> &'static Mutex<HashMap<PathBuf, Duration>> {
     static BUDGETS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Duration>>> =
@@ -12,10 +13,13 @@ pub(super) fn take_reattach_budget(root: &Path) -> Option<Duration> {
 
 fn shorten_reattach_budget(root: &Path) {
     // Scope the hook to one worker, so parallel remote tests keep the real budget.
+    // Empty attaches are 100 ms apart, so 1.5 s leaves room for several even on
+    // a loaded runner. Tests bound the whole recovery at 30 s, which only
+    // catches a budget that never expires.
     reattach_budgets()
         .lock()
         .unwrap()
-        .insert(root.into(), Duration::from_millis(250));
+        .insert(root.into(), Duration::from_millis(1_500));
 }
 
 fn crash_tasks() -> &'static Mutex<HashSet<String>> {
@@ -60,13 +64,14 @@ fn registry() -> BgTaskRegistry {
 
 pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunch {
     crate::bash_background::RemoteLaunch {
+        explicit_runon: false,
         connection_file: Some(connection),
         harness: "broca".into(),
         session: "session".into(),
         params: exec::FrozenParams {
             remote_exec: Some(exec::policy::RemoteExecPolicy {
                 enabled: true,
-                commands: vec!["printf".into()],
+                ..Default::default()
             }),
             ..Default::default()
         },
@@ -85,7 +90,7 @@ fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
             HashMap::from([("BUILD_REMOTE_ENV_TEST".into(), "environment-proof".into())]),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
             dir.into(),
-            10,
+            crate::bash_background::TaskSlot::Background { max: 10 },
             true,
             false,
             Some(dir.into()),
@@ -108,10 +113,103 @@ async fn terminal(registry: &BgTaskRegistry, task: &str) -> BgTaskSnapshot {
 }
 
 #[tokio::test]
+async fn exec_remote_bash_background_slots_are_shared_with_local_tasks() {
+    use crate::bash_background::{HardKill, TaskSlot};
+
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let local = registry
+        .spawn_with_shell(
+            SpawnPlan::Unsandboxed,
+            "sleep 30 # local-slot-holder",
+            crate::bash_background::BashShell::Bash,
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            HardKill::After(Duration::from_secs(60)),
+            dir.path().into(),
+            1,
+            false,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let remote_spawn = |slot| {
+        let mut launch = launch(daemon.connection.clone());
+        launch.explicit_runon = true;
+        registry.spawn_remote(
+            launch,
+            SpawnPlan::Unsandboxed,
+            "printf remote-slot-proof",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            HardKill::After(Duration::from_secs(60)),
+            dir.path().into(),
+            slot,
+            false,
+            false,
+            Some(dir.path().into()),
+        )
+    };
+    // Remote background work uses the same project-local budget, whereas a
+    // remote foreground call is admitted even when local work fills it.
+    let refusal = remote_spawn(TaskSlot::Background { max: 1 }).unwrap_err();
+    assert!(refusal.contains(&local), "{refusal}");
+    assert!(refusal.contains("local-slot-holder"), "{refusal}");
+    let foreground = remote_spawn(TaskSlot::Foreground).unwrap();
+    registry.kill(&local, "session").unwrap();
+    registry
+        .check_background_slot(TaskSlot::Background { max: 1 }, "session")
+        .expect("a waiting remote foreground command holds no slot");
+    registry.promote(&foreground, "session").unwrap();
+    let refusal = registry
+        .check_background_slot(TaskSlot::Background { max: 1 }, "session")
+        .unwrap_err();
+    assert!(refusal.contains(&foreground), "{refusal}");
+    assert!(refusal.contains("remote-slot-proof"), "{refusal}");
+    // Wait for executor acceptance before cancellation, and leave the async
+    // test runtime free to serve the fake executor's cancel response.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if registry
+                .task(&foreground)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .metadata
+                .remote
+                .as_ref()
+                .unwrap()
+                .job_id
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fake executor must accept the foreground command");
+    let killing = registry.clone();
+    let kill_task = foreground.clone();
+    tokio::task::spawn_blocking(move || killing.kill(&kill_task, "session").unwrap())
+        .await
+        .unwrap();
+    let done = terminal(&registry, &foreground).await;
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+}
+
+#[tokio::test]
 async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
     for (script, reason) in [
         (Script::Refused, "future_refusal"),
         (Script::KnownRefused, "unreachable"),
+        (Script::WorkspaceSetupRefused, "workspace_setup_failed"),
     ] {
         let daemon = daemon(script, "exec-remote/v1").await;
         let dir = tempfile::tempdir().unwrap();
@@ -124,9 +222,15 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
             "{}",
             done.output_preview
         );
-        assert!(
-            done.output_preview
-                .contains(&format!("ran locally: remote executor refused ({reason})")),
+        assert_eq!(
+            done.output_preview.lines().next(),
+            Some(
+                format!(
+                    "ran locally on {}: remote refused: {reason}",
+                    local_os_name()
+                )
+                .as_str()
+            ),
             "{}",
             done.output_preview
         );
@@ -137,6 +241,140 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
             "environment-proof"
         );
         assert_eq!(request.1["params"]["cwd"], dir.path().display().to_string());
+    }
+}
+
+fn refusal_response(snapshot: BgTaskSnapshot) -> crate::protocol::Response {
+    let now = std::time::Instant::now();
+    match crate::commands::bash_orchestrate::decide_bash_step(
+        snapshot, now, true, false, now, "runon",
+    ) {
+        crate::commands::bash_orchestrate::BashStep::Done(response) => response,
+        _ => panic!("a terminal refusal must finish the foreground call"),
+    }
+}
+
+fn assert_runon_refusal(response: &crate::protocol::Response, reason: &str) {
+    assert!(!response.success, "{response:?}");
+    assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
+    assert_eq!(
+        response.data["message"],
+        format!("runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally"),
+        "{response:?}"
+    );
+}
+
+#[tokio::test]
+async fn runon_executor_refusal_never_spawns_locally_and_returns_error() {
+    for (script, reason) in [
+        (Script::KnownRefused, "unreachable"),
+        (Script::WorkspaceSetupRefused, "workspace_setup_failed"),
+        (Script::Refused, "future_refusal"),
+    ] {
+        let daemon = daemon(script, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-run-locally");
+        let ctx = restarted_context(dir.path());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": format!("printf local-proof > '{}'", marker.display()),
+                "runon": "linux", "compressed": false
+            }),
+        );
+        assert!(
+            response.success,
+            "the asynchronous launch returns a task: {response:?}"
+        );
+        let task_id = response.data["task_id"].as_str().unwrap();
+        let done = terminal(ctx.bash_background(), task_id).await;
+        assert!(
+            !marker.exists(),
+            "explicit runon spawned locally after {reason}"
+        );
+        assert_eq!(done.child_pid, None);
+        assert_eq!(done.info.status, BgTaskStatus::Failed);
+        let task = ctx.bash_background().task(task_id).unwrap();
+        assert!(!task.state.lock().unwrap().metadata.local_fallback_started);
+        assert_runon_refusal(&refusal_response(done), reason);
+        let status = crate::commands::bash_status::handle(
+            &crate::protocol::RawRequest {
+                id: "runon-status".into(),
+                command: "bash_status".into(),
+                session_id: Some("session".into()),
+                lsp_hints: None,
+                params: serde_json::json!({"task_id": task_id}),
+            },
+            &ctx,
+        );
+        assert_runon_refusal(&status, reason);
+        assert_eq!(status.data["remote_refusal"]["code"], "remote_unavailable");
+        assert_eq!(exec_runs(&daemon).len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn prefix_routing_executor_refusal_still_spawns_locally_with_advisory() {
+    for (script, reason) in [
+        (Script::KnownRefused, "unreachable"),
+        (Script::WorkspaceSetupRefused, "workspace_setup_failed"),
+        (Script::Refused, "future_refusal"),
+    ] {
+        let daemon = daemon(script, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("local-fallback");
+        let ctx = restarted_context(dir.path());
+        let mut policy = launch(daemon.connection.clone());
+        policy.params.remote_exec.as_mut().unwrap().legacy_commands =
+            Some(serde_json::json!(["touch"]));
+        let response = handle_with_policy(
+            &ctx,
+            Some(policy),
+            serde_json::json!({
+                "command": format!("touch '{}'", marker.display()),
+                "compressed": false
+            }),
+        );
+        assert!(response.success, "{response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert!(
+            marker.exists(),
+            "prefix routing must run locally after {reason}"
+        );
+        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(
+            exec_runs(&daemon).len(),
+            1,
+            "the prefix must actually route remotely"
+        );
+        let status_request = crate::protocol::RawRequest {
+            id: "prefix-status".into(),
+            command: "bash_status".into(),
+            session_id: Some("session".into()),
+            lsp_hints: None,
+            params: serde_json::json!({"task_id": response.data["task_id"]}),
+        };
+        let status = crate::commands::bash_status::handle(&status_request, &ctx);
+        assert!(status.success, "{status:?}");
+        assert!(
+            status.data["output_preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!(
+                    "ran locally on {}: remote refused: {reason}",
+                    local_os_name()
+                )),
+            "tool status: {status:?}; execution note: {:?}",
+            ctx.bash_background()
+                .execution_note(response.data["task_id"].as_str().unwrap(), "session")
+        );
+        assert!(refusal_response(done).success);
+        assert_eq!(exec_runs(&daemon).len(), 1);
     }
 }
 
@@ -201,7 +439,7 @@ async fn exec_remote_bash_empty_attach_budget_reports_job_without_rerun() {
     shorten_reattach_budget(dir.path());
     let registry = registry();
     let task_id = start(&registry, dir.path(), daemon.connection.clone());
-    let done = tokio::time::timeout(Duration::from_secs(2), terminal(&registry, &task_id))
+    let done = tokio::time::timeout(Duration::from_secs(30), terminal(&registry, &task_id))
         .await
         .expect("empty attaches must exhaust the recovery budget");
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
@@ -358,7 +596,7 @@ async fn exec_remote_bash_attach_call_and_reconnect_failures_exhaust_budget() {
     shorten_reattach_budget(dir.path());
     let registry = registry();
     let task_id = start(&registry, dir.path(), daemon.connection.clone());
-    let done = tokio::time::timeout(Duration::from_secs(2), terminal(&registry, &task_id))
+    let done = tokio::time::timeout(Duration::from_secs(30), terminal(&registry, &task_id))
         .await
         .expect("failed attach calls and reconnects must exhaust the recovery budget");
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
@@ -387,7 +625,7 @@ async fn exec_remote_bash_restart_connect_failures_exhaust_reattach_budget() {
     );
     shorten_reattach_budget(dir.path());
     registry.resume_remote_task(&task_id).unwrap();
-    let done = tokio::time::timeout(Duration::from_secs(2), terminal(&registry, &task_id))
+    let done = tokio::time::timeout(Duration::from_secs(30), terminal(&registry, &task_id))
         .await
         .expect("restarting an accepted job cannot retry connect forever");
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
@@ -412,10 +650,21 @@ async fn exec_remote_bash_raw_utf8_pipeline_and_workspace_changes() {
         fs::read_to_string(&task.paths.pipeline_status).unwrap(),
         "3 0\n"
     );
-    assert!(done.output_preview.contains("ran remotely on ck-motor"));
-    assert!(done
-        .output_preview
-        .contains("workspace_changes (not copied back): generated.txt"));
+    assert_eq!(
+        done.output_preview.lines().next(),
+        Some("ran remotely on ck-motor")
+    );
+    // The changed file is named after the output, and it was not copied back.
+    assert!(
+        done.output_preview.ends_with(
+            "These files changed on the server and were NOT copied back:\n  generated.txt\n\
+             git state: not reported by the runner\n\
+             untracked files: not reported by the runner\n\
+             ignored writes: not reported by the runner"
+        ),
+        "{}",
+        done.output_preview
+    );
     assert!(!dir.path().join("generated.txt").exists());
 }
 
@@ -429,6 +678,8 @@ async fn exec_remote_bash_discloses_only_names_aft_stripped() {
         ("SHELL_SECRET".into(), "secret-fixture-value".into()),
         ("AWS_REGION".into(), "not-off-host".into()),
         ("AFT_CONTROL_PATH".into(), "private-control-value".into()),
+        ("NEXTEST_TEST_THREADS".into(), "5".into()),
+        ("RUST_TEST_THREADS".into(), "6".into()),
     ]);
     let task_id = registry
         .spawn_remote(
@@ -441,7 +692,7 @@ async fn exec_remote_bash_discloses_only_names_aft_stripped() {
             env,
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
             dir.path().into(),
-            10,
+            crate::bash_background::TaskSlot::Background { max: 10 },
             true,
             false,
             Some(dir.path().into()),
@@ -457,12 +708,22 @@ async fn exec_remote_bash_discloses_only_names_aft_stripped() {
     assert!(request["params"]["env"].get("SHELL_SECRET").is_none());
     assert!(request["params"]["env"].get("AWS_REGION").is_none());
     assert!(request["params"]["env"].get("AFT_CONTROL_PATH").is_none());
+    assert!(request["params"]["env"]
+        .get("NEXTEST_TEST_THREADS")
+        .is_none());
+    assert!(request["params"]["env"].get("RUST_TEST_THREADS").is_none());
     assert_eq!(request["params"]["env"]["BUILD_LABEL"], "ordinary-build");
     assert!(
         done.output_preview.contains("AFT stripped env names:"),
         "{done:?}"
     );
-    for name in ["SHELL_SECRET", "AWS_REGION", "AFT_CONTROL_PATH"] {
+    for name in [
+        "SHELL_SECRET",
+        "AWS_REGION",
+        "AFT_CONTROL_PATH",
+        "NEXTEST_TEST_THREADS",
+        "RUST_TEST_THREADS",
+    ] {
         assert!(done.output_preview.contains(name), "{done:?}");
     }
     for value in [
@@ -632,6 +893,54 @@ async fn exec_remote_bash_continuous_output_cannot_starve_cancel() {
 }
 
 #[tokio::test]
+async fn exec_remote_launch_is_fenced_by_a_refused_startup_receipt() {
+    // The bash reply deadline refused this startup and told the caller the
+    // command was not started; the remote launch must then create nothing:
+    // no registered task, no task record, no remote request or local fallback.
+    let daemon = daemon(Script::Refused, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let receipt = Arc::new(crate::bash_background::SpawnReceipt::new(
+        std::time::Instant::now() + Duration::from_secs(600),
+    ));
+    assert_eq!(
+        receipt.expire(),
+        crate::bash_background::StartupOutcome::Refused
+    );
+    let result = crate::bash_background::with_spawn_receipt(receipt, || {
+        registry.spawn_remote(
+            launch(daemon.connection.clone()),
+            SpawnPlan::Unsandboxed,
+            "printf local-proof > remote-fence-probe",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+    });
+    let error = result.expect_err("a refused receipt must refuse the remote launch");
+    assert!(error.contains("startup deadline expired"), "{error}");
+    assert!(registry.list(0).is_empty());
+    let (ids, _) = discover_task_ids(&session_tasks_dir(dir.path(), "session")).unwrap_or_default();
+    assert!(
+        ids.is_empty(),
+        "refused remote launch left records: {ids:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!dir.path().join("remote-fence-probe").exists());
+    assert!(
+        daemon.log.lock().unwrap().is_empty(),
+        "no remote request may be sent"
+    );
+}
+
+#[tokio::test]
 async fn exec_remote_bash_deadline_is_not_cancel() {
     let daemon = daemon(Script::Deadline, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
@@ -674,6 +983,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        explicit_runon: false,
         connection_file: Some(daemon.connection.clone()),
         harness: "broca".into(),
         session: "session".into(),
@@ -825,6 +1135,7 @@ fn persist_accepted_with_snapshot(
     metadata.status = BgTaskStatus::Running;
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        explicit_runon: false,
         connection_file: Some(connection),
         harness: "runner".into(),
         session: "session".into(),
@@ -851,12 +1162,20 @@ fn persist_accepted_with_snapshot(
 }
 
 fn restarted_context(dir: &Path) -> crate::context::AppContext {
+    restarted_context_with_runon(dir, true)
+}
+
+fn restarted_context_with_runon(dir: &Path, enabled: bool) -> crate::context::AppContext {
     // A fresh configuration would choose ordinary unsandboxed inheritance;
     // the saved Host plan must still clear ambient HOME before its command.
     crate::context::AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(dir.into()),
+            bash: crate::config::BashConfig {
+                runon_enabled: enabled,
+                ..Default::default()
+            },
             sandbox: crate::config::SandboxConfig {
                 enabled: false,
                 ..Default::default()
@@ -904,9 +1223,10 @@ async fn exec_remote_bash_restart_refusal_uses_original_launch_plan() {
     restarted.replay_session(dir.path(), "session").unwrap();
     let done = terminal(restarted, &task_id).await;
     assert_eq!(fs::read(&paths.stdout).unwrap(), b"host-proof");
-    assert!(done
-        .output_preview
-        .contains("ran locally: remote executor refused (future_refusal)"));
+    assert!(done.output_preview.contains(&format!(
+        "ran locally on {}: remote refused: future_refusal",
+        local_os_name()
+    )));
     assert!(
         crate::bash_background::persistence::read_task(&paths.json)
             .unwrap()
@@ -918,6 +1238,60 @@ async fn exec_remote_bash_restart_refusal_uses_original_launch_plan() {
         .unwrap()
         .iter()
         .any(|(_, b)| b["method"] == "exec.run"));
+}
+
+#[tokio::test]
+async fn runon_restart_executor_refusal_never_restores_local_launch() {
+    // Cover both an attach that learns a refusal and a refusal already saved
+    // before the previous process could decide whether to launch locally.
+    for saved_terminal in [false, true] {
+        let daemon = daemon(Script::AttachRefused, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-run-after-restart");
+        let command = format!("printf local-proof > '{}'", marker.display());
+        let (original, task_id, paths) =
+            persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), &command);
+        let mut metadata = read_task(&paths.json).unwrap();
+        let remote = metadata.remote.as_mut().unwrap();
+        remote.explicit_runon = true;
+        if saved_terminal {
+            remote.terminal = Some(TerminalRecord::new(
+                id(),
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::Unknown("future_refusal".into()),
+                },
+                1,
+                0,
+                0,
+            ));
+        }
+        write_task(&paths.json, &metadata).unwrap();
+        drop(original);
+        let ctx = restarted_context(dir.path());
+        let restarted = ctx.bash_background();
+        restarted.replay_session(dir.path(), "session").unwrap();
+        let done = terminal(restarted, &task_id).await;
+        assert!(
+            !marker.exists(),
+            "explicit runon restored a local launch after restart"
+        );
+        assert_eq!(done.child_pid, None);
+        assert!(!read_task(&paths.json).unwrap().local_fallback_started);
+        assert_runon_refusal(&refusal_response(done), "future_refusal");
+        assert!(
+            exec_runs(&daemon).is_empty(),
+            "restart must not resubmit remotely"
+        );
+        // The terminal refusal and its structured error also survive another restart.
+        drop(ctx);
+        let ctx = restarted_context(dir.path());
+        ctx.bash_background()
+            .replay_session(dir.path(), "session")
+            .unwrap();
+        let done = terminal(ctx.bash_background(), &task_id).await;
+        assert_runon_refusal(&refusal_response(done), "future_refusal");
+        assert!(!marker.exists());
+    }
 }
 
 #[tokio::test]
@@ -1314,4 +1688,335 @@ async fn exec_remote_bash_fallback_marker_before_cancel_uses_local_kill() {
         .unwrap()
         .iter()
         .any(|(_, b)| b["method"] == "exec.cancel"));
+}
+
+/// Run `params` through the bash command handler with `policy` installed as
+/// the session's remote policy, as the subc tool-call path does.
+fn handle_with_policy(
+    ctx: &crate::context::AppContext,
+    policy: Option<crate::bash_background::RemoteLaunch>,
+    params: serde_json::Value,
+) -> crate::protocol::Response {
+    let request = crate::protocol::RawRequest {
+        id: "runon".into(),
+        command: "bash".into(),
+        session_id: Some("session".into()),
+        lsp_hints: None,
+        params,
+    };
+    crate::bash_background::with_remote_policy(policy, || {
+        crate::commands::bash::handle(&request, ctx)
+    })
+}
+
+fn exec_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json::Value> {
+    daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.run")
+        .map(|(_, body)| body["params"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    // Pipes, an environment prefix, a list and a command the old prefix
+    // matcher would never have sent anywhere: all of it goes as one line.
+    let line = "BUILD_FLAVOR=ci git status | tr a-z A-Z && printf '%s' \"$HOME\" ; ls | wc -l";
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({"command": line, "runon": "linux", "compressed": false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let done = terminal(ctx.bash_background(), &task_id).await;
+    let runs = exec_runs(&daemon);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["command"], line);
+    assert_eq!(
+        Path::new(runs[0]["cwd"].as_str().unwrap()),
+        dir.path(),
+        "the remote run uses the call's working directory"
+    );
+    let rendered = crate::commands::bash_orchestrate::format_foreground_result(&done);
+    assert_eq!(
+        rendered.lines().next(),
+        Some("ran remotely on ck-motor"),
+        "{rendered}"
+    );
+    // A report without a changed-file list says so, after the output.
+    assert!(
+        rendered.ends_with(
+            "changed files: not reported by the runner\n\
+             git state: not reported by the runner\n\
+             untracked files: not reported by the runner\n\
+             ignored writes: not reported by the runner"
+        ),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn old_shape_prefix_routing_survives_the_runon_kill_switch_and_runon_works_when_enabled() {
+    for enabled in [false, true] {
+        let daemon =
+            crate::exec_remote::wire_tests::daemon_with_clients(Script::Plain, "exec-remote/v1", 2)
+                .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context_with_runon(dir.path(), enabled);
+        let mut old = launch(daemon.connection.clone());
+        old.params.remote_exec.as_mut().unwrap().legacy_commands =
+            Some(serde_json::json!(["cd", "cargo test"]));
+        let plain = handle_with_policy(
+            &ctx,
+            Some(old.clone()),
+            serde_json::json!({"command":"cargo test", "compressed":false}),
+        );
+        assert!(plain.success, "{plain:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            plain.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+        assert_eq!(
+            exec_runs(&daemon).len(),
+            1,
+            "plain cargo must keep using the deployed route"
+        );
+        let whole = handle_with_policy(
+            &ctx,
+            Some(old),
+            serde_json::json!({"command":"FOO=1 cargo test | tail -1", "runon":"linux"}),
+        );
+        if enabled {
+            assert!(whole.success, "{whole:?}");
+            let done = terminal(
+                ctx.bash_background(),
+                whole.data["task_id"].as_str().unwrap(),
+            )
+            .await;
+            assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+            assert_eq!(exec_runs(&daemon).len(), 2);
+        } else {
+            assert!(!whole.success);
+            assert!(whole.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("bash.runon_enabled"));
+            assert_eq!(exec_runs(&daemon).len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn runon_is_refused_when_the_daemon_has_no_exec_remote_provider() {
+    let daemon = daemon(Script::Plain, "exec.remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("must-not-run-locally");
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": format!("echo SHOULD_NOT_RUN > '{}'", marker.display()),
+            "runon": "linux"
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let task = response.data["task_id"].as_str().unwrap();
+    let snapshot = terminal(ctx.bash_background(), task).await;
+    assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
+    let rendered = crate::commands::bash_orchestrate::format_foreground_result(&snapshot);
+    assert!(rendered.contains("runon refused"), "{rendered}");
+    assert!(rendered.contains("exec-remote/v1"), "{rendered}");
+    assert!(!rendered.contains("ran locally"), "{rendered}");
+    assert!(exec_runs(&daemon).is_empty());
+    assert!(
+        !marker.exists(),
+        "missing providers must not cause local execution"
+    );
+}
+
+#[tokio::test]
+async fn without_runon_new_shape_plans_keep_commands_local() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    // New-shape plans have no prefix list and require an explicit remote demand.
+    let mut policy = launch(daemon.connection.clone());
+    policy.params.remote_exec.as_mut().unwrap().default_demand = Some("linux".into());
+    let response = handle_with_policy(
+        &ctx,
+        Some(policy),
+        serde_json::json!({"command": "printf local-proof", "compressed": false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let done = terminal(ctx.bash_background(), &task_id).await;
+    assert!(exec_runs(&daemon).is_empty());
+    let task = ctx.bash_background().task(&task_id).unwrap();
+    assert!(task.state.lock().unwrap().metadata.remote.is_none());
+    assert_eq!(
+        crate::commands::bash_orchestrate::format_foreground_result(&done),
+        "local-proof"
+    );
+}
+
+#[tokio::test]
+async fn runon_is_refused_by_name_whenever_it_cannot_run_remotely() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran-locally");
+    let command = format!("printf x > '{}'", marker.display());
+    let enabled = || Some(launch(daemon.connection.clone()));
+    let mut disabled = launch(daemon.connection.clone());
+    disabled.params.remote_exec.as_mut().unwrap().enabled = false;
+    let ctx = restarted_context(dir.path());
+    let mut project_off = crate::config::Config {
+        project_root: Some(dir.path().into()),
+        ..Default::default()
+    };
+    project_off.sandbox.enabled = false;
+    project_off.remote_exec.project_off = true;
+    project_off.bash.runon_enabled = true;
+    let project_off_ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        project_off,
+    );
+    for (ctx, policy, extra, expected) in [
+        (
+            &project_off_ctx,
+            enabled(),
+            serde_json::json!({}),
+            "remote runs are off for this project",
+        ),
+        (
+            &ctx,
+            None,
+            serde_json::json!({}),
+            "this session has no remote runner",
+        ),
+        (
+            &ctx,
+            Some(disabled.clone()),
+            serde_json::json!({}),
+            "this session has no remote runner",
+        ),
+        (
+            &ctx,
+            enabled(),
+            serde_json::json!({"pty": true}),
+            "runon cannot be combined with pty:true",
+        ),
+        (
+            &ctx,
+            enabled(),
+            serde_json::json!({"shell": "powershell"}),
+            "runon cannot run PowerShell",
+        ),
+        (
+            &ctx,
+            enabled(),
+            serde_json::json!({"runon": "windows"}),
+            "unknown runner demand \"windows\"",
+        ),
+    ] {
+        let mut params = serde_json::json!({"command": command, "runon": "linux"});
+        for (key, value) in extra.as_object().unwrap() {
+            params[key] = value.clone();
+        }
+        let response = handle_with_policy(ctx, policy, params);
+        assert!(!response.success, "{expected}: {response:?}");
+        let message = response.data["message"].as_str().unwrap_or_default();
+        assert!(message.contains(expected), "{expected}: {response:?}");
+    }
+    // Nothing ran anywhere: not on the server, and not quietly on this host.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(exec_runs(&daemon).is_empty());
+    assert!(!marker.exists());
+}
+
+#[test]
+fn published_report_vectors_render_changes_say_nothing_when_empty_and_name_what_is_absent() {
+    use crate::exec_remote::wire_tests::report_vector;
+    // Reported and changed: every kind of change is named, none copied back.
+    let all = "These files changed on the server and were NOT copied back:\n  result.txt\n\
+         Git state changed on the server and was NOT copied back:\n  \
+         HEAD: 111111111111 -> 222222222222\n  \
+         ref: refs/heads/main -> refs/heads/build\n  \
+         index tree changed (staged changes differ)\n  \
+         stash count: 0 -> 1 (+1)\n\
+         These untracked files were created on the server and were NOT copied back:\n  \
+         generated/new.txt\n  notes.txt\n\
+         25 writes under ignored paths on the server were NOT copied back, for example:\n  \
+         scratch/debug.log\n  cache/result.bin";
+    assert_eq!(
+        render_terminal_report(&report_vector("all")).as_deref(),
+        Some(all)
+    );
+    // Reported and unchanged: a reporting runner sent every field, all
+    // empty, so there is nothing to say.
+    let unchanged = report_vector("unchanged");
+    assert!(unchanged.git_state_changed.is_some());
+    assert_eq!(render_terminal_report(&unchanged), None);
+    // Absent (an older runner): each missing report is named on its own line.
+    assert_eq!(
+        render_terminal_report(&report_vector("older-runner")).as_deref(),
+        Some(
+            "These files changed on the server and were NOT copied back:\n  result.txt\n\
+             git state: not reported by the runner\n\
+             untracked files: not reported by the runner\n\
+             ignored writes: not reported by the runner"
+        )
+    );
+    // A detached HEAD has no ref on either side, so no ref line; an index
+    // tree that became available counts as changed.
+    let detached = render_terminal_report(&report_vector("detached-head")).unwrap();
+    assert!(!detached.contains("ref:"), "{detached}");
+    assert!(detached.contains("HEAD: 111111111111 -> 222222222222\n  index tree changed"));
+    // A capped untracked list says the runner listed only some of them.
+    let truncated = render_terminal_report(&report_vector("truncated-untracked")).unwrap();
+    assert!(
+        truncated
+            .contains("  notes.txt\n  (the runner listed only some of them; more were created)\n"),
+        "{truncated}"
+    );
+}
+
+#[tokio::test]
+async fn a_reporting_runner_report_is_printed_after_the_output() {
+    let daemon = daemon(Script::Reported, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({"command": "bash build.sh", "runon": "linux", "compressed": false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let done = terminal(ctx.bash_background(), &task_id).await;
+    let rendered = crate::commands::bash_orchestrate::format_foreground_result(&done);
+    assert_eq!(
+        rendered.lines().next(),
+        Some("ran remotely on ck-motor"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.ends_with(
+            &render_terminal_report(&crate::exec_remote::wire_tests::report_vector("all")).unwrap()
+        ),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("not reported by the runner"),
+        "{rendered}"
+    );
 }

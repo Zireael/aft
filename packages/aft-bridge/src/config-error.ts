@@ -1,8 +1,8 @@
 /**
  * The "config error" state shared by every plugin host.
  *
- * When AFT's configuration cannot be used (a rejected retired key, a config
- * file that does not parse, a subc connection file that does not exist, ...)
+ * When AFT's configuration cannot be used (an incomplete resolved config, a
+ * config file that does not parse, a subc connection file that does not exist, ...)
  * the plugins used to throw during initialization. Hosts react to that by not
  * loading the plugin at all and recording the reason only in their own log
  * file, so neither the user nor the model learns that AFT is missing.

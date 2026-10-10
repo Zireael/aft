@@ -67,7 +67,7 @@ def main() -> None:
                 configured = client.call("configure", {
                     "project_root": str(snapshot), "harness": "opencode", "storage_dir": storage,
                     "config": [{"tier": "user", "source": "<aft-hot-path>", "doc": json.dumps({
-                        "search_index": True, "semantic_search": args.semantic, "callgraph_store": False,
+                        "indexes": {"trigram": True, "semantic": args.semantic, "callgraph": False},
                     })}],
                 }, timeout_secs=300)
                 if not configured.get("success"):

@@ -581,6 +581,27 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
 /// The next connect resolves the files afresh and applies a held loosening.
 fn hold_project_loosening(candidate: &mut Config, floor: &Config) -> Vec<&'static str> {
     let mut held = Vec::new();
+    if !candidate.lsp_idle_minutes.tightens(floor.lsp_idle_minutes) {
+        candidate.lsp_idle_minutes = floor.lsp_idle_minutes;
+        held.push("lsp.idle_minutes");
+    }
+    let next = &mut candidate.inspect.categories;
+    let before = &floor.inspect.categories;
+    macro_rules! keep_off {
+        ($field:ident, $key:literal) => {
+            if !before.$field && next.$field {
+                next.$field = false;
+                held.push($key);
+            }
+        };
+    }
+    keep_off!(diagnostics, "inspect.categories.diagnostics");
+    keep_off!(todos, "inspect.categories.todos");
+    keep_off!(dead_code, "inspect.categories.dead_code");
+    keep_off!(unused_exports, "inspect.categories.unused_exports");
+    keep_off!(duplicates, "inspect.categories.duplicates");
+    keep_off!(cycles, "inspect.categories.cycles");
+    keep_off!(complexity, "inspect.categories.complexity");
     if floor.restrict_to_project_root && !candidate.restrict_to_project_root {
         candidate.restrict_to_project_root = true;
         held.push("restrict_to_project_root");
@@ -592,6 +613,10 @@ fn hold_project_loosening(candidate: &mut Config, floor: &Config) -> Vec<&'stati
     if floor.sandbox.enabled && !candidate.sandbox.enabled {
         candidate.sandbox.enabled = true;
         held.push("sandbox.enabled");
+    }
+    if floor.bash.disclaim_privacy && !candidate.bash.disclaim_privacy {
+        candidate.bash.disclaim_privacy = true;
+        held.push("bash.disclaim_privacy");
     }
     let missing_denies: Vec<PathBuf> = floor
         .sandbox
@@ -705,8 +730,14 @@ fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
             after.bash_long_running_reminder_interval_ms,
         );
     }
-    if before.inspect.enabled != after.inspect.enabled {
+    if before.inspect.enabled != after.inspect.enabled
+        || before.inspect.categories != after.inspect.categories
+    {
         ctx.reset_tier2_refresh_scheduler();
+    } else if before.inspect != after.inspect {
+        // Inspect settings shape Tier-2 results (for example duplicates'
+        // expected mirrors), so a failed category may now succeed.
+        ctx.inspect_manager().clear_tier2_retry_pauses();
     }
     if before.git.co_author == "off" && after.git.co_author != "off" {
         let storage_root = crate::bash_background::storage_dir(after.storage_dir.as_deref());
@@ -771,6 +802,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("callgraph_chunk_size", callgraph_chunk_size);
     // Inspect.
     live!("inspect.enabled", inspect.enabled);
+    live!("inspect.categories", inspect.categories);
     live!(
         "inspect.diagnostics_timeout_ms",
         inspect.diagnostics_timeout_ms
@@ -782,7 +814,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("inspect.duplicates.expected_mirrors", inspect.duplicates);
     // Idle, worktree, backup.
     live!("idle.root_ttl_minutes", idle.root_ttl_minutes);
-    live!("idle.lsp_ttl_minutes", idle.lsp_ttl_minutes);
+    live!("lsp.idle_minutes", lsp_idle_minutes);
     live!("worktree.ram_overlay", worktree.ram_overlay);
     later!("backup.enabled", backup.enabled);
     later!("backup.max_depth", backup.max_depth);
@@ -797,8 +829,10 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("bash.compress", experimental_bash_compress);
     later!("bash.background", experimental_bash_background);
     live!("bash.linux_scope", bash.linux_scope);
+    live!("bash.disclaim_privacy", bash.disclaim_privacy);
     live!("bash.foreground_wait_window_ms", foreground_wait_window_ms);
     live!("bash.host_fallback", bash.host_fallback);
+    live!("bash.runon_enabled", bash.runon_enabled);
     live!("bash.watch_sync_max_ms", bash.watch_sync_max_ms);
     live!("bash.worker_wait_max_ms", bash.worker_wait_max_ms);
     later!("bash.detach_on_user_message", bash.detach_on_user_message);
@@ -842,6 +876,10 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("opencode.server_url", opencode.server_url);
     later!("opencode.server_password_env", opencode.server_password_env);
     live!("git.co_author", git.co_author);
+    // Whether `runon` is offered is decided once per host process (the head
+    // plugins build bash's arguments at startup), so a change waits for a
+    // restart rather than refusing calls the surface still offers.
+    later!("remote_exec", remote_exec);
 
     // `aft_search_registered` is derived from `disabled_tools`, which is
     // deferred, so it is never copied.
@@ -904,10 +942,12 @@ fn classification_is_exhaustive(config: &Config) {
         gh_shim: _,
         opencode: _,
         git: _,
+        remote_exec: _,
         experimental_lsp_ty: _,
         lsp_servers: _,
         disabled_lsp: _,
         diagnostics_on_edit: _,
+        lsp_idle_minutes: _,
         url_fetch_allow_private: _,
         disabled_tools: _,
         idle,
@@ -920,11 +960,13 @@ fn classification_is_exhaustive(config: &Config) {
     let crate::config::BashConfig {
         enabled: _,
         host_fallback: _,
+        runon_enabled: _,
         detach_on_user_message: _,
         db_schema_hints: _,
         watch_sync_max_ms: _,
         worker_wait_max_ms: _,
         linux_scope: _,
+        disclaim_privacy: _,
         powershell_tool: _,
     } = bash;
     let crate::config::SandboxConfig {
@@ -952,6 +994,7 @@ fn classification_is_exhaustive(config: &Config) {
         enabled: _,
         diagnostics_timeout_ms: _,
         tier2_pass_timeout_ms: _,
+        categories: _,
         duplicates: _,
     } = inspect;
     let crate::config::BackupConfig {
@@ -966,7 +1009,6 @@ fn classification_is_exhaustive(config: &Config) {
     } = github;
     let crate::config::IdleConfig {
         root_ttl_minutes: _,
-        lsp_ttl_minutes: _,
     } = idle;
 }
 

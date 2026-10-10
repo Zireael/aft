@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Integration of trains 340, 343 and 344 with their CI fixes: plugin registration, vocabulary audit inputs, Windows and macOS unit fixtures, per-candidate storage cleanup locking with a startup grace, a native-path Windows conversion in the shared semantic base, and a corrected legacy migration fixture. Derived from git diff --name-only origin/main...HEAD against RANKING_FENCE_PREFIXES: fenced paths are crates/aft/src/commands/semantic_search/memo.rs, crates/aft/src/lib.rs, crates/aft/src/search_index.rs, crates/aft/src/semantic_index.rs and crates/aft/src/subc_tool_schemas.json. None of these changes alters ranking or routing, so all 93 benchmark rows must remain byte-identical to the reference."
+}

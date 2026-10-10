@@ -13,8 +13,48 @@ use std::ffi::OsStr;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+fn runon_refusal_message(reason: &str) -> String {
+    format!("runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally")
+}
+
+/// Derive the error from persisted remote proof, never from command output.
+/// Keeping it in snapshots lets foreground and restarted/background readers
+/// report the same named refusal without changing older task records.
+pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::RemoteRefusal> {
+    if metadata.status != super::BgTaskStatus::Failed {
+        return None;
+    }
+    let remote = metadata.remote.as_ref().filter(|r| r.explicit_runon)?;
+    let crate::exec_remote::Verdict::RunLocally { reason } =
+        crate::exec_remote::grade(remote.terminal.as_ref()?)
+    else {
+        return None;
+    };
+    let reason = serde_json::to_value(reason).ok()?;
+    Some(super::RemoteRefusal {
+        code: "remote_unavailable",
+        message: runon_refusal_message(reason.as_str()?),
+    })
+}
+
 #[cfg(unix)]
 const REMOTE_REATTACH_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+/// The remote runner AFT dispatches to; named in every remote reply header.
+#[cfg(unix)]
+const RUNNER_ID: &str = "ck-motor";
+
+/// This machine's operating system as a reader names it, for the header of a
+/// run that fell back to it.
+#[cfg(unix)]
+fn local_os_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        "freebsd" => "FreeBSD",
+        other => other,
+    }
+}
 
 /// Bound consecutive empty recovery attempts, not silence on an open stream.
 /// Accepted jobs can disappear with a wiped runner state; they must never rerun.
@@ -73,6 +113,8 @@ impl ReattachBudget {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
     pub connection_file: Option<PathBuf>,
+    #[serde(default)]
+    pub explicit_runon: bool,
     pub harness: String,
     pub session: String,
     pub job_id: Option<Uuid>,
@@ -323,14 +365,12 @@ impl BgTaskRegistry {
         mut env: HashMap<String, String>,
         hard_kill: super::super::HardKill,
         storage_dir: PathBuf,
-        max_running: usize,
+        slot: super::super::TaskSlot,
         notify: bool,
         compressed: bool,
         root: Option<PathBuf>,
     ) -> Result<String, String> {
-        if self.running_count() >= max_running {
-            return Err("background bash task limit exceeded".into());
-        }
+        self.check_background_slot(slot, &session_id)?;
         let layout = match plan.prepared_task() {
             Some(p) => p.resolved_task(),
             None => allocate_task_layout(&storage_dir, &session_id).map_err(|e| e.to_string())?,
@@ -363,9 +403,10 @@ impl BgTaskRegistry {
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         metadata.default_hard_kill = hard_kill.renewable();
         metadata.status = BgTaskStatus::Running;
-        metadata.execution_note = Some("remote execution requested on ck-motor".into());
+        metadata.execution_note = Some(format!("remote execution requested on {RUNNER_ID}"));
         metadata.remote = Some(RemoteTask {
             connection_file: launch.connection_file,
+            explicit_runon: launch.explicit_runon,
             harness: launch.harness,
             session: launch.session,
             job_id: None,
@@ -400,9 +441,19 @@ impl BgTaskRegistry {
         let handles =
             TaskIoHandles::create(&layout, BgMode::Pipes, true).map_err(|e| e.to_string())?;
         write_task_at(&layout, &metadata).map_err(|e| e.to_string())?;
+        // Commit point for a remote task: its record exists, and the remote
+        // worker (which can run the command remotely or fall back to a local
+        // process) starts below. Without this, a startup the reply deadline
+        // had already refused as "not started" could still run here.
+        if let Err(error) = super::super::commit_spawn_receipt(&task_id) {
+            let _ = delete_resolved_task(&layout);
+            return Err(error);
+        }
         self.dual_write_task(&layout.paths, &metadata);
         self.insert_rehydrated_task(metadata, layout.paths, false)?;
         let task = self.task(&task_id).unwrap();
+        task.holds_background_slot
+            .store(slot.holds_slot(), Ordering::SeqCst);
         task.state
             .lock()
             .map_err(|_| "task lock poisoned")?
@@ -582,7 +633,11 @@ impl BgTaskRegistry {
                 Ok(c) => break c,
                 Err(error) => {
                     if let Some((_, fallback)) = initial.take() {
-                        return self.remote_fallback(&task, fallback, &error);
+                        return if remote.explicit_runon {
+                            self.refuse_remote_before_dispatch(&task, &error)
+                        } else {
+                            self.remote_fallback(&task, fallback, &error)
+                        };
                     }
                     if let Some(point) = remote.point().filter(|_| remote.connection_file.is_some())
                     {
@@ -599,17 +654,23 @@ impl BgTaskRegistry {
         let mut stream = if let Some((request, local)) = initial.take() {
             let request = match request {
                 Ok(r) => r,
-                Err(error) => return self.remote_fallback(&task, local, &error.to_string()),
+                Err(error) => {
+                    return if remote.explicit_runon {
+                        self.refuse_remote_before_dispatch(&task, &error.to_string())
+                    } else {
+                        self.remote_fallback(&task, local, &error.to_string())
+                    }
+                }
             };
             fallback = Some(local);
             match client.run(&request).await {
                 Ok(stream) => stream,
                 Err(error) if proves_no_start(&error) => {
-                    return self.remote_fallback(
-                        &task,
-                        fallback.take().unwrap(),
-                        &error.to_string(),
-                    )
+                    return if remote.explicit_runon {
+                        self.refuse_remote_before_dispatch(&task, &error.to_string())
+                    } else {
+                        self.remote_fallback(&task, fallback.take().unwrap(), &error.to_string())
+                    }
                 }
                 Err(error) => {
                     return Err(format!("remote outcome unknown; not resubmitted: {error}"))
@@ -756,6 +817,13 @@ impl BgTaskRegistry {
         let mut db = DeferredDbWrites::new(self, task);
         let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
         let metadata = state.metadata.clone();
+        // Automatic prefix routing may fall back; an explicit remote demand
+        // must fail before any local launch state or process is created.
+        if metadata.remote.as_ref().is_some_and(|r| r.explicit_runon) {
+            drop(state);
+            drop(db);
+            return self.refuse_remote_executor(task, reason);
+        }
         let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
             .map_err(|e| e.to_string())?;
         let durable = read_task_at(&layout).map_err(|e| e.to_string())?;
@@ -774,8 +842,10 @@ impl BgTaskRegistry {
         state.metadata.local_fallback_started = true;
         state.metadata.started_at = unix_millis();
         let reason = reason.replace(['\n', '\r'], " ");
-        state.metadata.execution_note =
-            Some(format!("ran locally: remote executor refused ({reason})"));
+        state.metadata.execution_note = Some(format!(
+            "ran locally on {}: remote refused: {reason}",
+            local_os_name()
+        ));
         if let Some(changes) = metadata
             .remote
             .as_ref()
@@ -845,6 +915,11 @@ impl BgTaskRegistry {
         remote: &RemoteTask,
         reason: &str,
     ) -> Result<(), String> {
+        // Decide before even restoring a local launch plan: this also covers
+        // a refusal persisted just before the previous AFT process stopped.
+        if remote.explicit_runon {
+            return self.refuse_remote_executor(task, reason);
+        }
         let restore = (|| {
             let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
                 .map_err(|e| e.to_string())?;
@@ -887,6 +962,33 @@ impl BgTaskRegistry {
         if let Err(error) = restore {
             self.remote_terminal(task,Verdict::RunLocally { reason:RefusalReason::Unknown(reason.into()) },Some(format!("remote refused before start; the local fallback could not be restored after restart, so the command did not run: {error}")));
         }
+        Ok(())
+    }
+
+    fn refuse_remote_executor(&self, task: &Arc<BgTask>, reason: &str) -> Result<(), String> {
+        self.remote_terminal(
+            task,
+            Verdict::RunLocally {
+                reason: RefusalReason::Unknown(reason.into()),
+            },
+            Some(runon_refusal_message(reason)),
+        );
+        Ok(())
+    }
+
+    fn refuse_remote_before_dispatch(&self, task: &Arc<BgTask>, error: &str) -> Result<(), String> {
+        // Missing discovery providers and other proven pre-dispatch failures
+        // cannot satisfy an explicit remote demand. Do not turn them into a
+        // local run.
+        self.remote_terminal(
+            task,
+            Verdict::RunLocally {
+                reason: RefusalReason::Unreachable,
+            },
+            Some(format!(
+                "runon refused: remote execution is unavailable; command did not run: {error}"
+            )),
+        );
         Ok(())
     }
 
@@ -938,7 +1040,19 @@ impl BgTaskRegistry {
                 return;
             }
             if refused {
-                state.metadata.execution_note = Some("remote executor refused before start".into());
+                state.metadata.execution_note = Some(
+                    if state
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.terminal.is_some())
+                    {
+                        "remote executor refused before start"
+                    } else {
+                        "runon refused before remote dispatch; command did not run"
+                    }
+                    .into(),
+                );
             } else if matches!(
                 status,
                 BgTaskStatus::Completed
@@ -946,7 +1060,7 @@ impl BgTaskRegistry {
                     | BgTaskStatus::Killed
                     | BgTaskStatus::TimedOut
             ) {
-                state.metadata.execution_note = Some("ran remotely on ck-motor".into());
+                state.metadata.execution_note = Some(format!("ran remotely on {RUNNER_ID}"));
             }
             if let Some(terminal) = state
                 .metadata
@@ -955,13 +1069,6 @@ impl BgTaskRegistry {
                 .and_then(|r| r.terminal.as_ref())
                 .cloned()
             {
-                let changes = terminal.workspace_changes.as_ref();
-                if let Some(changes) = changes.filter(|c| !c.is_empty()) {
-                    state.metadata.execution_note = Some(format!(
-                        "ran remotely on ck-motor\nworkspace_changes (not copied back): {}",
-                        changes.join(", ")
-                    ));
-                }
                 if let Some(pipestatus) = &terminal.pipestatus {
                     if let Some(handles) = state.io_handles.as_mut() {
                         let _ = handles.write(
@@ -985,7 +1092,7 @@ impl BgTaskRegistry {
                 let note = state
                     .metadata
                     .execution_note
-                    .get_or_insert_with(|| "ran remotely on ck-motor".into());
+                    .get_or_insert_with(|| format!("ran remotely on {RUNNER_ID}"));
                 note.push_str(&format!("\n{reason}"));
             }
             task.mark_terminal_now();
@@ -1059,11 +1166,143 @@ fn append_output_loss(metadata: &mut PersistedTask) {
         );
         let note = metadata
             .execution_note
-            .get_or_insert_with(|| "remote execution on ck-motor".into());
+            .get_or_insert_with(|| format!("remote execution on {RUNNER_ID}"));
         if !note.contains(&warning) {
             note.push_str(&format!("\n{warning}"));
         }
     }
+}
+
+/// What the runner reported about the workspace after a remote run, printed
+/// after the command's output. Writes on the server are never copied back,
+/// so every change it reports is named. A kind of change the runner reported
+/// as empty says nothing; a kind it did not report says so, on its own line,
+/// instead of reading as "nothing changed". `None` when the command did not
+/// run remotely or there is nothing to say.
+#[cfg(unix)]
+pub(crate) fn remote_report(
+    metadata: &crate::bash_background::persistence::PersistedTask,
+) -> Option<String> {
+    let terminal = metadata.remote.as_ref()?.terminal.as_ref()?;
+    if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. })
+        || terminal.ran == Some(Ran::None)
+    {
+        return None;
+    }
+    render_terminal_report(terminal)
+}
+
+/// [`remote_report`] for one terminal record.
+#[cfg(unix)]
+fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
+    // Paths come from another machine; escaping keeps one per line.
+    fn path(path: &str) -> String {
+        path.escape_default().to_string()
+    }
+    fn id(id: Option<&str>) -> String {
+        id.map_or_else(|| "none".to_string(), |id| id.chars().take(12).collect())
+    }
+    let mut blocks: Vec<String> = Vec::new();
+    let mut unreported: Vec<&str> = Vec::new();
+
+    match terminal.workspace_changes.as_deref() {
+        Some([]) => {}
+        Some(changes) => {
+            let mut block =
+                String::from("These files changed on the server and were NOT copied back:");
+            for changed in changes {
+                block.push_str(&format!("\n  {}", path(changed)));
+            }
+            blocks.push(block);
+        }
+        None => unreported.push("changed files"),
+    }
+
+    match &terminal.git_state_changed {
+        Some(git) if git.changed() => {
+            let mut block =
+                String::from("Git state changed on the server and was NOT copied back:");
+            if git.head_before != git.head_after {
+                block.push_str(&format!(
+                    "\n  HEAD: {} -> {}",
+                    id(git.head_before.as_deref()),
+                    id(git.head_after.as_deref())
+                ));
+            }
+            if git.ref_before != git.ref_after {
+                let name = |r: Option<&str>| r.map_or_else(|| "detached".to_string(), path);
+                block.push_str(&format!(
+                    "\n  ref: {} -> {}",
+                    name(git.ref_before.as_deref()),
+                    name(git.ref_after.as_deref())
+                ));
+            }
+            if git.index_tree_before != git.index_tree_after {
+                block.push_str("\n  index tree changed (staged changes differ)");
+            }
+            if git.stash_count_before != git.stash_count_after {
+                let delta = i64::from(git.stash_count_after) - i64::from(git.stash_count_before);
+                block.push_str(&format!(
+                    "\n  stash count: {} -> {} ({delta:+})",
+                    git.stash_count_before, git.stash_count_after
+                ));
+            }
+            blocks.push(block);
+        }
+        Some(_) => {}
+        None => unreported.push("git state"),
+    }
+
+    match &terminal.untracked_files {
+        Some(untracked) if !untracked.paths.is_empty() || untracked.truncated => {
+            let mut block = String::from(
+                "These untracked files were created on the server and were NOT copied back:",
+            );
+            for created in &untracked.paths {
+                block.push_str(&format!("\n  {}", path(created)));
+            }
+            if untracked.truncated {
+                block.push_str("\n  (the runner listed only some of them; more were created)");
+            }
+            blocks.push(block);
+        }
+        Some(_) => {}
+        None => unreported.push("untracked files"),
+    }
+
+    match &terminal.ignored_writes {
+        Some(ignored) if ignored.count > 0 => {
+            let mut block = format!(
+                "{} write{} under ignored paths on the server {} NOT copied back",
+                ignored.count,
+                if ignored.count == 1 { "" } else { "s" },
+                if ignored.count == 1 { "was" } else { "were" },
+            );
+            if ignored.sample_paths.is_empty() {
+                block.push('.');
+            } else {
+                block.push_str(", for example:");
+                for written in &ignored.sample_paths {
+                    block.push_str(&format!("\n  {}", path(written)));
+                }
+            }
+            blocks.push(block);
+        }
+        Some(_) => {}
+        None => unreported.push("ignored writes"),
+    }
+
+    for field in unreported {
+        blocks.push(format!("{field}: not reported by the runner"));
+    }
+    (!blocks.is_empty()).then(|| blocks.join("\n"))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remote_report(
+    _metadata: &crate::bash_background::persistence::PersistedTask,
+) -> Option<String> {
+    None
 }
 
 #[cfg(unix)]
@@ -1077,9 +1316,10 @@ fn append_environment_disclosure(metadata: &mut PersistedTask) {
     );
     let note = metadata
         .execution_note
-        .get_or_insert_with(|| "remote execution on ck-motor".into());
+        .get_or_insert_with(|| format!("remote execution on {RUNNER_ID}"));
+    // Each disclosure gets its own line, so the header stays the first line.
     if !note.contains(&disclosure) {
-        note.push_str(&format!("; {disclosure}"));
+        note.push_str(&format!("\n{disclosure}"));
     }
 }
 
@@ -1107,9 +1347,10 @@ fn append_executor_environment_disclosure(metadata: &mut PersistedTask) {
     }
     let note = metadata
         .execution_note
-        .get_or_insert_with(|| "remote execution on ck-motor".into());
+        .get_or_insert_with(|| format!("remote execution on {RUNNER_ID}"));
+    // Each disclosure gets its own line, so the header stays the first line.
     if !note.contains(&disclosure) {
-        note.push_str(&format!("; {disclosure}"));
+        note.push_str(&format!("\n{disclosure}"));
     }
 }
 

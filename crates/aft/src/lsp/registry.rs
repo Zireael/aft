@@ -72,6 +72,13 @@ pub fn resolve_server_binary(
             }
         }
     }
+    if server.kind == ServerKind::Biome {
+        if let (Some(workspace), Some(project)) = (workspace_root, config.project_root.as_deref()) {
+            if let Some(found) = probe_node_bin_ancestors(&server.binary, workspace, project) {
+                return Some(found);
+            }
+        }
+    }
     let python_family = matches!(server.kind, ServerKind::Python | ServerKind::Ty);
 
     if python_family {
@@ -93,13 +100,56 @@ pub fn resolve_server_binary(
 
     // Python-family may fall back to the workspace root when no project root
     // is configured; every other language keeps the pre-existing ladder rooted
-    // strictly at the configured project root.
+    // strictly at the configured project root (Biome only after its nearest
+    // package-local lookup above found nothing).
     let project_root = if python_family {
         config.project_root.as_deref().or(workspace_root)
     } else {
         config.project_root.as_deref()
     };
+    if server.kind == ServerKind::Dockerfile && server.binary == "docker-langserver" {
+        if let Some(preferred) = resolve_lsp_binary(
+            "docker-language-server",
+            project_root,
+            &config.lsp_paths_extra,
+        ) {
+            return Some(preferred);
+        }
+    }
     resolve_lsp_binary(&server.binary, project_root, &config.lsp_paths_extra)
+}
+
+/// Find `binary` in the nearest `node_modules/.bin` from `workspace_root` up
+/// to and including `project_root`, the order Node resolves a package from
+/// the workspace's own directory.
+///
+/// Biome uses this because its configuration schema follows the installed
+/// version, so each package's `biome.json` must be served by that package's
+/// own Biome. Package managers that install per package (Bun 1.4 workspaces,
+/// pnpm without hoisting) put `biome` only in
+/// `packages/<name>/node_modules/.bin`, never in the project root's, so a
+/// lookup at the project root alone reported an installed Biome as missing.
+/// The walk never leaves the project root, and a workspace outside it gets
+/// no walk at all; the generic ladder still runs afterwards.
+fn probe_node_bin_ancestors(
+    binary: &str,
+    workspace_root: &Path,
+    project_root: &Path,
+) -> Option<PathBuf> {
+    let workspace_root = crate::inspect::job::canonicalize_normalized(workspace_root);
+    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
+    if !workspace_root.starts_with(&project_root) {
+        return None;
+    }
+    for directory in workspace_root.ancestors() {
+        if let Some(found) = probe_dir(&directory.join("node_modules").join(".bin"), binary) {
+            return Some(found);
+        }
+        if directory == project_root {
+            break;
+        }
+    }
+    None
 }
 
 fn probe_project_virtualenv(root: &Path, binary: &str) -> Option<PathBuf> {
@@ -277,8 +327,32 @@ pub struct ServerDef {
 }
 
 impl ServerDef {
+    /// Return executable names in preference order. Docker's upstream server
+    /// takes precedence over the older npm server, which remains the fallback.
+    pub fn binary_candidates(&self) -> Vec<String> {
+        if self.kind == ServerKind::Dockerfile && self.binary == "docker-langserver" {
+            vec!["docker-language-server".to_string(), self.binary.clone()]
+        } else {
+            vec![self.binary.clone()]
+        }
+    }
+
     /// The standalone Oxlint server uses stdio without the CLI's --lsp flag.
     pub fn spawn_args_for_binary(&self, binary: &Path) -> Vec<String> {
+        if self.kind == ServerKind::Dockerfile
+            && self.binary == "docker-langserver"
+            && matches!(
+                binary.file_name().and_then(|name| name.to_str()),
+                Some(
+                    "docker-language-server"
+                        | "docker-language-server.cmd"
+                        | "docker-language-server.exe"
+                        | "docker-language-server.bat"
+                )
+            )
+        {
+            return vec!["start".to_string(), "--stdio".to_string()];
+        }
         if self.kind == ServerKind::Oxlint
             && self.binary == "oxlint"
             && matches!(
@@ -2269,6 +2343,57 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dockerfile_server_prefers_docker_language_server_and_falls_back_on_path() {
+        const CHILD_ENV: &str = "AFT_DOCKER_SERVER_PATH_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let server = builtin_servers()
+                .into_iter()
+                .find(|server| server.kind == ServerKind::Dockerfile)
+                .unwrap();
+            let config = Config::default();
+            let preferred = resolve_server_binary(&server, None, &config).unwrap();
+            assert_eq!(
+                preferred.file_name().and_then(|name| name.to_str()),
+                Some("docker-language-server")
+            );
+            assert_eq!(
+                server.spawn_args_for_binary(&preferred),
+                ["start", "--stdio"]
+            );
+
+            std::fs::remove_file(&preferred).unwrap();
+            let fallback = resolve_server_binary(&server, None, &config).unwrap();
+            assert_eq!(
+                fallback.file_name().and_then(|name| name.to_str()),
+                Some("docker-langserver")
+            );
+            assert_eq!(server.spawn_args_for_binary(&fallback), ["--stdio"]);
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        touch_exe(&temp.path().join("docker-language-server"));
+        touch_exe(&temp.path().join("docker-langserver"));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lsp::registry::tests::dockerfile_server_prefers_docker_language_server_and_falls_back_on_path",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("PATH", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn generic_resolver_does_not_probe_project_virtualenv() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2455,6 +2580,103 @@ mod tests {
         assert!(
             resolved.map_or(true, |path| !path.starts_with(&workspace)),
             "generic resolution must not adopt the workspace root"
+        );
+    }
+
+    fn biome_def() -> ServerDef {
+        builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Biome)
+            .unwrap()
+    }
+
+    /// A Bun 1.4 workspace installs per package: `biome` exists only in
+    /// `packages/<name>/node_modules/.bin`, and the project root has a
+    /// `node_modules` without `.bin/biome`. Biome's server root is the
+    /// package (its `biome.json`), so the package-local Biome must resolve.
+    #[test]
+    fn biome_resolves_package_local_binary_in_a_per_package_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = crate::inspect::job::canonicalize_normalized(tmp.path());
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        let plugin = project.join("packages").join("plugin");
+        let plugin_bin = plugin.join("node_modules").join(".bin");
+        let binary_name = if cfg!(windows) { "biome.cmd" } else { "biome" };
+        touch_exe(&plugin_bin.join(binary_name));
+        let config = Config {
+            project_root: Some(project.clone()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_server_binary(&biome_def(), Some(&plugin), &config),
+            Some(plugin_bin.join(binary_name))
+        );
+    }
+
+    /// The nearest `node_modules/.bin` wins, as in Node resolution: a
+    /// package's own Biome over the project root's, and the project root's
+    /// when a nested package has none of its own.
+    #[test]
+    fn biome_prefers_nearest_node_modules_and_falls_back_to_the_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = crate::inspect::job::canonicalize_normalized(tmp.path());
+        let binary_name = if cfg!(windows) { "biome.cmd" } else { "biome" };
+        let root_bin = project.join("node_modules").join(".bin");
+        touch_exe(&root_bin.join(binary_name));
+        let cli = project.join("packages").join("cli");
+        let cli_bin = cli.join("node_modules").join(".bin");
+        touch_exe(&cli_bin.join(binary_name));
+        let nested = project.join("packages").join("dashboard").join("app");
+        let dashboard_bin = project
+            .join("packages")
+            .join("dashboard")
+            .join("node_modules")
+            .join(".bin");
+        touch_exe(&dashboard_bin.join(binary_name));
+        let bare = project.join("packages").join("retina-local-fs");
+        std::fs::create_dir_all(&bare).unwrap();
+        let config = Config {
+            project_root: Some(project.clone()),
+            ..Config::default()
+        };
+        let server = biome_def();
+
+        assert_eq!(
+            resolve_server_binary(&server, Some(&cli), &config),
+            Some(cli_bin.join(binary_name))
+        );
+        assert_eq!(
+            resolve_server_binary(&server, Some(&nested), &config),
+            Some(dashboard_bin.join(binary_name))
+        );
+        assert_eq!(
+            resolve_server_binary(&server, Some(&bare), &config),
+            Some(root_bin.join(binary_name))
+        );
+    }
+
+    /// The walk stops at the project root: a Biome installed above it is
+    /// never adopted through the package walk.
+    #[test]
+    fn biome_walk_does_not_leave_the_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = crate::inspect::job::canonicalize_normalized(tmp.path());
+        let binary_name = if cfg!(windows) { "biome.cmd" } else { "biome" };
+        let outside_bin = outside.join("node_modules").join(".bin");
+        touch_exe(&outside_bin.join(binary_name));
+        let project = outside.join("project");
+        let plugin = project.join("packages").join("plugin");
+        std::fs::create_dir_all(&plugin).unwrap();
+        let config = Config {
+            project_root: Some(project.clone()),
+            ..Config::default()
+        };
+
+        let resolved = resolve_server_binary(&biome_def(), Some(&plugin), &config);
+        assert!(
+            resolved.map_or(true, |path| !path.starts_with(&outside_bin)),
+            "the Biome walk must stop at the project root"
         );
     }
 

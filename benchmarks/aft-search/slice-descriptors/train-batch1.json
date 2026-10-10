@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Batch train stacked on views-leak: linked-worktree index retention (1 day), remote unknown-outcome reply, OpenCode 2 host tool overlap notice, watch-ci one query per tick, git-hook timer SIGKILL, foreground bash not blocked by the background limit, bash startup outcome fence, subc route drain, ckdev test binary names, CPU-waste fixes, and Train 346 (Docker LSP, package-local Biome, database route recovery, bash watchdog, semantic admission for opened roots, Tier-2 non-UTF-8 skips for issue #402, shared ignore rules for issue #403, bounded filesystem reads). Fenced paths: crates/aft/src/commands/semantic_search/mod.rs, crates/aft/src/lib.rs, crates/aft/src/search_index.rs. These bound filesystem work, unify corpus membership and restrict automatic semantic construction without changing ranking or routing; the benchmark evidence pool is pinned to the tracked tree, so all 93 real-query rows must stay byte-identical."
+}

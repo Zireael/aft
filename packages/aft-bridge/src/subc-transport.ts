@@ -164,6 +164,9 @@ export function isSubcClientClosedError(error: unknown): error is SubcError {
  * the connection has already been torn down locally.
  */
 export function isSocketDeathError(error: unknown, depth = 0): boolean {
+  // Raw data-plane requests wrap socket death in a SubcError; its typed
+  // connection-loss reason survives even when the underlying errno does not.
+  if (error instanceof SubcError && error.closeReason === "connection_lost") return true;
   if (error instanceof SubcCallError) {
     const cause = error.cause;
     return depth < 4 && cause !== undefined && cause !== error
@@ -966,6 +969,8 @@ interface SessionRecord {
   readonly generation?: RootGeneration;
   /** Current tool route for this session incarnation; replaced after route failures. */
   routeEntry: RouteEntry | null;
+  /** Replaced carriers still owned by pending unary requests, including cancelled callers. */
+  readonly retiredRoutes: Set<RouteEntry>;
   /** Dedicated bg_events subscription, present only when background events are enabled. */
   bgSub: BgSubscription | null;
   /** Closed marker set synchronously so in-flight requests can see the close. */
@@ -1009,11 +1014,12 @@ interface RouteEntry {
   handle: RouteHandle | null;
   /** Tombstone: a teardown raced the open — the resolving open must self-close. */
   closed: boolean;
+  /** Pending client requests, not callers: host cancellation can finish a caller first. */
+  inflight: number;
   /**
-   * Set when a call on this session gives up on the shared route after its own
-   * failure or cancellation and closes it, while other calls on the session may
-   * still have requests in flight on it. A session teardown leaves it null,
-   * because the session record's teardown reason already names that close.
+   * Retirement reason. Replacement stops new dispatches but closes the carrier
+   * only after all pending requests settle. Explicit teardown can still close
+   * it immediately, and the session's teardown reason takes precedence then.
    */
   closedBy: SubcLocalRouteCloseReason | null;
 }
@@ -1047,7 +1053,7 @@ function routeClosedMidCallError(
 ): unknown {
   if (!isLocalRouteCloseRejection(error)) return error;
   const reason =
-    entry.closedBy ?? teardownCloseReason(record.teardownReason) ?? "route closed by the plugin";
+    teardownCloseReason(record.teardownReason) ?? entry.closedBy ?? "route closed by the plugin";
   return new SubcRouteClosedMidCallError(reason, error);
 }
 
@@ -1715,6 +1721,7 @@ export class SubcTransportPool implements AftTransportPool {
       canonicalRoot: root,
       generation,
       routeEntry: null,
+      retiredRoutes: new Set(),
       bgSub: null,
       closed: false,
       teardownReason: null,
@@ -1764,6 +1771,7 @@ export class SubcTransportPool implements AftTransportPool {
         record.pendingBgNudge ||
         record.pendingDetach ||
         record.inflight > 0 ||
+        record.retiredRoutes.size > 0 ||
         record.routeEntry?.opening ||
         now - record.lastUsedAt < 15 * 60_000
       )
@@ -1960,6 +1968,7 @@ export class SubcTransportPool implements AftTransportPool {
       this.sessions.get(record.identityKey) === record &&
       !record.closed &&
       record.inflight === 0 &&
+      record.retiredRoutes.size === 0 &&
       record.backgroundTasks.size === 0 &&
       record.backgroundWatches.size === 0 &&
       !record.unknownBackgroundWork &&
@@ -2002,15 +2011,19 @@ export class SubcTransportPool implements AftTransportPool {
   private async cleanupDetached(detached: DetachedSession): Promise<void> {
     const cleanup: Promise<unknown>[] = [];
     if (detached.bgSub) cleanup.push(detached.bgSub.stop());
-    const routeEntry = detached.routeEntry;
-    const route = routeEntry?.handle;
-    if (routeEntry && route !== null && route !== undefined) {
-      try {
-        cleanup.push(
-          Promise.resolve(routeEntry.client.closeRouteChannel(route)).catch(() => undefined),
-        );
-      } catch {
-        // A client may throw synchronously when its socket is already closed.
+    const entries = new Set(detached.record.retiredRoutes);
+    detached.record.retiredRoutes.clear();
+    if (detached.routeEntry) entries.add(detached.routeEntry);
+    for (const entry of entries) {
+      entry.closed = true;
+      if (entry.handle != null) {
+        try {
+          cleanup.push(
+            Promise.resolve(entry.client.closeRouteChannel(entry.handle)).catch(() => undefined),
+          );
+        } catch {
+          // A client may throw synchronously when its socket is already closed.
+        }
       }
     }
     await Promise.allSettled(cleanup);
@@ -2038,6 +2051,17 @@ export class SubcTransportPool implements AftTransportPool {
       return error;
     }
     return this.rootReapedError(record);
+  }
+
+  private closeRetiredRoute(record: SessionRecord, entry: RouteEntry): void {
+    if (entry.inflight > 0 || !record.retiredRoutes.delete(entry)) return;
+    if (entry.handle != null) safeCloseRoute(entry.client, entry.handle);
+    this.deleteSessionIfEmpty(record.identityKey, record);
+  }
+
+  private releaseRouteRequest(record: SessionRecord, entry: RouteEntry): void {
+    entry.inflight -= 1;
+    this.closeRetiredRoute(record, entry);
   }
 
   /** Open or reuse a route while guarding every lifecycle boundary. */
@@ -2216,11 +2240,10 @@ export class SubcTransportPool implements AftTransportPool {
       const clearRouteEntry = (entry: RouteEntry): void => {
         if (record.routeEntry !== entry) return;
         entry.closed = true;
-        // Other calls on this session may still have requests in flight on
-        // the shared route; they learn that it was discarded, not torn down.
         entry.closedBy ??= "route replaced";
         record.routeEntry = null;
-        if (entry.handle != null) safeCloseRoute(entry.client, entry.handle);
+        record.retiredRoutes.add(entry);
+        this.closeRetiredRoute(record, entry);
       };
 
       const handleRequestFailure = (error: unknown, entry: RouteEntry): void => {
@@ -2238,18 +2261,29 @@ export class SubcTransportPool implements AftTransportPool {
             route: routeLabel(entry.handle),
           });
         }
-        clearRouteEntry(entry);
+        // A call's timeout or refusal says nothing about the route's health.
+        // Retire only a cancelled carrier or one known to be gone; a slow live
+        // route remains reusable, and no replacement may cut its other calls.
+        if (
+          aborted ||
+          isRouteProvenAbsentError(error) ||
+          (error instanceof SubcError && error.closeReason !== undefined)
+        ) {
+          clearRouteEntry(entry);
+        }
         if (aborted || !ownsClient || this.client !== client) return;
         if (isRouteProvenAbsentError(error)) return;
-        // Anything else is this call's own outcome: a timeout, a GOODBYE, a
-        // refusal, or a managed not_sent/outcome_unknown verdict. It fails this
-        // call and route only; a run of them just checks the connection.
-        this.noteUnansweredCall(client, {
-          error,
-          trigger: "request",
-          session: identity.session,
-          route: routeLabel(entry.handle),
-        });
+        if (isDaemonAnswerError(error)) {
+          this.transportFailures = 0;
+          this.noteClientAlive(client);
+        } else if (isUnansweredCallError(error)) {
+          this.noteUnansweredCall(client, {
+            error,
+            trigger: "request",
+            session: identity.session,
+            route: routeLabel(entry.handle),
+          });
+        }
       };
 
       const requestOnRoute = async (
@@ -2273,10 +2307,21 @@ export class SubcTransportPool implements AftTransportPool {
         };
         abortSignal?.addEventListener("abort", onAbort, { once: true });
         try {
-          const request = client.request(route, body, {
-            timeoutMs: Math.ceil(requestTimeoutMs),
-            onProgress,
-          });
+          // Track the actual client promise, not the abort race. A cancelled
+          // caller has no terminal from the daemon yet, so closing its carrier
+          // here would still cut sibling calls and invalidate request credits.
+          entry.inflight += 1;
+          let request: Promise<unknown>;
+          try {
+            request = client.request(route, body, {
+              timeoutMs: Math.ceil(requestTimeoutMs),
+              onProgress,
+            });
+          } catch (error) {
+            this.releaseRouteRequest(record, entry);
+            throw error;
+          }
+          request = request.finally(() => this.releaseRouteRequest(record, entry));
           const reply = abortSignal ? await Promise.race([request, aborted]) : await request;
           // A legacy closeSession may intentionally let an already-delivered reply
           // settle. It must not mutate shared state or recreate a subscription.
@@ -2299,6 +2344,9 @@ export class SubcTransportPool implements AftTransportPool {
       let reopened = false;
       let retriedAbsentRoute = false;
       while (true) {
+        // Another call can retire a just-acquired carrier before this caller
+        // dispatches. Only already-pending requests belong on retired routes.
+        if (routeAndEntry.entry.closed) routeAndEntry = await openRouteAfterReloadWindow();
         // Checked outside the try below so the retry branches never mistake
         // this call's own expiry for a daemon refusal worth retrying.
         const requestTimeoutMs = remainingMs();
@@ -2459,6 +2507,7 @@ export class SubcTransportPool implements AftTransportPool {
       opening: null,
       handle: null,
       closed: false,
+      inflight: 0,
       closedBy: null,
     };
     this.assertRootCanAttach(record.canonicalRoot);
@@ -2621,6 +2670,11 @@ export class SubcTransportPool implements AftTransportPool {
     );
     this.client = null;
     for (const record of this.sessions.values()) {
+      for (const retired of record.retiredRoutes) {
+        if (retired.client !== client) continue;
+        retired.closed = true;
+        record.retiredRoutes.delete(retired);
+      }
       const entry = record.routeEntry;
       if (entry?.client !== client) continue;
       entry.closed = true;

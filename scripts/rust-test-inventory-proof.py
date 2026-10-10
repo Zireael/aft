@@ -29,6 +29,8 @@ HASH_SUFFIX_RE = re.compile(r"-[0-9a-f]+(?:\.exe)?$")
 RUNNING_RE = re.compile(r"^\s*Running (.+) \((.+)\)$")
 COUNT_RE = re.compile(r"^\d+ tests?, \d+ benchmarks$")
 TEST_LINE_RE = re.compile(r"^(.*): test$")
+# A rustc diagnostic's source excerpt: `8845 |  code` and `|  ^^^ label` lines.
+WARNING_EXCERPT_RE = re.compile(r"^(?:\d+\s*)?\|\s")
 
 
 @dataclass(frozen=True)
@@ -102,10 +104,15 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
 
         # Compiler warnings (for example the macOS linker's `__eh_frame section too
         # large` note once the lib test binary passes 16 MB of unwind data) print
-        # a `warning:` line plus `|` and `= note:` continuation lines before the
-        # listing. sccache prints its own `sccache: warning:` lines when its
-        # server restarts mid-build. None of them carry test entries.
-        if stripped.startswith(("warning:", "= note:", "= help:", "sccache: ")) or stripped == "|":
+        # a `warning:` line plus `-->`, source-excerpt, `|` and `= note:`
+        # continuation lines before the listing. sccache prints its own
+        # `sccache: warning:` lines when its server restarts mid-build. None of
+        # them carry test entries.
+        if (
+            stripped.startswith(("warning:", "= note:", "= help:", "sccache: ", "--> ", "..."))
+            or stripped == "|"
+            or WARNING_EXCERPT_RE.match(stripped)
+        ):
             continue
 
         if stripped.startswith("Doc-tests "):

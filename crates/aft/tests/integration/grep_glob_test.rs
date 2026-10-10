@@ -325,6 +325,134 @@ fn grep_reports_empty_scope_separately() {
     assert!(status.success());
 }
 
+const IGNORE_RULES_NEEDLE: &str = "ignore_rules_needle";
+
+/// A tree whose top-level `.gitignore` hides `vendor/deps/` and `*.log`, and
+/// whose nested `src/nested/.gitignore` hides `generated/`. Every file holds
+/// the same needle, so grep shows which files a walk or index admitted.
+fn ignore_rules_project(git: bool) -> tempfile::TempDir {
+    let source = format!("fn marker() {{ {IGNORE_RULES_NEEDLE}(); }}\n");
+    let project = setup_project(&[
+        (".gitignore", "vendor/deps/\n*.log\n"),
+        ("src/nested/.gitignore", "generated/\n"),
+        ("src/main.rs", source.as_str()),
+        ("src/nested/keep.rs", source.as_str()),
+        ("vendor/other.rs", source.as_str()),
+        ("vendor/deps/lib.rs", source.as_str()),
+        ("vendor/deps/inner/deep.rs", source.as_str()),
+        ("src/nested/generated/out.rs", source.as_str()),
+        ("trace.log", source.as_str()),
+    ]);
+    if git {
+        let mut command = std::process::Command::new("git");
+        crate::test_helpers::apply_hermetic_git_env(command.current_dir(project.path()));
+        let status = command.args(["init", "-q"]).status().expect("git init");
+        assert!(status.success(), "git init failed");
+    }
+    project
+}
+
+fn relative_files(root: &Path, files: impl IntoIterator<Item = String>) -> Vec<String> {
+    let root = fs::canonicalize(root).expect("canonicalize root");
+    let mut relative = files
+        .into_iter()
+        .map(|file| {
+            Path::new(&file)
+                .strip_prefix(&root)
+                .unwrap_or_else(|_| panic!("{file} is outside {}", root.display()))
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    relative.sort();
+    relative.dedup();
+    relative
+}
+
+/// The files grep finds the needle in and the files glob lists, through the
+/// trigram index when `indexed`, else through the direct-scan fallback.
+fn grep_and_glob_files(root: &Path, indexed: bool) -> (Vec<String>, Vec<String>) {
+    let mut aft = AftProcess::spawn();
+    let grep_request = || {
+        json!({
+            "id": "grep-ignore-rules",
+            "command": "grep",
+            "pattern": IGNORE_RULES_NEEDLE,
+        })
+    };
+    let grep = if indexed {
+        configure_with_index(&mut aft, root);
+        wait_for_index_ready(&mut aft, grep_request)
+    } else {
+        configure(&mut aft, root);
+        send(&mut aft, grep_request())
+    };
+    assert_eq!(grep["success"], true, "grep should succeed: {grep:?}");
+    let grepped = grep["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|found| found["file"].as_str().expect("match file").to_string());
+    let grepped = relative_files(root, grepped);
+
+    let glob = send(
+        &mut aft,
+        json!({ "id": "glob-ignore-rules", "command": "glob", "pattern": "**/*" }),
+    );
+    assert_eq!(glob["success"], true, "glob should succeed: {glob:?}");
+    let globbed = glob["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .map(|file| file.as_str().expect("glob file").to_string());
+    let globbed = relative_files(root, globbed);
+
+    assert!(aft.shutdown().success());
+    (grepped, globbed)
+}
+
+#[test]
+fn grep_and_glob_skip_gitignored_paths_in_non_git_root_like_git_root() {
+    let plain = ignore_rules_project(false);
+    let git = ignore_rules_project(true);
+    let visible = vec![
+        "src/main.rs".to_string(),
+        "src/nested/keep.rs".to_string(),
+        "vendor/other.rs".to_string(),
+    ];
+    let ignored = [
+        "vendor/deps/lib.rs",
+        "vendor/deps/inner/deep.rs",
+        "src/nested/generated/out.rs",
+        "trace.log",
+    ];
+
+    for indexed in [true, false] {
+        let mode = if indexed { "index" } else { "fallback" };
+        let (plain_grep, plain_glob) = grep_and_glob_files(plain.path(), indexed);
+        assert_eq!(
+            plain_grep, visible,
+            "{mode}: non-git grep must find the needle only in files no .gitignore hides"
+        );
+        for path in ignored {
+            assert!(
+                !plain_glob.iter().any(|listed| listed == path),
+                "{mode}: non-git glob listed gitignored {path}: {plain_glob:?}"
+            );
+        }
+
+        let (git_grep, git_glob) = grep_and_glob_files(git.path(), indexed);
+        assert_eq!(
+            plain_grep, git_grep,
+            "{mode}: grep differs between non-git and git"
+        );
+        assert_eq!(
+            plain_glob, git_glob,
+            "{mode}: glob differs between non-git and git"
+        );
+    }
+}
+
 #[test]
 fn glob_fallback_respects_gitignore_and_returns_absolute_paths() {
     let project = setup_project(&[
@@ -1068,8 +1196,7 @@ fn semantic_search_with_both_lanes_off_refuses_instead_of_walking() {
             "harness": "opencode",
             "project_root": project.path(),
             "config": user_config(serde_json::json!({
-                "semantic_search": false,
-                "search_index": false
+                "indexes": { "trigram": false, "semantic": false }
             })),
         }),
     );

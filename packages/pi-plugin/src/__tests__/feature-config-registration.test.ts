@@ -11,7 +11,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -20,13 +20,7 @@ import {
   SEMANTIC_COST_NOTICE,
 } from "@cortexkit/aft-bridge";
 
-import {
-  type AftConfig,
-  ConfigRejectedError,
-  getConfigLoadNotices,
-  loadAftConfig,
-  setFeatureConfigPolicyVersionForTests,
-} from "../config.js";
+import { type AftConfig, getConfigLoadNotices, loadAftConfig } from "../config.js";
 import { registerPiToolSurface, resolvePiToolSurface } from "../tool-registration.js";
 import { makeMockApi, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
@@ -74,7 +68,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  setFeatureConfigPolicyVersionForTests(undefined);
   process.chdir(previousCwd);
   for (const [key, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[key];
@@ -127,17 +120,46 @@ describe("Pi/OMP feature-config registration", () => {
     expect(ADAPTER_UNIMPLEMENTED_TOOLS.omp).toEqual(["apply_patch", "glob"]);
   });
 
-  test("after the window retired keys and aliases reject the whole load", () => {
-    setFeatureConfigPolicyVersionForTests("0.59.0");
-    let rejected: unknown;
-    try {
-      loadWithUserConfig({ disabled_tools: ["aft_glob"] });
-    } catch (err) {
-      rejected = err;
-    }
-    expect(rejected).toBeInstanceOf(ConfigRejectedError);
-    expect((rejected as ConfigRejectedError).errors).toEqual([
-      "removed_config_key:aft_glob:use:glob",
+  test("retired keys in the user file translate and are left to the engine to rewrite", () => {
+    const user = {
+      disabled_tools: ["aft_glob"],
+      search_index: true,
+      semantic_search: false,
+      callgraph_store: false,
+      gh_shim: { enabled: false },
+      inspect: { max_drill_down_items: 20 },
+    };
+    const config = loadWithUserConfig(user);
+    expect(config.disabled_tools).toEqual(["glob"]);
+    expect(config.indexes).toEqual({ trigram: true, semantic: false, callgraph: false });
+    expect(config.github?.shim).toBe(false);
+    // The extension never writes the user file for retired keys: the AFT
+    // binary rewrites it on configure and reports that itself, so the
+    // extension queues no retired-key notice of its own.
+    const userPath = join(root, "xdg", "cortexkit", "aft.jsonc");
+    expect(readFileSync(userPath, "utf8")).toBe(JSON.stringify(user));
+    expect(
+      getConfigLoadNotices().filter(
+        (notice) => notice.configPath === userPath && notice.message.includes("retired keys"),
+      ),
+    ).toEqual([]);
+  });
+
+  test("retired keys in a project file translate under project limits, with one notice and no write", () => {
+    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+    const text = JSON.stringify({
+      search_index: false,
+      idle: { lsp_ttl_minutes: 120 },
+    });
+    writeFileSync(projectFile, text);
+    const config = loadWithUserConfig({ lsp: { idle_minutes: 30 } });
+    expect(config.indexes?.trigram).toBe(false);
+    expect(config.lsp?.idle_minutes).toBe(30);
+    expect(readFileSync(projectFile, "utf8")).toBe(text);
+    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
+    expect(notices.map((notice) => notice.message)).toEqual([
+      `${projectFile} uses retired keys (idle.lsp_ttl_minutes, search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`,
     ]);
   });
 });

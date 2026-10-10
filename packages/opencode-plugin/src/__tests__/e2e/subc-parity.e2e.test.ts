@@ -2,7 +2,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { sep } from "node:path";
 import { promisify } from "node:util";
 import type { BridgePool } from "@cortexkit/aft-bridge";
@@ -102,8 +102,7 @@ maybeDescribe(describeName, () => {
               source: "/tmp/aft-hashline-plugin.jsonc",
               doc: JSON.stringify({
                 edit_mode: "hashline",
-                search_index: false,
-                semantic_search: false,
+                indexes: { trigram: false, semantic: false },
               }),
             },
           ],
@@ -193,8 +192,7 @@ maybeDescribe(describeName, () => {
                   source: "/tmp/aft-hashline-registration.jsonc",
                   doc: JSON.stringify({
                     edit_mode: testCase.rustMode,
-                    search_index: false,
-                    semantic_search: false,
+                    indexes: { trigram: false, semantic: false },
                   }),
                 },
               ],
@@ -258,6 +256,88 @@ maybeDescribe(describeName, () => {
     }
   }, 120_000);
 
+  test("parity fixture excludes harness state from indexed grep and glob", async () => {
+    const harnesses: E2EHarness[] = [];
+    try {
+      for (const transport of ["ndjson", "subc"] as const) {
+        const harness = await createHarness(preparedBinary, {
+          fixtureNames: [],
+          transport,
+          tempPrefix: `aft-plugin-state-${transport}-`,
+        });
+        harnesses.push(harness);
+        await seedParityFixture(harness);
+        // Put matching text in the harness's real state directories before the
+        // daemon starts, so accidentally indexing them fails without a race.
+        await writeFile(
+          harness.path(".aft-env", "storage", "parity-probe.txt"),
+          "subc_parity_marker\n",
+        );
+        await writeFile(harness.path(".aft-user", "parity-probe.txt"), "subc_parity_marker\n");
+
+        const ready = (text: string) =>
+          !text.includes("[index: building") && !text.includes("[index: fallback]");
+        const grep = await toolTextUntil(
+          harness,
+          "grep",
+          { pattern: "subc_parity_marker", path: "." },
+          ready,
+        );
+        expect(ready(grep), `${transport}: ${grep}`).toBe(true);
+        expect(grep, transport).toContain("sample.ts");
+        expect(grep, transport).not.toContain(".aft-env/");
+        expect(grep, transport).not.toContain(".aft-user/");
+        expect(grep, transport).toContain("Found 1 match across 1 file");
+
+        const glob = await toolTextUntil(harness, "glob", { pattern: "**/*", path: "." }, ready);
+        expect(ready(glob), `${transport}: ${glob}`).toBe(true);
+        expect(glob, transport).toContain("sample.ts");
+        expect(glob, transport).not.toContain(".aft-env/");
+        expect(glob, transport).not.toContain(".aft-user/");
+      }
+    } finally {
+      await cleanupHarnesses(harnesses);
+    }
+  }, 90_000);
+
+  test("standalone indexed grep retires an externally deleted source", async () => {
+    const harness = await createHarness(preparedBinary, {
+      fixtureNames: [],
+      tempPrefix: "aft-plugin-delete-ndjson-",
+    });
+    try {
+      await seedParityFixture(harness);
+      await writeFile(harness.path("deleted.ts"), "export const removed = 'subc_parity_marker';\n");
+      const args = { pattern: "subc_parity_marker", path: "." };
+      const ready = (text: string) =>
+        !text.includes("[index: building") && !text.includes("[index: fallback]");
+      const before = await toolTextUntil(harness, "grep", args, ready);
+      expect(ready(before), before).toBe(true);
+      expect(before).toContain("deleted.ts");
+      expect(before).toContain("Found 2 match across 2 file");
+
+      // Delete outside AFT's mutation tools: only the OS watcher can retire
+      // this entry, not a tool's direct cache invalidation.
+      await rm(harness.path("deleted.ts"));
+      const started = Date.now();
+      const after = await toolTextUntil(
+        harness,
+        "grep",
+        args,
+        (text) => ready(text) && !text.includes("were not on disk in this checkout"),
+      );
+      expect(after).not.toContain("were not on disk in this checkout");
+      expect(after).not.toContain("deleted.ts");
+      expect(after).toContain("sample.ts");
+      expect(after).toContain("Found 1 match across 1 file");
+      // A generous bound for loaded CI runners: the failure this guards is an
+      // entry that is never retired, not a slow watcher.
+      expect(Date.now() - started).toBeLessThan(30_000);
+    } finally {
+      await harness.cleanup();
+    }
+  }, 60_000);
+
   test("server-rendered text matches NDJSON for representative tool calls", async () => {
     const harnesses: E2EHarness[] = [];
     try {
@@ -288,11 +368,13 @@ maybeDescribe(describeName, () => {
         // poll BOTH sides to the converged state before comparing. A
         // side that never converges still fails the assertion verbatim.
         // An index that listed a file since deleted is also a transient state:
-        // the watcher's next drain removes it.
+        // the watcher's next drain removes it, as do watcher changes not yet
+        // applied to the index.
         const converged = (text: string) =>
           !text.includes("building/retrying") &&
           !text.includes("[index: building") &&
-          !text.includes("were not on disk in this checkout");
+          !text.includes("were not on disk in this checkout") &&
+          !text.includes("Watcher changes pending");
         const ndjsonText = await toolTextUntil(ndjson, call.name, call.args, converged);
         const subcText = await toolTextUntil(subc, call.name, call.args, converged);
         expect(normalizeRoot(subcText, subc.tempDir), call.name).toBe(
@@ -306,15 +388,12 @@ maybeDescribe(describeName, () => {
 });
 
 async function seedParityFixture(harness: E2EHarness): Promise<void> {
-  // The NDJSON harness points its child's AFT_CACHE_DIR at `.aft-cache` inside
-  // the project, and both harnesses write `.aft-user/aft.jsonc` there. AFT's
-  // project walk includes hidden directories, so without this the NDJSON
-  // side indexed its own state: lock files and `*.tmp.*` files that come and
-  // go while it runs. A grep after one vanished reported "1 indexed file(s)
-  // were not on disk" on the NDJSON side only, because the subc daemon keeps
-  // its cache outside the project. Excluding both directories keeps each
-  // side's index to the fixture files.
-  await writeFile(harness.path(".aftignore"), ".aft-cache/\n.aft-user/\n", "utf8");
+  // The standalone harness puts its child's HOME, XDG directories, storage,
+  // and cache under `.aft-env`; subc keeps daemon state outside the project.
+  // Both harnesses also write `.aft-user/aft.jsonc`. Exclude these actual
+  // state directories so parity compares fixture sources, not one daemon's
+  // changing locks, logs, leases, or temporary files.
+  await writeFile(harness.path(".aftignore"), ".aft-env/\n.aft-user/\n", "utf8");
   await writeFile(
     harness.path("sample.ts"),
     [

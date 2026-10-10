@@ -98,6 +98,9 @@ pub mod cause {
     pub const ONNX_RUNTIME_UNAVAILABLE: &str = "onnx_runtime_unavailable";
     /// The semantic build failed for another reason.
     pub const SEMANTIC_BUILD_FAILED: &str = "semantic_build_failed";
+    /// No session has the project open and it has no saved semantic index, so
+    /// AFT does not build one (see `semantic_admission`).
+    pub const SEMANTIC_NOT_OPENED: &str = "not_opened";
     /// The callgraph builder was suspended after repeated build deaths.
     pub const BUILD_SUSPENDED: &str = "build_suspended";
     /// The callgraph build was refused for this configure generation.
@@ -328,6 +331,9 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
 
 /// Classify a failed semantic build into a named cause.
 pub fn semantic_failure_cause(ctx: &AppContext, message: &str) -> &'static str {
+    if crate::semantic_admission::is_not_opened_status(message) {
+        return cause::SEMANTIC_NOT_OPENED;
+    }
     let local_backend = matches!(
         ctx.config().semantic.backend,
         crate::config::SemanticBackend::Fastembed

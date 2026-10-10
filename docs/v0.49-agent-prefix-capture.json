@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "1f3f1ccce6441412081fdea25b2822a09b9a9812",
+  "source_commit": "ab84c33aecbc559e51cb2ea7e90e142d0629cba5",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -9,7 +9,7 @@
       "profile_id": "REG-V049-OC-MIN",
       "harness": "opencode",
       "host_version": {
-        "value": "1.18.30",
+        "value": "1.18.35",
         "method": "opencode --version"
       },
       "capture_method": "production buildOpenCodeToolMap registration output plus system-transform workflow hint input",
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "1f3f1ccce6441412081fdea25b2822a09b9a9812",
+      "source_commit": "ab84c33aecbc559e51cb2ea7e90e142d0629cba5",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -192,7 +192,7 @@
       "profile_id": "REG-V049-OC-REC",
       "harness": "opencode",
       "host_version": {
-        "value": "1.18.30",
+        "value": "1.18.35",
         "method": "opencode --version"
       },
       "capture_method": "production buildOpenCodeToolMap registration output plus system-transform workflow hint input",
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "1f3f1ccce6441412081fdea25b2822a09b9a9812",
+      "source_commit": "ab84c33aecbc559e51cb2ea7e90e142d0629cba5",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -377,7 +377,7 @@
             }
           },
           "bash": {
-            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports it is still running; watch again to keep waiting); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports it is still running; watch again to keep waiting); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -955,7 +955,7 @@
             }
           },
           "aft_inspect": {
-            "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1064,7 +1064,7 @@
       "profile_id": "REG-V049-OC-ALL",
       "harness": "opencode",
       "host_version": {
-        "value": "1.18.30",
+        "value": "1.18.35",
         "method": "opencode --version"
       },
       "capture_method": "production buildOpenCodeToolMap registration output plus system-transform workflow hint input",
@@ -1073,13 +1073,15 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "1f3f1ccce6441412081fdea25b2822a09b9a9812",
+      "source_commit": "ab84c33aecbc559e51cb2ea7e90e142d0629cba5",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
           "aft_conflicts",
+          "aft_delete",
           "aft_import",
           "aft_inspect",
+          "aft_move",
           "aft_outline",
           "aft_safety",
           "aft_search",
@@ -1249,8 +1251,53 @@
               ]
             }
           },
+          "aft_delete": {
+            "description": "Delete one or more files (or directories).\n\nEach file is backed up before deletion — use aft_safety undo to recover any of them. A recursive delete backs up the whole tree: directories (empty ones too, with their permissions), file contents, hard links (relinked by undo) and symlinks (the link itself, never its target; restored exactly, even when dangling). Sockets are deleted but undo does not restore them, and a file hard-linked to paths outside the tree comes back as an independent copy; both are reported as warnings. Refused before anything is deleted: mount points of another filesystem, named pipes, device nodes, and symlinks undo cannot recreate exactly (non-UTF-8 target, or on Windows). Paths under the system temp directory are never backed up, so only mount points are refused there. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would record more than 2,000 entries (files, directories and links) or copy 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\nPartial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`.",
+            "schema": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "files": {
+                  "description": "Paths to delete (one or more). May include directories when recursive=true.",
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "recursive": {
+                  "description": "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "files"
+              ]
+            }
+          },
+          "aft_move": {
+            "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for destination automatically\nNote: This moves/renames whole files at the OS level; it does not relocate an individual symbol or rewrite imports.",
+            "schema": {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "type": "object",
+              "properties": {
+                "path": {
+                  "description": "Source file path to move (absolute or relative to project root)",
+                  "type": "string"
+                },
+                "destination": {
+                  "description": "Destination file path (absolute or relative to project root)",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "destination"
+              ]
+            }
+          },
           "bash": {
-            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports it is still running; watch again to keep waiting); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports it is still running; watch again to keep waiting); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1888,7 +1935,7 @@
             }
           },
           "aft_inspect": {
-            "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1997,7 +2044,7 @@
       "profile_id": "REG-V049-PI-MIN",
       "harness": "pi",
       "host_version": {
-        "value": "1.0.0",
+        "value": "1.1.0",
         "method": "pi --version"
       },
       "capture_method": "production registerPiToolSurface registration output plus before_agent_start workflow hint input",
@@ -2006,7 +2053,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "1f3f1ccce6441412081fdea25b2822a09b9a9812",
+      "source_commit": "ab84c33aecbc559e51cb2ea7e90e142d0629cba5",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2188,7 +2235,7 @@
       "profile_id": "REG-V049-PI-REC",
       "harness": "pi",
       "host_version": {
-        "value": "1.0.0",
+        "value": "1.1.0",
         "method": "pi --version"
       },
       "capture_method": "production registerPiToolSurface registration output plus before_agent_start workflow hint input",
@@ -2197,7 +2244,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "1f3f1ccce6441412081fdea25b2822a09b9a9812",
+      "source_commit": "ab84c33aecbc559e51cb2ea7e90e142d0629cba5",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -2223,7 +2270,7 @@
           "bash": {
             "name": "bash",
             "label": "bash",
-            "description": "Execute shell commands. Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`. Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, `bash.worker_wait_max_ms`, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports it is still running; watch again to keep waiting); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: \"screen\" })` plus `bash_write`.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Execute shell commands. Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`. Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, `bash.worker_wait_max_ms`, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports it is still running; watch again to keep waiting); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: \"screen\" })` plus `bash_write`. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "promptSnippet": "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)",
             "promptGuidelines": [
               "DO NOT use bash for code search or exploration — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead.",
@@ -2869,7 +2916,7 @@
           "aft_inspect": {
             "name": "aft_inspect",
             "label": "inspect",
-            "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -3170,7 +3217,7 @@
       "profile_id": "REG-V049-PI-ALL",
       "harness": "pi",
       "host_version": {
-        "value": "1.0.0",
+        "value": "1.1.0",
         "method": "pi --version"
       },
       "capture_method": "production registerPiToolSurface registration output plus before_agent_start workflow hint input",
@@ -3179,13 +3226,15 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "1f3f1ccce6441412081fdea25b2822a09b9a9812",
+      "source_commit": "ab84c33aecbc559e51cb2ea7e90e142d0629cba5",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
           "aft_conflicts",
+          "aft_delete",
           "aft_import",
           "aft_inspect",
+          "aft_move",
           "aft_outline",
           "aft_safety",
           "aft_search",
@@ -3206,7 +3255,7 @@
           "bash": {
             "name": "bash",
             "label": "bash",
-            "description": "Execute shell commands. Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`. Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, `bash.worker_wait_max_ms`, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports it is still running; watch again to keep waiting); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: \"screen\" })` plus `bash_write`.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Execute shell commands. Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`. Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, `bash.worker_wait_max_ms`, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports it is still running; watch again to keep waiting); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: \"screen\" })` plus `bash_write`. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "promptSnippet": "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)",
             "promptGuidelines": [
               "DO NOT use bash for code search or exploration — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead.",
@@ -3852,7 +3901,7 @@
           "aft_inspect": {
             "name": "aft_inspect",
             "label": "inspect",
-            "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -4208,6 +4257,53 @@
                 "dryRun": {
                   "type": "boolean",
                   "description": "Preview without applying (default: false)"
+                }
+              }
+            }
+          },
+          "aft_delete": {
+            "name": "aft_delete",
+            "label": "delete",
+            "description": "Delete one or more files (or directories). Each file is backed up before deletion — use `aft_safety undo` to recover any of them. A recursive delete backs up the whole tree: directories (empty ones too, with their permissions), file contents, hard links (relinked by undo) and symlinks (the link itself, never its target; restored exactly, even when dangling). Sockets are deleted but undo does not restore them, and a file hard-linked to paths outside the tree comes back as an independent copy; both are reported as warnings. Refused before anything is deleted: mount points of another filesystem, named pipes, device nodes, and symlinks undo cannot recreate exactly (non-UTF-8 target, or on Windows). Paths under the system temp directory are never backed up, so only mount points are refused there. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would record more than 2,000 entries (files, directories and links) or copy 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. Directory deletion requires recursive: true. Returns { success, complete, deleted, skipped_files }: partial success is allowed; files that fail are reported in skipped_files.",
+            "parameters": {
+              "type": "object",
+              "required": [
+                "files"
+              ],
+              "properties": {
+                "files": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Paths to delete (one or more). May include directories when recursive=true.",
+                  "minItems": 1
+                },
+                "recursive": {
+                  "type": "boolean",
+                  "description": "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error."
+                }
+              }
+            }
+          },
+          "aft_move": {
+            "name": "aft_move",
+            "label": "move",
+            "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for the destination automatically. This operates on whole files at the OS level; it does not relocate an individual symbol or rewrite imports.",
+            "parameters": {
+              "type": "object",
+              "required": [
+                "path",
+                "destination"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Source file path to move (absolute or relative to project root)"
+                },
+                "destination": {
+                  "type": "string",
+                  "description": "Destination file path (absolute or relative to project root)"
                 }
               }
             }

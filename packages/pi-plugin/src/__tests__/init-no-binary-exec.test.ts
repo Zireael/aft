@@ -71,7 +71,7 @@ describe.serial.skipIf(process.platform === "win32")(
       );
 
       mkdirSync(home, { recursive: true });
-      writeUserConfig({ lsp: { auto_install: false }, semantic_search: false });
+      writeUserConfig({ lsp: { auto_install: false }, indexes: { semantic: false } });
       prevCwd = process.cwd();
       process.chdir(home);
     });
@@ -130,7 +130,7 @@ describe.serial.skipIf(process.platform === "win32")(
       writeFileSync(join(tempDir, "subc-connection.json"), "{}");
       writeUserConfig({
         lsp: { auto_install: false },
-        semantic_search: false,
+        indexes: { semantic: false },
         subc: { connection_file: join(tempDir, "subc-connection.json") },
       });
       const resolverCalls: string[] = [];

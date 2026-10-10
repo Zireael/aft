@@ -178,35 +178,70 @@ fn media_file_too_large_response(id: &str, byte_size: u64) -> Response {
     )
 }
 
-fn handle_media_read(
+enum PreparedPathRead {
+    Response(Response),
+    Media {
+        raw_bytes: Vec<u8>,
+        media: SniffedMedia,
+    },
+}
+
+impl PreparedPathRead {
+    fn into_response(self, id: &str) -> Response {
+        let (raw_bytes, media) = match self {
+            Self::Response(response) => return response,
+            Self::Media { raw_bytes, media } => (raw_bytes, media),
+        };
+        let byte_size = raw_bytes.len();
+        match media {
+            SniffedMedia::Pdf => handle_pdf_media(id, raw_bytes),
+            SniffedMedia::Image(kind) => match process_image_with_timeout(raw_bytes, kind) {
+                Ok(image) => image_attachment_response(id, image),
+                Err(reason) => media_omitted_response(id, byte_size, reason),
+            },
+        }
+    }
+}
+
+fn prepare_media_read(
     req: &RawRequest,
     path: &Path,
     byte_size: u64,
     media: SniffedMedia,
-) -> Response {
+    capture_source: bool,
+    captured_source: &mut Option<CapturedRead>,
+) -> PreparedPathRead {
     if byte_size > MAX_FILE_READ_BYTES {
-        return media_file_too_large_response(&req.id, byte_size);
+        return PreparedPathRead::Response(media_file_too_large_response(&req.id, byte_size));
     }
 
-    let raw_bytes = match fs::read(path) {
+    // Hashline tag publication needs source bytes and metadata, even to explain
+    // why binary content cannot receive line tags. Capture them within the
+    // filesystem deadline instead of reopening the file after a slow decode.
+    let source = capture_source
+        .then(|| crate::hashline::snapshot::read_source(path).ok())
+        .flatten();
+    let bytes = match source.as_ref().filter(|source| source.has_complete_bytes()) {
+        Some(source) => Ok(source.bytes().to_vec()),
+        None => fs::read(path),
+    };
+    let raw_bytes = match bytes {
         Ok(bytes) => bytes,
         Err(e) => {
-            return Response::error(
+            return PreparedPathRead::Response(Response::error(
                 &req.id,
                 "io_error",
                 format!("read: failed to read file: {}", e),
-            );
+            ));
         }
     };
-    let byte_size = raw_bytes.len();
-
-    match media {
-        SniffedMedia::Pdf => handle_pdf_media(&req.id, raw_bytes),
-        SniffedMedia::Image(kind) => match process_image_with_timeout(raw_bytes, kind) {
-            Ok(image) => image_attachment_response(&req.id, image),
-            Err(reason) => media_omitted_response(&req.id, byte_size, reason),
-        },
+    if let Some(source) = source {
+        *captured_source = Some(CapturedRead {
+            path: path.to_path_buf(),
+            source,
+        });
     }
+    PreparedPathRead::Media { raw_bytes, media }
 }
 
 fn handle_pdf_media(id: &str, raw_bytes: Vec<u8>) -> Response {
@@ -310,6 +345,8 @@ fn process_image_with_timeout(
     raw_bytes: Vec<u8>,
     kind: ImageKind,
 ) -> Result<ProcessedImage, String> {
+    #[cfg(test)]
+    IMAGE_PROCESSING_DELAY.with(|delay| std::thread::sleep(delay.get()));
     ACTIVE_IMAGE_DECODERS.fetch_update(
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
@@ -1087,6 +1124,10 @@ pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome 
 /// Returns for binary files:
 ///   `{ binary: true, byte_size }`
 pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
+    crate::bounded_io::command(req, ctx, handle_read_inner)
+}
+
+fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(file) = req.params.get("file").and_then(Value::as_str) {
         if is_github_read_target(file) {
             return handle_github_read(req, ctx, file);
@@ -1334,6 +1375,7 @@ struct CapturedRead {
 thread_local! {
     static LEGACY_HASHLINE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LEGACY_READ_RENDER_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IMAGE_PROCESSING_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 fn handle_read_local(
@@ -1372,45 +1414,125 @@ fn handle_read_local(
         };
     }
 
+    // The helper owns only request data and file bytes, never the actor or its
+    // reader hold. Include stat, directory iteration, open, and streaming reads:
+    // any of those can wait in the kernel on a protected or remote volume.
+    let owned_req = req.clone();
+    #[cfg(test)]
+    let legacy = LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
+    #[cfg(test)]
+    let image_delay = IMAGE_PROCESSING_DELAY.with(|delay| delay.get());
+    let result = crate::bounded_io::run(path.as_path(), None, move |path| {
+        #[cfg(test)]
+        LEGACY_HASHLINE_READ.with(|value| value.set(legacy));
+        #[cfg(test)]
+        IMAGE_PROCESSING_DELAY.with(|value| value.set(image_delay));
+        let mut captured = None;
+        let response = handle_read_path(&owned_req, &path, capture_source, &mut captured);
+        #[cfg(test)]
+        let observations = (
+            crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.get()),
+            LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.get()),
+        );
+        #[cfg(not(test))]
+        let observations = ();
+        Ok((response, captured, observations))
+    });
+    match result {
+        Ok((response, captured, _observations)) => {
+            #[cfg(test)]
+            {
+                crate::hashline::snapshot::SOURCE_READS
+                    .with(|reads| reads.set(reads.get() + _observations.0));
+                LEGACY_READ_RENDER_BYTES.with(|bytes| bytes.set(bytes.get() + _observations.1));
+            }
+            *captured_source = captured;
+            // Decoding, resizing and base64 encoding are CPU work, not OS access.
+            // Run them after the filesystem helper returns so a slow image uses
+            // the image-processing timeout rather than the filesystem deadline.
+            response.into_response(&req.id)
+        }
+        Err(error) => Response::error(&req.id, "read_blocked", error.to_string()),
+    }
+}
+
+fn handle_read_path(
+    req: &RawRequest,
+    path: &Path,
+    capture_source: bool,
+    captured_source: &mut Option<CapturedRead>,
+) -> PreparedPathRead {
+    let file = path.to_string_lossy();
     // Check existence
     if !path.exists() {
-        return Response::error(
+        return PreparedPathRead::Response(Response::error(
             &req.id,
             "not_found",
             format!("read: file not found: {}", file),
-        );
+        ));
     }
 
     // Directory listing
     if path.is_dir() {
-        return handle_directory(req, path.as_path());
+        return PreparedPathRead::Response(handle_directory(req, path));
     }
 
-    let metadata = match fs::metadata(path.as_path()) {
+    let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(e) => {
-            return Response::error(
+            return PreparedPathRead::Response(Response::error(
                 &req.id,
                 "io_error",
                 format!("read: failed to stat file: {}", e),
-            );
+            ));
         }
     };
 
-    let magic = match read_magic(path.as_path()) {
+    if !metadata.is_file() {
+        return PreparedPathRead::Response(Response::error(
+            &req.id,
+            "unsupported_file_type",
+            "read: only regular files and directories can be read",
+        ));
+    }
+
+    let magic = match read_magic(path) {
         Ok(magic) => magic,
         Err(e) => {
-            return Response::error(
+            return PreparedPathRead::Response(Response::error(
                 &req.id,
                 "io_error",
                 format!("read: failed to read file header: {}", e),
-            );
+            ));
         }
     };
     if let Some(media) = sniff_media(&magic) {
-        return handle_media_read(req, path.as_path(), metadata.len(), media);
+        return prepare_media_read(
+            req,
+            path,
+            metadata.len(),
+            media,
+            capture_source,
+            captured_source,
+        );
     }
 
+    PreparedPathRead::Response(handle_text_or_binary_read(
+        req,
+        path,
+        metadata.len(),
+        capture_source,
+        captured_source,
+    ))
+}
+
+fn handle_text_or_binary_read(
+    req: &RawRequest,
+    path: &Path,
+    file_byte_size: u64,
+    capture_source: bool,
+    captured_source: &mut Option<CapturedRead>,
+) -> Response {
     // Parse range parameters. Zero is outside the 1-based domain of every
     // range field, so a `0` placeholder counts as absent rather than selecting
     // an empty window (a zero limit or end line would read no lines at all).
@@ -1447,21 +1569,21 @@ fn handle_read_local(
     if has_explicit_range {
         return handle_streaming_range_read(
             req,
-            path.as_path(),
-            metadata.len(),
+            path,
+            file_byte_size,
             start_line,
             explicit_end_line,
             limit,
         );
     }
 
-    if metadata.len() > MAX_FILE_READ_BYTES {
+    if file_byte_size > MAX_FILE_READ_BYTES {
         return Response::error(
             &req.id,
             "invalid_request",
             format!(
                 "read: file is too large to load at once ({} bytes > {} bytes). Use start_line/end_line to read sections.",
-                metadata.len(),
+                file_byte_size,
                 MAX_FILE_READ_BYTES
             ),
         );
@@ -1469,14 +1591,14 @@ fn handle_read_local(
 
     // Read raw bytes for binary detection
     let read_source = capture_source
-        .then(|| crate::hashline::snapshot::read_source(path.as_path()).ok())
+        .then(|| crate::hashline::snapshot::read_source(path).ok())
         .flatten()
         .filter(|source| source.has_complete_bytes());
     let fallback_bytes;
     let raw_bytes = if let Some(source) = &read_source {
         source.bytes()
     } else {
-        fallback_bytes = match fs::read(path.as_path()) {
+        fallback_bytes = match fs::read(path) {
             Ok(b) => b,
             Err(e) => {
                 return Response::error(
@@ -1535,7 +1657,7 @@ fn handle_read_local(
     );
     if let Some(source) = read_source {
         *captured_source = Some(CapturedRead {
-            path: path.as_path().to_path_buf(),
+            path: path.to_path_buf(),
             source,
         });
     }
@@ -2083,6 +2205,7 @@ mod tests {
 
     #[test]
     fn github_read_response_preserves_engine_text_and_attachment_metadata() {
+        let _decoder_guard = image_decoder_test_guard();
         let request = RawRequest {
             id: "github-response".to_string(),
             command: "read".to_string(),
@@ -2172,7 +2295,16 @@ mod tests {
             .as_array()
             .and_then(|attachments| attachments.first())
             .and_then(Value::as_object)
-            .expect("first attachment object")
+            .unwrap_or_else(|| panic!("first attachment object: {data}"))
+    }
+
+    /// Image decoding admits at most `MAX_IMAGE_DECODERS` process-wide. Tests
+    /// that decode images run serially so a parallel test holding the slots
+    /// cannot turn an expected attachment into a capacity omission.
+    fn image_decoder_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn decoded_attachment_bytes(attachment: &serde_json::Map<String, Value>) -> Vec<u8> {
@@ -2205,6 +2337,7 @@ mod tests {
 
     #[test]
     fn media_sniff_supports_images_and_passthrough_for_small_files() {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let small = rgba_image(32, 16, false);
         let fixtures = [
@@ -2249,6 +2382,7 @@ mod tests {
 
     #[test]
     fn media_sniff_happens_before_explicit_range_and_resizes_large_images() {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let large = rgba_image(2048, 512, false);
         let bytes = encode_png(&large).unwrap();
@@ -2269,6 +2403,7 @@ mod tests {
 
     #[test]
     fn resized_webp_reencodes_with_source_mime() {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let large = rgba_image(2048, 512, false);
         let bytes = encode_webp_lossless(&large).unwrap();
@@ -2291,6 +2426,7 @@ mod tests {
 
     #[test]
     fn corrupt_images_are_omitted_with_reason() {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = write_fixture(temp.path(), "corrupt.png", b"\x89PNG\r\n\x1a\nnot a png");
 
@@ -2350,6 +2486,7 @@ mod tests {
 
     #[test]
     fn oversized_image_after_resize_is_omitted_with_reason() {
+        let _decoder_guard = image_decoder_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let noisy = rgba_image(1536, 1536, true);
         let bytes = encode_png(&noisy).unwrap();
@@ -2357,12 +2494,72 @@ mod tests {
 
         let response = read_response(temp.path(), &path, json!({}));
 
-        assert!(response.success);
+        assert!(response.success, "{response:?}");
         assert_eq!(response.data["attachments"].as_array().unwrap().len(), 0);
         assert!(response.data["attachment_omitted_reason"]
             .as_str()
             .unwrap()
             .contains("too large to inline"));
+    }
+
+    fn image_read_beyond_filesystem_deadline(hashline: bool) {
+        let _decoder_guard = image_decoder_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bytes = encode_png(&rgba_image(2, 2, false)).unwrap();
+        let path = write_fixture(temp.path(), "small.png", &bytes);
+        let ctx = ctx_for(temp.path());
+        let req = request(&path, json!({}));
+        if hashline {
+            assert!(
+                ctx.hashline_bindings()
+                    .register(
+                        temp.path(),
+                        req.session().to_string(),
+                        crate::hashline::integration::RegistrationRequest {
+                            configured_enabled: true,
+                            edit_slot_survives: true,
+                            read_slot_survives: true,
+                        },
+                    )
+                    .effective
+            );
+        }
+        crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.set(0));
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(1));
+        // Simulate slow decoding without adding CPU load. Filesystem access must
+        // finish within its budget, but image processing has a separate timeout.
+        let response = crate::bounded_io::with_budget(Some(budget), || {
+            let previous =
+                IMAGE_PROCESSING_DELAY.with(|delay| delay.replace(Duration::from_millis(1100)));
+            let response = handle_read(&req, &ctx);
+            IMAGE_PROCESSING_DELAY.with(|delay| delay.set(previous));
+            response
+        });
+
+        assert!(response.success, "{response:?}");
+        let attachment = first_attachment(&response.data);
+        assert_eq!(attachment["kind"], "image");
+        assert_eq!(decoded_attachment_bytes(attachment), bytes);
+        if hashline {
+            assert!(response.data["hashline_tag_unavailable_reason"]
+                .as_str()
+                .unwrap()
+                .contains("binary"));
+            assert_eq!(
+                crate::hashline::snapshot::SOURCE_READS.with(|reads| reads.get()),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn image_processing_does_not_consume_filesystem_deadline() {
+        image_read_beyond_filesystem_deadline(false);
+    }
+
+    #[test]
+    fn registered_image_processing_does_not_consume_filesystem_deadline() {
+        image_read_beyond_filesystem_deadline(true);
     }
 
     /// Render a read response through the agent-facing text formatter, the same

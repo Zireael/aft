@@ -8,9 +8,10 @@
 //! is invisible to the census.
 //!
 //! `parked_semantic_loads_are_unattributed` is the reproduction of the cause
-//! found. It runs a real `ck-subc` daemon in a temporary, isolated home with
-//! the `aft` binary this package builds as its module, and opens one short
-//! session per root: bind, run a 15 s command, close the route, the way agent
+//! found. It copies the configured `ck-subc` source to a test-only
+//! `ckdev-subc` executable in a temporary, isolated home, runs it with the
+//! `aft` binary this package builds as its module, and opens one short session
+//! per root: bind, run a 15 s command, close the route, the way agent
 //! sessions come and go. Each bind runs configure, which reloads that root's
 //! semantic index from disk on a background thread, and the next completion
 //! drain installs it. The name reflects the first hypothesis (a finished load
@@ -41,7 +42,7 @@
 //! ```
 //!
 //! The daemon test never touches the operator's daemon: it starts its own
-//! `ck-subc` with every XDG directory, `HOME` and `TMPDIR` pointed into a
+//! `ckdev-subc` copy with every XDG directory, `HOME` and `TMPDIR` pointed into a
 //! temporary directory, on a kernel-assigned port, in its own process group,
 //! and kills that group when it finishes. It runs the module with
 //! `MallocStackLogging=1` and reads that process with `malloc_history`, which
@@ -50,6 +51,7 @@
 #![cfg(target_os = "macos")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -272,7 +274,7 @@ fn serve_connection(mut stream: TcpStream, shutdown: &AtomicBool) {
 // Reproduction: a hermetic subc daemon with the aft module.
 // ---------------------------------------------------------------------------
 
-/// A `ck-subc` daemon started in its own process group under an isolated home.
+/// A `ckdev-subc` daemon started in its own process group under an isolated home.
 /// Dropping it kills the whole group, which includes the aft module process
 /// the daemon spawned.
 struct HermeticDaemon {
@@ -285,7 +287,8 @@ impl HermeticDaemon {
         let runtime = home.join("runtime");
         let connection_file = runtime.join("subc-connection.json");
         let _ = std::fs::remove_file(&connection_file);
-        let child = Command::new(subc_bin)
+        let test_bin = copy_test_daemon(subc_bin, home);
+        let child = Command::new(&test_bin)
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("HOME", home.join("home"))
@@ -300,12 +303,12 @@ impl HermeticDaemon {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("start hermetic ck-subc");
+            .expect("start hermetic ckdev-subc");
         let deadline = Instant::now() + Duration::from_secs(60);
         while !connection_file.exists() {
             assert!(
                 Instant::now() < deadline,
-                "hermetic ck-subc did not publish its connection file"
+                "hermetic ckdev-subc did not publish its connection file"
             );
             thread::sleep(Duration::from_millis(200));
         }
@@ -317,6 +320,33 @@ impl HermeticDaemon {
             connection_file,
         }
     }
+}
+
+fn copy_test_daemon(subc_bin: &Path, home: &Path) -> PathBuf {
+    let test_bin = home.join("ckdev-subc");
+    std::fs::copy(subc_bin, &test_bin).expect("copy daemon into the isolated test home");
+    test_bin
+}
+
+#[test]
+fn copied_test_daemon_executes_under_the_ckdev_name() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("ck-subc");
+    std::fs::write(&source, "#!/bin/sh\nprintf '%s\\n' \"$0\"\n").unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let test_bin = copy_test_daemon(&source, &home);
+    assert_eq!(test_bin.file_name(), Some(OsStr::new("ckdev-subc")));
+    let output = Command::new(&test_bin).output().expect("run copied daemon");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        test_bin.to_string_lossy()
+    );
 }
 
 impl Drop for HermeticDaemon {
@@ -533,7 +563,7 @@ fn parked_semantic_loads_are_unattributed() {
     std::fs::write(
         home.join("config/cortexkit/aft.jsonc"),
         format!(
-            r#"{{"search_index": true, "semantic_search": true,
+            r#"{{"indexes": {{"trigram": true, "semantic": true}},
   "semantic": {{"backend": "openai_compatible", "model": "stub-embedding",
                "base_url": "{base}", "timeout_ms": 60000}},
   "subc": {{"connection_file": "{conn}"}}}}"#,

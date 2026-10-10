@@ -169,6 +169,27 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
 }
 
 const CASES: ParityCase[] = [
+  { name: "privacy_user_on_project_off", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
+  { name: "privacy_project_on", user: { bash: { disclaim_privacy: false } }, project: { bash: { disclaim_privacy: true } } },
+  { name: "privacy_project_off_dropped", project: { bash: { disclaim_privacy: false } } },
+  { name: "privacy_user_on_project_bool", user: { bash: { disclaim_privacy: true } }, project: { bash: false } },
+  { name: "privacy_pi_project_on", harness: "pi", project: { bash: { disclaim_privacy: true } } },
+  { name: "privacy_pi_user_on_project_off", harness: "pi", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
+  { name: "lsp_idle_default", user: {} },
+  { name: "lsp_idle_never", user: { lsp: { idle_minutes: "never" } } },
+  { name: "lsp_idle_clamped_min", user: { lsp: { idle_minutes: 0 } } },
+  { name: "lsp_idle_clamped_max", user: { lsp: { idle_minutes: 2000 } } },
+  { name: "lsp_idle_project_tighten", user: { lsp: { idle_minutes: 120 } }, project: { lsp: { idle_minutes: 5 } } },
+  { name: "lsp_idle_project_number_from_never", user: { lsp: { idle_minutes: "never" } }, project: { lsp: { idle_minutes: 1440 } } },
+  { name: "lsp_idle_project_loosen_refused", user: { lsp: { idle_minutes: 30 } }, project: { lsp: { idle_minutes: 60 } } },
+  { name: "lsp_idle_project_never_refused", user: { lsp: { idle_minutes: 30 } }, project: { lsp: { idle_minutes: "never" } } },
+  { name: "inspect_categories_tighten", user: { inspect: { categories: { dead_code: false, todos: true } } }, project: { inspect: { categories: { dead_code: true, todos: false } } } },
+  { name: "inspect_categories_all_off", user: { inspect: { categories: { diagnostics: false, todos: false, dead_code: false, unused_exports: false, duplicates: false, cycles: false, complexity: false } } } },
+  { name: "inspect_removed_soft_deadline", user: { inspect: { tier2_soft_deadline_ms: 50 } } },
+  { name: "inspect_removed_max_items", project: { inspect: { max_drill_down_items: 20 } } },
+  { name: "inspect_removed_harness_idle", user: { harnesses: { pi: { idle: { lsp_ttl_minutes: 10 } } } }, harness: "pi" },
+  { name: "pi_lsp_idle_project_never_refused", user: { lsp: { idle_minutes: 30 } }, project: { lsp: { idle_minutes: "never" } }, harness: "pi" },
+  { name: "pi_inspect_categories_tighten", user: { inspect: { categories: { dead_code: false } } }, project: { inspect: { categories: { dead_code: true, todos: false } } }, harness: "pi" },
   { name: "empty" },
   {
     name: "user_only_basic",
@@ -592,12 +613,13 @@ const CASES: ParityCase[] = [
     user: { inspect: { tier2_pass_timeout_ms: 45000 } },
   },
   {
-    // The retired gh_shim.enabled alias rejects the whole load.
+    // The retired gh_shim.enabled alias translates to github.shim.
     name: "gh_shim_user_disabled",
     user: { gh_shim: { enabled: false } },
   },
   {
-    // The retired alias rejects even from the project tier.
+    // A project alias translates to github.shim, which a project may only
+    // turn off.
     name: "gh_shim_project_stripped",
     user: {},
     project: { gh_shim: { enabled: false } },
@@ -605,6 +627,25 @@ const CASES: ParityCase[] = [
   {
     name: "gh_shim_binary_path",
     user: { gh_shim: { binary_path: "/tmp/aft-dev-profile/aft" } },
+  },
+  {
+    // Remote runs (`runon`) are a user-tier switch with the runner demand
+    // a call without specifics runs under.
+    name: "remote_exec_user",
+    user: { remote_exec: { enabled: true, default_demand: "linux" } },
+  },
+  {
+    // A project can neither enable remote runs nor choose their runner.
+    name: "remote_exec_project_dropped",
+    user: {},
+    project: { remote_exec: { enabled: true, default_demand: "linux" } },
+  },
+  {
+    // A project may turn remote runs off for itself, and the refusal can
+    // then name the project.
+    name: "remote_exec_project_off",
+    user: { remote_exec: { enabled: true } },
+    project: { remote_exec: { enabled: false } },
   },
   {
     // The gate controls a host-wide tool description, so the project attempt is dropped.
@@ -759,6 +800,8 @@ const CASES: ParityCase[] = [
     harness: "opencode",
     user: { indexes: { semantic: false }, harnesses: { opencode: { indexes: { semantic: true } } } },
   },
+  // The fixture name is older than the alias translation: with both keys
+  // present, github.read wins over the gh_read alias.
   { name: "gh_read_alias_rejected", user: { gh_read: { enabled: false }, github: { read: true } } },
   { name: "bash_true", user: { bash: true } },
   { name: "bash_false", user: { bash: false } },
@@ -778,6 +821,20 @@ const CASES: ParityCase[] = [
     user: { bash: { foreground_wait_window_ms: 1 } },
   },
   { name: "bash_subagent", user: { bash: { subagent_background: true } } },
+  {
+    name: "bash_runon_project_cannot_enable",
+    user: { bash: { runon_enabled: false } },
+    project: { bash: { runon_enabled: true } },
+  },
+  {
+    name: "bash_runon_user_enabled",
+    user: { bash: { runon_enabled: true } },
+    project: { bash: { runon_enabled: false } },
+  },
+  {
+    name: "bash_runon_project_only_dropped",
+    project: { bash: { runon_enabled: true } },
+  },
   {
     name: "bash_host_fallback_project",
     user: { bash: { host_fallback: false } },
@@ -810,6 +867,52 @@ const CASES: ParityCase[] = [
   {
     name: "idle_non_integer_dropped",
     user: { idle: { root_ttl_minutes: 12.5 } },
+  },
+  // --- Retired keys are translated instead of failing the load. These cover
+  //     gh_read, gh_shim.enabled, idle.lsp_ttl_minutes and the two removed
+  //     inspect keys in both tiers; a project's translated value follows the
+  //     same project rules as the current key. ---
+  { name: "retired_gh_read_project_only", project: { gh_read: { enabled: true } } },
+  {
+    name: "retired_gh_shim_project_enable_dropped",
+    user: { github: { shim: false } },
+    project: { gh_shim: { enabled: true, binary_path: "/tmp/evil-shim" } },
+  },
+  {
+    name: "retired_lsp_ttl_project_loosen_refused",
+    user: { lsp: { idle_minutes: 30 } },
+    project: { idle: { lsp_ttl_minutes: 120 } },
+  },
+  {
+    name: "retired_lsp_ttl_project_tighten",
+    user: { lsp: { idle_minutes: 30 } },
+    project: { idle: { lsp_ttl_minutes: 10 } },
+  },
+  // A whole number written as a float: both languages must read 12.0 as 12.
+  { name: "retired_lsp_ttl_float_user", user: '{ "idle": { "lsp_ttl_minutes": 12.0 } }' },
+  {
+    name: "retired_lsp_ttl_float_project",
+    user: { lsp: { idle_minutes: 30 } },
+    project: '{ "idle": { "lsp_ttl_minutes": 12.0 } }',
+  },
+  { name: "retired_soft_deadline_project", project: { inspect: { tier2_soft_deadline_ms: 50 } } },
+  { name: "retired_max_items_user", user: { inspect: { max_drill_down_items: 20 } } },
+  {
+    name: "retired_window_keys_project",
+    harness: "opencode",
+    user: { disabled_tools: [] },
+    project: {
+      search_index: false,
+      hoist_builtin_tools: false,
+      disabled_tools: ["aft_glob", "aft_zoom"],
+      harnesses: { opencode: { tool_surface: "recommended" } },
+    },
+  },
+  {
+    // A false runtime gate only switches its behaviour off, even beside a
+    // retired key in the same block.
+    name: "retired_key_beside_false_gates",
+    user: { search_index: false, bash: false, backup: { enabled: false } },
   },
   {
     name: "jsonc_comments",

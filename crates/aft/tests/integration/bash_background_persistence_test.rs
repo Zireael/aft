@@ -19,7 +19,7 @@ use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
+use super::helpers::{user_config, wait_for_task_metadata, AftProcess, ReleaseOnDrop};
 use super::test_helpers::{init_test_logger, take_logs};
 
 const SESSION: &str = "persist-session";
@@ -791,7 +791,7 @@ fn foreign_session_replay_retires_completion_but_preserves_status_control() {
         let mut session_a = AftProcess::spawn();
         configure_background(&mut session_a, project.path(), storage.path(), "session-a");
         let task_id = spawn_bg(&mut session_a, "session-a", "echo session-a-done", None);
-        let completed = wait_for_status(&mut session_a, "session-a", &task_id, "completed");
+        let completed = wait_for_task_metadata(storage.path(), "opencode", &task_id, "completed");
         assert_eq!(completed["exit_code"], 0);
         assert_eq!(
             read_json(storage.path(), "session-a", &task_id)["completion_delivered"],
@@ -1872,7 +1872,7 @@ fn originating_session_restart_drains_completion_exactly_once_then_acks() {
         let mut first_session = AftProcess::spawn();
         configure_background(&mut first_session, project.path(), storage.path(), SESSION);
         let task_id = spawn_bg(&mut first_session, SESSION, "echo durable", None);
-        let _ = wait_for_status(&mut first_session, SESSION, &task_id, "completed");
+        let _ = wait_for_task_metadata(storage.path(), "opencode", &task_id, "completed");
         assert_eq!(
             read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
             false
@@ -1942,7 +1942,7 @@ fn pi_erased_bundle_notification_is_not_replayed_after_ack_and_second_restart() 
             "watch registration failed: {registered:?}"
         );
         fs::write(&release, "release").unwrap();
-        let _ = wait_for_status(&mut aft, SESSION, &task_id, "completed");
+        let _ = wait_for_task_metadata(storage.path(), "pi", &task_id, "completed");
         let frame = wait_for_pattern_frame(&mut aft, &task_id);
         assert_eq!(frame["reason"], "task_exit");
         assert!(aft.shutdown().success());
@@ -2676,7 +2676,7 @@ fn persistence_restore_does_not_push_completion_frame() {
         let mut aft = AftProcess::spawn();
         configure_background(&mut aft, project.path(), storage.path(), SESSION);
         let task_id = spawn_bg(&mut aft, SESSION, "echo restored", None);
-        let _ = wait_for_status(&mut aft, SESSION, &task_id, "completed");
+        let _ = wait_for_task_metadata(storage.path(), "opencode", &task_id, "completed");
         assert!(aft.shutdown().success());
         task_id
     };
@@ -3143,4 +3143,60 @@ fn background_bash_uses_bash_syntax_when_available() {
     assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
     assert_eq!(snapshot.exit_code, Some(0));
     assert!(snapshot.output_preview.contains("ok"));
+}
+
+#[test]
+fn terminal_status_preserves_completion_until_explicit_acknowledges() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let mut aft = AftProcess::spawn();
+    configure_background(&mut aft, project.path(), storage.path(), SESSION);
+    let task_id = spawn_bg(&mut aft, SESSION, "printf collected", None);
+    wait_for_task_metadata(storage.path(), "opencode", &task_id, "completed");
+    assert_eq!(
+        read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
+        false
+    );
+    let reply = status(&mut aft, SESSION, &task_id);
+    assert_eq!(reply["status"], "completed");
+    assert_eq!(
+        read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
+        false
+    );
+    assert!(aft.shutdown().success());
+    let mut restarted = AftProcess::spawn();
+    configure_background(&mut restarted, project.path(), storage.path(), SESSION);
+    assert_eq!(
+        status(&mut restarted, SESSION, &task_id)["status"],
+        "completed"
+    );
+    let pending = drain(&mut restarted, SESSION);
+    assert_eq!(
+        pending["bg_completions"].as_array().unwrap().len(),
+        1,
+        "{pending}"
+    );
+    assert_eq!(pending["bg_completions"][0]["task_id"], task_id);
+    let collected_reply = ack(&mut restarted, SESSION, &task_id);
+    assert_eq!(collected_reply["success"], true, "{collected_reply}");
+    assert_eq!(
+        read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
+        true
+    );
+    assert!(drain(&mut restarted, SESSION)["bg_completions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(restarted.shutdown().success());
+    let mut collected = AftProcess::spawn();
+    configure_background(&mut collected, project.path(), storage.path(), SESSION);
+    assert!(drain(&mut collected, SESSION)["bg_completions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        status(&mut collected, SESSION, &task_id)["status"],
+        "completed"
+    );
+    assert!(collected.shutdown().success());
 }

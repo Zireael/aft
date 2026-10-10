@@ -67,7 +67,7 @@ maybeDescribe("e2e bridge transport resilience (Pi)", () => {
   async function harness(): Promise<Harness> {
     const created = await createHarness(preparedBinary, {
       fixtureNames: [],
-      config: { search_index: false },
+      config: { indexes: { trigram: false, semantic: false } },
       timeoutMs: 10_000,
     });
     harnesses.push(created);
@@ -186,7 +186,7 @@ maybeDescribe("e2e bridge transport resilience (Pi)", () => {
     const pool = new BridgePool(
       preparedBinary.binaryPath,
       { timeoutMs: 10_000, maxRestarts: 0 },
-      configureParamsFromLegacyOverrides({ search_index: false, harness: "pi" }),
+      configureParamsFromLegacyOverrides({ indexes: { trigram: false }, harness: "pi" }),
     );
     extraPools.push(pool);
 

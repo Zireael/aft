@@ -20,7 +20,7 @@ where
 {
     let validated = validate(Path::new(raw))?;
     let single_root = search_root(project_root, &validated);
-    if single_root.exists() || !raw.chars().any(char::is_whitespace) {
+    if crate::bounded_io::metadata(&single_root).is_ok() || !raw.chars().any(char::is_whitespace) {
         return Ok(SearchPathResolution::Single(single_root));
     }
 
@@ -33,7 +33,7 @@ where
     for fragment in &fragments {
         let validated = validate(Path::new(fragment))?;
         let root = search_root(project_root, &validated);
-        if !root.exists() {
+        if crate::bounded_io::metadata(&root).is_err() {
             return Err(Response::error(
                 req_id,
                 "path_not_found",
@@ -68,7 +68,7 @@ pub(crate) fn dedupe_nested_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         {
             continue;
         }
-        let is_dir = path.is_dir();
+        let is_dir = crate::bounded_io::metadata(&path).is_ok_and(|metadata| metadata.is_dir());
         keyed.push((path, key, is_dir));
     }
 
@@ -89,7 +89,7 @@ pub(crate) fn dedupe_nested_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 pub(crate) fn canonical_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    crate::bounded_io::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn path_is_nested_under(path: &Path, ancestor: &Path) -> bool {

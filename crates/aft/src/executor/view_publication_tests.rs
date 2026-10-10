@@ -817,6 +817,10 @@ fn generation_sweep_waits_for_the_last_query_handle() {
     let CallgraphStoreAccess::Ready(previous_reader) = fixture.ctx.callgraph_store_for_ops() else {
         panic!("previous reader unavailable")
     };
+    // The initial publication also owns a deferred checkpoint connection. Settle
+    // it before replacing the view, so the old query handle is the only keeper
+    // of the obsolete database whose lifetime this test asserts.
+    crate::views::wait_for_derived_checkpoint_for_test(fixture.view.view_dir());
     fixture.change("next");
     fixture.schedule();
     fixture.wait_idle();

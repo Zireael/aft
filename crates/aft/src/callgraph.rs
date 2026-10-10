@@ -2139,6 +2139,15 @@ fn rust_use_entries(imp: &imports::ImportStatement) -> Vec<RustUseEntry> {
     entries
 }
 
+/// Reuse the resolver's use-tree expansion when a caller only needs the names
+/// introduced into scope, without resolving or reading imported modules.
+pub(crate) fn rust_import_local_names(imp: &imports::ImportStatement) -> Vec<String> {
+    rust_use_entries(imp)
+        .into_iter()
+        .map(|entry| entry.local_name)
+        .collect()
+}
+
 fn rust_use_body(raw: &str) -> Option<&str> {
     let use_pos = raw.find("use ")?;
     let body = raw[use_pos + 4..].trim();
@@ -3647,13 +3656,11 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
 
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
-    let walker = WalkBuilder::new(root)
-        .same_file_system(true)
-        .hidden(true)         // skip hidden files/dirs
-        .git_ignore(true)     // respect .gitignore
-        .git_global(true)     // respect global gitignore
-        .git_exclude(true)    // respect .git/info/exclude
-        .add_custom_ignore_filename(".aftignore") // AFT-specific ignores (e.g. submodules)
+    let mut builder = WalkBuilder::new(root);
+    builder.same_file_system(true).hidden(true); // skip hidden files/dirs
+                                                 // .gitignore (also outside a git repository), global excludes,
+                                                 // .git/info/exclude and .aftignore (e.g. submodules).
+    let walker = crate::context::apply_project_ignore_rules(&mut builder, root)
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             // Always exclude these directories regardless of .gitignore
@@ -4347,6 +4354,22 @@ export function main() {
             "Should exclude node_modules, got: {:?}",
             file_names
         );
+    }
+
+    #[test]
+    fn callgraph_walker_honours_gitignore_in_non_git_root_like_git_root() {
+        use crate::context::ignore_rules_fixture as fixture;
+        let plain = TempDir::new().unwrap();
+        let git = TempDir::new().unwrap();
+        fixture::write(plain.path(), false);
+        fixture::write(git.path(), true);
+        let walked = |root: &Path| {
+            fixture::relative_set(root, &walk_project_files(root).collect::<Vec<_>>())
+        };
+
+        let plain_files = walked(plain.path());
+        fixture::assert_honours_ignore_rules(&plain_files, "non-git call graph walk");
+        assert_eq!(plain_files, walked(git.path()));
     }
 
     #[test]

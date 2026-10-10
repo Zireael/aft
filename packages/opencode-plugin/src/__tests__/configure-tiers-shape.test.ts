@@ -141,9 +141,7 @@ describe("OpenCode configure config tiers cutover", () => {
         formatter: { typescript: "biome" },
         checker: { typescript: "tsc" },
         restrict_to_project_root: true,
-        search_index: true,
-        semantic_search: true,
-        callgraph_store: false,
+        indexes: { trigram: true, semantic: true, callgraph: false },
         callgraph_chunk_size: 3,
         experimental: {
           lsp_ty: true,

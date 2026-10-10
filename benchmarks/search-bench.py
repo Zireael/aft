@@ -32,7 +32,7 @@ class AftClient:
         self.id = 0
         # Configure
         self._send({"id": "cfg", "command": "configure",
-                     "project_root": repo, "experimental_search_index": True})
+                     "project_root": repo, "indexes": {"trigram": True}})
         self._recv()
         # Wait for index to build — scale with repo size
         time.sleep(min(30, max(2, file_count / 5000)))

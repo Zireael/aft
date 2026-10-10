@@ -24,9 +24,6 @@
     "typescript": "biome"
   },
 
-  // Enable indexed search for grep and glob hoisting
-  "search_index": true,
-
   // Break-glass: when the AFT bridge/daemon is transport-dead, bash may fall
   // back to direct host execution (foreground-only, per-command approval with
   // an AFT UNAVAILABLE banner). This is the repair lane for fixing AFT through
@@ -48,11 +45,5 @@
         ["packages/opencode-plugin/**", "packages/pi-plugin/**"]
       ]
     }
-  },
-
-  // Content-addressed index views (per-file artifacts keyed by content hash,
-  // per-checkout manifests from the git tree): branch switches become manifest
-  // swaps instead of re-embeds. Default off; enabled here as one of the three
-  // soak repositories before it becomes the default.
-  //"views": { "enabled": true }
+  }
 }

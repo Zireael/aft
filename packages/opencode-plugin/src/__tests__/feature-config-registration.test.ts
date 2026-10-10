@@ -10,18 +10,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CANONICAL_TOOLS, SEMANTIC_COST_NOTICE } from "@cortexkit/aft-bridge";
 
-import {
-  type AftConfig,
-  ConfigRejectedError,
-  getConfigLoadNotices,
-  loadAftConfig,
-  setFeatureConfigPolicyVersionForTests,
-} from "../config.js";
+import { type AftConfig, getConfigLoadNotices, loadAftConfig } from "../config.js";
 import { buildOpenCodeToolMap, registerAftTools } from "../tool-registration.js";
 import type { V2ProviderTool } from "../tools/definitions/v2.js";
 import type { PluginContext } from "../types.js";
@@ -74,7 +68,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  setFeatureConfigPolicyVersionForTests(undefined);
   for (const [key, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -155,7 +148,7 @@ describe("OpenCode feature-config registration", () => {
     expect(config.disabled_tools).toEqual(["aft_future_tool", "typo_name"]);
   });
 
-  test("in-window legacy aliases canonicalize without an unknown-name report", () => {
+  test("legacy aliases canonicalize without an unknown-name report", () => {
     const config = loadWithUserConfig({ disabled_tools: ["aft_glob"] });
     const reports: Array<readonly string[]> = [];
     const tools = buildOpenCodeToolMap(stubContext(config), config, (unknown) =>
@@ -167,20 +160,58 @@ describe("OpenCode feature-config registration", () => {
     expect(Object.keys(tools)).not.toContain("aft_glob");
   });
 
-  test("after the window retired keys and aliases reject the whole load", () => {
-    setFeatureConfigPolicyVersionForTests("0.59.0");
-    let rejected: unknown;
-    try {
-      loadWithUserConfig({ disabled_tools: ["aft_glob"], tool_surface: "all" });
-    } catch (err) {
-      rejected = err;
-    }
-    expect(rejected).toBeInstanceOf(ConfigRejectedError);
-    expect((rejected as ConfigRejectedError).errors).toEqual([
-      "removed_config_key:aft_glob:use:glob",
-      "removed_config_key:tool_surface:use:disabled_tools",
+  test("retired keys in the user file translate and are left to the engine to rewrite", () => {
+    const user = {
+      disabled_tools: ["aft_glob"],
+      tool_surface: "all",
+      hoist_builtin_tools: false,
+      enabled: false,
+      search_index: true,
+      experimental_search_index: false,
+      semantic_search: false,
+      experimental_semantic_search: true,
+      callgraph_store: false,
+      gh_read: { enabled: true },
+      idle: { lsp_ttl_minutes: 10 },
+    };
+    const config = loadWithUserConfig(user);
+    expect(config.disabled_tools).toEqual(["glob"]);
+    expect(config.indexes).toEqual({ trigram: true, semantic: false, callgraph: false });
+    expect(config.github?.read).toBe(true);
+    expect(config.lsp?.idle_minutes).toBe(10);
+    // The plugin never writes the user file for retired keys: the AFT binary
+    // rewrites it on configure and reports that itself, so the plugin queues
+    // no retired-key notice of its own.
+    const userPath = join(root, "xdg", "cortexkit", "aft.jsonc");
+    expect(readFileSync(userPath, "utf8")).toBe(JSON.stringify(user));
+    expect(
+      getConfigLoadNotices().filter(
+        (notice) => notice.configPath === userPath && notice.message.includes("retired keys"),
+      ),
+    ).toEqual([]);
+  });
+
+  test("retired keys in a project file translate under project limits, with one notice and no write", () => {
+    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+    const text = JSON.stringify({
+      search_index: false,
+      hoist_builtin_tools: false,
+      gh_read: { enabled: true },
+    });
+    writeFileSync(projectFile, text);
+    const config = loadWithUserConfig({ github: { read: false } });
+    expect(config.indexes?.trigram).toBe(false);
+    for (const host of HOSTS) expect(config.disabled_tools).not.toContain(host);
+    expect(config.github?.read).toBe(false);
+    expect(readFileSync(projectFile, "utf8")).toBe(text);
+    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
+    expect(notices.map((notice) => notice.message)).toEqual([
+      `${projectFile} uses retired keys (gh_read, hoist_builtin_tools, search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`,
     ]);
-    // Retained runtime gates stay accepted after the window.
+  });
+
+  test("a false runtime gate only switches its behaviour off", () => {
     expect(loadWithUserConfig({ backup: { enabled: false } }).disabled_tools).toEqual([
       "aft_delete",
       "aft_move",

@@ -118,8 +118,7 @@ maybeDescribe("OpenCode plugin instance disposal", () => {
         lsp: { auto_install: false },
         restrict_to_project_root: true,
         sandbox: { enabled: false },
-        search_index: false,
-        semantic_search: false,
+        indexes: { trigram: false, semantic: false },
       }),
       "utf8",
     );

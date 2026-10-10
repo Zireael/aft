@@ -15,16 +15,16 @@ use serde_json::{Map, Value};
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
-    InspectConfig, OpenCodeHostConfig, RerankBackendKind, RerankConfig, SandboxConfig,
-    SearchConfig, SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
-    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES,
-    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES, MAX_IDLE_ROOT_TTL_MINUTES,
+    InspectCategories, InspectConfig, LspIdleMinutes, OpenCodeHostConfig, RemoteExecConfig,
+    RerankBackendKind, RerankConfig, SandboxConfig, SearchConfig, SemanticBackend,
+    SemanticBackendConfig, UserServerDef, WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS,
+    DEFAULT_BASH_WORKER_WAIT_MAX_MS, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES,
     MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS,
-    MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES,
-    MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
-use crate::feature_config::{self, PolicyPhase};
+use crate::feature_config;
 use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
 
@@ -45,6 +45,8 @@ const PROTECTED_TOOL_REASON: &str =
     "security: a project config cannot disable aft_safety or a host tool slot (read, write, edit, apply_patch, grep, glob, bash)";
 const LSP_USER_ONLY_REASON: &str =
     "security: LSP executable-origin and diagnostic-suppression settings must come from user-level config";
+const REMOTE_EXEC_PROJECT_REASON: &str =
+    "security: a project config may only turn remote_exec off; enabling remote runs and choosing their runner must come from user-level config";
 const RERANK_PROJECT_REASON: &str =
     "security: a project config may only turn search.rerank off; every other rerank setting must come from user-level config";
 
@@ -93,7 +95,8 @@ pub struct ResolveResult {
     pub config: Config,
     pub dropped: Vec<DroppedKey>,
     pub warnings: Vec<ConfigWarning>,
-    /// Rejection diagnostics (for example `removed_config_key:<old>:use:<new>`).
+    /// Rejection diagnostics: a resolved configuration that is missing its
+    /// registration list or an index switch (`invalid_resolved_config:...`).
     /// When non-empty `config` must not be used: the whole candidate load is
     /// rejected rather than continuing with defaults.
     pub errors: Vec<String>,
@@ -145,6 +148,11 @@ pub struct RawAftConfig {
     pub bridge: Option<RawBridge>,
     pub subc: Option<RawSubc>,
     pub opencode: Option<RawOpenCode>,
+    pub remote_exec: Option<RawRemoteExec>,
+    /// Set by the resolver, never read from a file: a project tier turned
+    /// `remote_exec.enabled` off.
+    #[serde(skip)]
+    pub remote_exec_project_off: bool,
     /// Raw per-harness objects stay opaque until the resolver knows the active
     /// configure harness. Unknown harness names are intentionally ignored.
     pub harnesses: Option<BTreeMap<String, Value>>,
@@ -336,6 +344,7 @@ pub struct RawRerank {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct RawLsp {
+    pub idle_minutes: Option<LspIdleMinutes>,
     #[serde(default, deserialize_with = "deserialize_opt_lsp_servers")]
     pub servers: Option<BTreeMap<String, RawLspServerEntry>>,
     #[serde(
@@ -354,7 +363,8 @@ pub struct RawLsp {
 
 impl RawLsp {
     fn is_empty(&self) -> bool {
-        self.servers.is_none()
+        self.idle_minutes.is_none()
+            && self.servers.is_none()
             && self.disabled.is_none()
             && self.python.is_none()
             && self.diagnostics_on_edit.is_none()
@@ -423,6 +433,7 @@ pub struct RawBashFeatures {
     pub compress: Option<bool>,
     pub background: Option<bool>,
     pub host_fallback: Option<bool>,
+    pub runon_enabled: Option<bool>,
     pub subagent_background: Option<bool>,
     pub detach_on_user_message: Option<bool>,
     pub db_schema_hints: Option<bool>,
@@ -436,6 +447,7 @@ pub struct RawBashFeatures {
     #[serde(deserialize_with = "deserialize_opt_worker_wait_max_ms")]
     pub worker_wait_max_ms: Option<u64>,
     pub linux_scope: Option<bool>,
+    pub disclaim_privacy: Option<bool>,
     pub powershell_tool: Option<bool>,
 }
 
@@ -487,11 +499,8 @@ pub struct RawInspect {
     pub tier2_pass_timeout_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_nonnegative_f64")]
     pub tier2_idle_minutes: Option<f64>,
-    pub categories: Option<HashMap<String, bool>>,
-    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
-    pub tier2_soft_deadline_ms: Option<u64>,
-    #[serde(deserialize_with = "deserialize_opt_drill_down_items")]
-    pub max_drill_down_items: Option<usize>,
+    #[serde(deserialize_with = "deserialize_opt_inspect_categories")]
+    pub categories: Option<BTreeMap<String, bool>>,
     pub duplicates: Option<RawInspectDuplicates>,
 }
 
@@ -502,8 +511,6 @@ impl RawInspect {
             && self.tier2_pass_timeout_ms.is_none()
             && self.tier2_idle_minutes.is_none()
             && self.categories.is_none()
-            && self.tier2_soft_deadline_ms.is_none()
-            && self.max_drill_down_items.is_none()
             && self.duplicates.is_none()
     }
 }
@@ -528,12 +535,11 @@ impl RawInspectDuplicates {
 #[serde(default)]
 pub struct RawIdle {
     pub root_ttl_minutes: Option<Value>,
-    pub lsp_ttl_minutes: Option<Value>,
 }
 
 impl RawIdle {
     fn is_empty(&self) -> bool {
-        self.root_ttl_minutes.is_none() && self.lsp_ttl_minutes.is_none()
+        self.root_ttl_minutes.is_none()
     }
 }
 
@@ -646,6 +652,15 @@ pub struct RawBackup {
     pub max_file_size: Option<u64>,
 }
 
+/// `remote_exec`: whether bash calls may ask to run on the remote build server
+/// with `runon`. User tier only, except that a project may turn it off.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawRemoteExec {
+    pub enabled: Option<bool>,
+    pub default_demand: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RawSandbox {
@@ -688,28 +703,19 @@ pub fn resolve_config_for_harness(
     tiers: &[ConfigTier],
     harness: Option<&Harness>,
 ) -> ResolveResult {
-    resolve_config_for_harness_with_phase(tiers, harness, feature_config::current_policy_phase())
-}
-
-/// [`resolve_config_for_harness`] with an explicit migration-policy phase, so
-/// tests can exercise both the translation window and post-window rejection.
-pub fn resolve_config_for_harness_with_phase(
-    tiers: &[ConfigTier],
-    harness: Option<&Harness>,
-    phase: PolicyPhase,
-) -> ResolveResult {
     let mut merged = RawAftConfig::default();
     let mut dropped = Vec::new();
     let mut warnings = Vec::new();
-    let mut errors = Vec::new();
 
     let mut parsed = Vec::with_capacity(tiers.len());
     for tier in tiers {
-        let Some(outcome) = parse_tier(tier, phase) else {
+        let Some(outcome) = parse_tier(tier) else {
             continue;
         };
         let (raw, translation) = outcome;
-        errors.extend(translation.errors);
+        if translation.legacy_input {
+            log_retired_keys_once(tier, &translation);
+        }
         for warning in translation.warnings {
             // Migration notices are delivered once per identity by the host
             // plugin or CLI; the engine only records them in its log so the
@@ -731,16 +737,6 @@ pub fn resolve_config_for_harness_with_phase(
             );
         }
         parsed.push((tier, raw));
-    }
-    if !errors.is_empty() {
-        errors.sort();
-        errors.dedup();
-        return ResolveResult {
-            config: Config::default(),
-            dropped,
-            warnings,
-            errors,
-        };
     }
 
     // The absent-base default applies exactly once, to the user base, before
@@ -775,6 +771,7 @@ pub fn resolve_config_for_harness_with_phase(
             merge_trusted_config(&mut merged, raw);
         } else {
             record_project_drops(&raw, &tier.tier, &mut dropped);
+            record_resource_loosening(&merged, &raw, &tier.tier, &mut dropped);
             merge_project_config(&mut merged, raw);
         }
     }
@@ -803,7 +800,7 @@ pub fn resolve_config_for_harness_with_phase(
         config,
         dropped,
         warnings,
-        errors,
+        errors: Vec::new(),
     }
 }
 
@@ -909,7 +906,27 @@ fn carry_process_state(base: &Config, resolved: &mut Config) {
     resolved.lsp_inflight_installs = base.lsp_inflight_installs.clone();
 }
 
-/// Whether this superseded-legacy note is new to this process.
+/// Log, once per config file and set of retired keys in this process, that a
+/// tier's retired keys were translated in memory. Reloads and repeated binds
+/// of the same root therefore do not repeat it. The host plugin delivers the
+/// user-facing notice; the user file's automatic rewrite reports its own.
+fn log_retired_keys_once(tier: &ConfigTier, translation: &feature_config::DocumentTranslation) {
+    let keys = translation.retired_keys.join(", ");
+    if !first_superseded_note(&tier.source, "retired_keys", &keys) {
+        return;
+    }
+    let notice = if tier.tier == "user" {
+        format!(
+            "{} uses retired keys ({keys}); AFT applied their current equivalents in memory",
+            tier.source
+        )
+    } else {
+        feature_config::project_retired_keys_notice(&tier.source, translation)
+    };
+    crate::slog_warn!("config {}: {}", tier.tier, notice);
+}
+
+/// Whether this note (keyed by file, key and text) is new to this process.
 fn first_superseded_note(source: &str, key: &str, message: &str) -> bool {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
@@ -919,24 +936,21 @@ fn first_superseded_note(source: &str, key: &str, message: &str) -> bool {
         .insert(format!("{source}\u{0}{key}\u{0}{message}"))
 }
 
-fn parse_tier(
-    tier: &ConfigTier,
-    phase: PolicyPhase,
-) -> Option<(RawAftConfig, feature_config::DocumentTranslation)> {
+fn parse_tier(tier: &ConfigTier) -> Option<(RawAftConfig, feature_config::DocumentTranslation)> {
     let stripped = strip_jsonc(&tier.doc);
     let value = serde_json::from_str::<Value>(&stripped).ok()?;
     let Value::Object(mut map) = value else {
         return None;
     };
-    // Retired keys are translated (or rejected) on the raw document, before
-    // the strict schema sees it, so they never reach `RawAftConfig`. Only the
-    // user tier's base block may receive the absent-base default disables.
+    // Retired keys are translated on the raw document, before the strict
+    // schema sees it, so they never reach `RawAftConfig`. Only the user
+    // tier's base block may receive the absent-base default disables.
     let document_tier = if tier.tier == "user" {
         feature_config::DocumentTier::User
     } else {
         feature_config::DocumentTier::Project
     };
-    let translation = feature_config::translate_document(&mut map, phase, document_tier);
+    let translation = feature_config::translate_document(&mut map, document_tier);
 
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map.clone())) {
         Ok(config) => config,
@@ -954,8 +968,8 @@ fn parse_tier(
 /// A connect keeps that behaviour. A live reload must not: a typo would reset
 /// a key (possibly a security key the harness block set) to its default while
 /// the root stays bound, so the reload calls this first and keeps the last
-/// valid configuration instead. Retired keys are left to the resolver, which
-/// rejects them with its own errors.
+/// valid configuration instead. Retired keys are translated first, exactly as
+/// the resolver translates them, so they never count as invalid here.
 pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option<String> {
     let stripped = strip_jsonc(&tier.doc);
     let value = match serde_json::from_str::<Value>(&stripped) {
@@ -970,14 +984,7 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
     } else {
         feature_config::DocumentTier::Project
     };
-    let translation = feature_config::translate_document(
-        &mut map,
-        feature_config::current_policy_phase(),
-        document_tier,
-    );
-    if !translation.errors.is_empty() {
-        return None;
-    }
+    feature_config::translate_document(&mut map, document_tier);
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map)) {
         Ok(raw) => raw,
         Err(error) => {
@@ -1186,6 +1193,15 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.opencode.is_some() {
         base.opencode = override_config.opencode;
     }
+    if let Some(remote_exec) = override_config.remote_exec {
+        let merged = base.remote_exec.get_or_insert_with(RawRemoteExec::default);
+        if remote_exec.enabled.is_some() {
+            merged.enabled = remote_exec.enabled;
+        }
+        if remote_exec.default_demand.is_some() {
+            merged.default_demand = remote_exec.default_demand;
+        }
+    }
 }
 
 fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
@@ -1228,6 +1244,15 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     base.pi = merge_pi_config(base.pi.clone(), project.pi);
     base.sandbox = merge_project_sandbox(base.sandbox.clone(), project.sandbox);
+    // A project may turn remote runs off for itself, never on: running a
+    // repository's commands on a shared build server is the user's decision.
+    if project
+        .remote_exec
+        .as_ref()
+        .is_some_and(|remote| remote.enabled == Some(false))
+    {
+        base.remote_exec_project_off = true;
+    }
 }
 
 /// A project may set `search.rerank.backend` to `"off"` and nothing else;
@@ -1419,6 +1444,7 @@ fn merge_semantic_config(
 
 fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Option<RawLsp> {
     let mut lsp = base.unwrap_or(RawLsp {
+        idle_minutes: None,
         servers: None,
         disabled: None,
         python: None,
@@ -1429,6 +1455,11 @@ fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Optio
     });
 
     if let Some(project) = override_lsp {
+        if let Some(idle) = project.idle_minutes {
+            if idle.tightens(lsp.idle_minutes.unwrap_or_default()) {
+                lsp.idle_minutes = Some(idle);
+            }
+        }
         if project.python.is_some() {
             lsp.python = project.python;
         }
@@ -1481,9 +1512,33 @@ fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
         RawBash::Bool(enabled) => RawBash::Bool(enabled),
         RawBash::Features(mut features) => {
             features.linux_scope = None;
+            features.runon_enabled = None;
+            // A repository may tighten privacy, never restore inherited grants.
+            features.disclaim_privacy = features.disclaim_privacy.filter(|value| *value);
             RawBash::Features(features)
         }
     })
+}
+
+#[cfg(test)]
+#[test]
+fn runon_safety_switch_is_user_only_and_defaults_off() {
+    assert!(!resolve_config(&[]).config.bash.runon_enabled);
+    for enabled in [false, true] {
+        let result = resolve_config(&[
+            ConfigTier {
+                tier: "user".into(),
+                source: "user.jsonc".into(),
+                doc: format!("{{\"bash\":{{\"runon_enabled\":{enabled}}}}}"),
+            },
+            ConfigTier {
+                tier: "project".into(),
+                source: "project.jsonc".into(),
+                doc: format!("{{\"bash\":{{\"runon_enabled\":{}}}}}", !enabled),
+            },
+        ]);
+        assert_eq!(result.config.bash.runon_enabled, enabled);
+    }
 }
 
 fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> Option<RawBash> {
@@ -1500,6 +1555,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 compress: override_features.compress.or(base.compress),
                 background: override_features.background.or(base.background),
                 host_fallback: override_features.host_fallback.or(base.host_fallback),
+                runon_enabled: base.runon_enabled,
                 subagent_background: override_features
                     .subagent_background
                     .or(base.subagent_background),
@@ -1523,6 +1579,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                     .worker_wait_max_ms
                     .or(base.worker_wait_max_ms),
                 linux_scope: override_features.linux_scope.or(base.linux_scope),
+                disclaim_privacy: override_features.disclaim_privacy.or(base.disclaim_privacy),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
             }))
         }
@@ -1539,6 +1596,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             compress: Some(*enabled),
             background: Some(*enabled),
             host_fallback: None,
+            runon_enabled: None,
             subagent_background: None,
             detach_on_user_message: None,
             db_schema_hints: None,
@@ -1548,6 +1606,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             watch_sync_max_ms: None,
             worker_wait_max_ms: None,
             linux_scope: None,
+            disclaim_privacy: None,
             powershell_tool: None,
         },
         RawBash::Features(features) => features.clone(),
@@ -1561,9 +1620,6 @@ fn merge_idle_config(base: Option<RawIdle>, override_idle: Option<RawIdle>) -> O
     let mut idle = base.unwrap_or_default();
     if override_idle.root_ttl_minutes.is_some() {
         idle.root_ttl_minutes = override_idle.root_ttl_minutes;
-    }
-    if override_idle.lsp_ttl_minutes.is_some() {
-        idle.lsp_ttl_minutes = override_idle.lsp_ttl_minutes;
     }
     (!idle.is_empty()).then_some(idle)
 }
@@ -1595,13 +1651,13 @@ fn merge_inspect_config(
     inspect.tier2_idle_minutes = override_inspect
         .tier2_idle_minutes
         .or(inspect.tier2_idle_minutes);
-    inspect.categories = override_inspect.categories.or(inspect.categories);
-    inspect.tier2_soft_deadline_ms = override_inspect
-        .tier2_soft_deadline_ms
-        .or(inspect.tier2_soft_deadline_ms);
-    inspect.max_drill_down_items = override_inspect
-        .max_drill_down_items
-        .or(inspect.max_drill_down_items);
+    if let Some(project) = override_inspect.categories {
+        let categories = inspect.categories.get_or_insert_with(BTreeMap::new);
+        for (key, enabled) in project {
+            let user_enabled = categories.get(&key).copied().unwrap_or(true);
+            categories.insert(key, enabled && user_enabled);
+        }
+    }
     inspect.duplicates = merge_inspect_duplicates(inspect.duplicates, override_inspect.duplicates);
 
     (!inspect.is_empty()).then_some(inspect)
@@ -1646,7 +1702,58 @@ fn merge_inspect_duplicates(
     (!duplicates.is_empty()).then_some(duplicates)
 }
 
+/// Resource settings are ordered by cost: a shorter idle window or an off
+/// category tightens the user's budget. A project cannot increase that budget.
+fn record_resource_loosening(
+    base: &RawAftConfig,
+    project: &RawAftConfig,
+    tier: &str,
+    dropped: &mut Vec<DroppedKey>,
+) {
+    const REASON: &str = "resource: project settings may only tighten the user budget";
+    if let Some(next) = project.lsp.as_ref().and_then(|lsp| lsp.idle_minutes) {
+        let floor = base
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.idle_minutes)
+            .unwrap_or_default();
+        if !next.tightens(floor) {
+            push_drop(dropped, "lsp.idle_minutes", tier, REASON);
+        }
+    }
+    if let Some(categories) = project
+        .inspect
+        .as_ref()
+        .and_then(|inspect| inspect.categories.as_ref())
+    {
+        for (key, enabled) in categories {
+            let floor = base
+                .inspect
+                .as_ref()
+                .and_then(|inspect| inspect.categories.as_ref())
+                .and_then(|categories| categories.get(key))
+                .copied()
+                .unwrap_or(true);
+            if *enabled && !floor {
+                push_drop(dropped, &format!("inspect.categories.{key}"), tier, REASON);
+            }
+        }
+    }
+}
+
 fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<DroppedKey>) {
+    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.disclaim_privacy == Some(false))
+    {
+        push_drop(
+            dropped,
+            "bash.disclaim_privacy",
+            tier,
+            "projects may only enable privacy disclaiming",
+        );
+    }
+    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.runon_enabled.is_some()) {
+        push_drop(dropped, "bash.runon_enabled", tier, USER_ONLY_REASON);
+    }
     if raw.restrict_to_project_root.is_some() {
         push_drop(dropped, "restrict_to_project_root", tier, USER_ONLY_REASON);
     }
@@ -1683,6 +1790,24 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     }
     if raw.gh_shim.is_some() {
         push_drop(dropped, "gh_shim", tier, USER_ONLY_REASON);
+    }
+    if let Some(remote_exec) = &raw.remote_exec {
+        if remote_exec.enabled == Some(true) {
+            push_drop(
+                dropped,
+                "remote_exec.enabled",
+                tier,
+                REMOTE_EXEC_PROJECT_REASON,
+            );
+        }
+        if remote_exec.default_demand.is_some() {
+            push_drop(
+                dropped,
+                "remote_exec.default_demand",
+                tier,
+                REMOTE_EXEC_PROJECT_REASON,
+            );
+        }
     }
     if raw
         .index
@@ -1873,6 +1998,7 @@ fn apply_resolved_config(
     config.opencode = resolve_opencode_host_config(raw.opencode.as_ref());
     config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
+    config.remote_exec = resolve_remote_exec_config(raw);
     resolve_lsp_config(raw, config);
     resolve_bash_fields(raw, config, warnings);
     Ok(())
@@ -2038,14 +2164,6 @@ fn resolve_idle_config(raw: Option<&RawIdle>, warnings: &mut Vec<ConfigWarning>)
         MAX_IDLE_ROOT_TTL_MINUTES,
         warnings,
     );
-    idle.lsp_ttl_minutes = resolve_clamped_minutes(
-        raw.lsp_ttl_minutes.as_ref(),
-        "idle.lsp_ttl_minutes",
-        DEFAULT_IDLE_LSP_TTL_MINUTES,
-        MIN_IDLE_LSP_TTL_MINUTES,
-        MAX_IDLE_LSP_TTL_MINUTES,
-        warnings,
-    );
     idle
 }
 
@@ -2122,6 +2240,10 @@ fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
     };
     if let Some(enabled) = raw.enabled {
         inspect.enabled = enabled;
+    }
+    if let Some(categories) = &raw.categories {
+        inspect.categories = serde_json::from_value(serde_json::to_value(categories).unwrap())
+            .expect("validated inspect categories");
     }
     if let Some(value) = raw.diagnostics_timeout_ms {
         inspect.diagnostics_timeout_ms = value.clamp(
@@ -2232,8 +2354,18 @@ fn resolve_sandbox_config(raw: Option<&RawSandbox>) -> SandboxConfig {
     }
 }
 
+fn resolve_remote_exec_config(raw: &RawAftConfig) -> RemoteExecConfig {
+    let user = raw.remote_exec.as_ref();
+    RemoteExecConfig {
+        enabled: user.and_then(|r| r.enabled) == Some(true) && !raw.remote_exec_project_off,
+        default_demand: user.and_then(|r| r.default_demand.clone()),
+        project_off: raw.remote_exec_project_off,
+    }
+}
+
 fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     let lsp = raw.lsp.as_ref();
+    config.lsp_idle_minutes = lsp.and_then(|lsp| lsp.idle_minutes).unwrap_or_default();
     let mut disabled: HashSet<String> = lsp
         .and_then(|lsp| lsp.disabled.as_ref())
         .into_iter()
@@ -2302,6 +2434,7 @@ struct ResolvedBashConfig {
     compress: bool,
     background: bool,
     host_fallback: bool,
+    runon_enabled: bool,
     subagent_background: bool,
     detach_on_user_message: bool,
     db_schema_hints: bool,
@@ -2311,6 +2444,7 @@ struct ResolvedBashConfig {
     watch_sync_max_ms: u64,
     worker_wait_max_ms: u64,
     linux_scope: bool,
+    disclaim_privacy: bool,
     powershell_tool: bool,
 }
 
@@ -2321,11 +2455,13 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     let _plugin_only = bash.subagent_background;
     config.bash.enabled = bash.enabled;
     config.bash.host_fallback = bash.host_fallback;
+    config.bash.runon_enabled = bash.runon_enabled;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
     config.bash.db_schema_hints = bash.db_schema_hints;
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
     config.bash.worker_wait_max_ms = bash.worker_wait_max_ms;
     config.bash.linux_scope = bash.linux_scope;
+    config.bash.disclaim_privacy = bash.disclaim_privacy;
     config.bash.powershell_tool = bash.powershell_tool;
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
@@ -2392,6 +2528,9 @@ fn resolve_bash_config(
         compress: false,
         background: false,
         host_fallback: false,
+        runon_enabled: top_features
+            .and_then(|features| features.runon_enabled)
+            .unwrap_or(false),
         subagent_background: true,
         detach_on_user_message: true,
         db_schema_hints: top_features
@@ -2403,6 +2542,9 @@ fn resolve_bash_config(
         watch_sync_max_ms,
         worker_wait_max_ms,
         linux_scope: top_linux_scope,
+        disclaim_privacy: top_features
+            .and_then(|features| features.disclaim_privacy)
+            .unwrap_or(false),
         powershell_tool: false,
     };
 
@@ -2681,25 +2823,143 @@ where
     }
 }
 
-fn deserialize_opt_drill_down_items<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+fn deserialize_opt_inspect_categories<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, bool>>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<u64>::deserialize(deserializer)?;
-    match value {
-        Some(value) if value == 0 || value > 100 => {
-            Err(de::Error::custom("max_drill_down_items must be in 1..=100"))
+    let value = Option::<BTreeMap<String, bool>>::deserialize(deserializer)?;
+    if let Some(categories) = &value {
+        if categories
+            .keys()
+            .any(|key| !InspectCategories::KEYS.contains(&key.as_str()))
+        {
+            return Err(de::Error::custom("unknown inspect category"));
         }
-        Some(value) => usize::try_from(value)
-            .map(Some)
-            .map_err(|_| de::Error::custom("max_drill_down_items is too large")),
-        None => Ok(None),
     }
+    Ok(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsp_idle_default_never_and_project_tightening() {
+        let default = serde_json::to_value(resolve_config(&[]).config).unwrap();
+        assert_eq!(default["lsp_idle_minutes"], 60);
+        for (user, project, expected, refused) in [
+            ("60", "30", serde_json::json!(30), false),
+            ("30", "60", serde_json::json!(30), true),
+            ("30", "\"never\"", serde_json::json!(30), true),
+            ("\"never\"", "1440", serde_json::json!(1440), false),
+            ("\"never\"", "\"never\"", serde_json::json!("never"), false),
+        ] {
+            let result = resolve_config(&[
+                tier("user", &format!(r#"{{"lsp":{{"idle_minutes":{user}}}}}"#)),
+                tier(
+                    "project",
+                    &format!(r#"{{"lsp":{{"idle_minutes":{project}}}}}"#),
+                ),
+            ]);
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(
+                serde_json::to_value(&result.config).unwrap()["lsp_idle_minutes"],
+                expected
+            );
+            assert_eq!(
+                drop_keys(&result).contains(&"lsp.idle_minutes".to_string()),
+                refused
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_categories_project_can_only_disable() {
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"inspect":{"categories":{"dead_code":false,"todos":true}}}"#,
+            ),
+            tier(
+                "project",
+                r#"{"inspect":{"categories":{"dead_code":true,"todos":false}}}"#,
+            ),
+        ]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let config = serde_json::to_value(&result.config).unwrap();
+        assert_eq!(config["inspect"]["categories"]["dead_code"], false);
+        assert_eq!(config["inspect"]["categories"]["todos"], false);
+        assert_eq!(config["inspect"]["categories"]["diagnostics"], true);
+        assert!(drop_keys(&result).contains(&"inspect.categories.dead_code".to_string()));
+    }
+
+    /// The retired inspect/LSP keys load in either tier. The idle value moves
+    /// to `lsp.idle_minutes` and is then held to that key's project rule: a
+    /// project may only shorten the user's idle window.
+    #[test]
+    fn retired_inspect_and_lsp_keys_translate_under_current_key_rules() {
+        let minutes = |result: &ResolveResult| {
+            serde_json::to_value(&result.config).unwrap()["lsp_idle_minutes"].clone()
+        };
+        let user = resolve_config(&[tier("user", r#"{"idle":{"lsp_ttl_minutes":10}}"#)]);
+        assert!(user.errors.is_empty(), "{:?}", user.errors);
+        assert_eq!(minutes(&user), 10);
+
+        let tighten = resolve_config(&[
+            tier("user", r#"{"lsp":{"idle_minutes":30}}"#),
+            tier("project", r#"{"idle":{"lsp_ttl_minutes":10}}"#),
+        ]);
+        assert!(tighten.errors.is_empty(), "{:?}", tighten.errors);
+        assert_eq!(minutes(&tighten), 10);
+
+        let loosen = resolve_config(&[
+            tier("user", r#"{"lsp":{"idle_minutes":30}}"#),
+            tier("project", r#"{"idle":{"lsp_ttl_minutes":120}}"#),
+        ]);
+        assert!(loosen.errors.is_empty(), "{:?}", loosen.errors);
+        assert_eq!(minutes(&loosen), 30);
+        assert!(drop_keys(&loosen).contains(&"lsp.idle_minutes".to_string()));
+
+        for (tier_name, doc) in [
+            ("user", r#"{"inspect":{"tier2_soft_deadline_ms":50}}"#),
+            ("project", r#"{"inspect":{"max_drill_down_items":20}}"#),
+        ] {
+            let result = resolve_config(&[tier(tier_name, doc)]);
+            assert!(result.errors.is_empty(), "{doc}: {:?}", result.errors);
+        }
+    }
+
+    /// Retired keys never refuse a load, in either tier. A project file's
+    /// translated values are current keys, so the project trust rules apply:
+    /// an index may be switched off, and protected tools stay registered.
+    #[test]
+    fn retired_keys_resolve_in_both_tiers() {
+        let user = resolve_config(&[tier("user", r#"{"search_index":false}"#)]);
+        assert!(user.errors.is_empty(), "{:?}", user.errors);
+        assert!(!user.config.indexes.trigram);
+
+        let project = resolve_config(&[
+            tier("user", "{}"),
+            tier(
+                "project",
+                r#"{"search_index":false,"hoist_builtin_tools":false,"harnesses":{"opencode":{"tool_surface":"minimal"}}}"#,
+            ),
+        ]);
+        assert!(project.errors.is_empty(), "{:?}", project.errors);
+        assert!(!project.config.indexes.trigram);
+        for host in ["read", "write", "edit", "bash"] {
+            assert!(
+                !project
+                    .config
+                    .disabled_tools
+                    .iter()
+                    .any(|name| name == host),
+                "{host} is protected from a project file"
+            );
+        }
+    }
 
     fn tier(tier: &str, doc: &str) -> ConfigTier {
         ConfigTier {
@@ -2823,10 +3083,13 @@ mod tests {
             r#"{"backup": {"enabled": false}}"#,
             r#"{"bash": false}"#,
         ] {
-            let result = resolve_config(&[
-                tier("user", r#"{"disabled_tools": []}"#),
-                tier("project", project),
-            ]);
+            let result = resolve_config_for_harness(
+                &[
+                    tier("user", r#"{"disabled_tools": []}"#),
+                    tier("project", project),
+                ],
+                None,
+            );
             assert!(result.errors.is_empty());
             for kept in ["aft_move", "aft_delete"] {
                 assert!(
@@ -2845,14 +3108,12 @@ mod tests {
     /// unknown key. It can NEVER reach Config.
     #[test]
     fn nested_unknown_keys_are_stripped_but_top_level_privileged_keys_cannot_smuggle() {
-        // Nested unknown key: stripped, object survives — parity with TS (golden
-        // `bash_unknown_nested_key`). `bash: { unknown_key }` resolves like
-        // `bash: {}` → object form → bash ENABLED (object presence beats the
-        // minimal surface default). The point: the unknown key did not fail the
+        // Nested unknown key: stripped, object survives, and the bash object
+        // resolves as enabled. The point: the unknown key did not fail the
         // parse — the object survived and resolved.
         let nested = resolve_config(&[tier(
             "user",
-            r#"{ "tool_surface": "minimal", "bash": { "unknown_key": true } }"#,
+            r#"{ "disabled_tools": [], "bash": { "unknown_key": true } }"#,
         )]);
         assert!(nested.config.experimental_bash_rewrite);
         assert!(nested.config.experimental_bash_compress);
@@ -2862,15 +3123,15 @@ mod tests {
         // tier: not in RawAftConfig → full parse fails → partial-parse drops it.
         // It must never appear in Config (Config keeps its default storage_dir).
         let smuggle = resolve_config(&[
-            tier("user", r#"{ "search_index": true }"#),
+            tier("user", r#"{ "indexes": { "trigram": true } }"#),
             tier(
                 "project",
-                r#"{ "storage_dir": "/tmp/evil", "bash_permissions": true, "search_index": false }"#,
+                r#"{ "storage_dir": "/tmp/evil", "bash_permissions": true, "indexes": { "trigram": false } }"#,
             ),
         ]);
-        // The valid project key (search_index) still applies via partial-parse...
+        // The valid project index setting still applies via partial parsing.
         assert!(!smuggle.config.indexes.trigram);
-        // ...but the smuggled process-state fields never reach Config.
+        // The smuggled process-state fields never reach Config.
         assert!(smuggle.config.storage_dir.is_none());
         assert!(!smuggle.config.bash_permissions);
     }
@@ -2998,9 +3259,7 @@ mod tests {
               "formatter": { "rust": "rustfmt", "typescript": "prettier" },
               "checker": { "rust": "cargo", "typescript": "tsc" },
               "restrict_to_project_root": true,
-              "search_index": true,
-              "semantic_search": true,
-              "callgraph_store": false,
+              "indexes": { "trigram": true, "semantic": true, "callgraph": false },
               "callgraph_chunk_size": 17,
               "url_fetch_allow_private": true,
               "semantic": {
@@ -3155,13 +3414,13 @@ mod tests {
             r#"{ "harnesses": { "pi": { "hoist_builtin_tools": false } } }"#,
         )];
         assert_eq!(
-            resolve_config_for_harness(&harness_only, Some(&Harness::Opencode))
+            resolve_config_for_harness(&harness_only, Some(&Harness::Opencode),)
                 .config
                 .disabled_tools,
             ["aft_delete", "aft_move"]
         );
         assert_eq!(
-            resolve_config_for_harness(&harness_only, Some(&Harness::Pi))
+            resolve_config_for_harness(&harness_only, Some(&Harness::Pi),)
                 .config
                 .disabled_tools,
             hosts_and_default
@@ -3294,12 +3553,15 @@ mod tests {
 
     #[test]
     fn github_master_off_fills_absent_leaves_and_explicit_leaves_win() {
-        // The legacy master switch no longer vetoes explicit leaves: it only
-        // generates `false` for leaves the block leaves out.
-        let explicit = resolve_config(&[tier(
-            "user",
-            r#"{"github":{"enabled":false,"shim":true,"read":true,"write":true}}"#,
-        )]);
+        // The legacy GitHub master switch no longer overrides explicit leaves;
+        // it only supplies false for permissions omitted from the block.
+        let explicit = resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{"github":{"enabled":false,"shim":true,"read":true,"write":true}}"#,
+            )],
+            None,
+        );
         assert!(explicit.errors.is_empty());
         assert_eq!(
             explicit.config.github,
@@ -3310,7 +3572,8 @@ mod tests {
             }
         );
 
-        let master_only = resolve_config(&[tier("user", r#"{"github":{"enabled":false}}"#)]);
+        let master_only =
+            resolve_config_for_harness(&[tier("user", r#"{"github":{"enabled":false}}"#)], None);
         assert_eq!(
             master_only.config.github,
             GithubConfig {
@@ -3319,7 +3582,8 @@ mod tests {
                 write: false,
             }
         );
-        let master_true = resolve_config(&[tier("user", r#"{"github":{"enabled":true}}"#)]);
+        let master_true =
+            resolve_config_for_harness(&[tier("user", r#"{"github":{"enabled":true}}"#)], None);
         assert_eq!(master_true.config.github, GithubConfig::default());
     }
 
@@ -3339,37 +3603,40 @@ mod tests {
         assert!(warning.message.contains("github.read"));
     }
 
+    /// The GitHub enable aliases translate to the canonical leaves in either
+    /// tier. A canonical leaf in the same block wins, and a project's
+    /// translated leaf is dropped exactly like a spelled-out `github.read`.
     #[test]
-    fn retired_github_aliases_reject_the_whole_load_even_beside_canonical_leaves() {
-        for doc in [
-            r#"{"gh_read":{"enabled":true}}"#,
+    fn retired_github_aliases_translate_and_keep_the_project_boundary() {
+        let alias = resolve_config(&[tier("user", r#"{"gh_read":{"enabled":false}}"#)]);
+        assert!(alias.errors.is_empty(), "{:?}", alias.errors);
+        assert!(!alias.config.github.read);
+        let canonical = resolve_config(&[tier(
+            "user",
             r#"{"github":{"read":false},"gh_read":{"enabled":true}}"#,
-        ] {
-            let result = resolve_config(&[tier("user", doc)]);
-            assert_eq!(
-                result.errors,
-                vec!["removed_config_key:gh_read:use:github.read"]
-            );
-        }
+        )]);
+        assert!(canonical.errors.is_empty(), "{:?}", canonical.errors);
+        assert!(!canonical.config.github.read);
         let shim = resolve_config(&[tier("user", r#"{"gh_shim":{"enabled":false}}"#)]);
-        assert_eq!(
-            shim.errors,
-            vec!["removed_config_key:gh_shim:use:github.shim"]
+        assert!(shim.errors.is_empty(), "{:?}", shim.errors);
+        assert!(!shim.config.github.shim);
+
+        let project = resolve_config(&[
+            tier("user", r#"{"github":{"read":false}}"#),
+            tier("project", r#"{"gh_read":{"enabled":true}}"#),
+        ]);
+        assert!(project.errors.is_empty(), "{:?}", project.errors);
+        assert!(
+            !project.config.github.read,
+            "a project cannot enable GitHub reads"
         );
-        for phase in [PolicyPhase::Window, PolicyPhase::Rejecting] {
-            let project = resolve_config_for_harness_with_phase(
-                &[
-                    tier("user", r#"{"github":{"read":false}}"#),
-                    tier("project", r#"{"gh_read":{"enabled":true}}"#),
-                ],
-                None,
-                phase,
-            );
-            assert_eq!(
-                project.errors,
-                vec!["removed_config_key:gh_read:use:github.read"]
-            );
-        }
+        assert!(
+            drop_keys(&project)
+                .iter()
+                .any(|key| key.starts_with("github")),
+            "{:?}",
+            drop_keys(&project)
+        );
 
         // The supported binary override alone is not a retired alias.
         let binary = resolve_config(&[tier(
@@ -3400,7 +3667,7 @@ mod tests {
 
         let invalid = resolve_config(&[tier(
             "user",
-            r#"{"git":{"co_author":"not-an-identity"},"search_index":true}"#,
+            r#"{"git":{"co_author":"not-an-identity"},"indexes":{"trigram":true}}"#,
         )]);
         assert_eq!(invalid.config.git.co_author, "off");
         assert!(invalid.config.indexes.trigram);
@@ -3548,30 +3815,18 @@ mod tests {
     }
 
     #[test]
-    fn idle_lsp_ttl_clamps_to_one_through_ten() {
-        let below = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 0 } }"#)]);
-        assert_eq!(below.config.idle.lsp_ttl_minutes, MIN_IDLE_LSP_TTL_MINUTES);
-        assert!(below
-            .warnings
-            .iter()
-            .any(|warning| warning.code == "clamped_idle_ttl"
-                && warning.key == "idle.lsp_ttl_minutes"));
-
-        let above = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 20 } }"#)]);
-        assert_eq!(above.config.idle.lsp_ttl_minutes, MAX_IDLE_LSP_TTL_MINUTES);
-        assert!(above
-            .warnings
-            .iter()
-            .any(|warning| warning.code == "clamped_idle_ttl"
-                && warning.key == "idle.lsp_ttl_minutes"));
-
-        let at_min = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 1 } }"#)]);
-        assert_eq!(at_min.config.idle.lsp_ttl_minutes, 1);
-        assert!(at_min.warnings.is_empty());
-
-        let at_max = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 10 } }"#)]);
-        assert_eq!(at_max.config.idle.lsp_ttl_minutes, 10);
-        assert!(at_max.warnings.is_empty());
+    fn lsp_idle_clamps_to_five_through_1440() {
+        for (raw, expected) in [(0, 5), (5, 5), (1440, 1440), (2000, 1440)] {
+            let result = resolve_config(&[tier(
+                "user",
+                &format!(r#"{{"lsp":{{"idle_minutes":{raw}}}}}"#),
+            )]);
+            assert!(result.errors.is_empty());
+            assert_eq!(
+                result.config.lsp_idle_minutes,
+                LspIdleMinutes::Minutes(expected)
+            );
+        }
     }
 
     #[test]
@@ -3589,16 +3844,12 @@ mod tests {
     }
 
     #[test]
-    fn idle_project_tier_overrides_user_ttl() {
+    fn idle_project_tier_overrides_user_root_ttl() {
         let result = resolve_config(&[
-            tier("user", r#"{ "idle": { "lsp_ttl_minutes": 8 } }"#),
-            tier("project", r#"{ "idle": { "lsp_ttl_minutes": 3 } }"#),
+            tier("user", r#"{"idle":{"root_ttl_minutes":20}}"#),
+            tier("project", r#"{"idle":{"root_ttl_minutes":15}}"#),
         ]);
-        assert_eq!(result.config.idle.lsp_ttl_minutes, 3);
-        assert_eq!(
-            result.config.idle.root_ttl_minutes,
-            DEFAULT_IDLE_ROOT_TTL_MINUTES
-        );
+        assert_eq!(result.config.idle.root_ttl_minutes, 15);
     }
 
     #[test]
@@ -3632,10 +3883,13 @@ mod tests {
     fn project_indexes_can_only_turn_an_index_off() {
         // A project may switch an index off but never back on: its values AND
         // with the user resolution (legacy keys translate first).
-        let result = resolve_config(&[
-            tier("user", r#"{ "search_index": false }"#),
-            tier("project", r#"{ "search_index": true }"#),
-        ]);
+        let result = resolve_config_for_harness(
+            &[
+                tier("user", r#"{ "search_index": false }"#),
+                tier("project", r#"{ "search_index": true }"#),
+            ],
+            None,
+        );
         assert!(!result.config.indexes.trigram);
         assert!(result.dropped.is_empty());
 
@@ -3949,6 +4203,37 @@ mod tests {
     }
 
     #[test]
+    fn remote_exec_is_user_only_and_a_project_may_only_turn_it_off() {
+        assert_eq!(
+            resolve_config(&[]).config.remote_exec,
+            RemoteExecConfig::default()
+        );
+        let user = r#"{ "remote_exec": { "enabled": true, "default_demand": "linux" } }"#;
+        let on = resolve_config(&[tier("user", user)]).config.remote_exec;
+        assert!(on.enabled && !on.project_off);
+        assert_eq!(on.default_demand.as_deref(), Some("linux"));
+
+        // A project can neither enable remote runs nor pick their runner.
+        let project_on = resolve_config(&[tier(
+            "project",
+            r#"{ "remote_exec": { "enabled": true, "default_demand": "linux" } }"#,
+        )]);
+        assert_eq!(project_on.config.remote_exec, RemoteExecConfig::default());
+        let dropped = drop_keys(&project_on);
+        assert!(dropped.contains(&"remote_exec.enabled".to_string()));
+        assert!(dropped.contains(&"remote_exec.default_demand".to_string()));
+
+        // It can turn them off, and the refusal can then name the project.
+        let off = resolve_config(&[
+            tier("user", user),
+            tier("project", r#"{ "remote_exec": { "enabled": false } }"#),
+        ]);
+        assert!(!off.config.remote_exec.enabled);
+        assert!(off.config.remote_exec.project_off);
+        assert!(drop_keys(&off).is_empty());
+    }
+
+    #[test]
     fn bash_linux_scope_is_user_only_and_defaults_off() {
         assert!(!resolve_config(&[]).config.bash.linux_scope);
 
@@ -3958,6 +4243,30 @@ mod tests {
         ]);
         assert!(result.config.bash.linux_scope);
         assert!(drop_keys(&result).contains(&"bash.linux_scope".to_string()));
+    }
+
+    #[test]
+    fn privacy_disclaim_project_only_tightens_and_reports_weakening() {
+        assert!(!resolve_config(&[]).config.bash.disclaim_privacy);
+        for user in [false, true] {
+            for project in [false, true] {
+                let result = resolve_config(&[
+                    tier(
+                        "user",
+                        &format!(r#"{{"bash":{{"disclaim_privacy":{user}}}}}"#),
+                    ),
+                    tier(
+                        "project",
+                        &format!(r#"{{"bash":{{"disclaim_privacy":{project}}}}}"#),
+                    ),
+                ]);
+                assert_eq!(result.config.bash.disclaim_privacy, user || project);
+                assert_eq!(
+                    drop_keys(&result).contains(&"bash.disclaim_privacy".to_string()),
+                    !project
+                );
+            }
+        }
     }
 
     #[test]
@@ -3999,7 +4308,7 @@ mod tests {
         // The legacy minimal surface no longer switches the bash runtime off; it
         // unregisters bash and its companions through disabled_tools instead.
         let minimal_surface_result =
-            resolve_config(&[tier("user", r#"{ "tool_surface": "minimal" }"#)]);
+            resolve_config_for_harness(&[tier("user", r#"{ "tool_surface": "minimal" }"#)], None);
         assert!(minimal_surface_result.config.bash.enabled);
         assert!(minimal_surface_result.config.experimental_bash_rewrite);
         assert!(minimal_surface_result
@@ -4034,13 +4343,10 @@ mod tests {
 
     #[test]
     fn config_resolve_bash_foreground_wait_clamps_to_floor() {
-        let Some((raw, _)) = parse_tier(
-            &tier(
-                "user",
-                r#"{ "bash": { "foreground_wait_window_ms": 1, "subagent_background": true } }"#,
-            ),
-            PolicyPhase::Window,
-        ) else {
+        let Some((raw, _)) = parse_tier(&tier(
+            "user",
+            r#"{ "bash": { "foreground_wait_window_ms": 1, "subagent_background": true } }"#,
+        )) else {
             panic!("test tier should parse");
         };
         let mut warnings = Vec::new();
@@ -4079,7 +4385,7 @@ mod tests {
             "user",
             r#"{
               "semantic": { "timeout_ms": 0 },
-              "search_index": true,
+              "indexes": { "trigram": true },
               "format_on_edit": false
             }"#,
         )]);
@@ -4094,7 +4400,7 @@ mod tests {
     fn config_resolve_unknown_top_level_key_is_dropped_but_rest_survives() {
         let result = resolve_config(&[tier(
             "user",
-            r#"{ "not_a_real_key": true, "search_index": true }"#,
+            r#"{ "not_a_real_key": true, "indexes": { "trigram": true } }"#,
         )]);
 
         assert!(result.config.indexes.trigram);
@@ -4130,7 +4436,10 @@ mod tests {
 
         // Bind 2 omits all three. With reset semantics they return to DEFAULT —
         // the second bind cannot inherit the first bind's capabilities.
-        let _ = resolve_config_onto(&[tier("user", r#"{ "search_index": true }"#)], &mut config);
+        let _ = resolve_config_onto(
+            &[tier("user", r#"{ "indexes": { "trigram": true } }"#)],
+            &mut config,
+        );
         assert!(
             !config.url_fetch_allow_private,
             "url_fetch_allow_private must reset to default, not inherit prior bind"
@@ -4181,7 +4490,10 @@ mod tests {
             ..Default::default()
         };
 
-        let _ = resolve_config_onto(&[tier("user", r#"{ "search_index": true }"#)], &mut config);
+        let _ = resolve_config_onto(
+            &[tier("user", r#"{ "indexes": { "trigram": true } }"#)],
+            &mut config,
+        );
 
         assert_eq!(
             config.storage_dir,
@@ -4279,7 +4591,7 @@ mod tests {
             "user",
             r#"{
               // line comment
-              "search_index": true,
+              "indexes": { "trigram": true },
               "formatter": {
                 "rust": "rustfmt", /* block comment */
               },

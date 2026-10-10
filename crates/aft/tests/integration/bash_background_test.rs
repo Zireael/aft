@@ -1032,6 +1032,39 @@ fn background_concurrent_task_cap_is_enforced() {
         "9th task should fail: {rejected:?}"
     );
     assert_eq!(rejected["code"], "background_task_limit_exceeded");
+    // The refusal names every task holding a slot and how to free one, so the
+    // agent can act on it without another call.
+    let message = rejected["message"].as_str().unwrap_or_default();
+    for task_id in &task_ids {
+        assert!(
+            message.contains(task_id.as_str()),
+            "refusal does not list slot holder {task_id}: {message}"
+        );
+    }
+    assert!(message.contains("bash_kill"), "{message}");
+
+    // A foreground command still runs with every background slot taken.
+    let foreground = aft.send(
+        &json!({
+            "id": "foreground-at-cap",
+            "command": "bash",
+            "params": { "command": echo_text_command("ok") }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        foreground["success"], true,
+        "foreground command refused at the background cap: {foreground:?}"
+    );
+    let foreground_id = foreground["task_id"].as_str().unwrap().to_string();
+    let done = wait_for_status(&mut aft, &foreground_id, "completed");
+    assert!(
+        done["output_preview"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ok"),
+        "foreground output: {done:?}"
+    );
 
     for task_id in task_ids {
         let _ = aft.send(

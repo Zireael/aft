@@ -109,9 +109,7 @@ class ProductionAftClient(AftClient):
         if self.arm.max_input_tokens is not None:
             semantic["max_input_tokens"] = self.arm.max_input_tokens
         doc = {
-            "search_index": True,
-            "semantic_search": True,
-            "callgraph_store": False,
+            "indexes": {"trigram": True, "semantic": True, "callgraph": False},
             "semantic": semantic,
         }
         response = self.call(

@@ -13,7 +13,7 @@ use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit;
 use crate::imports;
 use crate::lsp_hints;
-use crate::parser::{detect_language, grammar_for, LangId};
+use crate::parser::{detect_language, grammar_for, parse_source_with_cached_parser, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::SymbolKind;
 
@@ -564,7 +564,12 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut results: Vec<serde_json::Value> = Vec::new();
 
     // 1. Write source file (symbol removed)
-    match edit::write_format_validate(&source_path, &new_source, &ctx.config(), &req.params) {
+    match edit::write_format_validate_deferred(
+        &source_path,
+        &new_source,
+        &ctx.config(),
+        &req.params,
+    ) {
         // A rolled-back write means the result was invalid syntax and the file
         // was reverted (symbol NOT removed). Continuing would add the symbol to
         // the destination too, leaving it defined in BOTH files. Treat it like a
@@ -612,7 +617,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // 2. Write destination file (symbol added)
-    match edit::write_format_validate(&dest_path, &new_dest, &ctx.config(), &req.params) {
+    match edit::write_format_validate_deferred(&dest_path, &new_dest, &ctx.config(), &req.params) {
         // CRITICAL: the source already had the symbol removed. If the
         // destination write is rolled back (invalid syntax — e.g. moving
         // TS-only syntax into a .js file), the symbol would be defined NOWHERE —
@@ -679,7 +684,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // 3. Write consumer files (imports rewritten)
     let mut consumers_updated = usize::from(source_rewritten_as_consumer);
     for (path, _original, new_content) in &consumer_rewrites {
-        match edit::write_format_validate(&path, new_content, &ctx.config(), &req.params) {
+        match edit::write_format_validate_deferred(&path, new_content, &ctx.config(), &req.params) {
             // A rolled-back consumer rewrite leaves the move half-applied (this
             // consumer still imports from the old location while others were
             // updated). Restore everything and fail, same as the Err branch.
@@ -731,6 +736,16 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    let paths: Vec<PathBuf> = std::iter::once(source_path.to_path_buf())
+        .chain(std::iter::once(dest_path.to_path_buf()))
+        .chain(consumer_rewrites.iter().map(|(path, _, _)| path.clone()))
+        .collect();
+    let validation = edit::validate_written_files(&paths, &ctx.config(), &req.params);
+    if let Some(validation) = &validation {
+        for (path, result) in paths.iter().zip(&mut results) {
+            validation.append_to(path, result);
+        }
+    }
     let files_modified = results.len();
 
     log::debug!(
@@ -741,17 +756,18 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         consumers_updated
     );
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "ok": true,
-            "files_modified": files_modified,
-            "consumers_updated": consumers_updated,
-            "checkpoint_name": checkpoint_name,
-            "backup_ids": backup_ids,
-            "results": results,
-        }),
-    )
+    let mut result = serde_json::json!({
+        "ok": true,
+        "files_modified": files_modified,
+        "consumers_updated": consumers_updated,
+        "checkpoint_name": checkpoint_name,
+        "backup_ids": backup_ids,
+        "results": results,
+    });
+    if let Some(validation) = validation {
+        result["output"] = serde_json::json!(validation.summary());
+    }
+    Response::success(&req.id, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,13 +1081,9 @@ fn collect_ts_js_files(root: &Path, out: &mut Vec<PathBuf>, source_path: &Path, 
     use ignore::WalkBuilder;
 
     // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-    let walker = WalkBuilder::new(root)
-        .same_file_system(true)
-        .hidden(false) // include .storybook/, .config/, etc. (tracked consumers)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .add_custom_ignore_filename(".aftignore")
+    let mut builder = WalkBuilder::new(root);
+    builder.same_file_system(true).hidden(false); // include .storybook/, .config/, etc. (tracked consumers)
+    let walker = crate::context::apply_project_ignore_rules(&mut builder, root)
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 return !matches!(
@@ -1127,6 +1139,17 @@ fn rewrite_consumer_imports(
 
     // Only handle TS/JS/TSX for now (the primary use case).
     if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
+        return Ok(None);
+    }
+
+    // Import and re-export syntax requires these literal keywords. A script
+    // with neither cannot consume another file's export. The source itself is
+    // exempt: its remaining local references can require a new import even
+    // when it had no module declarations before the move.
+    if !consumer_content.contains("import")
+        && !consumer_content.contains("export")
+        && !paths_equivalent(consumer_file, source_file)
+    {
         return Ok(None);
     }
 
@@ -1778,12 +1801,16 @@ fn parse_imports_from_content(
     content: &str,
     lang: LangId,
 ) -> Option<(tree_sitter::Tree, imports::ImportBlock)> {
-    let grammar = grammar_for(lang);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&grammar).ok()?;
-    let tree = parser.parse(content.as_bytes(), None)?;
+    #[cfg(test)]
+    MOVE_CONSUMER_PARSES.with(|count| count.set(count.get() + 1));
+    let tree = parse_source_with_cached_parser(Path::new("consumer"), content, lang).ok()?;
     let block = imports::parse_imports(content, &tree, lang);
     Some((tree, block))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MOVE_CONSUMER_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn build_add_moved_import_edit(
@@ -2596,6 +2623,52 @@ mod tests {
         let from = Path::new("src/components/Button.ts");
         let to = Path::new("src/components/utils.ts");
         assert_eq!(compute_relative_import_path(from, to), "./utils");
+    }
+
+    #[test]
+    fn move_consumer_prefilter_skips_scripts_without_module_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.ts");
+        let dest = root.path().join("dest.ts");
+        std::fs::write(&source, "export function moved() {}\n").unwrap();
+        std::fs::write(&dest, "").unwrap();
+        let consumer = root.path().join("consumer.ts");
+        MOVE_CONSUMER_PARSES.with(|count| count.set(0));
+        for i in 0..512 {
+            let script = format!("const script{i} = {}\n", "[0, 1, 2];\n".repeat(256));
+            assert_eq!(
+                rewrite_consumer_imports(
+                    &script,
+                    &consumer,
+                    &source,
+                    &dest,
+                    "moved",
+                    Some(LangId::TypeScript),
+                    false,
+                    root.path()
+                ),
+                Ok(None)
+            );
+        }
+        let input = "import { moved } from './source';\nmoved();\n";
+        let actual = rewrite_consumer_imports(
+            input,
+            &consumer,
+            &source,
+            &dest,
+            "moved",
+            Some(LangId::TypeScript),
+            false,
+            root.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual, "import { moved } from './dest';\nmoved();\n");
+        assert_eq!(
+            MOVE_CONSUMER_PARSES.with(|count| count.get()),
+            1,
+            "consumer parses"
+        );
     }
 
     #[test]

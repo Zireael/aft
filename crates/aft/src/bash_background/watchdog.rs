@@ -8,7 +8,7 @@ use crossbeam_channel::{tick, Receiver};
 use super::registry::{BgTask, BgTaskRegistry, WatchdogPassCause};
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
-const FINISHED_RETENTION: Duration = Duration::from_secs(60 * 60);
+pub(super) const FINISHED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long periodic passes leave an exited PTY task to its reader's wake.
 /// The reader normally reaches end-of-file right after the child exits, but a
 /// background grandchild can keep the terminal open, so after this the
@@ -29,97 +29,198 @@ pub(crate) fn current_pass() -> Option<WatchdogPassCause> {
     CURRENT_PASS.with(std::cell::Cell::get)
 }
 
+/// Registries subscribe to one process timer and wake multiplexer. Weak entries
+/// cannot keep an unloaded project (and all its finished history) alive forever.
 pub(crate) fn start(registry: BgTaskRegistry) {
-    thread::spawn(move || {
-        let ticker = tick(WATCHDOG_INTERVAL);
-        let cleanup_ticker = tick(CLEANUP_INTERVAL);
-        let wake_rx = registry.inner.wake_rx.clone();
-        // PTY tasks a periodic pass has left to the reader's wake, mapped to
-        // when that was first decided.
-        let mut awaiting_reader: HashMap<String, Instant> = HashMap::new();
-        while !registry.inner.shutdown.load(Ordering::SeqCst) {
-            CURRENT_PASS.with(|pass| pass.set(None));
-            let pass_cause = crossbeam_channel::select! {
-                recv(ticker) -> tick => {
-                    if tick.is_err() {
-                        break;
+    scheduler()
+        .send(std::sync::Arc::downgrade(&registry.inner))
+        .expect("bash watchdog scheduler stopped");
+}
+
+struct Subscription {
+    registry: std::sync::Weak<super::registry::RegistryInner>,
+    wake_rx: Receiver<()>,
+    awaiting_reader: HashMap<String, Instant>,
+}
+
+fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::registry::RegistryInner>>
+{
+    static SCHEDULER: std::sync::OnceLock<
+        crossbeam_channel::Sender<std::sync::Weak<super::registry::RegistryInner>>,
+    > = std::sync::OnceLock::new();
+    SCHEDULER.get_or_init(|| {
+        let (tx, rx) =
+            crossbeam_channel::unbounded::<std::sync::Weak<super::registry::RegistryInner>>();
+        thread::Builder::new()
+            .name("aft-bash-watchdog".into())
+            .spawn(move || {
+                let ticker = tick(WATCHDOG_INTERVAL);
+                let cleanup_ticker = tick(CLEANUP_INTERVAL);
+                let mut subscriptions: Vec<Subscription> = Vec::new();
+                let cleaning = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                loop {
+                    subscriptions.retain(|entry| {
+                        entry
+                            .registry
+                            .upgrade()
+                            .is_some_and(|inner| !inner.shutdown.load(Ordering::SeqCst))
+                    });
+                    let (selected, registration) = {
+                        let mut select = crossbeam_channel::Select::new();
+                        select.recv(&rx);
+                        select.recv(&ticker);
+                        select.recv(&cleanup_ticker);
+                        for entry in &subscriptions {
+                            select.recv(&entry.wake_rx);
+                        }
+                        let operation = select.select();
+                        let index = operation.index();
+                        let mut registration = None;
+                        match index {
+                            0 => {
+                                registration = operation.recv(&rx).ok();
+                            }
+                            1 => {
+                                let _ = operation.recv(&ticker);
+                            }
+                            2 => {
+                                let _ = operation.recv(&cleanup_ticker);
+                            }
+                            _ => {
+                                let _ = operation.recv(&subscriptions[index - 3].wake_rx);
+                            }
+                        }
+                        (index, registration)
+                    };
+                    if let Some(registry) = registration {
+                        if let Some(inner) = registry.upgrade() {
+                            subscriptions.push(Subscription {
+                                registry,
+                                wake_rx: inner.wake_rx.clone(),
+                                awaiting_reader: HashMap::new(),
+                            });
+                        }
                     }
-                    WatchdogPassCause::Tick
+                    if selected == 0 {
+                        continue;
+                    }
+                    if selected == 2 {
+                        // Filesystem deletion and persisted GC must not delay every
+                        // project's exit observation. At most one cleanup runs.
+                        if !cleaning.swap(true, Ordering::SeqCst) {
+                            let registries: Vec<_> = subscriptions
+                                .iter()
+                                .map(|entry| entry.registry.clone())
+                                .collect();
+                            let cleaning = std::sync::Arc::clone(&cleaning);
+                            thread::Builder::new()
+                                .name("aft-bash-cleanup".into())
+                                .spawn(move || {
+                                    struct Reset(std::sync::Arc<std::sync::atomic::AtomicBool>);
+                                    impl Drop for Reset {
+                                        fn drop(&mut self) {
+                                            self.0.store(false, Ordering::SeqCst);
+                                        }
+                                    }
+                                    let _reset = Reset(cleaning);
+                                    for inner in registries
+                                        .into_iter()
+                                        .filter_map(|registry| registry.upgrade())
+                                    {
+                                        let registry = BgTaskRegistry { inner };
+                                        registry.cleanup_finished(FINISHED_RETENTION);
+                                        registry.request_recurring_persisted_gc();
+                                    }
+                                })
+                                .expect("failed to start bash cleanup");
+                        }
+                        continue;
+                    }
+                    for (index, entry) in subscriptions.iter_mut().enumerate() {
+                        if selected >= 3 && index != selected - 3 {
+                            continue;
+                        }
+                        let Some(inner) = entry.registry.upgrade() else {
+                            continue;
+                        };
+                        let registry = BgTaskRegistry { inner };
+                        if registry.inner.shutdown.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        let cause = prefer_pending_wake(
+                            if selected == 1 {
+                                WatchdogPassCause::Tick
+                            } else {
+                                WatchdogPassCause::Wake
+                            },
+                            &entry.wake_rx,
+                        );
+                        // A broken project must not disable exits for every other root.
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_pass(&registry, cause, &mut entry.awaiting_reader)
+                        }))
+                        .is_err()
+                        {
+                            log::error!("background watchdog pass panicked");
+                        }
+                        CURRENT_PASS.with(|pass| pass.set(None));
+                    }
                 }
-                recv(cleanup_ticker) -> _ => {
-                    registry.cleanup_finished(FINISHED_RETENTION);
-                    continue;
-                }
-                recv(wake_rx) -> _ => WatchdogPassCause::Wake,
-            };
-            let pass_cause = prefer_pending_wake(pass_cause, &wake_rx);
-            CURRENT_PASS.with(|pass| pass.set(Some(pass_cause)));
+            })
+            .expect("failed to start bash watchdog");
+        tx
+    })
+}
 
-            if registry.inner.shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-
-            registry.evaluate_erased_watch_targets();
-
-            let tasks = registry.running_tasks();
-            awaiting_reader.retain(|task_id, _| tasks.iter().any(|task| &task.task_id == task_id));
-            if tasks.is_empty() {
-                continue;
-            }
-
-            for task in tasks {
-                if leave_to_reader_wake(&registry, &task, pass_cause, &mut awaiting_reader) {
-                    continue;
-                }
-                let _ = registry.poll_task(&task);
-                registry.scan_task_watch_output(&task);
-                // A kill that has released the state lock to signal and reap
-                // the task owns its outcome and publishes the terminal state
-                // itself. Keep watching the task until then rather than
-                // retiring it as "no longer running" while it is `killing`.
-                if task.kill_in_flight() {
-                    continue;
-                }
-                if !task.is_running() {
-                    registry.scan_task_watch_output(&task);
-                    retire_terminal_task(&registry, &task, pass_cause, &mut awaiting_reader);
-                    continue;
-                }
-
-                let timeout_expired = task
-                    .state
-                    .lock()
-                    .ok()
-                    .map(|state| {
-                        state.metadata.remote.is_none()
-                            && state.metadata.timeout_ms.is_some_and(|timeout_ms| {
-                                task.elapsed_for_metadata(&state.metadata)
-                                    >= Duration::from_millis(timeout_ms)
-                            })
-                    })
-                    .unwrap_or(false);
-                if timeout_expired {
-                    let _ = registry.kill_for_timeout(&task.task_id, &task.session_id);
-                    continue;
-                }
-
-                registry.maybe_emit_long_running_reminder(&task);
-                // The PTY child may have exited since the poll above; the
-                // reap below would finalize it, so give it the same chance
-                // to complete through its wake.
-                if leave_to_reader_wake(&registry, &task, pass_cause, &mut awaiting_reader) {
-                    continue;
-                }
-                registry.reap_child(&task);
-                // Record a completion the reap published in this same pass,
-                // so the pass that observed it is the one on record.
-                if !task.kill_in_flight() && !task.is_running() {
-                    registry.scan_task_watch_output(&task);
-                    retire_terminal_task(&registry, &task, pass_cause, &mut awaiting_reader);
-                }
-            }
+fn run_pass(
+    registry: &BgTaskRegistry,
+    pass_cause: WatchdogPassCause,
+    awaiting_reader: &mut HashMap<String, Instant>,
+) {
+    CURRENT_PASS.with(|pass| pass.set(Some(pass_cause)));
+    registry.evaluate_erased_watch_targets();
+    let tasks = registry.running_tasks();
+    awaiting_reader.retain(|task_id, _| tasks.iter().any(|task| &task.task_id == task_id));
+    for task in tasks {
+        if leave_to_reader_wake(registry, &task, pass_cause, awaiting_reader) {
+            continue;
         }
-    });
+        let _ = registry.poll_task(&task);
+        registry.scan_task_watch_output(&task);
+        if task.kill_in_flight() {
+            continue;
+        }
+        if !task.is_running() {
+            registry.scan_task_watch_output(&task);
+            retire_terminal_task(registry, &task, pass_cause, awaiting_reader);
+            continue;
+        }
+        let timeout_expired = task
+            .state
+            .lock()
+            .ok()
+            .map(|state| {
+                state.metadata.remote.is_none()
+                    && state.metadata.timeout_ms.is_some_and(|timeout_ms| {
+                        task.elapsed_for_metadata(&state.metadata)
+                            >= Duration::from_millis(timeout_ms)
+                    })
+            })
+            .unwrap_or(false);
+        if timeout_expired {
+            let _ = registry.kill_for_timeout(&task.task_id, &task.session_id);
+            continue;
+        }
+        registry.maybe_emit_long_running_reminder(&task);
+        if leave_to_reader_wake(registry, &task, pass_cause, awaiting_reader) {
+            continue;
+        }
+        registry.reap_child(&task);
+        if !task.kill_in_flight() && !task.is_running() {
+            registry.scan_task_watch_output(&task);
+            retire_terminal_task(registry, &task, pass_cause, awaiting_reader);
+        }
+    }
 }
 
 /// Record which pass observed `task` terminal (if publishing it did not

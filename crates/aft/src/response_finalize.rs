@@ -123,6 +123,7 @@ pub fn finalize_response_with_bg_completions(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
+    acknowledge_terminal_bash_reply(response, ctx, session_id, attach_command);
     attach_checkout_query_gaps(response, ctx);
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
@@ -149,6 +150,7 @@ pub fn finalize_tool_response(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
+    acknowledge_terminal_bash_reply(response, ctx, session_id, attach_command);
     attach_checkout_query_gaps(response, ctx);
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
@@ -158,6 +160,37 @@ pub fn finalize_tool_response(
         append_trailing_line(text, &line);
     }
     enforce_reply_ceiling(attach_command, text);
+}
+
+/// Foreground and watch replies consume terminal results for their originating
+/// session. `bash_status` is a read-only snapshot, even when terminal: polling
+/// it must leave the completion available for a later notification or drain.
+fn acknowledge_terminal_bash_reply(
+    response: &Response,
+    ctx: &AppContext,
+    session_id: &str,
+    command: &str,
+) {
+    if !response.success || !matches!(command, "bash" | "bash_watch") {
+        return;
+    }
+    if !response
+        .data
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| {
+            matches!(
+                status,
+                "completed" | "failed" | "killed" | "timed_out" | "fate_unknown"
+            )
+        })
+    {
+        return;
+    }
+    if let Some(task_id) = response.data.get("task_id").and_then(Value::as_str) {
+        ctx.bash_background()
+            .ack_terminal_result_for_session(task_id, session_id);
+    }
 }
 
 fn append_trailing_line(text: &mut String, line: &str) {
@@ -185,6 +218,7 @@ pub fn finalize_response_for_dispatch_root(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
+    acknowledge_terminal_bash_reply(response, ctx, session_id, attach_command);
     attach_checkout_query_gaps(response, ctx);
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
@@ -608,19 +642,23 @@ fn aft_status_segment(counts: &crate::context::StatusBarCounts) -> String {
 /// Renders the agent-facing bar from the omission-preserving values. A category with no
 /// trustworthy value yet shows `?` (as the OpenCode footer does) rather than a clean `0`.
 fn agent_status_bar(values: &crate::context::StatusBarCountValues) -> String {
-    fn count(value: Option<usize>) -> String {
-        value.map_or_else(|| "?".to_string(), |value| value.to_string())
-    }
+    let count = |value: Option<usize>, category: &str| -> String {
+        if values.disabled_categories.contains(&category) {
+            "○".to_string()
+        } else {
+            value.map_or_else(|| "?".to_string(), |value| value.to_string())
+        }
+    };
     let stale_mark = if values.tier2_stale { "~" } else { "" };
     format!(
         "[AFT E{} W{} | {}D{} U{} C{} | T{}]",
-        count(values.errors),
-        count(values.warnings),
+        count(values.errors, "diagnostics"),
+        count(values.warnings, "diagnostics"),
         stale_mark,
-        count(values.dead_code),
-        count(values.unused_exports),
-        count(values.duplicates),
-        count(values.todos)
+        count(values.dead_code, "dead_code"),
+        count(values.unused_exports, "unused_exports"),
+        count(values.duplicates, "duplicates"),
+        count(values.todos, "todos")
     )
 }
 
@@ -818,6 +856,7 @@ mod tests {
             duplicates: Some(13),
             todos: None,
             tier2_stale: true,
+            disabled_categories: Vec::new(),
         };
         assert_eq!(agent_status_bar(&values), "[AFT E? W? | ~D21 U0 C13 | T?]");
     }

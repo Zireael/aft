@@ -659,10 +659,9 @@ fn compute_unchecked_files(ctx: &AppContext, dir: &Path) -> (Vec<String>, bool) 
     let config = ctx.config();
 
     // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-    let walker = ignore::WalkBuilder::new(dir)
-        .same_file_system(true)
-        .standard_filters(true) // honors .gitignore + hidden-file rules
-        .add_custom_ignore_filename(".aftignore")
+    let mut builder = ignore::WalkBuilder::new(dir);
+    builder.same_file_system(true).standard_filters(true); // hidden-file rules
+    let walker = crate::context::apply_project_ignore_rules(&mut builder, dir)
         .filter_entry(|e| {
             // Skip noisy directories that explode walk time on real repos.
             let name = e.file_name().to_string_lossy();

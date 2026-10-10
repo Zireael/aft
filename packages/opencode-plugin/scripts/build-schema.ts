@@ -231,22 +231,20 @@ function buildSchema(): Record<string, unknown> {
           },
           categories: {
             type: "object",
-            additionalProperties: { type: "boolean" },
+            properties: Object.fromEntries(
+              [
+                "diagnostics",
+                "todos",
+                "dead_code",
+                "unused_exports",
+                "duplicates",
+                "cycles",
+                "complexity",
+              ].map((key) => [key, { type: "boolean", default: true }]),
+            ),
+            additionalProperties: false,
             description:
-              "Per-category enable/disable overrides keyed by category id (e.g. { 'dead-code': false, 'todos': true }).",
-          },
-          tier2_soft_deadline_ms: {
-            type: "integer",
-            minimum: 1,
-            description:
-              "Soft deadline for Tier 2 inspect analysis in milliseconds. Analysis may be truncated beyond this.",
-          },
-          max_drill_down_items: {
-            type: "integer",
-            minimum: 1,
-            maximum: 100,
-            description:
-              "Maximum number of drill-down items returned per inspect category. Capped at 100.",
+              "Per-category computation switches, all true by default. Off categories run no scans or refreshes and render as off, never incomplete. Project config may only turn a category off.",
           },
           duplicates: {
             type: "object",
@@ -285,15 +283,9 @@ function buildSchema(): Record<string, unknown> {
             description:
               "Minutes without tool traffic before an unbound root's indexes are evicted. Default 30; values outside 5..=30 are clamped. Reclaimed state rebuilds on the next request. User and project tiers.",
           },
-          lsp_ttl_minutes: {
-            type: "integer",
-            default: 10,
-            description:
-              "Minutes without a request before language servers for a root are shut down, even while the root is still bound. Default 10; values outside 1..=10 are clamped. Servers respawn on the next diagnostics request. Independent of root_ttl_minutes. User and project tiers.",
-          },
         },
         additionalProperties: false,
-        description: "Idle reclamation windows for unbound-root artifacts and language servers.",
+        description: "Idle reclamation window for unbound-root artifacts.",
       },
 
       worktree: {
@@ -400,6 +392,12 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag.",
               },
+              runon_enabled: {
+                type: "boolean",
+                description:
+                  "User-only live safety gate for whole-line runon. Default false; legacy prefix routing is unaffected.",
+                default: false,
+              },
               host_fallback: {
                 type: "boolean",
                 default: false,
@@ -444,6 +442,12 @@ function buildSchema(): Record<string, unknown> {
                 default: false,
                 description:
                   "Linux-only, user-tier opt-in. Run tool shells in transient systemd user scopes when systemd-run and the user manager are available; otherwise fall back to the normal spawn.",
+              },
+              disclaim_privacy: {
+                type: "boolean",
+                default: false,
+                description:
+                  "On macOS, agent shells and governed gh commands do not inherit the supervisor's privacy grants. Default false. Live for future commands; user tier controls it and projects may only enable it. Protected folders such as ~/Downloads should be read with AFT's read tool. Accepted but inert on other platforms; unavailable spawn attributes refuse the command instead of inheriting grants.",
               },
               long_running_reminder_enabled: {
                 type: "boolean",
@@ -535,6 +539,15 @@ function buildSchema(): Record<string, unknown> {
       lsp: {
         type: "object",
         properties: {
+          idle_minutes: {
+            anyOf: [
+              { type: "integer", minimum: 5, maximum: 1440 },
+              { type: "string", const: "never" },
+            ],
+            default: 60,
+            description:
+              "Minutes since the last AFT tool call on that repository. Default 60; integers are clamped to 5..=1440. 'never' disables only idle reaping; servers still stop on unbind, eviction and shutdown. Project config may only lower the user value, or set a number when the user has 'never'. Applies live.",
+          },
           servers: {
             type: "object",
             additionalProperties: lspServerEntry,
@@ -811,6 +824,26 @@ function buildSchema(): Record<string, unknown> {
         additionalProperties: false,
         description:
           "Managed gh shim binary override. Whether the shim is used is github.shim; binary_path is the advanced AFT-image override.",
+      },
+
+      remote_exec: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+            default: false,
+            description:
+              "Offer bash's runon argument, which runs a command line on the remote Linux build server (subc mode only). User-scoped: a project config may set false to turn remote runs off for itself, never true.",
+          },
+          default_demand: {
+            type: "string",
+            description:
+              'The runner demand a runon call without specifics runs under (today only "linux"). Never makes a call remote by itself. User-scoped only.',
+          },
+        },
+        additionalProperties: false,
+        description:
+          "Remote runs requested per bash call with runon. See docs/tools.md (bash: running on the remote build server).",
       },
 
       git: {

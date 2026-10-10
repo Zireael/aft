@@ -838,12 +838,12 @@ describe("OpenCode doctor generation and load path", () => {
         ok: false,
         stdout: "",
         stderr:
-          "removed_config_key:gh_read:use:github.read\nAFT cannot load this configuration. Run `aft doctor --fix` to migrate it, then rerun setup.",
+          "invalid_config:/u/aft.jsonc: the config must be a JSON object\nAFT cannot load this configuration. Fix the file, then rerun setup.",
         status: 1,
       }),
     });
     expect(rejected).toBe(1);
-    expect(lines.join("\n")).toContain("removed_config_key:gh_read:use:github.read");
+    expect(lines.join("\n")).toContain("invalid_config:/u/aft.jsonc");
   });
 
   test("accepts an explicit semver registration on V1", () => {

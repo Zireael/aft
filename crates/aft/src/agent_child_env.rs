@@ -4,7 +4,7 @@
 //! children. AFT never edits the user's shell startup files or global Git
 //! configuration, so an operator's terminal keeps its existing behavior.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,11 @@ use crate::config::Config;
 
 pub const SHIMS_DIR_NAME: &str = "shims";
 pub const GIT_HOOKS_DIR_NAME: &str = "git-hooks";
+const ALFONSO_TEST_THREADS_FILE: &str = "alfonso-test-threads";
+const DEFAULT_WORKER_TEST_THREADS: u32 = 4;
+const MAX_WORKER_TEST_THREADS: u32 = 256;
+const NEXT_TEST_THREADS_ENV: &str = "NEXTEST_TEST_THREADS";
+const RUST_TEST_THREADS_ENV: &str = "RUST_TEST_THREADS";
 const GIT_HOOKS_QUARANTINE_DIR_NAME: &str = "quarantine";
 const PREPARE_COMMIT_MSG: &str = "prepare-commit-msg";
 // This is the complete hook inventory documented by `githooks(5)`, including
@@ -68,6 +73,174 @@ const SUBC_IDENTITY_ENV_KEYS: [&str; 3] = [
     subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV,
 ];
 
+static WORKER_TEST_THREAD_LOGGED_WORKTREES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static WORKER_TEST_THREAD_OVERSIZE_LOGGED_WORKTREES: OnceLock<Mutex<HashSet<PathBuf>>> =
+    OnceLock::new();
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerTestThreadBudgetIssue {
+    Invalid(&'static str),
+    Oversized(String),
+}
+
+/// Supply bounded test-run concurrency to a worker-preset bash child without
+/// replacing a value the caller already chose.
+pub(crate) fn inject_worker_test_threads(
+    project_root: &Path,
+    environment: &mut HashMap<String, String>,
+) {
+    inject_worker_test_threads_with(project_root, environment, |name| {
+        std::env::var_os(name).is_some()
+    });
+}
+
+fn inject_worker_test_threads_with(
+    project_root: &Path,
+    environment: &mut HashMap<String, String>,
+    inherited_has: impl Fn(&str) -> bool,
+) {
+    let missing = [NEXT_TEST_THREADS_ENV, RUST_TEST_THREADS_ENV]
+        .into_iter()
+        .filter(|name| !has_test_thread_override(environment, name) && !inherited_has(name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+
+    let (threads, issue) = worker_test_thread_budget(project_root);
+    if let Some(issue) = issue {
+        log_worker_test_thread_fallback_once(project_root, issue);
+    }
+    let threads = threads.to_string();
+    for name in missing {
+        environment.insert(name.to_string(), threads.clone());
+    }
+}
+
+fn has_test_thread_override(environment: &HashMap<String, String>, name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        environment.keys().any(|key| key.eq_ignore_ascii_case(name))
+    }
+    #[cfg(not(windows))]
+    {
+        environment.contains_key(name)
+    }
+}
+
+fn worker_test_thread_budget_path(project_root: &Path) -> Option<PathBuf> {
+    project_root.parent().map(|worktree_parent| {
+        worktree_parent
+            .join(".cargo")
+            .join(ALFONSO_TEST_THREADS_FILE)
+    })
+}
+
+/// Reject oversized budgets instead of letting a corrupt file overwhelm the
+/// shared machine; valid values are always between one and 256 threads.
+fn worker_test_thread_budget(project_root: &Path) -> (u32, Option<WorkerTestThreadBudgetIssue>) {
+    let Some(path) = worker_test_thread_budget_path(project_root) else {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "worktree has no parent directory",
+            )),
+        );
+    };
+    let contents = match fs::read(&path) {
+        Ok(contents) => contents,
+        Err(_) => {
+            return (
+                DEFAULT_WORKER_TEST_THREADS,
+                Some(WorkerTestThreadBudgetIssue::Invalid(
+                    "budget file is absent or unreadable",
+                )),
+            )
+        }
+    };
+    let Ok(contents) = std::str::from_utf8(&contents) else {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "budget file is not valid UTF-8",
+            )),
+        );
+    };
+    let Some(digits) = contents.strip_suffix('\n') else {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "budget file must contain a decimal integer and newline",
+            )),
+        );
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "budget file does not contain a positive decimal integer",
+            )),
+        );
+    }
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "budget file does not contain a positive decimal integer",
+            )),
+        );
+    }
+    if significant.len() > 3 || (significant.len() == 3 && significant > "256") {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some(WorkerTestThreadBudgetIssue::Oversized(digits.to_string())),
+        );
+    }
+    match significant.parse::<u32>() {
+        Ok(threads) => (threads, None),
+        Err(_) => (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "budget file does not contain a positive decimal integer",
+            )),
+        ),
+    }
+}
+
+fn log_worker_test_thread_fallback_once(worktree: &Path, issue: WorkerTestThreadBudgetIssue) {
+    match issue {
+        WorkerTestThreadBudgetIssue::Invalid(reason) => {
+            let logged = WORKER_TEST_THREAD_LOGGED_WORKTREES.get_or_init(Default::default);
+            let Ok(mut logged) = logged.lock() else {
+                return;
+            };
+            if logged.insert(worktree.to_path_buf()) {
+                log::debug!(
+                    "using {DEFAULT_WORKER_TEST_THREADS} test threads for worker bash in {}: {reason}",
+                    worktree.display()
+                );
+            }
+        }
+        WorkerTestThreadBudgetIssue::Oversized(value) => {
+            let logged = WORKER_TEST_THREAD_OVERSIZE_LOGGED_WORKTREES.get_or_init(Default::default);
+            let Ok(mut logged) = logged.lock() else {
+                return;
+            };
+            if logged.insert(worktree.to_path_buf()) {
+                let path = worker_test_thread_budget_path(worktree)
+                    .unwrap_or_else(|| PathBuf::from(ALFONSO_TEST_THREADS_FILE));
+                log::warn!(
+                    "worker test thread budget file {} contains value {}; using {DEFAULT_WORKER_TEST_THREADS} threads for {} because budgets above {MAX_WORKER_TEST_THREADS} are invalid",
+                    path.display(),
+                    value,
+                    worktree.display()
+                );
+            }
+        }
+    }
+}
+
 /// Git for Windows runs shebang hooks through its bundled POSIX shell, so the
 /// same dispatcher bytes work there and on Unix. Only the repository hook
 /// receives Git's stdin; resolver probes have closed input and a deadline.
@@ -88,24 +261,36 @@ else
 fi
 
 bounded_probe() (
-  # Resolver commands do not consume hook input. Keep the watchdog's output out
-  # of command-substitution pipes, and reap it on success rather than waiting
-  # for the whole deadline or leaving its sleep behind.
+  # Resolver commands do not consume hook input. The watchdog owns and reaps its
+  # timer; none of its output may keep a resolver command-substitution pipe open.
   "$@" </dev/null &
   probe_pid=$!
-  (
-    sleeper=
-    trap 'if [ -n "$sleeper" ]; then kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; fi; exit 0' TERM
-    sleep 10 &
-    sleeper=$!
-    wait "$sleeper"
-    kill -KILL "$probe_pid" 2>/dev/null
-  ) </dev/null >/dev/null 2>&1 &
-  watchdog_pid=$!
+  # Read the timer PID only after the watchdog has started its child. Both the
+  # watchdog and timer close the publication pipe so this substitution ends
+  # immediately, not when the deadline expires. Cancellation kills the timer
+  # directly: a shell can lose a signal sent to it while forking or entering wait.
+  timer_pid=$(
+    (
+      # Explicit exec makes $! the timer itself even on shells that otherwise
+      # retain an intermediate shell for background commands. Close the PID pipe
+      # in the timer too; it must not keep the reader waiting for ten seconds.
+      ( exec sleep 10 ) 3>&- &
+      timer_pid=$!
+      printf '%s\n' "$timer_pid" >&3
+      exec 3>&-
+      wait "$timer_pid" 2>/dev/null
+      timer_status=$?
+      # SIGKILL denotes cancellation; only an uncancelled timer kills the probe.
+      if [ "$timer_status" -ne 137 ]; then
+        kill -KILL "$probe_pid" 2>/dev/null
+      fi
+    ) 3>&1 </dev/null >/dev/null 2>&1 &
+  )
+  # SIGKILL cannot run shell cleanup. If the hook itself is killed externally,
+  # the detached watchdog still finishes within the ten-second deadline.
   wait "$probe_pid" 2>/dev/null
   probe_status=$?
-  kill "$watchdog_pid" 2>/dev/null || :
-  wait "$watchdog_pid" 2>/dev/null || :
+  kill -KILL "$timer_pid" 2>/dev/null || :
   # Git uses 128 for ordinary errors, including --show-toplevel in a bare
   # repository. Only the watchdog's SIGKILL status denotes a deadline here.
   if [ "$probe_status" -eq 137 ]; then
@@ -458,6 +643,7 @@ pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<Stri
         command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
     }
     command.envs(environment);
+    command.env_remove(crate::privacy_spawn::CONTROL_ENV);
 
     let mut credential_keys = std::env::vars_os()
         .map(|(key, _)| key)
@@ -478,6 +664,7 @@ pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<Stri
 /// CommandBuilder materializes the process environment when it is constructed,
 /// so filtering the builder covers Unix exec and Windows CreateProcess alike.
 pub(crate) fn scrub_pty_command(command: &mut portable_pty::CommandBuilder) {
+    command.env_remove(crate::privacy_spawn::CONTROL_ENV);
     let mut credential_keys = std::env::vars_os()
         .map(|(key, _)| key)
         .filter(|key| key.to_str().is_some_and(is_subc_credential_env_key))
@@ -511,6 +698,11 @@ pub fn inject(
     // daemon connection. Remove them only from the child snapshot so the module
     // process retains the credentials it needs.
     environment.retain(|key, _| !is_subc_credential_env_key(key));
+    // This control belongs to the pinned config, never a caller or outer daemon.
+    environment.remove(crate::privacy_spawn::CONTROL_ENV);
+    if config.bash.disclaim_privacy {
+        environment.insert(crate::privacy_spawn::CONTROL_ENV.to_owned(), "1".to_owned());
+    }
 
     let gh_enabled = config.github.shim;
     environment.remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
@@ -771,6 +963,7 @@ fn ensure_managed_git_hooks(hooks_dir: &Path) -> Result<(), String> {
     if fs::symlink_metadata(hooks_dir).is_err() {
         install_managed_git_hook_set(hooks_dir, expected)?;
     }
+    crate::private_storage::tighten_open_dir(hooks_dir.parent().unwrap_or(hooks_dir), hooks_dir);
     // The directory is shared by every storage root, so verify it before each
     // child launch: tampering in one place would otherwise reach every agent.
     // An intact set costs only reads here; nothing is rewritten or re-chmodded.
@@ -891,6 +1084,12 @@ fn replace_legacy_hook(
     permissions: fs::Permissions,
 ) -> Result<(), String> {
     use std::io::Write;
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = permissions;
+        fs::Permissions::from_mode(crate::private_storage::DIR_MODE)
+    };
 
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temporary = path.with_file_name(format!(
@@ -900,7 +1099,7 @@ fn replace_legacy_hook(
         SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let replaced = (|| {
-        let mut file = fs::OpenOptions::new()
+        let mut file = crate::private_storage::executable_options()
             .write(true)
             .create_new(true)
             .open(&temporary)?;
@@ -908,7 +1107,7 @@ fn replace_legacy_hook(
         file.set_permissions(permissions)?;
         drop(file);
         // rename replaces an existing regular file atomically, including on
-        // Windows. Preserve the old mode before publishing the new inode.
+        // Windows. Publish owner-only executables on Unix; retain Windows ACLs.
         fs::rename(&temporary, path)
     })();
     if let Err(error) = replaced {
@@ -935,7 +1134,7 @@ fn install_managed_git_hook_set(
             hooks_dir.display()
         )
     })?;
-    fs::create_dir_all(parent).map_err(|error| {
+    crate::private_storage::open_root(parent).map_err(|error| {
         format!(
             "failed to create child Git hooks directory {}: {error}",
             parent.display()
@@ -955,7 +1154,7 @@ fn install_managed_git_hook_set(
         STAGING_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let populated = (|| {
-        fs::create_dir(&staging).map_err(|error| {
+        crate::private_storage::create_dir(&staging).map_err(|error| {
             format!(
                 "failed to create Git hooks staging directory {}: {error}",
                 staging.display()
@@ -963,12 +1162,14 @@ fn install_managed_git_hook_set(
         })?;
         for (name, contents) in expected {
             let hook = staging.join(name);
-            fs::write(&hook, contents.as_bytes()).map_err(|error| {
-                format!(
-                    "failed to write staged Git hook {}: {error}",
-                    hook.display()
-                )
-            })?;
+            crate::private_storage::write_executable(&hook, contents.as_bytes()).map_err(
+                |error| {
+                    format!(
+                        "failed to write staged Git hook {}: {error}",
+                        hook.display()
+                    )
+                },
+            )?;
             #[cfg(unix)]
             set_executable(&hook)?;
         }
@@ -1054,7 +1255,7 @@ fn quarantine_foreign_hook_entries(
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        fs::create_dir(&staging).map_err(|error| {
+        crate::private_storage::create_dir(&staging).map_err(|error| {
             format!(
                 "failed to stage the Git hook quarantine directory {}: {error}",
                 staging.display()
@@ -1076,7 +1277,7 @@ fn quarantine_foreign_hook_entries(
         moved.push(quarantine.join(destination_name));
         foreign.retain(|path| path != &quarantine);
     } else {
-        fs::create_dir_all(&quarantine).map_err(|error| {
+        crate::private_storage::create_dir_all(&quarantine).map_err(|error| {
             format!(
                 "failed to create Git hook quarantine directory {}: {error}",
                 quarantine.display()
@@ -1175,12 +1376,14 @@ fn quarantine_test_logs() -> &'static Mutex<Vec<String>> {
 fn ensure_gh_entry(shims_dir: &Path, binary: &Path) -> Result<(), String> {
     use std::os::unix::fs::symlink;
 
-    fs::create_dir_all(shims_dir).map_err(|error| {
-        format!(
-            "failed to create gh shim directory {}: {error}",
-            shims_dir.display()
-        )
-    })?;
+    crate::private_storage::open_dir(shims_dir.parent().unwrap_or(shims_dir), shims_dir).map_err(
+        |error| {
+            format!(
+                "failed to create gh shim directory {}: {error}",
+                shims_dir.display()
+            )
+        },
+    )?;
     let entry = shims_dir.join("gh");
     if fs::read_link(&entry).ok().as_deref() == Some(binary) {
         return Ok(());
@@ -1211,7 +1414,7 @@ fn ensure_gh_entry(shims_dir: &Path, binary: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn ensure_gh_entry(shims_dir: &Path, binary: &Path) -> Result<(), String> {
-    fs::create_dir_all(shims_dir).map_err(|error| {
+    crate::private_storage::create_dir_all(shims_dir).map_err(|error| {
         format!(
             "failed to create gh shim directory {}: {error}",
             shims_dir.display()
@@ -1266,7 +1469,7 @@ fn write_hook_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
         {
             use std::os::unix::fs::PermissionsExt;
             let executable = fs::metadata(path)
-                .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o755);
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o700);
             if !executable {
                 set_executable(path)?;
             }
@@ -1298,7 +1501,7 @@ fn install_managed_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(
     let parent = path
         .parent()
         .ok_or_else(|| format!("managed child file has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent).map_err(|error| {
+    crate::private_storage::create_dir_all(parent).map_err(|error| {
         format!(
             "failed to create managed child directory {}: {error}",
             parent.display()
@@ -1314,7 +1517,12 @@ fn install_managed_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(
         std::process::id(),
         TEMPORARY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    fs::write(&temporary, bytes).map_err(|error| {
+    let write = if executable {
+        crate::private_storage::write_executable(&temporary, bytes)
+    } else {
+        crate::private_storage::write(&temporary, bytes)
+    };
+    write.map_err(|error| {
         format!(
             "failed to write managed child file {}: {error}",
             temporary.display()
@@ -1350,18 +1558,18 @@ fn install_managed_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(
 
 #[cfg(unix)]
 fn set_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path)
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
         .map_err(|error| {
             format!(
-                "failed to read hook permissions {}: {error}",
+                "failed to open hook permissions {}: {error}",
                 path.display()
             )
-        })?
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions)
+        })?;
+    file.set_permissions(fs::Permissions::from_mode(crate::private_storage::DIR_MODE))
         .map_err(|error| format!("failed to make hook executable {}: {error}", path.display()))
 }
 
@@ -1375,10 +1583,99 @@ pub fn windows_gh_cmd(binary: &Path) -> Vec<u8> {
     format!("@echo off\r\n\"{rendered}\" gh-shim %*\r\n").into_bytes()
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn write_storage_permission_fixture(root: &Path) {
+    let hooks = root
+        .join(GIT_HOOKS_DIR_NAME)
+        .join(&managed_git_hook_set().key);
+    ensure_managed_git_hooks(&hooks).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Config, GitConfig};
+
+    fn test_thread_file(root: &Path, contents: Option<&[u8]>) {
+        let path = root
+            .parent()
+            .unwrap()
+            .join(".cargo")
+            .join(ALFONSO_TEST_THREADS_FILE);
+        if let Some(contents) = contents {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+    }
+
+    #[test]
+    fn worker_thread_budget_defaults_invalid_and_oversized_files() {
+        let container = tempfile::tempdir().unwrap();
+        let root = container.path().join("worktree");
+        fs::create_dir(&root).unwrap();
+
+        assert_eq!(worker_test_thread_budget(&root).0, 4);
+        for contents in [
+            b"\n".as_slice(),
+            b"garbage\n",
+            b"0\n",
+            b"4",
+            b"4\r\n",
+            b"\xff\n",
+        ] {
+            test_thread_file(&root, Some(contents));
+            assert_eq!(worker_test_thread_budget(&root).0, 4, "{contents:?}");
+        }
+        test_thread_file(&root, Some(b"9\n"));
+        assert_eq!(worker_test_thread_budget(&root), (9, None));
+        test_thread_file(&root, Some(b"256\n"));
+        assert_eq!(worker_test_thread_budget(&root), (256, None));
+        test_thread_file(&root, Some(b"257\n"));
+        assert_eq!(
+            worker_test_thread_budget(&root),
+            (
+                DEFAULT_WORKER_TEST_THREADS,
+                Some(WorkerTestThreadBudgetIssue::Oversized("257".into()))
+            )
+        );
+        test_thread_file(&root, Some(b"999999999999999999999999999999999\n"));
+        assert_eq!(
+            worker_test_thread_budget(&root).0,
+            DEFAULT_WORKER_TEST_THREADS
+        );
+
+        let path = root
+            .parent()
+            .unwrap()
+            .join(".cargo")
+            .join(ALFONSO_TEST_THREADS_FILE);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            worker_test_thread_budget(&root).0,
+            DEFAULT_WORKER_TEST_THREADS
+        );
+    }
+
+    #[test]
+    fn worker_thread_defaults_preserve_inherited_and_call_environment_values() {
+        let container = tempfile::tempdir().unwrap();
+        let root = container.path().join("worktree");
+        fs::create_dir(&root).unwrap();
+        test_thread_file(&root, Some(b"6\n"));
+
+        let mut environment = HashMap::from([(NEXT_TEST_THREADS_ENV.into(), "13".into())]);
+        inject_worker_test_threads_with(&root, &mut environment, |name| {
+            name == RUST_TEST_THREADS_ENV
+        });
+        assert_eq!(environment[NEXT_TEST_THREADS_ENV], "13");
+        assert!(!environment.contains_key(RUST_TEST_THREADS_ENV));
+
+        let mut environment = HashMap::from([(RUST_TEST_THREADS_ENV.into(), "17".into())]);
+        inject_worker_test_threads_with(&root, &mut environment, |_| false);
+        assert_eq!(environment[RUST_TEST_THREADS_ENV], "17");
+        assert_eq!(environment[NEXT_TEST_THREADS_ENV], "6");
+    }
 
     #[cfg(unix)]
     const TEST_CO_AUTHOR: &str = "Pair Agent <pair@example.test>";
@@ -1395,6 +1692,28 @@ mod tests {
         let mut after = before.clone();
         inject(&config, Path::new("/unused"), &mut after, None).unwrap();
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn privacy_disclaim_control_comes_only_from_config_and_never_reaches_the_child() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        let mut environment =
+            HashMap::from([(crate::privacy_spawn::CONTROL_ENV.to_owned(), "1".to_owned())]);
+        inject(&config, root.path(), &mut environment, None).unwrap();
+        assert!(!environment.contains_key(crate::privacy_spawn::CONTROL_ENV));
+        config.bash.disclaim_privacy = true;
+        inject(&config, root.path(), &mut environment, None).unwrap();
+        assert!(crate::privacy_spawn::requested(&environment));
+        let mut command = Command::new("sh");
+        apply_to_command(&mut command, &environment);
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == crate::privacy_spawn::CONTROL_ENV && value.is_none()));
+        let mut pty = portable_pty::CommandBuilder::new("sh");
+        pty.env(crate::privacy_spawn::CONTROL_ENV, "1");
+        scrub_pty_command(&mut pty);
+        assert!(pty.get_env(crate::privacy_spawn::CONTROL_ENV).is_none());
     }
 
     #[test]
@@ -1532,10 +1851,12 @@ mod tests {
         );
 
         let pty_spawns = pty.matches(".spawn_command(").count();
-        assert_eq!(pty_spawns, 1, "agent PTY spawn inventory drifted");
+        // The macOS opt-in branch uses posix_spawn; these two inherited
+        // alternatives are mutually exclusive cfg paths.
+        assert_eq!(pty_spawns, 2, "agent PTY spawn inventory drifted");
         assert_eq!(
             pty.matches("sandbox_spawn::pty_command_for_plan(").count(),
-            pty_spawns,
+            1,
             "every PTY spawn must use the scrubbed command factory"
         );
         assert!(
@@ -2146,7 +2467,7 @@ mod tests {
                     .unwrap()
                     .permissions()
                     .mode();
-                assert_eq!(mode & 0o777, 0o755, "{name} is not executable");
+                assert_eq!(mode & 0o777, 0o700, "{name} is not owner-only executable");
             }
         }
         assert_eq!(
@@ -2493,7 +2814,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn legacy_refresh_preserves_modes_and_never_rewrites_foreign_files() {
+    fn legacy_refresh_tightens_owned_modes_and_never_rewrites_foreign_files() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let temp = tempfile::tempdir().unwrap();
@@ -2527,7 +2848,7 @@ mod tests {
             after.ino(),
             "refresh must publish a new inode atomically"
         );
-        assert_eq!(after.permissions().mode() & 0o777, 0o750);
+        assert_eq!(after.permissions().mode() & 0o777, 0o700);
         assert_eq!(fs::read(&foreign).unwrap(), foreign_bytes);
         assert_eq!(fs::metadata(&foreign).unwrap().ino(), foreign_inode);
         assert_eq!(fs::read(&copied_header).unwrap(), unkeyed_bytes);
@@ -2621,6 +2942,344 @@ mod tests {
                 assert!(status.success());
             }
         }
+    }
+
+    #[cfg(unix)]
+    struct DispatcherProcessFixture {
+        temp: tempfile::TempDir,
+        sessions: Vec<u32>,
+        initial_pids: HashSet<u32>,
+    }
+
+    #[cfg(unix)]
+    fn dispatcher_process_snapshot() -> Vec<(u32, u32, String)> {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,ppid=,pgid=,sess=,stat=,command="])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "ps failed: {output:?}");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let mut columns = line.split_whitespace();
+                let pid = columns.next()?.parse().ok()?;
+                columns.next()?; // Parent PID is retained in the diagnostic line.
+                let pgid = columns.next()?.parse().ok()?;
+                columns.next()?; // macOS reports an opaque session identifier.
+                let state = columns.next()?;
+                // Zombies cannot run or retain a cwd. Their eventual reaping by
+                // init is outside the dispatcher's control after a hook SIGKILL.
+                (!state.starts_with('Z')).then(|| (pid, pgid, line.to_owned()))
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    impl DispatcherProcessFixture {
+        fn new(git_body: &str) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path().join("repo");
+            assert!(Command::new("git")
+                .args(["-c", "core.hooksPath=/dev/null", "init", "--quiet"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success());
+            write_executable(&temp.path().join("git"), git_body);
+            Self {
+                temp,
+                sessions: Vec::new(),
+                initial_pids: dispatcher_process_snapshot()
+                    .into_iter()
+                    .map(|(pid, _, _)| pid)
+                    .collect(),
+            }
+        }
+
+        fn spawn(&mut self, contents: &str) -> std::process::Child {
+            use std::process::Stdio;
+
+            let hook = self.temp.path().join("post-index-change");
+            write_executable(&hook, contents);
+            // Every invocation has a fresh session/process group. POSIX sh does
+            // not enable job control here, so all descendants (including ones
+            // reparented to init) keep this group. This scopes ps to processes
+            // started by the test without relying on command names or PPIDs.
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg(&hook)
+                .current_dir(self.temp.path().join("repo"))
+                .env("AFT_TEST_REPO", self.temp.path().join("repo"))
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        self.temp.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::bash_background::process::start_new_session(&mut command);
+            let child = command.spawn().unwrap();
+            self.sessions.push(child.id());
+            child
+        }
+
+        fn remaining_processes(&self) -> Vec<String> {
+            dispatcher_process_snapshot()
+                .into_iter()
+                .filter(|(pid, pgid, _)| {
+                    !self.initial_pids.contains(pid) && self.sessions.contains(pgid)
+                })
+                .map(|(_, _, line)| line)
+                .collect()
+        }
+
+        fn assert_drained(&self, allowance: Duration) {
+            let deadline = Instant::now() + allowance;
+            loop {
+                let remaining = self.remaining_processes();
+                if remaining.is_empty() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "dispatcher left live descendants (pid ppid pgid sess stat command):\n{}",
+                    remaining.join("\n")
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait(child: &mut std::process::Child, allowance: Duration) -> std::process::ExitStatus {
+            let deadline = Instant::now() + allowance;
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return status;
+                }
+                if Instant::now() >= deadline {
+                    let remaining: Vec<_> = dispatcher_process_snapshot()
+                        .into_iter()
+                        .filter(|(_, pgid, _)| *pgid == child.id())
+                        .map(|(pid, _, line)| {
+                            #[cfg(target_os = "linux")]
+                            {
+                                let status = fs::read_to_string(format!("/proc/{pid}/status"))
+                                    .unwrap_or_default();
+                                let signals: Vec<_> = status
+                                    .lines()
+                                    .filter(|line| line.starts_with("Sig"))
+                                    .collect();
+                                format!("{line}\n{}", signals.join("\n"))
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                let _ = pid;
+                                line
+                            }
+                        })
+                        .collect();
+                    crate::bash_background::process::terminate_process(child);
+                    panic!(
+                        "dispatcher exceeded {allowance:?} (pid ppid pgid sess stat command):\n{}",
+                        remaining.join("\n")
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for DispatcherProcessFixture {
+        fn drop(&mut self) {
+            // A failing orphan assertion must not itself leave test processes.
+            for &session in &self.sessions {
+                unsafe { libc::kill(-(session as libc::pid_t), libc::SIGKILL) };
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_fast_probes_leave_no_orphan_processes() {
+        let mut fixture = DispatcherProcessFixture::new(
+            "#!/bin/sh\ncase $1 in\nrev-parse) printf '%s\\n' \"$AFT_TEST_REPO\";;\nconfig) printf '%s\\n' \"$AFT_TEST_REPO/missing-hooks\";;\nesac\n",
+        );
+        let hook = managed_git_hook_contents("post-index-change");
+        // A loaded runner can delay a healthy hook for more than two seconds.
+        // Allow scheduling slack, but stay below the ten-second watchdog so a
+        // stuck fast probe cannot pass merely by waiting for its timer to expire.
+        let fast_probe_allowance = Duration::from_secs(6);
+        let mut longest_dispatch = Duration::ZERO;
+        for _ in 0..200 {
+            let start = Instant::now();
+            let mut child = fixture.spawn(&hook);
+            assert!(DispatcherProcessFixture::wait(&mut child, fast_probe_allowance).success());
+            longest_dispatch = longest_dispatch.max(start.elapsed());
+        }
+        println!("200 fast dispatches; longest dispatch: {longest_dispatch:?}");
+        // Model scheduler latency without generating CPU load. This delay is
+        // before any probe/watchdog starts, so it cannot mask a leaked timer.
+        let slow_start = hook.replacen("#!/bin/sh", "#!/bin/sh\n/bin/sleep 3", 1);
+        let mut child = fixture.spawn(&slow_start);
+        assert!(DispatcherProcessFixture::wait(&mut child, fast_probe_allowance).success());
+        // Delay after backgrounding the timer so the probe finishes before
+        // timer_pid is published. The delay is synchronous, so $! still names the
+        // timer child. The loop above checks 200 unmodified fast dispatches; this
+        // invocation additionally checks cancellation during PID publication.
+        let delayed = hook.replace(
+            "( exec sleep 10 ) 3>&- &",
+            "( exec sleep 10 ) 3>&- &\n    /bin/sleep 0.05",
+        );
+        assert_ne!(hook, delayed, "test delay must reach the real watchdog");
+        let mut child = fixture.spawn(&delayed);
+        assert!(DispatcherProcessFixture::wait(&mut child, fast_probe_allowance).success());
+        // Give exiting children scheduling slack, not enough time for an orphan
+        // sleep 10 from the final publication-window probe to expire naturally.
+        fixture.assert_drained(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_cancels_a_timer_that_ignores_term() {
+        let mut fixture = DispatcherProcessFixture::new(
+            "#!/bin/sh\nwhile [ ! -f \"$AFT_TEST_REPO/timer-ready\" ]; do /bin/sleep 0.01; done\n",
+        );
+        // TERM sent between fork and exec can be consumed by the timer child's
+        // inherited shell trap. Model an equally unresponsive timer explicitly,
+        // and let the probe finish only after that timer is known to be running.
+        write_executable(
+            &fixture.temp.path().join("sleep"),
+            "#!/bin/sh\ntrap '' TERM\n: > \"$AFT_TEST_REPO/timer-ready\"\nexec /bin/sleep \"$@\"\n",
+        );
+        let hook = managed_git_hook_contents("post-index-change");
+        let bounded = hook.split("\nprobe_value()").next().unwrap();
+        let mut child = fixture.spawn(&format!("{bounded}\nbounded_probe git\nexit \"$?\"\n"));
+        assert!(DispatcherProcessFixture::wait(&mut child, Duration::from_secs(6)).success());
+        fixture.assert_drained(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_timer_exec_leaves_no_intermediate_shell_child() {
+        let mut fixture = DispatcherProcessFixture::new(
+            "#!/bin/sh\nwhile [ ! -f \"$AFT_TEST_REPO/timer-ready\" ]; do /bin/sleep 0.01; done\n",
+        );
+        write_executable(
+            &fixture.temp.path().join("sleep"),
+            "#!/bin/sh\n: > \"$AFT_TEST_REPO/timer-ready\"\nexec /bin/sleep \"$@\"\n",
+        );
+        let hook = managed_git_hook_contents("post-index-change");
+        // Delay the timer child before exec to model scheduling after fork. A
+        // trailing command prevents shells from implicitly exec'ing the last
+        // command: only the dispatcher's explicit exec can replace this shell.
+        // The probe waits for the sleep wrapper so cancellation cannot precede
+        // the fork of the real timer in a dispatcher that omits exec.
+        let delayed = hook
+            .replace("    ( ", "    ( /bin/sleep 0.05; ")
+            .replace("sleep 10 ) 3>&- &", "sleep 10; : ) 3>&- &");
+        assert_ne!(hook, delayed, "test delay must reach the real timer child");
+        let bounded = delayed.split("\nprobe_value()").next().unwrap();
+        let mut child = fixture.spawn(&format!("{bounded}\nbounded_probe git\nexit \"$?\"\n"));
+        assert!(DispatcherProcessFixture::wait(&mut child, Duration::from_secs(2)).success());
+        fixture.assert_drained(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_waits_for_timer_pid_before_cancelling() {
+        let mut fixture = DispatcherProcessFixture::new(
+            "#!/bin/sh\nwhile [ ! -f \"$AFT_TEST_REPO/timer-ready\" ]; do /bin/sleep 0.01; done\n",
+        );
+        write_executable(
+            &fixture.temp.path().join("sleep"),
+            "#!/bin/sh\n: > \"$AFT_TEST_REPO/timer-ready\"\nexec /bin/sleep \"$@\"\n",
+        );
+        let hook = managed_git_hook_contents("post-index-change");
+        // Let the probe finish while the watchdog has forked the timer but has
+        // not published timer_pid. Cancellation must wait for the correct PID.
+        let delayed = hook.replace(
+            "( exec sleep 10 ) 3>&- &",
+            "( exec sleep 10 ) 3>&- &\n    /bin/sleep 0.1",
+        );
+        assert_ne!(
+            hook, delayed,
+            "test delay must precede timer PID publication"
+        );
+        let bounded = delayed.split("\nprobe_value()").next().unwrap();
+        let mut child = fixture.spawn(&format!("{bounded}\nbounded_probe git\nexit \"$?\"\n"));
+        assert!(DispatcherProcessFixture::wait(&mut child, Duration::from_secs(2)).success());
+        fixture.assert_drained(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_cancellation_survives_term_suppressed_during_timer_fork() {
+        let mut fixture = DispatcherProcessFixture::new(
+            "#!/bin/sh\nwhile [ ! -f \"$AFT_TEST_REPO/timer-ready\" ]; do /bin/sleep 0.01; done\n",
+        );
+        write_executable(
+            &fixture.temp.path().join("sleep"),
+            "#!/bin/sh\n: > \"$AFT_TEST_REPO/timer-ready\"\nexec /bin/sleep \"$@\"\n",
+        );
+        let hook = managed_git_hook_contents("post-index-change");
+        // Suppress TERM before the timer fork so sleep inherits an ignored
+        // signal. Cancellation must still kill it rather than leave a live
+        // timer until the deadline.
+        let suppressed = hook.replace(
+            "( exec sleep 10 ) 3>&- &",
+            "trap '' TERM\n    ( exec sleep 10 ) 3>&- &",
+        );
+        assert_ne!(hook, suppressed, "test must suppress TERM in the watchdog");
+        let bounded = suppressed.split("\nprobe_value()").next().unwrap();
+        let mut child = fixture.spawn(&format!("{bounded}\nbounded_probe git\nexit \"$?\"\n"));
+        assert!(DispatcherProcessFixture::wait(&mut child, Duration::from_secs(2)).success());
+        fixture.assert_drained(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_deadline_probe_returns_124_without_orphan_processes() {
+        let mut fixture = DispatcherProcessFixture::new("#!/bin/sh\nexec sleep 600\n");
+        // Exercise the exact generated function independently of probe_value,
+        // whose caller deliberately converts a timeout into hook failure (1).
+        let hook = managed_git_hook_contents("post-index-change");
+        let bounded = hook.split("\nprobe_value()").next().unwrap();
+        let mut child = fixture.spawn(&format!("{bounded}\nbounded_probe git\nexit \"$?\"\n"));
+        assert_eq!(
+            DispatcherProcessFixture::wait(&mut child, Duration::from_secs(16)).code(),
+            Some(124)
+        );
+        fixture.assert_drained(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_sigkilled_hook_descendants_exit_within_deadline() {
+        let mut fixture = DispatcherProcessFixture::new("#!/bin/sh\nexec sleep 600\n");
+        let mut child = fixture.spawn(&managed_git_hook_contents("post-index-change"));
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            if fixture
+                .remaining_processes()
+                .iter()
+                .any(|line| line.ends_with("sleep 600"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "stalled probe was not reached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Kill only the hook PID, not its session, to model an outside caller
+        // that cannot run a shell trap. The surviving watchdog must still end
+        // the stalled probe and then exit within its original ten-second bound.
+        child.kill().unwrap();
+        assert!(!DispatcherProcessFixture::wait(&mut child, Duration::from_secs(6)).success());
+        fixture.assert_drained(Duration::from_secs(12));
     }
 
     #[cfg(unix)]

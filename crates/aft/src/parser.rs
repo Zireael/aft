@@ -999,6 +999,8 @@ pub(crate) mod work_counters {
         pub(crate) static GRAMMAR_LOADS: Cell<usize> = const { Cell::new(0) };
         /// Source reads the language provider does to inspect a file's tree.
         pub(crate) static PARSED_FILE_READS: Cell<usize> = const { Cell::new(0) };
+        /// Reads performed by FileParser to construct a tree, not by a provider.
+        pub(crate) static TREE_SOURCE_READS: Cell<usize> = const { Cell::new(0) };
         /// Copies of a cached symbol list handed out by `FileParser`.
         pub(crate) static CACHED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
         pub(crate) static FILE_PARSE_READS: Cell<usize> = const { Cell::new(0) };
@@ -1093,7 +1095,7 @@ fn cached_file_is_fresh(
             released.wait();
         }
     });
-    let Ok(metadata) = std::fs::metadata(path) else {
+    let Ok(metadata) = crate::bounded_io::metadata(path) else {
         return false;
     };
     let current_size = metadata.len();
@@ -1636,7 +1638,7 @@ impl FileParser {
         })?;
 
         let canon = path.to_path_buf();
-        let current_mtime = std::fs::metadata(path)
+        let current_mtime = crate::bounded_io::metadata(path)
             .and_then(|m| m.modified())
             .map_err(|e| AftError::FileNotFound {
                 path: format!("{}: {}", path.display(), e),
@@ -1659,9 +1661,12 @@ impl FileParser {
         if needs_reparse {
             #[cfg(test)]
             work_counters::FILE_PARSE_READS.with(|count| count.set(count.get() + 1));
-            let source = std::fs::read_to_string(path).map_err(|e| AftError::FileNotFound {
-                path: format!("{}: {}", path.display(), e),
-            })?;
+            #[cfg(test)]
+            work_counters::TREE_SOURCE_READS.with(|count| count.set(count.get() + 1));
+            let source =
+                crate::bounded_io::read_to_string(path).map_err(|e| AftError::FileNotFound {
+                    path: format!("{}: {}", path.display(), e),
+                })?;
 
             let tree = Self::parse_source(path, &source, lang)?;
 
@@ -1783,7 +1788,7 @@ impl FileParser {
         path: &Path,
     ) -> Result<(Arc<Vec<Symbol>>, bool, bool), AftError> {
         let canon = path.to_path_buf();
-        let current_mtime = std::fs::metadata(path)
+        let current_mtime = crate::bounded_io::metadata(path)
             .and_then(|m| m.modified())
             .map_err(|e| AftError::FileNotFound {
                 path: format!("{}: {}", path.display(), e),
@@ -1843,9 +1848,10 @@ impl FileParser {
             }
         }
 
-        let source = std::fs::read_to_string(path).map_err(|e| AftError::FileNotFound {
-            path: format!("{}: {}", path.display(), e),
-        })?;
+        let source =
+            crate::bounded_io::read_to_string(path).map_err(|e| AftError::FileNotFound {
+                path: format!("{}: {}", path.display(), e),
+            })?;
         let size = source.len() as u64;
         let content_hash = content_hash_for_source(&source);
 
@@ -8562,14 +8568,15 @@ impl TreeSitterProvider {
     ) -> Result<(String, Tree, LangId), AftError> {
         #[cfg(test)]
         work_counters::PARSED_FILE_READS.with(|count| count.set(count.get() + 1));
-        let current_mtime = std::fs::metadata(file)
+        let current_mtime = crate::bounded_io::metadata(file)
             .and_then(|m| m.modified())
             .map_err(|e| AftError::FileNotFound {
                 path: format!("{}: {}", file.display(), e),
             })?;
-        let source = std::fs::read_to_string(file).map_err(|e| AftError::FileNotFound {
-            path: format!("{}: {}", file.display(), e),
-        })?;
+        let source =
+            crate::bounded_io::read_to_string(file).map_err(|e| AftError::FileNotFound {
+                path: format!("{}: {}", file.display(), e),
+            })?;
         let size = source.len() as u64;
         let content_hash = content_hash_for_source(&source);
         let (tree, lang) =

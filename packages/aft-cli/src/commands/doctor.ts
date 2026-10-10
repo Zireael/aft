@@ -1483,8 +1483,9 @@ async function runFixFlow(
   // Apply the ONNX Runtime repair when diagnostics found a managed-runtime issue.
   const onnxResult = await applyOnnxFix(adapters, report, { yes: true });
 
-  // Rewrite retired config keys to their canonical replacements. This is the
-  // only path allowed to repair configuration that ordinary loading rejects.
+  // Rewrite retired config keys to their canonical replacements. Loading
+  // already rewrites the user file and translates a project file in memory;
+  // this is how a project file gets updated.
   const configSummary = applyConfigMigration(
     runNativeFn,
     binaryDownloadError !== null,

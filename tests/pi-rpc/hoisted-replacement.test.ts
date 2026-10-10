@@ -172,10 +172,9 @@ describe("hoisted tool replacement matrix (real Pi RPC)", () => {
     }
   }, 120_000);
 
-  test("prefixed aft_edit is gone: the legacy hoist_builtin_tools=false no longer registers it", async () => {
-    // AFT no longer ships aft_read/aft_write/aft_edit variants. A legacy
-    // `hoist_builtin_tools: false` now translates to disabling the host slots,
-    // so a call to the old prefixed name must fail rather than edit the file.
+  test("prefixed aft_edit is gone: disabling host slots does not register it", async () => {
+    // AFT no longer ships aft_read/aft_write/aft_edit variants. Disabling the
+    // canonical host slots must not bring back the old prefixed edit tool.
     const toolEnd = await withPiTool(
       {
         name: "aft_edit",
@@ -187,7 +186,19 @@ describe("hoisted tool replacement matrix (real Pi RPC)", () => {
       },
       {
         message: "Update prefixed.txt through AFT's prefixed edit tool.",
-        aftConfigOverrides: { hoist_builtin_tools: false },
+        aftConfigOverrides: {
+          disabled_tools: [
+            "aft_delete",
+            "aft_move",
+            "apply_patch",
+            "bash",
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "write",
+          ],
+        },
         setup: async (env) => writeFile(join(env.workdir, "prefixed.txt"), "before\n"),
         afterTool: async (env) => {
           expect(await readFile(join(env.workdir, "prefixed.txt"), "utf8")).toBe("before\n");
