@@ -14,40 +14,10 @@ name: Tests
 # recovery, path separators).
 
 on:
-  pull_request:
-    paths:
-      - "crates/**"
-      - "packages/**"
-      - "tests/**"
-      - "scripts/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "package.json"
-      - "bun.lock"
-      - ".github/opencode-version.txt"
-      - ".github/workflows/tests.yml"
-      - ".github/workflows/release.yml"
-      - ".github/workflows/_unit-suite.yml"
-      - ".github/workflows/_e2e-suite.yml"
-      - ".github/workflows/bump-opencode.yml"
-  push:
-    branches:
-      - main
-    paths:
-      - "crates/**"
-      - "packages/**"
-      - "tests/**"
-      - "scripts/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "package.json"
-      - "bun.lock"
-      - ".github/opencode-version.txt"
-      - ".github/workflows/tests.yml"
-      - ".github/workflows/release.yml"
-      - ".github/workflows/_unit-suite.yml"
-      - ".github/workflows/_e2e-suite.yml"
-      - ".github/workflows/bump-opencode.yml"
+  # Automatic triggers (push / pull_request / schedule / release /
+  # workflow_run / ...) were removed on 2026-10-31. This workflow now
+  # runs only when started by hand: Actions tab -> Run workflow, or
+  # `gh workflow run <file>`.
   workflow_dispatch:
     inputs:
       ref:
