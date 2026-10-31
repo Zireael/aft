@@ -34,10 +34,10 @@ name: Bump OpenCode pin
 # from a PAT DO trigger downstream workflows.
 
 on:
-  schedule:
-    # Every Monday 06:00 UTC. Far enough from typical release Friday
-    # evenings that any urgent post-release fixes are usually in.
-    - cron: "0 6 * * 1"
+  # Automatic triggers (push / pull_request / schedule / release /
+  # workflow_run / ...) were removed on 2026-10-31. This workflow now
+  # runs only when started by hand: Actions tab -> Run workflow, or
+  # `gh workflow run <file>`.
   workflow_dispatch: {}
 
 permissions:
